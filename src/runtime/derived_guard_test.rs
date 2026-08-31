@@ -127,6 +127,7 @@ async fn nothing_may_be_created_inside_the_folder_by_hand() {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     let error = runtime
         .workspace()
@@ -154,6 +155,7 @@ async fn the_folder_name_itself_cannot_be_claimed_by_hand() {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     assert!(
         runtime
@@ -198,6 +200,7 @@ async fn a_derived_file_can_be_moved_neither_out_nor_in() {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     runtime
         .workspace()
@@ -284,6 +287,7 @@ async fn ordinary_notes_are_untouched() {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     runtime
         .workspace()

@@ -8,6 +8,7 @@ import { ArrowLeft, Inbox as InboxIcon, Info, Mail, Send } from "lucide-react";
 import type { OpenCompanyClient } from "@/api/client";
 import { enabledInboxes, preview } from "@/api/inbox";
 import type { InboxDto, InboxMessageDto } from "@/api/types";
+import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -151,7 +152,7 @@ export function InboxView({ client, company }: Props) {
       <div className="flex flex-1 flex-col overflow-hidden">
         <InboxParkingNotice />
         <div className="flex flex-1 flex-col gap-2 p-4">
-          <h1 className="sr-only">Inbox</h1>
+          <PageHeader hidden title="Inbox" />
           {Array.from({ length: 6 }).map((_, i) => (
             <Skeleton key={i} className="h-16 rounded-lg" />
           ))}
@@ -165,7 +166,7 @@ export function InboxView({ client, company }: Props) {
       <div className="flex flex-1 flex-col overflow-hidden">
         <InboxParkingNotice />
         <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center text-muted-foreground">
-          <h1 className="sr-only">Inbox</h1>
+          <PageHeader hidden title="Inbox" />
           <InboxIcon className="size-8" />
           <div className="space-y-1">
             <p className="font-medium text-foreground">Inboxes unavailable</p>
@@ -184,7 +185,7 @@ export function InboxView({ client, company }: Props) {
       <div className="flex flex-1 flex-col overflow-hidden">
         <InboxParkingNotice />
         <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center text-muted-foreground">
-          <h1 className="sr-only">Inbox</h1>
+          <PageHeader hidden title="Inbox" />
           <InboxIcon className="size-8" />
           <div className="space-y-1">
             <p className="font-medium text-foreground">No inboxes yet</p>
@@ -206,7 +207,7 @@ export function InboxView({ client, company }: Props) {
     <div className="flex flex-1 flex-col overflow-hidden">
       <InboxParkingNotice />
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        <h1 className="sr-only">Inbox</h1>
+        <PageHeader hidden title="Inbox" />
         {/* Message list */}
         <section
           className={cn(

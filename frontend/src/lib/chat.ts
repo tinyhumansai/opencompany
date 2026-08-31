@@ -1,4 +1,9 @@
-import type { ChatHistoryMessageDto, TurnStep } from "@/api/types";
+import type {
+  AttachmentDto,
+  ChatHistoryMessageDto,
+  ChatMentionDto,
+  TurnStep,
+} from "@/api/types";
 
 /**
  * The company's main line, by thread id.
@@ -11,6 +16,64 @@ import type { ChatHistoryMessageDto, TurnStep } from "@/api/types";
  */
 export const MAIN_THREAD_ID = "main";
 
+/**
+ * The name of the company-wide channel, rendered after the `#`.
+ *
+ * Mirrors the host's `GENERAL_CHANNEL` (`src/server/ops/language.rs`), the same
+ * way {@link MAIN_THREAD_ID} mirrors its `MAIN_THREAD_ID`.
+ */
+export const GENERAL_CHANNEL = "general";
+
+/**
+ * Does this id name the built-in `#general` channel?
+ *
+ * Mirrors the host's `is_general_chat` (`src/server/chat_history.rs`), which
+ * has folded four spellings into one conversation since issue #65: the empty
+ * string, `main` (what this console addresses the line as), `General` (the
+ * name the host attributes an unaddressed turn to), and `general`. The host
+ * reserves every one of them — a desk cannot be created with any of them as
+ * its id — so this is a closed set, not a guess.
+ *
+ * **Case-folded and nothing else.** The host compares with
+ * `eq_ignore_ascii_case` against the string exactly as journaled, so it does
+ * not trim — and neither may this, or the two disagree about the same id.
+ * Trimming here was strictly worse than being strict: an API client posting
+ * `chat: "  Main  "` has that spelling journaled verbatim, so the console
+ * rendered the live reply in `#general` while `chat/history?desk=main` did not
+ * return it, and the message vanished on the next reload. A live frame that
+ * never lands is a message the operator has not seen; one that lands and then
+ * disappears reads as data loss.
+ *
+ * Lives here rather than in `lib/desks.ts` — where it used to — because it is a
+ * fact about chat *addressing*, like {@link MAIN_THREAD_ID} beside it, and
+ * because `dispatchMarkerPlacement` below has to apply it. `lib/desks.ts`
+ * re-exports it, so nothing that reads it had to move.
+ */
+export function isGeneralChannel(id: string): boolean {
+  const key = id.toLowerCase();
+  return key === "" || key === MAIN_THREAD_ID || key === GENERAL_CHANNEL;
+}
+
+/**
+ * The channel that renders `threadId`, given the shell's thread → channel map.
+ *
+ * A plain `map[threadId]` is not enough for the General line and never was: the
+ * map is seeded with four literal spellings, while the host accepts **any
+ * casing** of them and echoes back the one the caller addressed. So a live
+ * frame from an API client that posted `MAIN` matched nothing, and its reply
+ * and working indicator appeared only once polling recovered the durable
+ * history (issue #1743).
+ *
+ * `null` when the map does not know the thread — never a fall back to whatever
+ * the operator has open, which is issue #368's bug.
+ */
+export function generalAwareChannel(
+  map: Readonly<Record<string, string>>,
+  threadId: string,
+): string | null {
+  return map[threadId] ?? (isGeneralChannel(threadId) ? (map[MAIN_THREAD_ID] ?? null) : null);
+}
+
 /** One person's reaction on one line. Mirrors `ChatReactionDto` on the host. */
 export interface Reaction {
   emoji: string;
@@ -19,6 +82,9 @@ export interface Reaction {
   /** Whether the reader is the one who reacted. */
   mine: boolean;
 }
+
+/** One mention on one line, exactly as resolved by the host. */
+export type Mention = ChatMentionDto;
 
 /** One line in the conversation with the company. */
 export interface ChatMessage {
@@ -30,8 +96,24 @@ export interface ChatMessage {
   /**
    * The reply's originating channel (e.g. "operator"). Threads the company
    * side by sender: a distinct channel reads as its own agent in the chat.
+   *
+   * **Not a provenance signal.** The offline echo brain names its own outbound
+   * channel `operator` too, so this cannot tell a person's message from a
+   * canned reply — read {@link byPerson} for that.
    */
   channel?: string;
+  /**
+   * A person typed this line, rather than the runtime producing it (issue
+   * #1734). Read straight off the host; never inferred here.
+   *
+   * Only set by {@link fromHistory}, because it is the only path a message
+   * somebody *else* wrote arrives on — every locally built company line is an
+   * agent reply, from this console's own POST or from an `AgentReplyEvent`.
+   *
+   * `undefined` means the host could not say, and nothing downstream may turn
+   * that into a claim in either direction.
+   */
+  byPerson?: boolean;
   /**
    * The message this one replies to. A line with a parent is a thread reply:
    * it stays out of the channel timeline and renders inside the thread panel.
@@ -62,6 +144,23 @@ export interface ChatMessage {
    * `#/tasks/<id>`.
    */
   taskId?: string;
+  /**
+   * Files attached to this line (issue #1682), each a reference into the
+   * company workspace. Set on your own message from the composer's pending
+   * attachment (optimistic), and rehydrated from `chat/history` on reload so a
+   * bubble carries the same chips whichever way it reached the transcript.
+   * Absent on a line with no attachment.
+   */
+  attachments?: AttachmentDto[];
+  /**
+   * Who this line names (`@engineer`, `@Jane Doe`, `@everyone`), as the host
+   * resolved them — spans plus a label, never a target id.
+   *
+   * Carried rather than re-parsed from `text`, so a chip is drawn only where
+   * somebody was actually notified. Absent when the line names nobody, and on
+   * a host that predates the field.
+   */
+  mentions?: Mention[];
 }
 
 /**
@@ -196,6 +295,9 @@ export function makeMessage(
     steps?: TurnStep[];
     taskId?: string;
     messageId?: string;
+    attachments?: AttachmentDto[];
+    /** Mention spans the host resolved against this message, for chip rendering. */
+    mentions?: Mention[];
   } = {},
 ): ChatMessage {
   return {
@@ -207,6 +309,10 @@ export function makeMessage(
     parentId: opts.parentId,
     steps: opts.steps,
     taskId: opts.taskId,
+    // Issue #1682: an empty list is dropped to `undefined` so a line with no
+    // attachment stays exactly the shape it was before the field existed.
+    attachments: opts.attachments?.length ? opts.attachments : undefined,
+    mentions: opts.mentions?.length ? opts.mentions : undefined,
   };
 }
 
@@ -275,7 +381,12 @@ export function dispatchMarkerPlacement(
   const threadId = event.chatId === "" ? MAIN_THREAD_ID : event.chatId;
   return {
     threadId,
-    channelId: chatChannelByThread[threadId] ?? null,
+    // Resolved the same way every other live frame is (issue #1743): the map
+    // carries four literal General spellings, while the host accepts any casing
+    // and echoes back the one the caller addressed. A bare index dropped the
+    // marker for `MAIN` or `GENERAL`, so a dispatch settled with nothing to
+    // show for it until a reload.
+    channelId: generalAwareChannel(chatChannelByThread, threadId),
     message: makeMessage("system", dispatchMarkerText(event.column), {
       taskId: event.taskId,
       messageId: String(event.seq),
@@ -305,6 +416,9 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       from,
       text: entry.text,
       at: entry.atMillis,
+      // Straight through, never derived: see the field's own note, and
+      // `MessageView::by_person` for why the host is the only layer that knows.
+      byPerson: entry.byPerson,
       // The host names the parent by its own id, which lives in the same
       // namespace as `entry.id` — so it takes the same prefix, or the reply
       // would point at a line no console id matches (issue #364).
@@ -312,6 +426,9 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       // Reactions come through whoever the host said reacted; nothing is
       // inferred here, `mine` included.
       reactions: entry.reactions?.length ? entry.reactions : undefined,
+      // Same rule as reactions: the host says who was mentioned, and nothing
+      // here infers one from the text.
+      mentions: entry.mentions?.length ? entry.mentions : undefined,
       // A sent message never carries a channel; only attribute one when the
       // line came from someone/something else, mirroring `ChatPane.send`.
       channel: from === "company" ? entry.channel : undefined,
@@ -328,6 +445,10 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       // Only your own lines never have one — you did not open a card by
       // speaking.
       taskId: from === "you" ? undefined : entry.taskId,
+      // Rehydrate the operator's attachments (issue #1682) so a bubble carries
+      // the same chips on reload it showed live. Empty drops to `undefined`,
+      // keeping the pre-#1682 line shape.
+      attachments: entry.attachments?.length ? entry.attachments : undefined,
     };
   });
 }
@@ -447,4 +568,144 @@ export function clearTaskCard(messages: ChatMessage[], taskId: string): ChatMess
     return rest;
   });
   return changed ? next : messages;
+}
+
+/** Stable content fields shared by an optimistic row and its history echo. */
+function messageFingerprint(message: ChatMessage): string {
+  return JSON.stringify([message.from, message.text, message.parentId ?? null]);
+}
+
+/** The host event sequence encoded by a durable console id, when available. */
+function messageSequence(message: ChatMessage): number | null {
+  if (!isHostMessageId(message.id)) return null;
+  const sequence = Number(toHostMessageId(message.id));
+  return Number.isSafeInteger(sequence) ? sequence : null;
+}
+
+/**
+ * Fold one `chat/history` response into a live transcript (issue #1690).
+ *
+ * `chat/history` is the host's authoritative, **oldest-first** record for a
+ * thread; a live transcript is that record plus whatever has not been
+ * journaled yet — the operator's own optimistic bubbles, minted with
+ * browser-local `m<seq>` ids the host does not know. Folding the response in
+ * is therefore neither prepend nor append but *reconstruction*, and the two
+ * rules below are what make that safe:
+ *
+ * 1. **Persisted rows take the history's own order.** A reply the live SSE
+ *    path missed lands after the message it follows (a plain append/prepend
+ *    rule could put it *before* the transcript), and a gap the SSE path
+ *    dropped is filled in its correct position rather than tacked on after
+ *    the tail — `[1, 3]` + history `[1, 2, 3]` must merge to `[1, 2, 3]`,
+ *    never `[1, 3, 2]`.
+ * 2. **Rows the host has not persisted yet stay in their live order.** They
+ *    are inserted at the boundary implied by their durable neighbours, while
+ *    optimistic sends with no durable sequence remain at the tail.
+ *
+ * Rows the history names that are already on screen are kept as the caller's
+ * own objects (reactions and other local decoration survive the re-fetch)
+ * rather than replaced by the freshly-projected copy. When nothing differs the
+ * input array is returned unchanged, so a caller can bail out of a state write
+ * and React can skip a re-render.
+ */
+export function mergeHistoryInOrder(
+  existing: ChatMessage[],
+  hydrated: ChatMessage[],
+): ChatMessage[] {
+  const historyIds = new Set(hydrated.map((m) => m.id));
+  const existingById = new Map(existing.map((m) => [m.id, m]));
+  const durableEchoes = new Map<string, ChatMessage[]>();
+  for (const message of hydrated) {
+    const matches = durableEchoes.get(messageFingerprint(message)) ?? [];
+    matches.push(message);
+    durableEchoes.set(messageFingerprint(message), matches);
+  }
+
+  const persisted = hydrated.map((m) => existingById.get(m.id) ?? m);
+  const consumedEchoes = new Set<ChatMessage>();
+  const liveRows = existing.filter((m) => !historyIds.has(m.id));
+  const liveDurable = liveRows.filter((m) => isHostMessageId(m.id));
+  const hydratedSequences = hydrated.map(messageSequence);
+  const firstSequence = hydratedSequences.find((sequence) => sequence !== null) ?? null;
+  const lastSequence = [...hydratedSequences]
+    .reverse()
+    .find((sequence) => sequence !== null) ?? null;
+  const snapshotAt = hydrated.length ? hydrated[hydrated.length - 1].at : null;
+
+  const optimistic = liveRows.filter((message) => {
+    if (isHostMessageId(message.id)) return false;
+    const matches = durableEchoes.get(messageFingerprint(message));
+    const echo = matches?.find((candidate) => {
+      if (consumedEchoes.has(candidate)) return false;
+      // A durable row already present in the live transcript is an older
+      // identical send, even when it is the newest (or only) row in the page.
+      // Only an id that was not on screen when this fold began can reconcile
+      // this local bubble; otherwise a send made after the snapshot would be
+      // consumed by the page-boundary row it duplicated.
+      if (existingById.has(candidate.id)) return false;
+      // A matching row before the snapshot may be an older identical message,
+      // not this send. A row at/after the snapshot is fresh evidence; for a
+      // single-row response there is no older page boundary to consult, but
+      // the id check above still protects that boundary when it was live.
+      return snapshotAt === null || hydrated.length === 1 || candidate.at >= snapshotAt;
+    });
+    if (!echo) return true;
+    consumedEchoes.add(echo);
+    return false;
+  });
+
+  const outsidePage = liveDurable.filter((message) => {
+    const sequence = messageSequence(message);
+    if (sequence !== null && firstSequence !== null && lastSequence !== null) {
+      // A durable row absent from the page may be a gap or a live tail. Keep
+      // every such row and let sequence-aware insertion restore its position.
+      return true;
+    }
+    if (!hydrated.length) return true;
+    return message.at <= hydrated[0].at || message.at >= hydrated[hydrated.length - 1].at;
+  });
+
+  // Start with the authoritative page, then insert rows that were already
+  // live. Numeric host sequences are the ordering authority; timestamps are a
+  // compatibility fallback for legacy/non-numeric ids. Finally insert local
+  // rows without a durable position at the boundary implied by their live
+  // neighbours, rather than moving every optimistic send to the tail.
+  const merged = [...persisted];
+  for (const message of outsidePage) {
+    const sequence = messageSequence(message);
+    let index = -1;
+    if (sequence !== null) {
+      index = merged.findIndex((candidate) => {
+        const candidateSequence = messageSequence(candidate);
+        return candidateSequence !== null && candidateSequence > sequence;
+      });
+    } else {
+      index = merged.findIndex((candidate) => candidate.at > message.at);
+    }
+    merged.splice(index < 0 ? merged.length : index, 0, message);
+  }
+
+  for (const message of optimistic) {
+    const liveIndex = liveRows.indexOf(message);
+    // A local row's position is defined by the nearest durable live row on
+    // either side of it. The preceding live row may itself be optimistic and
+    // already inserted; using it as the lower bound preserves the order of a
+    // burst of local sends around one durable SSE row.
+    const previousLive = liveRows
+      .slice(0, liveIndex)
+      .reverse()
+      .find((candidate) => merged.includes(candidate));
+    const nextLive = liveRows.slice(liveIndex + 1).find((candidate) => merged.includes(candidate));
+    if (previousLive) {
+      merged.splice(merged.indexOf(previousLive) + 1, 0, message);
+    } else if (nextLive) {
+      merged.splice(merged.indexOf(nextLive), 0, message);
+    } else {
+      merged.push(message);
+    }
+  }
+
+  return merged.length === existing.length && merged.every((m, i) => m === existing[i])
+    ? existing
+    : merged;
 }

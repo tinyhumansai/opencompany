@@ -1,3 +1,78 @@
+type AgentRun {
+	"""
+	The attempt id.
+	"""
+	id: ID!
+	"""
+	The teammate that ran it.
+	"""
+	agentId: String!
+	"""
+	1-based attempt ordinal at its card.
+	"""
+	attempt: Int!
+	"""
+	`pending` | `running` | `waiting_approval` | `paused` | `succeeded` |
+	`failed` | `cancelled`.
+	"""
+	status: String!
+	"""
+	`active` | `parked` | `terminal` — read this rather than inferring a
+	phase from timestamps.
+	"""
+	phase: String!
+	"""
+	The card this attempted, when it attempted one.
+	"""
+	taskId: ID
+	"""
+	The conversation it belongs to, when one raised it.
+	"""
+	chatId: ID
+	"""
+	The workflow run whose node spawned it.
+	"""
+	workflowRunId: ID
+	"""
+	The graph node within that run.
+	"""
+	nodeId: ID
+	"""
+	When the row was opened.
+	"""
+	createdAtMillis: Float!
+	"""
+	When it began running.
+	"""
+	startedAtMillis: Float
+	"""
+	When it settled. `None` while it is still going.
+	"""
+	finishedAtMillis: Float
+	"""
+	Why it failed, when it did.
+	"""
+	error: String
+	"""
+	Token and cost totals. Provisional until the attempt settles — they are
+	written by the settle, not accumulated on the row.
+	"""
+	usage: RunUsage!
+	"""
+	The settled step count.
+	
+	**Null while the attempt is live**, deliberately: `step_count` is written
+	by the settle, so returning the stored `0` for a running attempt would be
+	a lie that a client cannot detect. A live reader counts `steps` instead,
+	and this being `null` is what tells it to.
+	"""
+	stepCount: Int
+	"""
+	The step trace, oldest first.
+	"""
+	steps: [RunStep!]!
+}
+
 """
 Token totals for one teammate.
 """
@@ -65,6 +140,16 @@ type Approval {
 	board task's attempt), which is the majority.
 	"""
 	workflowRunId: String
+	"""
+	Which workflow a parked `workflow.approve` gate is asking about
+	(issue #1418), when the effect is one.
+	
+	Carried for the same reason it is on the REST summary: it is the second
+	half of the run address, and it must survive role redaction or a Member
+	holding up a stalled workflow would see `workflow_run_id` and still have
+	nowhere to click.
+	"""
+	workflowId: String
 }
 
 """
@@ -130,10 +215,13 @@ type Company {
 	"""
 	The approvals currently awaiting the operator for this company.
 	
-	Contents are role-gated exactly as on the REST list (issue #618). This
-	is the surface that made the question worth asking: it maps the same
-	projection, so a redaction applied only to the REST handlers would leave
-	the whole boundary reachable through one GraphQL field.
+	Contents are role-gated exactly as on the REST list (issue #618), and
+	ownership is resolved exactly as there (#1891). This is the surface that
+	made the question worth asking: it maps the same projection, so either
+	applied only to the REST handlers would leave the whole boundary
+	reachable through one GraphQL field — the redaction as a contents hole,
+	and the raw park stamp as a client putting an approval on a card the
+	host does not consider its owner.
 	"""
 	approvals: [Approval!]!
 	"""
@@ -156,6 +244,25 @@ type Company {
 	The task board, optionally filtered to one column.
 	"""
 	tasks(column: String, first: Int! = 100, offset: Int! = 0): TaskPage!
+	"""
+	Attempts at work — a card dispatch, a chat turn, or a workflow node —
+	newest first, each with its step trace.
+	
+	`workflowRunId` is the join that had no answer before agent nodes minted
+	rows: a node's turn has neither a card nor a conversation, so nothing
+	could ask what a workflow run's agents did.
+	
+	The unredacted half of each step is **role-gated**: a member sees the
+	scrubbed trace, and only a principal who may read sensitive contents sees
+	the raw reasoning, arguments and output (`approval_visibility`).
+	"""
+	agentRuns(taskId: ID, workflowRunId: ID, limit: Int! = 50): [AgentRun!]!
+	"""
+	One attempt by id, with its step trace; null when absent.
+	
+	The unredacted half is role-gated exactly as on [`agent_runs`](Self::agent_runs).
+	"""
+	agentRun(id: ID!): AgentRun
 	"""
 	The company's installed skills.
 	"""
@@ -255,6 +362,36 @@ type ConnectionState {
 	The manifest's stated reason for wanting this connection.
 	"""
 	reason: String
+}
+
+"""
+The unredacted companion of one step. **Carries secrets by construction.**
+"""
+type DeepStepDetail {
+	"""
+	Model reasoning for a thinking step.
+	"""
+	reasoning: String
+	"""
+	The tool's arguments as the model emitted them, unredacted.
+	"""
+	arguments: String
+	"""
+	The tool's raw output, before it was reduced to a shape.
+	"""
+	output: String
+	"""
+	The harness's own contextual label.
+	"""
+	displayDetail: String
+	"""
+	Which pass of the tool loop this step belongs to.
+	"""
+	iteration: Int
+	"""
+	Whether the store clipped any field above to its cap.
+	"""
+	clipped: Boolean!
 }
 
 """
@@ -604,6 +741,39 @@ type Message {
 	cannot disagree about who was mentioned.
 	"""
 	mentions: [MessageMention!]!
+	"""
+	Files attached to this message (issue #1682), each a reference into the
+	company workspace with the store-computed name / mime / size. Empty on a
+	reply, a system pill, and every operator message journaled before the
+	field existed. Same [`MessageView`] field the REST route reads, so the
+	two surfaces carry the same rows (issue #65).
+	"""
+	attachments: [MessageAttachment!]!
+}
+
+"""
+One file attached to a history message (issue #1682). GraphQL mirror of the
+REST `attachments` array, so the two surfaces carry the same rows. Every
+field is store-authored metadata; the bytes are fetched separately through
+the hardened `GET …/workspace/blob/{nodeId}` route.
+"""
+type MessageAttachment {
+	"""
+	The workspace node id the payload is stored under.
+	"""
+	nodeId: ID!
+	"""
+	The stored file's display name.
+	"""
+	name: String!
+	"""
+	The stored payload's media type.
+	"""
+	mime: String!
+	"""
+	The stored payload's exact length in bytes.
+	"""
+	size: Float!
 }
 
 """
@@ -710,6 +880,16 @@ type Policy {
 	"""
 	alwaysApprove: [String!]!
 	"""
+	The spend cap actually in force — console override where one sets it,
+	the committed manifest otherwise. A higher cap is looser; `null` is the
+	strictest setting — no spend is auto-approved, so every spend parks.
+	"""
+	autoApproveUnderUsd: Float
+	"""
+	How long an undecided approval remains actionable, in hours.
+	"""
+	approvalTtlHours: Float!
+	"""
 	The manifest's tier, so a client can see what a reset would restore.
 	"""
 	manifestMode: String!
@@ -717,6 +897,17 @@ type Policy {
 	The manifest's always-ask list, for the same reason.
 	"""
 	manifestAlwaysApprove: [String!]!
+	"""
+	The manifest's spend cap, for the same reason — what a reset would
+	restore (a higher cap is looser; `null` is the strictest setting — no
+	spend is auto-approved, so every spend parks).
+	"""
+	manifestAutoApproveUnderUsd: Float
+	"""
+	The manifest's approval deadline, for the same reason — what a reset
+	would restore.
+	"""
+	manifestApprovalTtlHours: Float
 	"""
 	Whether an operator override is in force.
 	
@@ -823,6 +1014,79 @@ type RegistrySkill {
 	skill authored before `version` existed.
 	"""
 	version: String
+}
+
+"""
+One step of an attempt's trace.
+"""
+type RunStep {
+	"""
+	The step's ordinal within its run.
+	"""
+	seq: Int!
+	"""
+	When it was recorded.
+	"""
+	atMillis: Float!
+	"""
+	`tool_call` | `thinking` | `note`.
+	"""
+	kind: String!
+	"""
+	`ok` | `error` | `running` | `awaiting_approval`.
+	"""
+	status: String!
+	"""
+	The display label — the tool's name, or "Thinking".
+	"""
+	label: String!
+	"""
+	Arguments, **through the host redactor**. Safe to render anywhere.
+	"""
+	detail: String
+	"""
+	A summary or shape of the result — never a remote body.
+	"""
+	result: String
+	"""
+	The typed failure class, when the step failed.
+	"""
+	failure: String
+	"""
+	Whether the harness truncated the result before we saw it.
+	"""
+	truncated: Boolean!
+	"""
+	Wall-clock duration.
+	"""
+	elapsedMs: Float
+	"""
+	The unredacted half. `None` when this host keeps no deep trace, and when
+	the step produced none.
+	"""
+	deep: DeepStepDetail
+}
+
+"""
+Token and cost totals for one attempt.
+"""
+type RunUsage {
+	"""
+	Input tokens.
+	"""
+	inputTokens: Float!
+	"""
+	Output tokens.
+	"""
+	outputTokens: Float!
+	"""
+	Input tokens served from the provider's cache.
+	"""
+	cachedInputTokens: Float!
+	"""
+	Cost in USD.
+	"""
+	costUsd: Float!
 }
 
 """
@@ -976,6 +1240,14 @@ type TeamMember {
 	range that would overflow GraphQL's `Int`, matching `Approval.atMillis`.
 	"""
 	budgetSetAtMillis: Float
+	"""
+	The face this teammate wears, when somebody has chosen one — a
+	`tiny:<flavour>` mascot or a `blob:<nodeId>` upload
+	(`docs/spec/runtime/avatars.md`). Absent means **nobody has chosen**, and
+	the console draws the mascot it hashes from the id. Mirrors the REST
+	team DTO's `avatar`; both arms of the roster read answer the same way.
+	"""
+	avatar: String
 }
 
 """
@@ -1211,6 +1483,12 @@ type WorkflowNode {
 	words, so the model shape needs no camelCase mirror the way `retry` does.
 	"""
 	destination: JSON
+	"""
+	A node's declared deterministic postcondition (issue #1866), as a JSON
+	scalar for the same reason `destination` is — `require`/`field` are
+	single words, so no camelCase mirror is needed.
+	"""
+	postcondition: JSON
 }
 
 """

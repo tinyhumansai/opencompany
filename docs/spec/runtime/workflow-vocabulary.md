@@ -209,6 +209,190 @@ because the vendor wording ("the conversation is too long … please start a new
 chat") describes a chat product: a workflow step has no conversation an operator
 owns and no chat for them to start.
 
+## A node's declared postcondition halts before its output flows downstream (issue #1866)
+
+A `postcondition` is a mechanical, deterministic check on a node's OWN output,
+run before the run is allowed to advance past that node — the general form of
+the truncation check the iteration-cap signal (#1865) already applies, but
+author-declared instead of engine-derived. It is a different mechanism from
+`on_error`/`retry` (which react to the node's *call* failing) and from the
+`blocked` outcome above (which reacts to a *tool call inside the turn* being
+parked) — a postcondition reacts to the call succeeding with an output the
+author decided is not good enough to hand to the next node.
+
+**`agent` nodes only, in this slice** — `tool_call`/`http_request` are a
+follow-up (see the issue). Declared as a table on the node, evaluated by
+[`evaluate_postcondition`](../../../src/workflows/caps/postcondition.rs) inside
+[`HarnessAgentRunner::run_turn`](../../../src/workflows/caps/mod.rs):
+
+```toml
+[[node]]
+id = "research"
+kind = "agent"
+name = "Research"
+agent = "analyst"
+
+[node.postcondition]
+require = "field_present"
+field = "json.items"
+```
+
+`require` is one of three predicates, checked against the agent's reply
+best-effort parsed as JSON (`Value::Null` when it is not valid JSON — the
+common case, since agent nodes are prose by default):
+
+| `require` | Checks | `field` |
+| --- | --- | --- |
+| `non_empty` | the reply's prose (`text`) is present and non-blank after trimming | unused |
+| `field_present` | the dotted `field` path resolves to a present, non-null value inside the parsed reply | **required** |
+| `non_empty_list` | the target is a JSON array with at least one element | optional — the whole parsed reply when omitted, else the dotted path within it |
+
+`field` is a dot-separated path evaluated against the reply's structured
+content — `json.items` in the example above means "the agent's reply, parsed
+as JSON, must have a top-level `items` key" (so a reply of
+`{"items": [1, 2, 3]}` satisfies both `field_present` on `json.items` and
+`non_empty_list` on the same path). The `json.` prefix mirrors the engine's
+`{ json, text, raw }` item envelope everywhere else in this document — see
+[What an agent node receives from upstream](#what-an-agent-node-receives-from-upstream-and-its-bound)
+— it does not name a real top-level `json` key on the reply itself.
+
+**A `field` must be rooted at `json`, `text`, or `agent_ref` — nothing else
+ever resolves.** The evaluator checks `field` against the exact `{ text,
+agent_ref, json }` envelope shown above, not the parsed reply directly, so a
+bare structured field like `field = "items"` (missing the `json.` prefix)
+can never resolve — `resolve_path` looks for a top-level `items` key on the
+envelope, which is never there regardless of what the agent replies.
+`parse_workflow` refuses this at author time (issue #1937 boundary sweep)
+with a message pointing at the `json.`-prefixed form, the same way it refuses
+`field_present` with no `field` at all above — a gate that can never pass is
+as much an authoring bug as one that is missing entirely.
+
+**Only `json` has anything to descend INTO.** `text` and `agent_ref` are
+always plain strings in the envelope `field` resolves against, so while
+`field = "text"` or `field = "agent_ref"` are valid roots on their own, a
+dotted descendant of either — `field = "text.foo"`, `field =
+"agent_ref.id"` — can never resolve any more than a bare `items` could:
+indexing a string with a further path segment always comes back empty.
+`parse_workflow` refuses these the same way, at author time. `json` is the
+only root with real structure to walk into (`json.items`, `json.result.count`,
+…).
+
+**The combination rule: `require`'s accepted value kinds ∩ `field`'s
+possible value kinds must be non-empty, or the gate can never pass.** Every
+rejection on this page — bare `items`, a `text.`/`agent_ref.` descendant,
+`non_empty_list` on `text`/`agent_ref` — is the same structural fact, not a
+list of unrelated special cases: `text` and `agent_ref` can only ever hold a
+string (the envelope guarantees it), `json` (bare or dotted) can hold
+anything the agent's reply parses to, and each `require` only accepts
+certain kinds back from its target. When a root's guaranteed kind and a
+predicate's accepted kinds don't overlap, no reply can ever satisfy the
+gate, and `parse_workflow` refuses it before it can save. The full
+satisfiability table, `field` (columns) against `require` (rows) — omitted
+means no `field` set at all:
+
+| `require` | omitted | `text` | `agent_ref` | `json` | `json.<path>` |
+| --- | --- | --- | --- | --- | --- |
+| `non_empty` | ✅ (ignores `field`) | ✅ (ignores `field`) | ✅ (ignores `field`) | ✅ (ignores `field`) | ✅ (ignores `field`) |
+| `field_present` | — (`field` required at author time) | ✅ always (never null) | ✅ always (never null) | ✅ if object/array/scalar reply — but a bare scalar is then refused at EVALUATION time (below), a delivery constraint the author-time kind check can't see | ✅ if the path resolves to non-null |
+| `non_empty_list` | ✅ if the reply is a bare array | ❌ never — `text` is never an array | ❌ never — `agent_ref` is never an array | ✅ if the reply is a bare array | ✅ if the path resolves to an array |
+
+`non_empty` ignores `field` entirely (a set-but-unused `field` alongside it
+is inert, not rejected — there is nothing for it to conflict with).
+`field_present` accepts any non-null kind, so it never conflicts with a
+root's fixed kind; the `json`-scalar cell is the one place a check beyond
+kind-intersection is needed, covered next. Only `non_empty_list`'s narrow
+"array only" acceptance ever collides with `text`/`agent_ref`'s fixed
+"always string" kind — the two ❌ cells above.
+
+**`field_present`'s bare-scalar-under-`json` refusal is a DIFFERENT check,
+at a different time, for a different reason.** The table above is about
+*author-time* kind compatibility (could a value of this KIND ever satisfy
+this predicate). A bare scalar reply passes that check for `field_present`
+on `json` (a scalar is a valid non-null kind) — the problem shows up only at
+*evaluation* time, and only about *delivery*: the engine's own envelope
+construction discards a scalar (see the emission section below), so
+certifying one would pass a gate whose value never reaches a downstream
+binding. That is why it is enforced in
+[`evaluate_postcondition`](../../../src/workflows/caps/postcondition.rs), not
+[`validate`](../../../src/company/workflow_file.rs) — it depends on the
+runtime value's actual shape, not the field path's static kind.
+
+**`field` is not the place for an `=`-expression.** `postcondition` lowers
+into the same engine-resolved node config as everything else in this
+document, so it is tempting to write `field = "=item.some_key"` the way
+`args`/`input`/etc. do elsewhere. Don't: the rooted-`field` rule above
+already refuses it at author time (no `=`-expression's first dotted segment
+can ever equal `json`/`text`/`agent_ref`), and even if a graph reached
+runtime with one anyway — an older validator, a hand-edited seed file — a
+`field` that resolves away to null is refused at evaluation time too, rather
+than silently letting the reply through: `field_present`'s whole job is
+checking that one named field exists, so a resolution quirk that erases the
+name it was told to check fails the gate, not the other way around.
+
+**`json.text` and `json.agent_ref` are reserved and refused at save.** The
+emitted output always carries the raw reply string under `text` and the real
+roster id under `agent_ref` — that is what lets `delivery.rs::report_text`
+keep finding prose in a delivered report for the overwhelming majority of
+nodes whose reply isn't structured at all, rather than the literal string
+`"null"`. A `field` that drills into the *parsed* reply's own `text` or
+`agent_ref` key (e.g. `json.text` when the model happens to answer with
+`{"text": [...]}`) would validate whatever shape the model put there, but a
+downstream `=item.json.text`/`=item.json.agent_ref` binding always reads the
+raw reply string / real roster id regardless — a gate that can pass on one
+value while the field it named resolves to a different one downstream.
+`parse_workflow` refuses this at author time, naming both reserved paths in
+the error, rather than let a workflow ship a gate that certifies a shape the
+emitted output can never actually hold.
+
+**No-field `non_empty_list`** checks the parsed reply as a whole: only a reply
+that IS the literal JSON text of a non-empty array (`["a", "b"]`) passes —
+`non_empty_list` accepts arrays and nothing else, so a plain-prose reply, a
+reply that parses to a scalar, and a reply that parses to a JSON *object*
+(`{"a": 1}`) all fail with "is not a list — the shape does not match.". An
+unrecognized `require` value is rejected at author time by
+[`validate`](../../../src/company/workflow_file.rs) — a graph naming one never
+saves — and fails OPEN (a `tracing::warn!`, the node proceeds) if it somehow
+still reaches the evaluator, the same fail-open stance
+[`HarnessAgentRunner::run_turn`](../../../src/workflows/caps/mod.rs)'s own
+module doc applies to a failed attempt-row mint: observability must never be
+able to fail the work it is observing.
+
+**On failure, the node halts — the same shape as `on_error = "stop"`.** The
+attempt settles `Failed` with a plain-English message naming the gap — e.g.
+"the node's output is missing `json.items` — the expected field never
+landed." — `run_turn` returns `Err`, and because `on_error` defaults to
+`"stop"` and `retry.max_attempts` to `1`, nothing downstream ever sees the
+insufficient output. This runs BEFORE the iteration-cap check (#1865), deliberately: a
+capped turn's partial reply is exactly the truncation class a postcondition is
+meant to catch, so a declared postcondition is checked regardless of whether
+the cap already would have failed the attempt on its own.
+
+**On success, the node's emitted output reflects what the gate certified —
+except a bare scalar, which the gate refuses to certify in the first
+place.** When (and only when) a postcondition is declared, the node's output
+— what a downstream `=item.json.<field>` binding reads — is enriched with
+the parsed reply: an object reply's own keys are merged in (so `json.items`
+above also resolves downstream, not only inside the gate's own check), and a
+bare-array reply (`["a", "b"]`) replaces the emitted value with the array
+itself (so `=item.json` resolves to the exact array `non_empty_list`
+validated). A bare **scalar** reply (`42`, `true`, `"ok"`) is different: the
+engine's own item envelope only ever carries an object or array under
+`json` — anything else normalizes to `null` on the way to a downstream
+binding, a fixed property of the runtime this postcondition layer cannot
+change. `field_present` on the bare `field = "json"` root therefore REFUSES
+a scalar reply rather than certifying a value nothing downstream could ever
+read: it fails with a gap sentence naming the scalar and suggesting the
+fix — have the agent reply with an object naming the value (e.g.
+`{"value": 42}`) and target the dotted path (`field = "json.value"`), which
+already works via the object-merge case above. A dotted path *under* `json`
+(`json.count`) is unaffected by this — reaching a scalar there means the
+reply was already an object, which merges into the emitted value intact, so
+`item.json.count` really does resolve downstream. A node with **no**
+declared postcondition is entirely unaffected by any of this — its output
+stays the plain `{text, agent_ref}` shape it always had, regardless of what
+the agent happens to reply, so this feature changes nothing for a workflow
+that never opted into it.
+
 ## The engine-only kinds OpenCompany rejects
 
 The engine catalog carries four kinds the parser does **not** accept:

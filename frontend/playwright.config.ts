@@ -18,6 +18,7 @@ import {
   MOCK_BRAIN_BIND,
   VISUAL,
 } from "./test/e2e/capabilities";
+import { MANAGED_HOST_HOME } from "./test/e2e/host-identity";
 
 // `package.json` is `"type": "module"`, so this file is ESM and `__dirname`
 // does not exist here — it type-checks against `@types/node` and then throws at
@@ -33,7 +34,10 @@ const here = dirname(fileURLToPath(import.meta.url));
  *
  * **`PW_BASE_URL` set** — you brought your own host and this config touches
  * nothing else: no `webServer`, and `PW_STORAGE_STATE` keeps its exact former
- * meaning (unset ⇒ no `globalSetup` ⇒ no sign-in). Unchanged contract.
+ * meaning (unset ⇒ no sign-in). Unchanged contract. `globalSetup` does run
+ * either way now, to identify what is on the address before the suite trusts
+ * it (issue #1773); it still authenticates only when a storage state is
+ * configured.
  *
  * **`PW_BASE_URL` unset** — the config brings a host up itself through
  * `test/e2e/host.sh` and authenticates against it, so `npm run e2e` is the
@@ -114,8 +118,15 @@ const VISUAL_SPEC = /visual\.spec\.ts$/;
 
 const providedBaseURL = process.env.PW_BASE_URL;
 
-/** Whether this config is responsible for the host, as opposed to driving yours. */
-const managesHost = !providedBaseURL;
+/**
+ * Whether this config is responsible for the host, as opposed to driving yours.
+ *
+ * Derived from `MANAGED_HOST_HOME` rather than from `providedBaseURL` directly,
+ * even though the two say the same thing (`!process.env.PW_BASE_URL`). One
+ * source, so the address this config manages and the data root behind it can
+ * never disagree about whether there is a host of ours at all.
+ */
+const managesHost = MANAGED_HOST_HOME !== undefined;
 
 /**
  * Where a host *we* manage listens.
@@ -244,10 +255,13 @@ const composioEnv: Record<string, string> = managesComposio
  * not go through `PW_HOST_PASSTHROUGH`.
  */
 const firstRunEnv: Record<string, string> =
-  managesHost && FIRST_RUN
+  // `MANAGED_HOST_HOME !== undefined` rather than `managesHost`, which is the
+  // same test: TypeScript narrows the data root away from `undefined` only
+  // through the comparison itself, not through a boolean aliasing it.
+  MANAGED_HOST_HOME !== undefined && FIRST_RUN
     ? {
         PW_HOST_COMPANY: resolve(here, "..", FIRST_RUN_COMPANY),
-        PW_HOST_DATA_DIR: resolve(here, "../target/e2e/first-run-data"),
+        PW_HOST_DATA_DIR: MANAGED_HOST_HOME,
       }
     : {};
 
@@ -264,10 +278,11 @@ const firstRunEnv: Record<string, string> =
  * not go through `PW_HOST_PASSTHROUGH`.
  */
 const eulerEnv: Record<string, string> =
-  managesHost && EULER
+  // See `firstRunEnv` for why this is not `managesHost`.
+  MANAGED_HOST_HOME !== undefined && EULER
     ? {
         PW_HOST_COMPANY: resolve(here, "..", EULER_COMPANY),
-        PW_HOST_DATA_DIR: resolve(here, "../target/e2e/euler-data"),
+        PW_HOST_DATA_DIR: MANAGED_HOST_HOME,
       }
     : {};
 
@@ -371,7 +386,18 @@ export default defineConfig({
         : VISUAL
           ? { testMatch: VISUAL_SPEC }
           : { testIgnore: [FIRST_RUN_SPEC, LIVE_LLM_SPEC, EULER_SPEC, VISUAL_SPEC] }),
-  globalSetup: storageState ? "./test/e2e/global-setup.ts" : undefined,
+  // UNCONDITIONAL, and it was not always (issue #1773). `global-setup.ts` runs
+  // after every `webServer` above has resolved, which makes it the only hook
+  // that sees the server Playwright *adopted* rather than the one it was
+  // configured to start — and `reuseExistingServer` will adopt anything
+  // answering 2xx, including a console dev server whose SPA fallback answers
+  // 200 for `/healthz`. So it now identifies the server before doing anything
+  // else, and that has to happen on every run, not only the ones that sign in.
+  //
+  // The sign-in contract is unchanged: `global-setup.ts` reads the resolved
+  // `storageState` off the config and returns before authenticating when there
+  // is none, exactly as an absent `globalSetup` did.
+  globalSetup: "./test/e2e/global-setup.ts",
   fullyParallel: false,
   workers: 1,
   timeout: 60_000,

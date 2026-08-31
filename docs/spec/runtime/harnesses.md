@@ -148,59 +148,7 @@ expensive way to discover that `[harness.inference]` needs `kind = "built_in"`.
 
 ## ACP transports
 
-```toml
-[harness.acp]
-transport = "local"      # spawn an agent on this machine
-agent     = "claude"     # claude | codex
-
-[harness.acp]
-transport = "runner"     # reach one that dialed in
-runner    = "stevens_laptop"
-```
-
-**A remote runner is a transport, not a third kind.** `transport = "local"` and
-`transport = "runner"` resolve to the same `AcpAgent` port
-(`crate::ports::acp::AcpAgent`); only how bytes reach the agent differs.
-Modelling the runner as a third kind would add a resolution path that resolves
-to the same place.
-
-The transports differ in where they live, which is why `AcpAgent` is a **port**
-rather than an ACP client in the host crate: a subprocess over stdio belongs to
-the desktop shell, a WebSocket to the runner lane. The same inversion the
-storage ports use — and, concretely, why the port itself lives at
-`crate::ports::acp`, ungated, rather than under `crate::harness` (behind
-`openhuman`): the desktop shell that supplies the `local` implementation does
-not enable that feature. See that module's own docs for the full reasoning.
-
-`local` has a real implementation as of issue #1245 — `LocalAcpAgent`
-(`src-tauri/src/acp/local_agent.rs`), wired through `AppState::with_acp_agents`
-and `desktop::register`. `runner` does not yet: `src/runner/dispatch.rs`
-declares `RunnerDispatch`, but it does not implement `AcpAgent`, and nothing
-wires it into `lanes::build`. A `runner`-transport harness resolves
-`unavailable` on every build today, `local` included.
-
-### Readiness
-
-For `transport = "local"`, the desktop probes four states rather than two:
-
-| state | what to do |
-|---|---|
-| `NotInstalled` | install it |
-| `NotSignedIn` | sign in |
-| `Ready` | — |
-| `SpawnFailed` | read the reason |
-
-**Installed but not signed in** is the most common state on a fresh machine, and
-it looks identical to "not installed" if all you check is `which`. The fixes are
-completely different, so collapsing them tells someone to do the wrong thing.
-
-Sign-in is probed by looking for the harness's credential file, not by running
-it: asking a harness whether it is logged in means starting it, which is slow on
-a list refreshed whenever a settings pane opens, and for some prompts
-interactively. The probe can be wrong in one direction — a stale credential
-reads as signed in — and that is the acceptable direction, because the failure
-then surfaces on first use with the harness's own message, which is more
-accurate than anything guessed.
+Moved to [`harnesses-acp.md`](harnesses-acp.md) — this file was over the repository's 500-line limit. See that page for the two transports, the readiness states, session continuity across a restart, and live execution state.
 
 ---
 
@@ -263,6 +211,116 @@ silent fallback either.
   resolved against whatever provider its harness turns out to use, so an agent
   keeps its tier when it moves between harnesses. See
   [providers.md](providers.md).
+
+---
+
+## How long a turn may take
+
+There is exactly **one whole-turn** time bound anywhere on the path from a
+workflow run to a model call, and it does not live in this repo. Individual
+**tool** calls can carry a second, tighter bound of their own — see below.
+
+```
+workflow run ............................. no time bound
+  └─ tinyflows node execution ............ no time bound (duration observed only)
+      └─ agent capability → agent.turn() . no time bound
+          └─ tinyagents run "agent_turn" . the per-turn wall-clock ceiling
+              └─ each model call ......... bounded by (ceiling − run elapsed)
+              └─ each tool call .......... the lesser of that and the tool's own
+                  └─ sub-agent turn ...... inherits the parent's remainder
+```
+
+The ceiling is the vendored harness policy's `max_wall_clock_ms`, set in
+`vendor/openhuman/src/openhuman/agent/tinyagents/mod.rs::run_policy_for`. It
+defaults to ten minutes, is overridden with
+**`OPENHUMAN_AGENT_TURN_TIMEOUT_SECS`** (whole seconds; `0` removes it
+entirely), and is process-global — not per node, not per workflow, and not
+settable from a manifest or from the console.
+
+**It bounds the whole turn, from the moment the harness run starts.** Remaining
+budget is `ceiling − Instant::elapsed()`, so model time, tool time, sub-agent
+time and retry backoff all count against it; each individual call is then given
+whatever is left. It is deliberately generous: a hang backstop, not a UX
+deadline.
+
+### Why the harness's own message misleads, and what this crate says instead
+
+When the ceiling fires, the vendored leaf reads:
+
+```
+model call for run 'agent_turn' exceeded its remaining wall-clock budget (56636 ms)
+```
+
+Every word of that is true and it is almost impossible to read correctly. The
+number is the budget that **remained** when that call was issued — not the
+call's duration, and not the ceiling. A turn that ran the full ten minutes
+therefore reports a figure ten times smaller than the limit it hit, and reads
+as though one slow model call were at fault. Issue #1680 was filed on exactly
+that reading: a node that had already spent about nine minutes before its last
+model call started was diagnosed as a 56-second budget being too tight.
+
+`CompanyAgent::classify_turn` (`src/harness/built_in/mod.rs`) therefore times
+each turn attempt and rewrites this one class of error, naming what the turn
+actually spent, saying that the harness's figure is a remainder, and naming the
+environment variable that moves the ceiling. The underlying error is appended
+verbatim — it is the only thing that says which call was in flight.
+
+Two constraints on that message are deliberate:
+
+- **It does not restate the default value.** `DEFAULT_AGENT_TURN_TIMEOUT_SECS`
+  is private to the vendored crate and cannot be read from here; a copy of
+  `600` would go stale on the next vendored bump without anything failing. The
+  elapsed time is measured and the knob's *name* is a fact independent of its
+  value, so both can be stated honestly while the number cannot.
+- **A ceiling hit stays a hard failure.** It is not retried — the one-shot
+  empty-reply retry would turn a ten-minute failure into a twenty-minute one —
+  and it fails the node rather than degrading to a partial result.
+
+### The per-tool bounds this crate *does* set
+
+Several tools bound themselves, more tightly than the ceiling and independently
+of it, so a turn can lose a call without being anywhere near its own limit:
+
+- **The built-in web tools** — `web_fetch`, `http_request` and `curl`, all three
+  wired in `web_tools` (`src/harness/built_in/toolbelt.rs`) from
+  `HttpRequestConfig::default().timeout_secs`, which is **30 seconds**. One
+  source deliberately: `curl` takes it too rather than its own schema default of
+  120, and `web_fetch` is constructed with `None` so it falls back to the same
+  number. This is the bound an operator is most likely to meet and least likely
+  to look for, because nothing in the tool's own output names the ceiling.
+- **BYO web search** — `TIMEOUT_SECS` in `src/harness/built_in/search_byo.rs`,
+  thirty seconds, passed to each provider tool and applied as the HTTP request
+  timeout on its client. Deliberately shorter than a turn: a search that has not
+  answered in half a minute has already cost more than the answer is worth. Only
+  the bring-your-own providers; the managed tool keeps upstream's own policy.
+- **MCP** — each server declaration's `timeout_secs`, forwarded verbatim to the
+  transport by `server_config` in `src/harness/built_in/mcp.rs`. Per server, set
+  in the company's MCP config, and the one bound on this page an operator can
+  actually edit.
+
+None of them ends the turn. A call that trips its own bound comes back as a
+failed tool result, which the agent may retry or route around; only the ceiling
+above fails the node. The ceiling still counts every second they spent — which
+is the reading #1680 turned on, since a turn can burn most of its budget on tool
+calls that each looked fine.
+
+So a timeout an operator sees is one of two different facts, and the message is
+what tells them apart: a per-tool bound names the tool (`tool \`curl\` timed out
+after 30000 ms`), while the ceiling names the run and the *remaining* budget,
+which is what this crate rewrites.
+
+### What this crate does not bound
+
+OpenCompany imposes no run-level or node-level deadline of its own. The two
+`Duration` constants in `src/workflows/runner.rs` are a progress-collector join
+(`PROGRESS_DRAIN_TIMEOUT`) and a grace period that arms only after an explicit
+operator cancel (`CANCEL_HARD_ABORT_GRACE`); neither fires on its own. The
+per-node `elapsed_ms` on `WorkflowRunNodeRow` is recorded **after** the fact and
+compared to nothing.
+
+So a node whose agent turn walks off the ceiling is the only way a workflow run
+stops on time alone, and the honest reading of that failure is "this step asked
+for more than one turn can do", not "the model was slow".
 
 ---
 
@@ -332,8 +390,11 @@ running on an operator-supplied credential rather than a signed-in account.
 | per-agent dispatch | `src/harness/router.rs` |
 | building the lanes at boot, resolving `acp` engines | `src/harness/lanes.rs` |
 | the built-in engine | `src/harness/built_in/` |
-| the `AcpAgent`/`AcpAgentFactory` ports (ungated) | `src/ports/acp.rs` |
+| the `AcpAgent`/`AcpAgentFactory`/`AcpObserver` ports (ungated) | `src/ports/acp.rs` |
 | the ACP `RunTurn` (folds a port `AcpTurn` into `TurnStep`) | `src/harness/acp/run_turn.rs` |
+| live frames while an ACP turn runs (`live_frame_from`, `observer_for`) | `src/harness/acp/run_turn.rs` |
+| remembering + resuming a session (`session_record_path`, `resume_session`) | `src-tauri/src/acp/local_agent.rs` |
+| the transport's bounds on a tool call's title/result | `src-tauri/src/acp/local_agent.rs` (`MAX_TITLE_CHARS`, `MAX_RESULT_CHARS`) |
 | wiring an `AcpAgentFactory` onto a host | `AppState::with_acp_agents` (`src/app/types.rs`), consumed by `desktop::register` |
 | local transport: discovery, spawn, codec | `src-tauri/src/acp/` (`client.rs`, `discovery.rs`, `confine.rs`) |
 | the `local` `AcpAgentFactory` implementation | `src-tauri/src/acp/local_agent.rs` (`LocalAcpAgent`/`LocalAcpAgentFactory`) |

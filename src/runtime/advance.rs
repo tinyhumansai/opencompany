@@ -41,10 +41,11 @@
 
 use crate::Result;
 use crate::ports::TaskStore;
+use crate::ports::notifications::{Notification, NotificationStore, Subject, SubjectKind};
 use crate::ports::now_millis;
 use crate::ports::runs::RunStatus;
 use crate::ports::tasks::{
-    COLUMN_IN_PROGRESS, COLUMN_PLANNING, COLUMN_TODO, column_for_settled_run,
+    COLUMN_IN_PROGRESS, COLUMN_PAUSED, COLUMN_PLANNING, COLUMN_TODO, column_for_settled_run,
 };
 use crate::ports::types::CompanyId;
 
@@ -122,9 +123,157 @@ pub async fn advance_settled_card(
         reason,
     ));
     card.column = column.to_string();
+    // Issue #1865: the board's bounce chip, set on the exact same landing this
+    // function already computed and cleared on any other one. `column` is
+    // `column_for_settled_run`'s answer, so this cannot drift from the write
+    // above into a second, independent reading of "did this bounce".
+    card.bounced = bounced_reason(column, status, reason);
     card.updated_at_millis = now_millis();
     tasks.upsert(company, &card).await?;
     Ok(Some(column))
+}
+
+/// Returns a card whose blocker expired unanswered to [`COLUMN_TODO`],
+/// carrying the question nobody answered (issue #1861). `true` when the card
+/// moved.
+///
+/// The approval TTL's default-deny reaching the board. A blocker parks the card
+/// in `paused` and asks; if nothing answers before the deadline the question is
+/// retired, and this is what stops the card sitting in `paused` forever waiting
+/// on a decision that has already been made against it. Epic #183's rule
+/// applies again at that point: a card that cannot proceed goes back to To-do
+/// carrying its reason, never into a stuck column of its own.
+///
+/// # Why the question is preserved rather than dropped
+///
+/// The unanswered question is the single most useful thing on the card. It is
+/// what a person needs in order to unblock the work whenever they next look —
+/// the TTL expiring does not make the work possible, it only stops pretending
+/// somebody is about to answer.
+///
+/// # The guard, and why it differs from [`advance_settled_card`]'s
+///
+/// That function guards on [`COLUMN_IN_PROGRESS`] because it settles a run that
+/// was running. This one guards on [`COLUMN_PAUSED`], the column the blocker
+/// itself put the card in. Same principle either way: a card an operator has
+/// since dragged somewhere is theirs, and an expiry must not drag it back.
+///
+/// # Why the chip is set here rather than through [`bounced_reason`]
+///
+/// `bounced_reason` answers "did this *settle* bounce", from a
+/// [`RunStatus`] — and there is no run settling here. The attempt this blocker
+/// came from ended long ago; what expired is a park. The chip is still exactly
+/// right for the board's purpose (#1865): this card is not fresh, and an
+/// operator scanning To-do must be able to see that without opening it.
+pub async fn return_expired_blocker_card(
+    tasks: &dyn TaskStore,
+    company: &CompanyId,
+    task_id: &str,
+    question: &str,
+) -> Result<bool> {
+    let Some(mut card) = tasks
+        .list(company)
+        .await?
+        .into_iter()
+        .find(|t| t.id == task_id)
+    else {
+        return Ok(false);
+    };
+    if card.column != COLUMN_PAUSED {
+        return Ok(false);
+    }
+    let reason = format!("{EXPIRED_BLOCKER}: {question}");
+    card.note = Some(append_result(
+        card.note.as_deref(),
+        SYSTEM_ATTRIBUTION,
+        &reason,
+    ));
+    card.column = COLUMN_TODO.to_string();
+    card.bounced = Some(reason);
+    card.updated_at_millis = now_millis();
+    tasks.upsert(company, &card).await?;
+    Ok(true)
+}
+
+/// The lead-in on a card returned by an unanswered blocker (issue #1861).
+///
+/// Its own wording rather than the failure one: nothing failed. The work is
+/// exactly as possible as it was, and the only thing that changed is that
+/// nobody answered in time.
+pub const EXPIRED_BLOCKER: &str =
+    "nobody answered this in time, so it is back in To-do — it still needs";
+
+/// Whether a settle lands a card back on [`COLUMN_TODO`] because the attempt
+/// **failed or was cancelled**, as opposed to any other landing this function
+/// writes (issue #1865).
+///
+/// The single rule both card-write sites (this module's system mover, and
+/// `run_task`'s own rich settle in `harness::built_in::brain`) apply, so
+/// "which card gets the bounce chip" cannot answer differently depending on
+/// which of the two paths happened to settle a given run.
+///
+/// `WaitingApproval`/`Paused` also land on a column other than
+/// [`COLUMN_IN_PROGRESS`] but never on `COLUMN_TODO` — see
+/// [`column_for_settled_run`] — so checking the column alone already excludes
+/// them; the status check on top is what tells a genuine failure apart from
+/// the one other status [`column_for_settled_run`] maps to `COLUMN_TODO`... in
+/// practice there is none today, but the explicit check keeps this correct by
+/// construction rather than by the current shape of that mapping.
+pub fn bounced_reason(column: &str, status: RunStatus, reason: &str) -> Option<String> {
+    (column == COLUMN_TODO && matches!(status, RunStatus::Failed | RunStatus::Cancelled))
+        .then(|| reason.to_string())
+}
+
+/// Files the durable "a board card's dispatch failed and bounced back to
+/// To-do" notification (issue #1865).
+///
+/// Shared by every system path that settles a run its own turn did not —
+/// [`CompanyRuntime::abandon_run`](crate::company::runtime::CompanyRuntime::abandon_run),
+/// the cycle's terminality backstop, and the boot reaper's card sweep in
+/// [`RuntimeBuilder::build`](crate::runtime::RuntimeBuilder::build) — so a
+/// crash-recovered dispatch failure is announced exactly like a live one
+/// instead of only picking up the bounce chip silently. Call this only after
+/// [`advance_settled_card`] actually reports the card landed on
+/// [`COLUMN_TODO`]; a run that settled without moving the card raises nothing.
+///
+/// Whole-company audience: a bounced card has no single decider the way a
+/// mention does, and its assignee is exactly who the card's own `assignee`
+/// field already names for anyone who opens it.
+///
+/// Best-effort and logged, never propagated: the dispatch has already failed,
+/// and a bookkeeping write cannot make that better or worse.
+pub async fn notify_dispatch_failed(
+    notifications: &dyn NotificationStore,
+    company: &CompanyId,
+    task_id: &str,
+    reason: &str,
+) {
+    // `Notification.title` is documented as one line. `reason` is a free-form
+    // failure text (an error's `Display`, in practice) and is not guaranteed
+    // not to carry `\r`/`\n`, so normalize before interpolating — otherwise a
+    // multiline reason persists a multiline title.
+    let one_line_reason = reason.replace(['\r', '\n'], " ");
+    let note = Notification {
+        id: crate::ports::generate_id(),
+        kind: "dispatch_failed".to_string(),
+        subject: Subject {
+            kind: SubjectKind::Task,
+            id: task_id.to_string(),
+        },
+        created_at: now_millis(),
+        title: format!("A card's dispatch failed and returned to To-do: {one_line_reason}"),
+        audience: None,
+        context: None,
+    };
+    if let Err(err) = notifications.append(company, &note).await {
+        tracing::warn!(
+            company = %company,
+            task = %task_id,
+            error = %err,
+            "[runs] a dispatch-failure notification could not be recorded; the card still \
+             bounced, but nobody is badged for it"
+        );
+    }
 }
 
 /// The note a card gets when a planning pass was interrupted by the host going
@@ -233,6 +382,7 @@ mod test {
             workflow_proposal: None,
             origin_run_id: None,
             origin_workflow_id: None,
+            bounced: None,
         }
     }
 
@@ -287,6 +437,86 @@ mod test {
             after.note.as_deref(),
             Some("[system] the host restarted"),
             "the reason must be readable on the card"
+        );
+        // Issue #1865: the board's bounce chip, set on the same landing.
+        assert_eq!(
+            after.bounced.as_deref(),
+            Some("the host restarted"),
+            "a card failed back to To-do must carry the bounce reason"
+        );
+    }
+
+    /// A landing other than To-do — the far more common case — must never set
+    /// the bounce chip. `WaitingApproval` lands on Paused, which this test
+    /// exercises as the representative non-bounce settle.
+    #[tokio::test]
+    async fn a_non_todo_landing_never_sets_bounced() {
+        let (_dir, tasks) = store().await;
+        let company = CompanyId::new("acme");
+        tasks
+            .upsert(&company, &card("t-2", COLUMN_IN_PROGRESS))
+            .await
+            .unwrap();
+
+        advance_settled_card(
+            tasks.as_ref(),
+            &company,
+            "t-2",
+            RunStatus::WaitingApproval,
+            "parked a gate",
+        )
+        .await
+        .unwrap();
+
+        let after = tasks
+            .list(&company)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == "t-2")
+            .unwrap();
+        assert_eq!(after.column, COLUMN_PAUSED);
+        assert_eq!(
+            after.bounced, None,
+            "a card parked for approval did not bounce"
+        );
+    }
+
+    // ── Issue #1865: `bounced_reason`, the pure rule both card-write sites share ──
+
+    #[test]
+    fn bounced_reason_fires_on_failed_landing_on_todo() {
+        assert_eq!(
+            bounced_reason(COLUMN_TODO, RunStatus::Failed, "boom"),
+            Some("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn bounced_reason_fires_on_cancelled_landing_on_todo() {
+        assert_eq!(
+            bounced_reason(COLUMN_TODO, RunStatus::Cancelled, "stopped"),
+            Some("stopped".to_string())
+        );
+    }
+
+    #[test]
+    fn bounced_reason_is_none_off_todo_even_for_a_failure() {
+        // Structurally `column_for_settled_run` never actually pairs `Failed`
+        // with anything but `COLUMN_TODO` — this pins the function's OWN
+        // contract regardless, so it stays correct if that mapping ever grows
+        // a second failure landing.
+        assert_eq!(
+            bounced_reason(COLUMN_IN_REVIEW, RunStatus::Failed, "boom"),
+            None
+        );
+    }
+
+    #[test]
+    fn bounced_reason_is_none_on_todo_for_a_non_failure_status() {
+        assert_eq!(
+            bounced_reason(COLUMN_TODO, RunStatus::Succeeded, "n/a"),
+            None
         );
     }
 
@@ -513,6 +743,129 @@ mod test {
             vec!["a-1".to_string()]
         );
         assert_eq!(column_of(&tasks, &beta, "b-1").await, COLUMN_PLANNING);
+    }
+
+    /// CodeRabbit review (PR #1883): `Notification.title` is documented as
+    /// one line, but `reason` is interpolated unnormalized. A failure reason
+    /// carrying `\r`/`\n` — plausible, since it is an error's `Display` in
+    /// practice — used to persist a multiline title.
+    #[tokio::test]
+    async fn notify_dispatch_failed_keeps_the_title_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let notifications: Arc<dyn NotificationStore> = Arc::new(FsOps::new(dir.path()));
+        let company = CompanyId::new("acme");
+
+        notify_dispatch_failed(
+            notifications.as_ref(),
+            &company,
+            "t-1",
+            "boom\nsecond line\r\nthird line",
+        )
+        .await;
+
+        let notes = notifications.list(&company, "anyone").await.unwrap();
+        let filed = notes
+            .iter()
+            .find(|n| n.notification.subject.id == "t-1")
+            .expect("the notification was filed");
+        assert!(
+            !filed.notification.title.contains('\n') && !filed.notification.title.contains('\r'),
+            "the title must stay one line: {:?}",
+            filed.notification.title
+        );
+        assert!(
+            filed
+                .notification
+                .title
+                .contains("boom second line  third line"),
+            "the reason's content must survive, just flattened: {:?}",
+            filed.notification.title
+        );
+    }
+
+    /// CodeRabbit review (PR #1883): the boot-reaper conformance test
+    /// (`runtime::builder::tests::boot_reaper_notifies_a_bounced_card_same_as_the_live_paths`)
+    /// checks only `kind` and `subject.id`. This unit-tests the two things
+    /// that shared assertion never exercised: the title actually names the
+    /// task and carries the reason, and the row is company-wide
+    /// (`audience: None`) — the whole reason this notification exists (issue
+    /// #1865's doc comment) rather than a targeted one only the assignee
+    /// would see.
+    #[tokio::test]
+    async fn notify_dispatch_failed_files_a_company_wide_row_naming_task_and_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let notifications: Arc<dyn NotificationStore> = Arc::new(FsOps::new(dir.path()));
+        let company = CompanyId::new("acme");
+
+        notify_dispatch_failed(
+            notifications.as_ref(),
+            &company,
+            "t-42",
+            "the host vanished",
+        )
+        .await;
+
+        let notes = notifications.list(&company, "anyone-at-all").await.unwrap();
+        let filed = notes
+            .iter()
+            .find(|n| n.notification.subject.id == "t-42")
+            .expect("the notification was filed");
+        assert_eq!(filed.notification.kind, "dispatch_failed");
+        assert_eq!(filed.notification.subject.kind, SubjectKind::Task);
+        assert!(
+            filed.notification.title.contains("the host vanished"),
+            "the title must carry the reason: {:?}",
+            filed.notification.title
+        );
+        assert_eq!(
+            filed.notification.audience, None,
+            "a bounced card has no single decider the way a mention does — this must be \
+             company-wide, not targeted at the assignee alone"
+        );
+    }
+
+    /// A [`NotificationStore`] whose `append` always fails — the "the durable
+    /// row itself could not be recorded" case `notify_dispatch_failed`'s own
+    /// doc comment says is best-effort and logged, never propagated.
+    struct FailingNotifications;
+
+    #[async_trait::async_trait]
+    impl NotificationStore for FailingNotifications {
+        async fn append(&self, _company: &CompanyId, _notification: &Notification) -> Result<()> {
+            Err(crate::error::OpenCompanyError::Store(
+                "notification append always fails in this test".to_string(),
+            ))
+        }
+
+        async fn list(
+            &self,
+            _company: &CompanyId,
+            _user: &str,
+        ) -> Result<Vec<crate::ports::notifications::NotificationView>> {
+            Ok(Vec::new())
+        }
+
+        async fn mark_read(
+            &self,
+            _company: &CompanyId,
+            _user: &str,
+            _ids: Option<&[String]>,
+        ) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// CodeRabbit review (PR #1883): the boot-reaper test never exercises a
+    /// failing store, so nothing proved the append failure stays best-effort.
+    /// This is the whole point of the doc comment on `notify_dispatch_failed`
+    /// — a card that bounced must not un-bounce because the notification
+    /// bookkeeping write happened to fail.
+    #[tokio::test]
+    async fn notify_dispatch_failed_does_not_panic_or_propagate_when_append_fails() {
+        let company = CompanyId::new("acme");
+        // The whole assertion: this returns `()`, not a `Result`, and the call
+        // completes without panicking even though `append` always errors.
+        notify_dispatch_failed(&FailingNotifications, &company, "t-1", "boom").await;
     }
 
     /// The note is append-only: a second block never eats the first.

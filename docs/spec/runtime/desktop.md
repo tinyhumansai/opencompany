@@ -49,14 +49,47 @@ either a second `tauri.conf.json` or a script that invokes a bare `tauri`.
 
 ## What the desktop compiles in
 
-The desktop links the host with an explicit feature set, declared on the
-`opencompany` dependency in `src-tauri/Cargo.toml`:
+The desktop links the host with an explicit feature set, and it is declared in
+**two** places — reading only the first is issue #1738. The manifest's list, on
+the `opencompany` dependency in `src-tauri/Cargo.toml`:
 
 ```toml
 opencompany = { path = "..", default-features = false, features = [
-  "sqlite", "platform-jwt", "oauth", "mcp",
+  "sqlite", "platform-jwt", "oauth", "mcp", "tinymemory",
 ] }
 ```
+
+and the shipped set, passed on the `tauri` command line as
+`DESKTOP_RELEASE_FEATURES` in `.github/workflows/release-desktop-macos.yml`:
+
+```text
+opencompany/acp,opencompany/composio
+```
+
+Those two are `= ["openhuman"]` in the root manifest — pure `cfg` switches that
+pull no `dep:` entry, and `mcp` already enables `openhuman` — so turning them on
+adds no package and leaves `src-tauri/Cargo.lock` byte-identical, which is what
+lets a release still build `--locked`. A feature gating an optional dependency
+could not be passed this way and would have to move into the manifest.
+
+The cost of that arrangement is several copies of one string, and #1738 is what
+a missing copy looks like: `scripts/desktop-dev.sh` ran `tauri dev` bare, so a
+developer's shell was the manifest set and every DMG was the release set. The
+visible half was Connections — `in_build: cfg!(feature = "composio")` reported
+false, so eight provider tiles rendered "not available here" over a card asking
+the operator to paste a Composio token, on a build nobody ships. `acp` was dark
+the same way and less visibly (`acp_agents = None`, so every `transport =
+"local"` harness resolved `unavailable`; issue #1245).
+
+#1823 fixed the launcher without adding a copy: it **parses**
+`DESKTOP_RELEASE_FEATURES` out of the release workflow, with a
+`DESKTOP_FEATURES` override for the leaner build. A derived value cannot drift.
+
+`scripts/ci/assert-desktop-features.sh` guards what is still duplicated (the two
+`ci.yml` steps, `npm run tauri:build`, the by-hand command below), that the
+release `tauri build` still consumes the variable it declares — otherwise the
+source of truth is a lie — and that the launcher still derives rather than
+re-hardcoding a literal.
 
 `mcp` is the one that puts an agent harness in the app. It implies `openhuman`,
 which is what compiles `src/harness/` at all; without it the bundle boots, seeds
@@ -73,9 +106,18 @@ the vendored runtime. Features left off, each on purpose:
 | Off | Why |
 | --- | --- |
 | `tinycortex`, `tinymemory*` | In-pod memory engines. They carry tinycortex, `tinyagents/sqlite` and a second bundled SQLite into the bundle for a surface the desktop does not offer; the runtime keeps its fs-backed memory stores. |
-| `media`, `composio`, and the other managed backends | Each needs a platform credential the desktop has no way to hold, and each fails closed without one. |
-| `acp` | `src-tauri/src/acp/` is an ACP *client* and compiles without it (see below). Turning it on additionally wires `RuntimeBuilder::with_acp_agents`, which is a separate decision from having a harness. |
+| `media` | Unlike `composio` it is `["openhuman", "openhuman_core/media"]`, so it pulls an upstream domain nothing else here compiles, and its credential really is managed: the tools are wired only when a company grants the namespace **and** a platform credential is configured. There is no BYO tier, so no desktop operator has anything to supply, and `…/capabilities` answers `media_in_build: false`. |
 | `mongodb` | A per-tenant cluster is a hosting concern. |
+
+`composio` and `acp` are **not** in this table. They are shipped, by the command
+line above. The row that used to exclude them said the managed backends "need a
+platform credential the desktop has no way to hold", and that was never true of
+`composio`: `company::composio::resolve_credential` answers over three tiers and
+the platform identity is the *last* — the BYO `composio/token` override wins,
+then the company's own TinyHumans key. Tier one is exactly what a desktop
+operator can hold, and the Connections card already asks them for it. It also
+named a `search` feature, which does not exist; `search_in_build` derives from
+`cfg!(feature = "openhuman")`, which `mcp` already turns on.
 
 ### The `[patch]` table is replicated, not inherited
 
@@ -132,8 +174,16 @@ package**:
 
 ```sh
 npm --prefix frontend run build     # from the repository root
-cargo tauri build                   # or: frontend/node_modules/.bin/tauri build
+cargo tauri build -- --features opencompany/acp,opencompany/composio
 ```
+
+The `--features` is not optional decoration. `tauri build` without it packages
+the **default** set, so a locally-packaged app has Composio and ACP compiled out
+while looking in every other respect like the shipped one — #1738 at the
+packaging entry point, and harder to spot there than in a dev window. `npm run
+tauri:build` carries the same string, and
+`scripts/ci/assert-desktop-features.sh` fails if the two drift from
+`DESKTOP_RELEASE_FEATURES`.
 
 `frontendDist` is resolved relative to `src-tauri/`, where `tauri.conf.json`
 lives, so it means the same thing from every working directory. A hook does not:

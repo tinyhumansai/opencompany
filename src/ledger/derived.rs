@@ -147,6 +147,7 @@ pub async fn publish(
                 mime: None,
                 size: None,
                 sha256: None,
+                adopted: false,
             };
             workspace.create(company, &node, Some(body)).await?;
         }

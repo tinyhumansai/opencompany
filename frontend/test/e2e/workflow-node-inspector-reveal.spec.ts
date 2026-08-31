@@ -56,6 +56,19 @@ function inspector(page: Page) {
   return page.getByTestId("workflow-node-detail");
 }
 
+/**
+ * Issue #1683 opens the Copilot on select. Copilot and the node inspector
+ * share the canvas's right edge and Copilot wins while open (#303), so this
+ * spec — which is entirely about the inspector — has to close it first.
+ */
+async function closeCopilotIfOpen(page: Page) {
+  const toggle = page.getByTestId("workflow-copilot-toggle");
+  if (await toggle.isVisible().catch(() => false)) {
+    await toggle.click();
+    await expect(page.getByTestId("workflow-copilot")).toBeHidden();
+  }
+}
+
 async function box(locator: Locator) {
   const b = await locator.boundingBox();
   expect(b, "element has no box").not.toBeNull();
@@ -91,6 +104,7 @@ async function setup(page: Page, width: number, height = 900) {
   await page.goto("/#/workflows");
   await dismissTour(page);
   await openWorkflow(page, FIXTURE);
+  await closeCopilotIfOpen(page);
 
   const flow = canvas(page);
   await expect(flow).toBeVisible({ timeout: 30_000 });
@@ -177,6 +191,7 @@ test("a node nowhere near the panel does not move the canvas at all", async ({
   await page.goto("/#/workflows");
   await dismissTour(page);
   await openWorkflow(page, FIXTURE);
+  await closeCopilotIfOpen(page);
 
   const flow = canvas(page);
   await expect(flow).toBeVisible({ timeout: 30_000 });

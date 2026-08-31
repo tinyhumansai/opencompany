@@ -62,6 +62,7 @@ The operator console is a separate, company-agnostic app at
 | [`agentic_law_firm`](agentic_law_firm/) | Drafts, research, discovery | Approving filings |
 | [`agentic_pharma_startup`](agentic_pharma_startup/) | Candidate molecules & trial plans | Laboratory work |
 | [`agentic_research_lab`](agentic_research_lab/) | Source-backed research reports with the evidence attached | Setting the question & accepting findings |
+| [`agentic_math_lab`](agentic_math_lab/) | Verified answers to computational problems, with the programs that produced them | Stating the problem & accepting the answer |
 | [`signals_opportunity_studio`](signals_opportunity_studio/) | A ranked weekly opportunity brief | Which opportunities to fund |
 
 Signals and the Opportunity Engine ship as the

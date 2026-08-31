@@ -164,6 +164,7 @@ const startFrame = (runId: string): Ev => ({
   workflowId: "digest",
   runId,
   scheduled: true,
+  startedBy: "schedule",
 });
 const nodeStartedFrame = (runId: string, nodeId: string): Ev => ({
   type: "workflow_node_started",
@@ -206,6 +207,11 @@ function fakeClient(): OpenCompanyClient {
       return GRAPH;
     },
     post: async () => ({}),
+    // Issue #1845: the week-1 nudge banner polls this on mount; an empty
+    // feed keeps it a no-op for every test in this file, which is not about
+    // the nudge.
+    notifications: async () => ({ notifications: [], unread: 0 }),
+    markNotificationsRead: async () => ({ unread: 0 }),
   } as unknown as OpenCompanyClient;
 }
 

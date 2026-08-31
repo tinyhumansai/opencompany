@@ -55,6 +55,16 @@ import { CronPreviewLine } from "@/views/CronPreviewLine";
 import { NodeConfigFields } from "@/views/workflows/NodeConfigFields";
 import type { TeamMemberDto } from "@/api/types";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -130,6 +140,14 @@ export interface DraftNode {
    * the same hazard as a dropped `requiresApproval`.
    */
   repeatable?: boolean;
+  /**
+   * Issue #1866. Same "carried but not authored" contract as `repeatable`
+   * above: an operator sets a postcondition through the write route (agent
+   * nodes only today), this dialog has no control for it, and dropping it on
+   * an unrelated edit silently removes a run-safety gate rather than merely
+   * an operational-tuning field (issue #1937 review).
+   */
+  postcondition?: WorkflowNode["postcondition"];
 }
 
 /** How long the graph must sit still before the host is asked about it (issue
@@ -245,8 +263,10 @@ export function destinationTargetProblem(
   //
   // #981: the same sentence the host's save-time rejection carries, so an author
   // who trips the pre-flight and an author who trips the 400 are told the same
-  // thing. `operator` is no longer in the list the host serves — it never was a
-  // delivery target — so this is what now catches it.
+  // thing. `operator` used to be excluded from the list the host serves, since
+  // it was an in-memory response surface delivery refused by name — but since
+  // #1757 it is a durable, journal-backed channel every company wires, so it is
+  // a real target like any other and this check accepts it the same way.
   //
   // Gated on `status === "ready"`, NOT on the list being non-empty. Those were
   // the same test until the host started answering `[]` for a company with no
@@ -328,6 +348,13 @@ export interface GraphDraft {
   id: string;
   name: string;
   description: string;
+  /**
+   * The owning desk (issue #1862 prerequisite), carried through unedited —
+   * see {@link WorkflowGraph.ownerDesk}. This dialog has no control for it;
+   * it exists on the draft purely so a Save round-trips whatever the loaded
+   * graph had instead of dropping it (issue #1882 review).
+   */
+  ownerDesk?: string;
   nodes: DraftNode[];
   edges: DraftEdge[];
 }
@@ -395,6 +422,10 @@ export function assembleGraph(draft: GraphDraft): AssembledGraph {
       // a dropped `repeatable: false` is a repeat guard removed by an unrelated
       // edit, the same hazard as a dropped `requiresApproval`.
       repeatable: n.repeatable,
+      // Round-trips a declared postcondition (issue #1866) the same way —
+      // this dialog has no control for it, so a Save must not silently clear
+      // a run-safety gate an operator set through the write route.
+      postcondition: n.postcondition,
     });
   }
   return {
@@ -403,6 +434,9 @@ export function assembleGraph(draft: GraphDraft): AssembledGraph {
       id: draft.id.trim(),
       name: draft.name.trim(),
       description: draft.description.trim() || undefined,
+      // No control edits this — carried through exactly as loaded, so Save
+      // never clears an owner this dialog can't show (issue #1882 review).
+      ownerDesk: draft.ownerDesk,
       // Locally-built body; the conditional-write token is passed separately as
       // `expectedVersion`, so this carries none (issue #1013 makes it explicit).
       version: null,
@@ -648,6 +682,12 @@ export function changeKind(kind: string): Partial<DraftNode> {
     // switching away from a call node leaves a value `submit()` still sends,
     // and the save fails on a field the author can no longer see.
     repeatable: undefined,
+    // Same reasoning as `repeatable` immediately above, for the same reason:
+    // a postcondition (issue #1866) is valid on `agent` nodes only, this
+    // dialog has no control to author or clear it, and a kind change is the
+    // one place left to reset a value that would otherwise survive onto a
+    // kind the host rejects it on.
+    postcondition: undefined,
   };
 }
 
@@ -679,8 +719,13 @@ function starterNodes(): DraftNode[] {
  * and a real bug: `fieldErrors` is keyed on `key`, so two graphs that share a
  * node id (`start` is the starter row's id, so most of them do) would share an
  * error map, and a complaint raised on one graph would render on the next.
+ *
+ * Exported for the tests, the same reason {@link assembleGraph} is: proving a
+ * carried-but-not-authored field (issue #1866 review, #1937) survives a
+ * round trip needs THIS function, not a hand-built `GraphDraft` that could
+ * never reproduce the read-side half of the bug.
  */
-function draftNodes(graph: WorkflowGraph): DraftNode[] {
+export function draftNodes(graph: WorkflowGraph): DraftNode[] {
   return graph.nodes.map((n) => {
     const common = {
       id: n.id,
@@ -695,6 +740,7 @@ function draftNodes(graph: WorkflowGraph): DraftNode[] {
       retry: n.retry,
       requiresApproval: n.requiresApproval,
       repeatable: n.repeatable,
+      postcondition: n.postcondition,
     };
     // A form kind (#541) hydrates its config into per-field strings plus a
     // preserved `extra` bag; a form-less kind keeps the raw overlay in `config`.
@@ -762,6 +808,9 @@ export function WorkflowCreateDialog({
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  // No control in this dialog sets this — see {@link GraphDraft.ownerDesk}.
+  // Held purely so a Save carries forward whatever the loaded graph had.
+  const [ownerDesk, setOwnerDesk] = useState<string | undefined>(undefined);
   const [nodes, setNodes] = useState<DraftNode[]>(starterNodes());
   const [edges, setEdges] = useState<DraftEdge[]>([]);
   const [roster, setRoster] = useState<TeamMemberDto[]>([]);
@@ -788,6 +837,19 @@ export function WorkflowCreateDialog({
    * a click, any caller added later — would both read `false` and both post. The
    * state stays because the render needs it; the ref is what actually guards. */
   const submittingRef = useRef(false);
+  /**
+   * Whether the create-time id confirm is on screen (issue #1808).
+   *
+   * The id is a permanent backend join key — it keys the overlay body, the
+   * revision store, the scheduler's armed state, run history, and cross-graph
+   * `sub_workflow` references — so the host answers 400 to a rename. Creation is
+   * the only moment it can be set, and in create mode it is silently derived
+   * from the name, so a name typo becomes a permanent id with no acknowledgement.
+   * `submit()` gates on this in create mode: the first Create shows the confirm,
+   * the confirm's own action runs the write. Never true in edit mode — the id is
+   * fixed there and the form field is read-only.
+   */
+  const [confirmingId, setConfirmingId] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** The submit-time error banner, so a failed submit can scroll it into view
    * and focus it rather than leave the message off-screen (#813 defect 6). */
@@ -928,10 +990,17 @@ export function WorkflowCreateDialog({
     let nextId = workflow?.id ?? "";
     let nextName = workflow?.name ?? "";
     let nextDescription = workflow?.description ?? "";
+    // No control edits this (see `ownerDesk` state above) — hydrated purely so
+    // Save round-trips it. `undefined` on a fresh create, same as every other
+    // field here.
+    let nextOwnerDesk = workflow?.ownerDesk;
     let nextNodes = workflow ? draftNodes(workflow) : starterNodes();
     let nextEdges = workflow ? draftEdges(workflow) : [];
     setError(null);
     setFieldErrors({});
+    // Issue #1808: a fresh open (or a re-hydrate) never carries a prior attempt's
+    // pending id confirm — the previewed id it named may not be this graph's.
+    setConfirmingId(false);
     // Issue #274: a fresh open (or a re-hydrate after a restore) must not carry
     // the previous graph's history. It re-loads on the next expand, and against
     // the freshly-restored body's version token.
@@ -980,6 +1049,7 @@ export function WorkflowCreateDialog({
     setId(nextId);
     setName(nextName);
     setDescription(nextDescription);
+    setOwnerDesk(nextOwnerDesk);
     setNodes(nextNodes);
     setEdges(nextEdges);
     // The baseline every later keystroke is compared against. A copilot
@@ -1127,6 +1197,7 @@ export function WorkflowCreateDialog({
     id,
     name,
     description,
+    ownerDesk,
     nodes,
     edges,
   }) : null;
@@ -1218,6 +1289,10 @@ export function WorkflowCreateDialog({
   function changeName(value: string) {
     setName(value);
     clearSubmitError();
+    // Issue #1808: the name derives the previewed id, so editing it after a
+    // Back invalidates whatever the confirm was showing — retire the pending
+    // confirm so a stale preview can't reappear on the next Create.
+    setConfirmingId(false);
     // Issue #1053: the form used to reject "Weekly digest" for a missing id,
     // then reject "weekly digest" for an unsafe one — twice, for something it
     // could derive. Derived only while the id is nobody's yet, and never in edit
@@ -1238,6 +1313,9 @@ export function WorkflowCreateDialog({
     // including when they clear it back to empty, which is a decision too.
     setAuthoredId(value);
     clearSubmitError();
+    // Issue #1808: the id the confirm would show just changed under it — retire
+    // the pending confirm so Back-then-edit re-derives the new one.
+    setConfirmingId(false);
   }
 
   function changeDescription(value: string) {
@@ -1680,25 +1758,18 @@ export function WorkflowCreateDialog({
     });
   }
 
-  async function submit() {
-    // Re-entrancy guard (issue #1005). The Create button disables while a write
-    // is in flight, but `disabled` is a property of one DOM node: a second
-    // activation landing in the same tick as the first, an Enter keypress, or
-    // any future caller would otherwise post the graph twice — and for create
-    // that means two workflows, or a 409 the operator did nothing to earn.
-    //
-    // It reads the REF, not `submitting`: the state value here is the one from
-    // the render that built this closure, so two calls in the same tick would
-    // both see `false` and the guard would pass twice. The ref is written below
-    // before the first `await`, which makes it true for every later caller.
-    if (submittingRef.current) return;
-    const problem = validate();
-    if (problem) {
-      showError(problem);
-      return;
-    }
-    // Set before the first `await` — after `validate()`, so a draft the client
-    // rejects never latches the guard and the operator can fix it and retry.
+  /**
+   * Assembles the graph and runs one write, carrying the submit-time guard,
+   * the spinner state, and the host-error handling (issue #1005/#1016).
+   *
+   * Both Create and Save go through here so there is a SINGLE write path: the
+   * re-entrancy guard, the `workflow_invalid` per-node mapping, and the 409
+   * conflict handoff live once. The caller supplies only the verb — `create()`
+   * posts, the edit branch of `submit()` puts — via `write`.
+   */
+  async function runWrite(write: (graph: WorkflowGraph) => Promise<void>) {
+    // Set before the first `await` — the caller has already run `validate()`, so
+    // a draft the client rejects never latches the guard.
     submittingRef.current = true;
     setSubmitting(true);
     setError(null);
@@ -1709,7 +1780,7 @@ export function WorkflowCreateDialog({
       // dialog's own `onOpenChange`. The operator was locked in the dialog, and
       // the only remaining exit, reloading the page, was the one that lost the
       // edit. Everything that can fail now clears `submitting` on the way out.
-      const assembled = assembleGraph({ id, name, description, nodes, edges });
+      const assembled = assembleGraph({ id, name, description, ownerDesk, nodes, edges });
       if (!assembled.ok) {
         // `validate()` already passed, so this is the form and the serializer
         // disagreeing — a defect, not something the author did. Say which node
@@ -1718,27 +1789,7 @@ export function WorkflowCreateDialog({
         showError(`${nodeLabel(assembled.node)}: ${assembled.error}`);
         return;
       }
-      const graph = assembled.graph;
-      if (workflow) {
-        // The id keys the saved graph, the schedule and the run history, so it
-        // is the graph's own id that is sent, not the (read-only) field —
-        // there is no path here that renames anything, and the host answers
-        // 400 if one ever appeared. `version` makes the write conditional: it
-        // means "save over the graph I was looking at", not "over whatever is
-        // there now". The response carries a fresh token, so a second save
-        // needs no intervening read.
-        const saved = await updateWorkflow(
-          client,
-          company,
-          workflow.id,
-          graph,
-          workflow.version,
-        );
-        onSaved?.(saved);
-      } else {
-        const created = await createWorkflow(client, company, graph);
-        onCreated?.(created);
-      }
+      await write(assembled.graph);
       onOpenChange(false);
     } catch (e) {
       // Issue #1016: a `workflow_invalid` refusal carries per-node `problems`.
@@ -1807,10 +1858,77 @@ export function WorkflowCreateDialog({
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      // Issue #1808: the create-mode confirm steps aside on every terminal
+      // state. Success closes the whole dialog above; a failure surfaces the
+      // banner on the form the confirm was covering — either way the modal must
+      // not linger, or its inert backdrop swallows the next click. A no-op in
+      // edit mode, where `confirmingId` is never set.
+      setConfirmingId(false);
     }
   }
 
+  /**
+   * The create write, gated behind the id confirm (issue #1808). The confirm's
+   * primary action calls this; the shared guard in {@link runWrite} keeps it
+   * single-fire even though it is reachable only after the confirm opens.
+   */
+  async function create() {
+    if (submittingRef.current) return;
+    await runWrite(async (graph) => {
+      const created = await createWorkflow(client, company, graph);
+      onCreated?.(created);
+    });
+  }
+
+  async function submit() {
+    // Re-entrancy guard (issue #1005). The Create button disables while a write
+    // is in flight, but `disabled` is a property of one DOM node: a second
+    // activation landing in the same tick as the first, an Enter keypress, or
+    // any future caller would otherwise post the graph twice — and for create
+    // that means two workflows, or a 409 the operator did nothing to earn.
+    //
+    // It reads the REF, not `submitting`: the state value here is the one from
+    // the render that built this closure, so two calls in the same tick would
+    // both see `false` and the guard would pass twice.
+    if (submittingRef.current) return;
+    const problem = validate();
+    if (problem) {
+      showError(problem);
+      return;
+    }
+    // Issue #1808: create mode confirms the permanent id before it writes. The
+    // previewed id is valid by here (validate() passed), so the confirm shows a
+    // real id, and the confirm's own action runs `create()`. Edit mode falls
+    // straight through — the id keys the saved graph and the field is read-only,
+    // so there is nothing to confirm.
+    if (!editing) {
+      if (!confirmingId) {
+        setConfirmingId(true);
+        return;
+      }
+      await create();
+      return;
+    }
+    await runWrite(async (graph) => {
+      // The id keys the saved graph, the schedule and the run history, so it is
+      // the graph's own id that is sent, not the (read-only) field — there is no
+      // path here that renames anything, and the host answers 400 if one ever
+      // appeared. `version` makes the write conditional: "save over the graph I
+      // was looking at", not "over whatever is there now". The response carries a
+      // fresh token, so a second save needs no intervening read.
+      const saved = await updateWorkflow(
+        client,
+        company,
+        workflow!.id,
+        graph,
+        workflow!.version,
+      );
+      onSaved?.(saved);
+    });
+  }
+
   return (
+    <>
     <Dialog
       open={open}
       onOpenChange={(o) => {
@@ -2288,6 +2406,64 @@ export function WorkflowCreateDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+      {/* Issue #1808: the create-time id confirm. The id is a permanent backend
+          join key set only at creation and silently derived from the name, so a
+          typo becomes a permanent id with no acknowledgement — this is the one
+          moment to surface it. Create mode only; an edit has no id to set. An
+          AlertDialog (focus-trapped, labelled, matching the console) rather than
+          `window.confirm`, and it surfaces the exact id the write will send. */}
+      {!editing && (
+        <AlertDialog
+          open={confirmingId}
+          onOpenChange={(o) => {
+            // Opening is driven by `submit()`; only react to a dismiss — Esc, an
+            // outside click, or the Close primitive behind Back/Create.
+            if (!o) setConfirmingId(false);
+          }}
+        >
+          <AlertDialogContent data-testid="workflow-id-confirm">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Confirm the workflow ID</AlertDialogTitle>
+              <AlertDialogDescription>
+                The ID is permanent — it keys this workflow’s schedule and run
+                history and can’t be changed after creation. Check it now.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <div className="grid gap-1 rounded-md border bg-muted/40 p-3 text-center">
+              {name.trim() && (
+                <span className="text-xs text-muted-foreground">{name.trim()}</span>
+              )}
+              <code
+                data-testid="workflow-id-confirm-value"
+                className="font-mono text-lg font-semibold break-all"
+              >
+                {id.trim()}
+              </code>
+            </div>
+            <AlertDialogFooter>
+              <AlertDialogCancel
+                data-testid="workflow-id-confirm-back"
+                onClick={() => setConfirmingId(false)}
+                disabled={submitting}
+              >
+                Back
+              </AlertDialogCancel>
+              {/* Fire-and-forget, the repo idiom for an async confirm action:
+                  our handler runs before the primitive's Close, so the write is
+                  launched and the confirm dismisses in the same click. */}
+              <AlertDialogAction
+                data-testid="workflow-id-confirm-create"
+                onClick={() => void create()}
+                disabled={submitting}
+              >
+                {submitting && <Loader2 className="mr-1.5 size-4 animate-spin" />}
+                Create workflow
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
+    </>
   );
 }
 
@@ -2486,10 +2662,10 @@ function NodeRow({
               <>
                 {/* #813: pick from the channels this company can actually
                     deliver to, instead of a free-text box that only fails at
-                    delivery time. #981: the host no longer includes `operator`
-                    in that list — it is an in-memory response surface with no
-                    durable reader, and delivery refuses it by name — so the
-                    picker can no longer offer it. */}
+                    delivery time. #1757: the list now includes `operator` —
+                    it is a durable, journal-backed channel every company
+                    wires, not the in-memory surface #981 once excluded — so
+                    the picker offers it like any other real target. */}
                 <Select
                   value={node.destinationTarget || ""}
                   onValueChange={(v) => {

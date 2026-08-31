@@ -165,6 +165,22 @@ pub fn namespace_of(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `tool` is one of the raw HTTP web tools that take a plain `url`
+/// argument — `web_fetch`, `http_request`, `curl`.
+///
+/// This is the `url`-taking subset of the `web` namespace: `image_info` is also
+/// `web` but inspects a workspace file, so it is excluded. Kept here — beside
+/// [`namespace_of`], the single source of truth for the family — so the S2
+/// Composio deflection guardrail
+/// ([`web_call_deflection`](crate::harness::composio_catalog::web_call_deflection),
+/// consulted by
+/// [`ApprovalPolicy::check`](crate::harness::policy::ApprovalPolicy)) recognises
+/// the deflectable tools from one place rather than re-hardcoding the three
+/// names where it hooks in.
+pub fn is_web_request_tool(tool: &str) -> bool {
+    matches!(tool, "web_fetch" | "http_request" | "curl")
+}
+
 /// Build the exec-grade [`SecurityPolicy`] shared by an agent's shell + code +
 /// web tools, sandboxed to `workspace`.
 ///
@@ -710,6 +726,24 @@ pub fn filter_by_capabilities(
     }
 }
 
+/// The native capability namespaces actually present on a built tool belt.
+///
+/// Derived the same way [`filter_by_capabilities`] reads the belt — each tool's
+/// [`namespace_of`] — kept to the shared native vocabulary
+/// ([`native_capability_namespaces`](crate::company::native_capability_namespaces)),
+/// so a tool that was wired makes its namespace show up here and one that was
+/// not never does. Sorted and unique for a stable system-prompt rendering.
+pub fn native_capabilities_on_belt(
+    tools: &[Box<dyn Tool>],
+) -> std::collections::BTreeSet<&'static str> {
+    let native = crate::company::native_capability_namespaces();
+    tools
+        .iter()
+        .filter_map(|tool| namespace_of(tool.name()))
+        .filter(|ns| native.contains(ns))
+        .collect()
+}
+
 /// Whether a [`CapabilityFilter`] denies a given namespace — the same test
 /// [`filter_by_capabilities`] applies per tool, exposed standalone so a
 /// caller that needs the outcome without a tool vector in hand (the sandbox
@@ -724,6 +758,33 @@ pub fn namespace_denied(filter: &CapabilityFilter, namespace: &str) -> bool {
         CapabilityFilter::AllowAll => false,
         CapabilityFilter::DenyNamespaces(denied) => denied.contains(namespace),
     }
+}
+
+/// Whether the per-tenant Composio surface may be wired for this agent's
+/// current turn — one predicate shared by both the S1 brief
+/// ([`build::build_agent`](crate::harness::built_in::build::build_agent)) and
+/// the S2 deflection policy
+/// ([`build_roster`](crate::harness::built_in::build_roster)) so the two
+/// cannot drift back out of lockstep the way they did before this fix (PR
+/// #1780 review, issue #1759).
+///
+/// `wired` is the grant+credential outcome each call site already resolved
+/// (an explicit `composio` grant AND a resolved credential with a non-empty
+/// toolkit allowlist) — this function does not re-derive it, only narrows it
+/// by the per-turn capability tier. When [`namespace_denied`] reports
+/// `composio` denied (a `free`/`starter`/`pro` plan's Composio budget is
+/// exhausted, or a fail-closed metering error), `filter_by_capabilities`
+/// strips every `composio_*` tool from the belt — describing the brief or
+/// installing the deflection anyway would ground the agent in a surface it no
+/// longer holds, or point a blocked web call at a tool that is not on the
+/// belt.
+///
+/// Deliberately NOT behind the `composio` feature, like the rest of this
+/// module's namespace plumbing and like `composio_catalog`'s own S1/S2 pair —
+/// pure logic stays outside the gate so CI's fast, always-run `openhuman`
+/// lane exercises it, rather than only the `composio` feature's partial lane.
+pub fn composio_capability_admits(wired: bool, capabilities: &CapabilityFilter) -> bool {
+    wired && !namespace_denied(capabilities, "composio")
 }
 
 #[cfg(test)]
@@ -991,6 +1052,19 @@ mod tests {
         assert_eq!(namespace_of("mcp_registry_tool_call"), None);
     }
 
+    /// The `url`-taking web subset the S2 deflection guardrail keys on: the three
+    /// raw HTTP tools, and NOT `image_info` (which is `web` but reads a workspace
+    /// file, not a URL) nor anything outside the family.
+    #[test]
+    fn is_web_request_tool_is_the_url_taking_web_subset() {
+        assert!(is_web_request_tool("web_fetch"));
+        assert!(is_web_request_tool("http_request"));
+        assert!(is_web_request_tool("curl"));
+        assert!(!is_web_request_tool("image_info"));
+        assert!(!is_web_request_tool("shell"));
+        assert!(!is_web_request_tool("composio_execute"));
+    }
+
     /// `GATEABLE_NAMESPACES` must be a superset of every namespace `namespace_of`
     /// can emit — otherwise an exec family would be ungateable (silently always
     /// granted). `subagent` is additionally present as the reserved namespace.
@@ -1048,6 +1122,54 @@ mod tests {
             GATEABLE_NAMESPACES.contains(&"search"),
             "the metered search namespace must be gateable (issue #238)"
         );
+    }
+
+    /// Every namespace `namespace_of` can emit that is neither the Composio
+    /// connection path nor the raw-HTTP `web` family must be in the shared
+    /// native vocabulary — otherwise a future native tool would be wired but
+    /// invisible to native-first routing (the brief and the classifier both key
+    /// off that vocabulary).
+    #[test]
+    fn native_vocabulary_covers_every_native_mapped_namespace() {
+        let mapped = [
+            "shell",
+            "read_workspace_state",
+            "apply_patch",
+            "git_operations",
+            "csv_export",
+            "web_fetch",
+            "http_request",
+            "curl",
+            "image_info",
+            "media_generate_image",
+            "media_generate_video",
+            "media_list_models",
+            "composio_list_toolkits",
+            "composio_list_connections",
+            "composio_list_tools",
+            "composio_authorize",
+            "composio_execute",
+            "web_search",
+            "exa_find_similar",
+            "exa_get_contents",
+            "brave_news_search",
+            "brave_image_search",
+            "brave_video_search",
+        ];
+        let native: std::collections::HashSet<&str> =
+            crate::company::native_capability_namespaces()
+                .into_iter()
+                .collect();
+        for tool in mapped {
+            let ns = namespace_of(tool).expect("mapped tool has a namespace");
+            if ns == "composio" || ns == "web" {
+                continue;
+            }
+            assert!(
+                native.contains(ns),
+                "native namespace `{ns}` (from `{tool}`) is not in the native vocabulary"
+            );
+        }
     }
 
     #[test]
@@ -1421,5 +1543,39 @@ mod tests {
         // A namespace outside `DenyNamespaces`' set is simply not denied — it
         // is never asked to special-case a name it does not recognize.
         assert!(!namespace_denied(&filter, "web"));
+    }
+
+    /// The grant/credential resolving `wired = true` is not enough: a
+    /// capability tier that has denied `composio` (budget exhausted, or a
+    /// fail-closed metering error) must still turn the predicate off, because
+    /// `filter_by_capabilities` is about to strip every `composio_*` tool from
+    /// the belt. This is the fix for the P1 codex found on PR #1780 — before
+    /// it, the S1 brief and S2 deflection policy were wired from the grant
+    /// alone, exactly the shape `sandbox_brief_flags_withhold_a_capability_denied_namespace`
+    /// (PR #1670) fixed for `shell`/`code`.
+    #[test]
+    fn composio_capability_admits_withholds_when_the_tier_denies_it() {
+        assert!(
+            composio_capability_admits(true, &CapabilityFilter::AllowAll),
+            "wired + no denial must admit"
+        );
+        assert!(
+            !composio_capability_admits(false, &CapabilityFilter::AllowAll),
+            "not wired must never admit, regardless of the tier"
+        );
+
+        let deny_composio = CapabilityFilter::DenyNamespaces(["composio"].into_iter().collect());
+        assert!(
+            !composio_capability_admits(true, &deny_composio),
+            "wired but denied must not admit — the brief/policy must not \
+             describe a surface `filter_by_capabilities` is about to strip"
+        );
+
+        // A denial of an unrelated namespace must not withhold composio.
+        let deny_shell = CapabilityFilter::DenyNamespaces(["shell"].into_iter().collect());
+        assert!(
+            composio_capability_admits(true, &deny_shell),
+            "a denial of another namespace must not withhold composio"
+        );
     }
 }

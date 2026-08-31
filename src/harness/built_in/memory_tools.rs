@@ -215,17 +215,23 @@ impl Tool for MemoryStoreTool {
                 body.len()
             )));
         }
+        // Redact the title once, here, so the label, the stored body and the
+        // success echo all carry the redacted form — a model-supplied title
+        // like "Bearer sk-longsecret" must not persist verbatim in any of them.
+        let title = super::memory::redact_secrets(title);
         let chunk = ContextChunk {
-            label: format!("{}{}", self.mem.own_prefix(), slug(title)),
+            label: format!("{}{}", self.mem.own_prefix(), slug(&title)),
             // Title on the first line so the body is self-describing wherever
             // it surfaces (recall snippet, Brain view, ambient injection).
-            body: format!("{title}\n\n{body}"),
+            // Title and body pass through the same secret redaction as every
+            // other memory write, so an agent that stores a credential in
+            // either field does not persist it.
+            body: format!("{title}\n\n{}", super::memory::redact_secrets(body)),
         };
         let addr = self.mem.context.put(&self.mem.company, chunk).await?;
         Ok(ToolResult::success(format!(
-            "Remembered as `{}` (addr {}). It will surface in future turns when relevant; \
+            "Remembered as `{title}` (addr {}). It will surface in future turns when relevant; \
              `memory_forget` with that addr discards it.",
-            title,
             addr.as_ref()
         )))
     }
@@ -498,6 +504,43 @@ mod test {
             "already-forgotten must be a no-op: {again:?}"
         );
         assert!(again.text().contains("already gone"));
+    }
+
+    #[tokio::test]
+    async fn memory_store_redacts_credentials_in_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let company = CompanyId::new("acme");
+        let context = ctx(dir.path());
+        let (store, _, _) = tools_for(dir.path(), "acme", "ceo");
+
+        // A credential-shaped title must not persist verbatim anywhere: not in
+        // the stored body, not in the label, not in the success echo.
+        let stored = store
+            .execute(json!({"title": "Bearer sk-longsecret", "body": "the api key for staging"}))
+            .await
+            .unwrap();
+        assert!(!stored.is_error, "{stored:?}");
+        assert!(
+            stored.text().contains("[REDACTED]"),
+            "success echo must carry the redacted title: {}",
+            stored.text()
+        );
+        assert!(
+            !stored.text().contains("sk-longsecret"),
+            "{}",
+            stored.text()
+        );
+
+        let addr = addr_from(&stored.text());
+        let peeked = context
+            .peek(&company, &ChunkAddr::new(addr), None)
+            .await
+            .unwrap();
+        assert!(
+            peeked.contains("Bearer [REDACTED]"),
+            "stored title must be redacted: {peeked}"
+        );
+        assert!(!peeked.contains("sk-longsecret"), "{peeked}");
     }
 
     #[tokio::test]

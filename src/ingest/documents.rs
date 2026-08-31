@@ -10,6 +10,49 @@ use super::Extracted;
 #[cfg(feature = "documents")]
 use super::text::normalize;
 
+/// The largest declared uncompressed size an OOXML archive or spreadsheet may
+/// have before it is refused, in bytes.
+///
+/// The callers cap the *compressed* blob they hand us (4 MiB for a chat
+/// attachment, 25 MiB for a memory drop), but a small highly-compressed part
+/// can expand arbitrarily — a zip bomb — and every parser here holds the whole
+/// document plus its extraction in memory at once. The entry sizes declared in
+/// the archive's central directory are summed before anything is read, and
+/// each entry read is additionally capped, so a crafted archive cannot force a
+/// multi-hundred-megabyte allocation out of a few-hundred-kilobyte upload.
+#[cfg(feature = "documents")]
+pub(crate) const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most cells a spreadsheet's dense range may hold before it is refused.
+///
+/// The decompression guard above bounds the *bytes* of an archive, but
+/// calamine's `worksheet_range` then materializes the dense bounding box of the
+/// cells that actually appear in a sheet: a tiny archive with one cell at `A1`
+/// and one at `XFD1048576` passes that guard yet forces a ~17-billion-cell
+/// allocation inside the blocking extraction thread. The used range of a real
+/// spreadsheet is a small fraction of the grid, so this only bites hostile
+/// input; refuse rather than allocate (codex review finding).
+#[cfg(feature = "documents")]
+pub(crate) const MAX_SPREADSHEET_DENSE_CELLS: usize = 1_000_000;
+
+/// Sums the uncompressed sizes every entry of `archive` declares, without
+/// reading any entry data.
+///
+/// The central directory is the only thing touched, so this stays cheap no
+/// matter how much the archive expands. `None` means an entry could not be
+/// inspected, which the caller treats as a refusal.
+#[cfg(feature = "documents")]
+fn declared_uncompressed<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<u64> {
+    (0..archive.len()).try_fold(0u64, |total, i| {
+        archive
+            .by_index(i)
+            .ok()
+            .map(|file| total.saturating_add(file.size()))
+    })
+}
+
 /// Extracts a PDF's text layer.
 ///
 /// A scanned PDF has none, and that is [`Extracted::Empty`], not a failure:
@@ -57,8 +100,30 @@ pub fn pptx(bytes: &[u8]) -> Extracted {
 pub fn xlsx(bytes: &[u8]) -> Extracted {
     use calamine::{Data, Reader};
 
+    // Zip-bomb guard before calamine materializes the whole workbook: the
+    // declared uncompressed sizes are summed from the central directory, and
+    // an archive that expands beyond the cap is refused without parsing any
+    // entry data. `None` (an uninspectable archive) is refused too.
+    let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return Extracted::Unsupported(format!("the spreadsheet could not be read: {error}"));
+        }
+    };
+    if declared_uncompressed(&mut archive).is_none_or(|total| total > MAX_DECOMPRESSED_BYTES) {
+        return Extracted::Unsupported(
+            "the spreadsheet expands beyond the size this build can read safely".to_string(),
+        );
+    }
+
     let cursor = std::io::Cursor::new(bytes.to_vec());
-    let mut workbook = match calamine::open_workbook_auto_from_rs(cursor) {
+    // Opened as a concrete Xlsx rather than auto-detected: the dispatch only
+    // ever sends `.xlsx`/`.xlsm` here, and the other formats calamine's auto
+    // open would fall back to (`.xls`, `.xlsb`, `.ods`) build their dense
+    // ranges during open — before any extent guard could run — so accepting a
+    // mislabeled file would leave the same allocation attack open in them.
+    // A file that says `.xlsx` and is not one is refused cleanly instead.
+    let mut workbook = match calamine::open_workbook_from_rs::<calamine::Xlsx<_>, _>(cursor) {
         Ok(workbook) => workbook,
         Err(error) => {
             return Extracted::Unsupported(format!("the spreadsheet could not be read: {error}"));
@@ -66,6 +131,38 @@ pub fn xlsx(bytes: &[u8]) -> Extracted {
     };
     let mut out = String::new();
     for name in workbook.sheet_names().to_vec() {
+        // The dense-range guard: `worksheet_range` materializes the bounding
+        // box of a sheet's *actual* cells, so scan them sparsely first (cheap
+        // — no grid is allocated) and refuse a sheet whose box would exceed
+        // the cap before the materialization happens. A sheet with no cells
+        // has nothing to materialize. The reader is dropped here so the
+        // workbook's borrow is free for `worksheet_range` below.
+        let dense = {
+            let Ok(mut reader) = workbook.worksheet_cells_reader(&name) else {
+                continue;
+            };
+            let mut row_min = u32::MAX;
+            let mut row_max = 0;
+            let mut col_min = u32::MAX;
+            let mut col_max = 0;
+            while let Ok(Some(cell)) = reader.next_cell() {
+                let (row, col) = cell.get_position();
+                row_min = row_min.min(row);
+                row_max = row_max.max(row);
+                col_min = col_min.min(col);
+                col_max = col_max.max(col);
+            }
+            if row_min == u32::MAX {
+                continue;
+            }
+            (row_max - row_min + 1).saturating_mul(col_max - col_min + 1) as usize
+        };
+        if dense > MAX_SPREADSHEET_DENSE_CELLS {
+            return Extracted::Unsupported(
+                "the spreadsheet's used range exceeds the size this build can read safely"
+                    .to_string(),
+            );
+        }
         let Ok(range) = workbook.worksheet_range(&name) else {
             continue;
         };
@@ -105,13 +202,23 @@ fn ooxml(bytes: &[u8], entries: &[&str], paragraph_tag: &str, text_tag: &str) ->
             return Extracted::Unsupported(format!("the document is not a readable file: {error}"));
         }
     };
+    // Zip-bomb guard before any entry data is read: refuse an archive whose
+    // declared expansion exceeds the cap instead of materializing it.
+    if declared_uncompressed(&mut archive).is_none_or(|total| total > MAX_DECOMPRESSED_BYTES) {
+        return Extracted::Unsupported(
+            "the document expands beyond the size this build can read safely".to_string(),
+        );
+    }
     let mut out = String::new();
     for entry in entries {
-        let Ok(mut file) = archive.by_name(entry) else {
+        let Ok(file) = archive.by_name(entry) else {
             continue;
         };
         let mut xml = String::new();
-        if std::io::Read::read_to_string(&mut file, &mut xml).is_err() {
+        // Capped read as well: a lying archive that declares small sizes but
+        // streams more data cannot force an unbounded allocation either.
+        let mut capped = std::io::Read::take(file, MAX_DECOMPRESSED_BYTES);
+        if std::io::Read::read_to_string(&mut capped, &mut xml).is_err() {
             continue;
         }
         out.push_str(&xml_text(&xml, paragraph_tag, text_tag));

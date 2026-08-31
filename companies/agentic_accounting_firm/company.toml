@@ -7,6 +7,20 @@ name = "Agentic Accounting Firm"
 output = "Books, taxes, payroll, and forecasts"
 human_role = "Sign-off on filings"
 
+[tools]
+# The default belt plus `chargebee` (#788) — the CEILING, not the grant. An accounting firm that cannot raise an invoice is a hole in the
+# template, so this is the one shipped company where billing plainly belongs.
+#
+# `allow` REPLACES the default rather than extending it, so the inherited belt
+# is restated verbatim before `chargebee` is appended. `*` does not cover
+# `chargebee`: these tools mail invoices to a real business's real customers,
+# so the namespace is opted into by name.
+#
+# Every teammate below states its own `tools` line for the same reason — an
+# omitted line takes this whole ceiling, so silence would hand billing to all
+# of them.
+allow = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*", "chargebee"]
+
 # The close-review desk keeps the people who reconcile, file, and substantiate the books together.
 [[group_chat]]
 id = "close_review"
@@ -24,7 +38,7 @@ enabled = ["month_end_close", "filing_prep"]
 # from its own manifest instead of inferred from an absent block.
 #
 # `auto` runs the agent's own sandbox writes and outward reads unattended and
-# still parks everything that leaves the company or spends money. `always_approve`
+# policy HITL is disabled; agents use `request_approval` when they want sign-off. `always_approve`
 # is omitted, so it keeps its default.
 [policy]
 mode = "auto"

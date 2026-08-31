@@ -95,10 +95,14 @@ async fn main() -> anyhow::Result<()> {
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     };
 
     let dir = tempfile::tempdir()?;
@@ -121,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         audit_root: dir.path().to_path_buf(),
         model_override,
         tasks: None,
+        notifications: None,
         skills: None,
         skills_source_dir: None,
         skills_registry: std::sync::Arc::from([]),
@@ -156,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         search: None,
         tenant_search: None,
         workspace: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
 
     let pool = HarnessPool::new();
@@ -163,7 +170,13 @@ async fn main() -> anyhow::Result<()> {
 
     println!("── prompt → ceo ──\n{prompt}\n");
     let outcome = pool
-        .run(&record.id, "ceo", &prompt, &deps, Some("General"))
+        .run(
+            &record.id,
+            "ceo",
+            &prompt,
+            &deps,
+            opencompany::runtime::delegation::ChatTarget::channel(Some("General")),
+        )
         .await?;
     let reply = outcome.reply;
     println!("── ceo reply ──\n{reply}\n");

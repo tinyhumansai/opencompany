@@ -228,15 +228,31 @@ async fn local_acp_agent_answers_a_prompt_through_the_acp_agent_trait() {
         .build("claude", None, &Default::default(), &workspace_root)
         .expect("claude-agent-acp must be on PATH");
 
+    // Watched as the real adapter reports it, which is the invariant the live
+    // console timeline rests on: what an observer sees during the turn is
+    // exactly what the turn returns afterwards — a tee, never a hand-off. A
+    // fixture can only prove that against a fixture.
+    let observed: Arc<Mutex<Vec<opencompany::ports::acp::AcpUpdate>>> = Arc::default();
+    let seen = Arc::clone(&observed);
+    let observer: opencompany::ports::acp::AcpObserver =
+        Arc::new(move |update| seen.lock().unwrap().push(update.clone()));
+
     let company = CompanyId::new("acme-live-smoke");
     let turn = agent
         .prompt(
             &company,
             &format!("{}::researcher", company.as_ref()),
             "Reply with exactly the single word PONG and nothing else.",
+            Some(&observer),
         )
         .await
         .expect("prompt");
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        turn.updates,
+        "every update the observer saw is in the returned turn, in order"
+    );
 
     assert_eq!(
         turn.stop_reason, "end_turn",
@@ -307,6 +323,10 @@ async fn local_acp_agent_steers_codex_via_set_config_option_fallback() {
             &company,
             &format!("{}::researcher", company.as_ref()),
             "Reply with exactly the single word PONG and nothing else.",
+            // Unwatched: what this test is about is the model-steering
+            // fallback, and the tee is asserted against the real adapter in
+            // `local_acp_agent_answers_a_prompt_through_the_acp_agent_trait`.
+            None,
         )
         .await
         .expect("prompt — including its session/set_config_option fallback call");
@@ -548,4 +568,141 @@ async fn an_installed_adapter_starts_and_speaks_acp() {
         .expect("the installed adapter completes the ACP handshake");
 
     eprintln!("[install] {} -> {}", harness.version, adapter.display());
+}
+
+/// The assumption durable session continuity rests on: that
+/// `agentCapabilities.loadSession` is real, that a session id outlives the
+/// process that opened it, and that the resumed conversation still carries
+/// what was said before the restart.
+///
+/// Runs the adapter **twice** — the second time against a session the first
+/// one opened, with the first process gone — which is exactly the shape of an
+/// operator restarting the app between two questions to the same teammate.
+#[tokio::test]
+#[ignore = "spawns a real, authenticated claude-agent-acp twice and costs real usage"]
+async fn a_session_survives_the_process_that_opened_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    let session = {
+        let updates = Updates::default();
+        let client = AcpClient::spawn(
+            "claude-agent-acp",
+            &[],
+            &root,
+            &[],
+            handler(&root),
+            updates.sink(),
+        )
+        .await
+        .expect("claude-agent-acp must be on PATH");
+        let hello = client.initialize().await.expect("initialize");
+
+        // Read, never assumed: an adapter that cannot resume must get a fresh
+        // `session/new` rather than a `session/load` that fails every cold
+        // start. Printed because this is the field the whole feature is gated
+        // on, and it is worth seeing when it changes.
+        eprintln!(
+            "[loadSession] {:?}",
+            hello["agentCapabilities"]["loadSession"]
+        );
+        assert_eq!(
+            hello["agentCapabilities"]["loadSession"].as_bool(),
+            Some(true),
+            "claude-agent-acp advertises loadSession; got: {hello:#}"
+        );
+
+        let session = client.new_session(&root).await.expect("session/new");
+        client
+            .prompt(
+                &session,
+                "The codeword for this conversation is `pomegranate`. \
+                 Reply with exactly: OK. Do not use any tools.",
+            )
+            .await
+            .expect("prompt");
+        session
+        // The client drops here, and with it the subprocess (`kill_on_drop`) —
+        // the restart this test is about.
+    };
+
+    let updates = Updates::default();
+    let client = AcpClient::spawn(
+        "claude-agent-acp",
+        &[],
+        &root,
+        &[],
+        handler(&root),
+        updates.sink(),
+    )
+    .await
+    .expect("claude-agent-acp must be on PATH");
+    client.initialize().await.expect("initialize");
+
+    client
+        .call(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session,
+                "cwd": root.display().to_string(),
+                "mcpServers": [],
+            }),
+        )
+        .await
+        .expect("session/load reopens a session opened by a dead process");
+
+    client
+        .prompt(
+            &session,
+            "What was the codeword I gave you? Answer in one word. Do not use any tools.",
+        )
+        .await
+        .expect("prompt");
+
+    let said = updates.said().to_lowercase();
+    assert!(
+        said.contains("pomegranate"),
+        "the resumed conversation still carries what was said before the restart; got: {said:?}"
+    );
+}
+
+/// The failure the fallback is written for: an id the adapter no longer holds
+/// — a cleared CLI session store, a record copied between machines — is
+/// refused, not silently answered with an empty session that would look like
+/// a teammate whose memory went blank.
+///
+/// Cheap enough to be worth its own test: no model call, so this costs
+/// nothing but a spawn.
+#[tokio::test]
+#[ignore = "spawns a real claude-agent-acp"]
+async fn an_unknown_session_is_refused_rather_than_invented() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let updates = Updates::default();
+
+    let client = AcpClient::spawn(
+        "claude-agent-acp",
+        &[],
+        &root,
+        &[],
+        handler(&root),
+        updates.sink(),
+    )
+    .await
+    .expect("claude-agent-acp must be on PATH");
+    client.initialize().await.expect("initialize");
+
+    let refused = client
+        .call(
+            "session/load",
+            serde_json::json!({
+                "sessionId": "00000000-0000-4000-8000-000000000000",
+                "cwd": root.display().to_string(),
+                "mcpServers": [],
+            }),
+        )
+        .await;
+
+    let error = refused.expect_err("an unknown session id is not loadable");
+    eprintln!("[session/load unknown] {error}");
 }

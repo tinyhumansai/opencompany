@@ -20,6 +20,7 @@ function node(over: {
   name: string;
   kind: "folder" | "file";
   parentId?: string | null;
+  updatedAt?: number;
 }): FsNode {
   return {
     parentId: null,
@@ -122,6 +123,28 @@ describe("hasOperatorContent", () => {
 });
 
 describe("childrenOf pins derived last (issue #1382)", () => {
+  it("sorts each sibling group by modified time, then name", () => {
+    const tree = [
+      node({ id: "old", name: "Older", kind: "folder", updatedAt: 10 }),
+      node({ id: "tie-z", name: "Zebra", kind: "folder", updatedAt: 20 }),
+      node({ id: "derived", name: "derived", kind: "folder", updatedAt: 40 }),
+      node({ id: "new", name: "Newest", kind: "folder", updatedAt: 30 }),
+      node({ id: "tie-a", name: "Alpha", kind: "folder", updatedAt: 20 }),
+      node({ id: "file-old", name: "Older.md", kind: "file", updatedAt: 10 }),
+      node({ id: "file-new", name: "Newest.md", kind: "file", updatedAt: 30 }),
+    ];
+
+    expect(childrenOf(tree, null).map((n) => n.name)).toEqual([
+      "Newest",
+      "Alpha",
+      "Zebra",
+      "Older",
+      "derived",
+      "Newest.md",
+      "Older.md",
+    ]);
+  });
+
   it("sorts the read-only folder after the ones a person made", () => {
     const tree = [
       node({ id: "z", name: "Zebra", kind: "folder" }),

@@ -35,12 +35,13 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::company::dns::DomainStatus;
+use crate::company::setup::AgentFocus;
 use crate::error::OpenCompanyError;
 use crate::ports::inbox::InboxMeta;
 use crate::ports::now_millis;
@@ -63,6 +64,23 @@ pub fn router() -> Router<AppState> {
         .merge(scoped(
             "/team/{agent_id}",
             super::team_agent::method_router().delete(remove_member),
+        ))
+        // Issue #1776: the same drafting for a teammate that does not exist
+        // yet — the Add-teammate form, which has no id to address. A static
+        // segment, so it shadows nothing: no `POST` is served on
+        // `/team/{agent_id}`, and a teammate whose id really is `draft` drafts
+        // at `/team/draft/draft`.
+        .merge(scoped(
+            "/team/draft",
+            post(super::team_agent::draft_new_profile),
+        ))
+        // Issue #1776: drafting a mandate or persona for one teammate. Its own
+        // path rather than another method on `/team/{agent_id}`, because it is
+        // not a write to that teammate — it reads the record and returns text,
+        // and a `POST` on the teammate's own path would read as one.
+        .merge(scoped(
+            "/team/{agent_id}/draft",
+            post(super::team_agent::draft_profile),
         ))
         .merge(scoped("/team/{agent_id}/inbox", put(toggle_inbox)))
         .merge(scoped(
@@ -119,9 +137,10 @@ struct TeamMemberDto {
     ///
     /// `companyAllow` repeats on every row, which is the payload cost of
     /// mirroring the detail shape exactly rather than inventing a leaner
-    /// parallel one. It is worth paying: an **empty `requested` means the
-    /// company's standard grant**, not "no tools", and a row that dropped the
-    /// ceiling would leave a client no way to say which it was looking at.
+    /// parallel one. It is worth paying: `requested` is three-state since issue
+    /// #1804 (`null` = the company's standard grant, `[]` = an explicit no-tools
+    /// grant, `[globs]` = narrow), and a row that dropped the ceiling would leave
+    /// a client no way to say which of the three it was looking at.
     tools: super::team_agent::AgentToolsDto,
     /// The desks this teammate sits on, resolved through the same helper the
     /// detail read uses (issue #601). Desks are the company's real grouping —
@@ -160,6 +179,16 @@ struct TeamMemberDto {
     /// When that cap was set (epoch millis). Paired with `budgetSetBy`.
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_set_at_millis: Option<u64>,
+    /// The face this teammate wears, when somebody has chosen one — a
+    /// `tiny:<flavour>` mascot or a `blob:<nodeId>` upload
+    /// (`docs/spec/runtime/avatars.md`). Absent means **nobody has chosen**, and
+    /// the console draws the mascot it hashes from the id.
+    ///
+    /// Skipped rather than defaulted for the reason `tier` is: absent is a real
+    /// answer here, and a client that could not tell it from a choice would have
+    /// no way to offer "reset to the default face".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar: Option<String>,
     /// Whether this teammate came from the **global baseline**
     /// (`docs/spec/runtime/globals.md`) rather than from this company — the
     /// same `Agent::global` marker the merge itself sets (issue #1404).
@@ -195,6 +224,30 @@ struct AddMember {
     /// only restrict the new teammate below what the company already allows.
     #[serde(default)]
     tools: Vec<String>,
+    /// An optional face for the new teammate — a `tiny:<flavour>` mascot or a
+    /// `blob:<nodeId>` upload (`docs/spec/runtime/avatars.md`), so a teammate can
+    /// be born wearing the face the operator picked in the create dialog rather
+    /// than flashing a hashed one until a second PATCH lands.
+    ///
+    /// A plain `Option` for the same reason `instructions` is one: at creation
+    /// there is nothing to reset to, so `null` and omitted are the same thing —
+    /// the hashed default.
+    #[serde(default)]
+    avatar: Option<String>,
+    /// The job shape that decides this teammate's tool belt, sent by the
+    /// first-run setup build-out (issue #1674). When present it derives the
+    /// grant list through
+    /// [`tools_for_focus`](crate::company::setup::tools_for_focus) — the same
+    /// host-side belt table the roster proposal uses — instead of `tools`, so a
+    /// setup-created teammate gets the belt its shape was approved with on the
+    /// review screen rather than inheriting the whole company default. An
+    /// unreadable value fails closed to the Writing belt, exactly as the
+    /// proposal's [`focus_from_wire`](crate::company::setup) does; the derived
+    /// list is still intersected with the company `[tools].allow` like any
+    /// other `tools` line, so this can only ever narrow. Takes no permission:
+    /// the setup flow that sends it is the same member-level add as before.
+    #[serde(default)]
+    focus: Option<String>,
     /// Optional persona instructions for the new teammate (issue #1530), so a
     /// teammate can be born with an overridden persona rather than needing a
     /// second PATCH. A plain `Option` — at creation there is no blueprint to
@@ -231,7 +284,7 @@ pub(super) struct SetBudget {
 /// Deserializes into `Some(inner)` when the field is present (so an explicit
 /// `null` becomes `Some(None)`). Without a companion `#[serde(default)]` an
 /// omitted field stays an error — which is what [`SetBudget`] wants.
-pub(super) fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -365,6 +418,11 @@ fn member_row(
         spent_today_usd: cap.and_then(|_| spent(agent_id)),
         budget_set_by: attribution.map(|entry| entry.set_by.id.clone()),
         budget_set_at_millis: attribution.map(|entry| entry.at_millis),
+        // Resolved through the record, like every other overlay-backed field:
+        // one override row answers for a manifest teammate and an overlay one
+        // alike, so both arms of the list above get the chosen face with no
+        // second lookup to keep in step.
+        avatar: record.effective_avatar(agent_id),
         // Through the same helper as the four above, for the same reason: the
         // roster read is what the first-run gate is decided on, so a second
         // copy of the provenance rule here is a second thing to forget.
@@ -433,12 +491,42 @@ async fn add_member(
     // add that does not keeps working for any member, exactly as before. The
     // check is deliberately conditional: adding this field must not quietly
     // take the existing capability away from members.
-    let author = match body.budget_usd_daily {
+    let mut author = match body.budget_usd_daily {
         Some(cap) => {
             if let Some(refusal) = validate_cap(cap) {
                 return Err(refusal.into());
             }
             Some(require_admin(&headers, &state, &company.runtime, peer).await?)
+        }
+        None => None,
+    };
+
+    // A create-time face, resolved *before* the write lock below is taken.
+    //
+    // A `blob:` avatar streams up to 4 MiB from the workspace backend, and the
+    // bytes it resolves to do not depend on the record — so holding the
+    // per-company write lock across that I/O would let a slow or stalled remote
+    // store block every other roster and policy write, on a request any member
+    // can repeat. The immutable reference is resolved here instead, and the
+    // lock below is held only for the load-mutate-save of the record. (Same
+    // shape as `edit_agent` in `team_agent.rs`.)
+    //
+    // Blank is dropped rather than stored — "no choice" is the hashed default.
+    let resolved_avatar: Option<String> = match body
+        .avatar
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => {
+            let stored = crate::company::avatar::resolve(
+                company.runtime.workspace().as_ref(),
+                company.id(),
+                value,
+            )
+            .await
+            .map_err(|e| ApiError(e).into_response())?;
+            Some(stored)
         }
         None => None,
     };
@@ -450,13 +538,71 @@ async fn add_member(
 
     // Issue #661 / L5: trim + drop blank globs, mirroring the orchestrator
     // `add_agent` parse. Empty stays empty → the standard company-wide grant.
-    let tools: Vec<String> = body
-        .tools
-        .into_iter()
-        .map(|glob| glob.trim().to_string())
-        .filter(|glob| !glob.is_empty())
-        .collect();
+    //
+    // Issue #1674: a `focus` from the setup build-out derives the grant list
+    // host-side instead — the belt table lives in `src/company/setup.rs`, and
+    // the console has no business choosing a permission boundary. An unreadable
+    // focus fails closed to the Writing belt (`tools_for_focus`), never wider.
+    let mut tools: Vec<String> = match body.focus.as_deref().map(str::trim) {
+        Some(focus) if !focus.is_empty() => {
+            crate::company::setup::tools_for_focus(AgentFocus::from_wire(focus))
+        }
+        _ => body
+            .tools
+            .into_iter()
+            .map(|glob| glob.trim().to_string())
+            .filter(|glob| !glob.is_empty())
+            .collect(),
+    };
+    // Naming a BYO real-money namespace for a NEW teammate is a billing
+    // decision. A budget that spends money is already admin-only above; an
+    // explicit `chargebee`/`paypal`/`hosting` grant without a cap must be too —
+    // otherwise the day a company's ceiling includes `chargebee`, any member
+    // could mint a billing-capable teammate, while editing an existing
+    // teammate's `tools` is already admin-only (`team_agent.rs`). Focus-derived
+    // belts never name these namespaces, so only a hand-typed grant trips this.
+    if author.is_none()
+        && tools.iter().any(|grant| {
+            let one = std::slice::from_ref(grant);
+            crate::company::grants_chargebee_explicit(one)
+                || crate::company::grants_paypal_explicit(one)
+                || crate::company::grants_hosting_explicit(one)
+        })
+    {
+        author = Some(require_admin(&headers, &state, &company.runtime, peer).await?);
+    }
     let mut record = load_record(&company).await?;
+    // A teammate created with no stated grant does not inherit the BYO
+    // real-money namespaces (#788/#789), even though "empty" otherwise means
+    // the standard company-wide grant. A company holds `chargebee` because
+    // somebody named it so that ONE teammate could invoice; the next teammate
+    // an operator types into the console is not that teammate, and silence is
+    // not consent to bill a customer. `creation_default_grants` returns empty
+    // — leaving the inherit-everything contract untouched — for every company
+    // that grants none of them, which is all but a handful.
+    //
+    // Deliberately here rather than in the roster build: this materialises the
+    // narrowed list ONCE, at creation, so the stored teammate carries its own
+    // line. Narrowing at read time instead would silently re-widen the day an
+    // operator edited the teammate for an unrelated reason.
+    if tools.is_empty() {
+        match crate::company::creation_default_grants(&record.manifest.tools.allow) {
+            crate::company::CreationGrant::Standard => {}
+            crate::company::CreationGrant::Narrowed(narrowed) => tools = narrowed,
+            // Nothing safe to store: see `CreationGrant::NothingLeft`. Refusing
+            // is the honest answer and the operator can still create the
+            // teammate by naming its tools.
+            crate::company::CreationGrant::NothingLeft => {
+                return Err(ApiError(crate::error::OpenCompanyError::InvalidRequest(
+                    "this company grants only billing namespaces, so a teammate created with no \
+                     `tools` would inherit them. State the teammate's tools explicitly."
+                        .to_string(),
+                ))
+                .into_response()
+                .into());
+            }
+        }
+    }
     let agent = OverlayAgent {
         // A readable id derived from the name, unique against the roster this
         // record already holds (issue #686). Minted here rather than pushed and
@@ -469,8 +615,13 @@ async fn add_member(
         role: body.role,
         description: body.description,
         // Issue #661 / L5: the teammate's own grant, intersected with the
-        // company allow-list by the shared reads/roster build. Empty = standard.
-        tools,
+        // company allow-list by the shared reads/roster build. A teammate created
+        // with no stated (and no billing-narrowed) grant is stored as `None` —
+        // inherit the company's standard grant — not `Some(vec![])`, which since
+        // issue #1804 is an explicit deny-all. This create path expresses only
+        // "inherit" and "narrow"; the deny-all state is reachable by editing the
+        // teammate afterwards (`PATCH …/team/{id}` with `tools: []`).
+        tools: if tools.is_empty() { None } else { Some(tools) },
         model: None,
         harness: None,
     };
@@ -508,6 +659,15 @@ async fn add_member(
             ..Default::default()
         });
     }
+    // The resolved face is applied to the record under the lock so the upsert
+    // lands in the same atomic save as the teammate itself.
+    if let Some(stored) = resolved_avatar.clone() {
+        record.upsert_agent_override(AgentOverride {
+            agent_id: agent.id.clone(),
+            avatar: Some(stored),
+            ..Default::default()
+        });
+    }
     company.runtime.store().save(&record).await?;
     // A brand-new overlay teammate has no `[[agent]]` row at all, so it declares
     // no tier, holds the company's standard grant, and sits on no desk until
@@ -537,6 +697,7 @@ async fn add_member(
         spent_today_usd: body.budget_usd_daily.map(|_| 0.0),
         budget_set_by: attribution.as_ref().map(|entry| entry.set_by.id.clone()),
         budget_set_at_millis: attribution.as_ref().map(|entry| entry.at_millis),
+        avatar: resolved_avatar,
         // An operator just created this one, so it is by construction not from
         // the baseline — the merge only ever appends to the manifest roster.
         // It is also exactly the write that closes the first-run gate.
@@ -573,6 +734,23 @@ async fn remove_member(
         )));
     }
 
+    // Tombstone the operator-feed divert before it can be lost (issue #1781
+    // review, Codex P2 follow-up to the desk-deletion fix): a manifest
+    // teammate at the literal id `operator` is already covered below —
+    // `retire_agent` tombstones it under the same key
+    // `operator_feed_channel`'s own `is_retired` check reads — but an
+    // *overlay* teammate is deleted outright with no tombstone at all. If
+    // this removal is what's currently holding the divert (id or, via
+    // `is_roster_agent`, nothing else does for a teammate — desks are the
+    // only case matched by display name), the fallback address must stay
+    // fixed after the removal exactly as `delete_desk` already keeps it
+    // fixed after a colliding desk's removal — see
+    // `CompanyRecord::divert_operator_feed_permanently`'s doc.
+    if record.operator_feed_channel()
+        == crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK
+    {
+        record.divert_operator_feed_permanently();
+    }
     let is_manifest = record.manifest.agents.iter().any(|a| a.id == agent_id);
     if is_manifest {
         // A tombstone, not a manifest rewrite: `company.toml` and the global
@@ -921,10 +1099,14 @@ mod tests {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -1381,6 +1563,138 @@ mod tests {
         assert_eq!(detail["instructionsOverridden"], true, "{detail}");
     }
 
+    /// Issue #1674: a setup-created teammate carries its job shape (`focus`) so
+    /// it is created with the belt that shape was approved with on the review
+    /// screen, rather than inheriting the whole company default. `research` is
+    /// the read-only shape: its effective grants hold no `workspace.write`, and
+    /// a focus-less add still gets the standard company-wide grant.
+    #[tokio::test]
+    async fn a_teammate_created_with_a_focus_is_scoped_to_that_focus_belt() {
+        use crate::ports::UserRole;
+        let home_dir = home();
+        let state = state_with_manifest(
+            home_dir.path(),
+            "[company]\nname = \"Acme\"\n[tools]\n\
+             allow = [\"workspace.read\", \"workspace.write\", \"docs.*\", \
+             \"files.*\", \"web.*\", \"search\", \"mcp:*\"]\n",
+        )
+        .await;
+        let member =
+            crate::server::test_support::seed_session(&state, "acme", UserRole::Member).await;
+
+        // A Research teammate: reads the workspace and browses, but has no
+        // business writing the company's own guidance tree.
+        let (status, created) = send(
+            &state,
+            "POST",
+            "/api/v1/company/team",
+            Some(json!({
+                "name": "Jamie",
+                "role": "Researcher",
+                "focus": "research",
+            })),
+            Some(&member),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let jamie = created["id"].as_str().unwrap().to_string();
+        let row = team_row(&state, &jamie).await;
+        let grants = |field: &str| {
+            row["tools"][field]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let effective = grants("effective");
+        assert!(
+            effective.contains(&"workspace.read"),
+            "research reads the workspace: {effective:?}"
+        );
+        assert!(
+            !effective.contains(&"workspace.write"),
+            "research must not write the workspace it reports on: {effective:?}"
+        );
+        let requested = grants("requested");
+        assert!(
+            !requested.contains(&"workspace.write"),
+            "the stored belt is the research belt, not the company grant: {requested:?}"
+        );
+
+        // A focus-less add keeps the standard company-wide grant — the field
+        // takes no permission away from the generic add path.
+        let (status, created) = send(
+            &state,
+            "POST",
+            "/api/v1/company/team",
+            Some(json!({"name": "Sam", "role": "Generalist"})),
+            Some(&member),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let sam = created["id"].as_str().unwrap().to_string();
+        let row = team_row(&state, &sam).await;
+        let effective = row["tools"]["effective"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            effective.contains(&"workspace.write"),
+            "a focus-less add still inherits the company grant: {effective:?}"
+        );
+    }
+
+    /// Issue #788/#789: naming a BYO billing namespace for a NEW teammate is a
+    /// billing decision, and a member must not be able to make it. A budget
+    /// that spends money is already admin-only; an explicit `chargebee` grant
+    /// without a budget must be too — otherwise any member could mint a
+    /// billing-capable teammate the day the company ceiling includes one, while
+    /// editing an existing teammate's `tools` is already admin-only.
+    #[tokio::test]
+    async fn a_member_may_not_create_a_teammate_with_a_billing_grant() {
+        use crate::ports::UserRole;
+        let home_dir = home();
+        let state = state_with_manifest(
+            home_dir.path(),
+            "[company]\nname = \"Acme\"\n[tools]\n\
+             allow = [\"*\", \"workspace.*\", \"workspace.write\", \"media\", \"composio\", \
+             \"search\", \"mcp:*\", \"chargebee\"]\n",
+        )
+        .await;
+        let member =
+            crate::server::test_support::seed_session(&state, "acme", UserRole::Member).await;
+
+        let (status, body) = send(
+            &state,
+            "POST",
+            "/api/v1/company/team",
+            Some(json!({"name": "Jamie", "role": "Billing", "tools": ["chargebee"]})),
+            Some(&member),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        // The refused add must not have persisted a teammate.
+        let (list_status, team) = get_team(&state).await;
+        assert_eq!(list_status, StatusCode::OK, "{team}");
+        let rows = team.as_array().unwrap();
+        assert!(
+            rows.iter().all(|r| r["name"] != "Jamie"),
+            "a refused add must not persist a teammate: {team}"
+        );
+
+        // An admin can still mint the billing-capable teammate.
+        let (status, created) = send(
+            &state,
+            "POST",
+            "/api/v1/company/team",
+            Some(json!({"name": "Dana", "role": "Billing", "tools": ["chargebee"]})),
+            Some(&admin_cookie()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["id"], "dana", "{created}");
+    }
+
     /// An **overlay** teammate can be capped after the fact too — the case the
     /// pre-#343 read path hardcoded to `None` ("uncapped in v1").
     ///
@@ -1424,6 +1738,7 @@ mod tests {
                     cost_usd: 0.75,
                     kind: SampleKind::Inference,
                     run_id: None,
+                    model: None,
                 },
             )
             .await
@@ -1613,6 +1928,77 @@ mod tests {
         );
     }
 
+    /// Issue #1781 review, Codex P2 follow-up: the sibling of the desk-side
+    /// fix — a legacy **overlay** teammate at the literal id `operator`
+    /// (grandfathered; `POST .../team` reserves this id going forward, the
+    /// same way `create_desk` reserves it for desks) diverts
+    /// `operator_feed_channel()` to the fallback address via `is_roster_agent`.
+    /// Unlike a manifest teammate, `remove_member`'s overlay branch deletes
+    /// outright with no `retire_agent` tombstone — so without this fix the
+    /// live `is_roster_agent`/`is_retired` checks would both go false the
+    /// moment the delete lands, reverting the feed to `OPERATOR_CHANNEL` and
+    /// orphaning every report already journaled under the fallback.
+    ///
+    /// Seeded directly on the stored record rather than through `POST
+    /// .../team`, for the same reason the desk-side test seeds its collision
+    /// directly: the creation route has refused this id since before this fix
+    /// existed, so this shape can only be reached by data that predates it.
+    #[tokio::test]
+    async fn removing_an_overlay_teammate_at_the_operator_id_keeps_the_feed_diverted() {
+        let home_dir = home();
+        let state = state_with_manifest(home_dir.path(), ROSTER).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut record = runtime.store().load(&id).await.unwrap().unwrap();
+        record
+            .overlay_agents
+            .push(crate::ports::types::OverlayAgent {
+                id: "operator".to_string(),
+                name: "Legacy Operator".to_string(),
+                role: "Chief of Staff".to_string(),
+                description: None,
+                tools: None,
+                model: None,
+                harness: None,
+            });
+        runtime.store().save(&record).await.unwrap();
+
+        let reloaded = runtime.store().load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.operator_feed_channel(),
+            crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "fixture must start in the collision state this test exercises"
+        );
+
+        let (status, _) = send(
+            &state,
+            "DELETE",
+            "/api/v1/company/team/operator",
+            None,
+            Some(&admin_cookie()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let after = runtime.store().load(&id).await.unwrap().unwrap();
+        assert!(
+            !after.is_roster_agent(crate::runtime::channel::OPERATOR_CHANNEL),
+            "the colliding teammate must actually be gone, or this is not \
+             exercising the live-check-flips-back failure mode at all"
+        );
+        assert_eq!(
+            after.operator_feed_channel(),
+            crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "the feed address must stay on the fallback once the overlay \
+             teammate that caused the collision is deleted — flipping back to \
+             OPERATOR_CHANNEL would orphan every report already journaled \
+             under the fallback and let the deleted teammate's own historical \
+             DM history (chat_id == \"operator\") resurface as system-feed \
+             content"
+        );
+    }
+
     /// The id is minted once. `PATCH …/team/{id}` renames the teammate and
     /// leaves the id alone — a name-keyed id would orphan the teammate's
     /// workspace folder, its budget row and its desk memberships on every
@@ -1732,6 +2118,7 @@ mod tests {
                         cost_usd: cost,
                         kind: SampleKind::Inference,
                         run_id: None,
+                        model: None,
                     },
                 )
                 .await
@@ -1752,6 +2139,7 @@ mod tests {
                     cost_usd: 9.00,
                     kind: SampleKind::Inference,
                     run_id: None,
+                    model: None,
                 },
             )
             .await
@@ -1800,6 +2188,7 @@ mod tests {
                     cost_usd: 9.00,
                     kind: SampleKind::Inference,
                     run_id: None,
+                    model: None,
                 },
             )
             .await

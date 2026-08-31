@@ -224,6 +224,69 @@ pub fn grants_hosting_explicit(grants: &[String]) -> bool {
         .any(|grant| grant == "hosting" || grant.starts_with("hosting."))
 }
 
+/// The grant list a teammate created with **no stated `tools`** should receive.
+///
+/// An omitted `tools` line means "the company's standard grant", and the
+/// standard grant is the whole of `[tools].allow`. That is the right default
+/// for the belt a company runs on — issue #1674 made it wider on purpose,
+/// because a teammate minted from three sentences in a wizard reporting its
+/// own tools as "not enabled" is the worse failure. It is the wrong default
+/// for a namespace `*` deliberately refuses to confer: a company that added
+/// `chargebee` by name so that ONE teammate could invoice should not hand
+/// billing to the next teammate an operator types into the console.
+///
+/// So this withholds exactly the **BYO real-money** namespaces — the ones a
+/// company only ever holds because somebody named them, and that reach a real
+/// business's customers, wallet, or public identity. `media`, `composio` and
+/// `search` are deliberately NOT withheld: they ship in the default belt, so
+/// withholding them would re-create the #1674 complaint for every new
+/// teammate.
+///
+/// Returns **empty** when nothing is withheld, preserving the "empty means the
+/// standard company grant" contract for the overwhelming majority of companies
+/// that grant none of these. A non-empty return is the allow-list minus the
+/// withheld namespaces, materialised so the stored teammate carries its own
+/// narrowed line rather than inheriting a ceiling that later widens.
+pub fn creation_default_grants(allow: &[String]) -> CreationGrant {
+    let withheld = |grant: &String| {
+        let one = std::slice::from_ref(grant);
+        grants_chargebee_explicit(one)
+            || grants_paypal_explicit(one)
+            || grants_hosting_explicit(one)
+    };
+    if !allow.iter().any(withheld) {
+        return CreationGrant::Standard;
+    }
+    let kept: Vec<String> = allow.iter().filter(|g| !withheld(g)).cloned().collect();
+    if kept.is_empty() {
+        return CreationGrant::NothingLeft;
+    }
+    CreationGrant::Narrowed(kept)
+}
+
+/// What [`creation_default_grants`] decided for a teammate created with no
+/// stated `tools`.
+///
+/// Three cases rather than a `Vec`, because a `Vec` cannot express the third
+/// one: an empty list is already spoken for — it means "the standard company
+/// grant" — so returning the filtered-to-nothing result as `vec![]` would hand
+/// back the exact capability the filter just removed. The orchestrator's
+/// `add_agent` refuses on the same reasoning when narrowing a requested scope
+/// yields nothing, and this mirrors it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreationGrant {
+    /// Nothing was withheld. Store an empty line, which keeps tracking
+    /// `[tools].allow` the way an unstated grant always has.
+    Standard,
+    /// Store this narrowed line: the allow-list minus the withheld namespaces.
+    Narrowed(Vec<String>),
+    /// The company's whole belt is withheld namespaces (`allow = ["chargebee"]`
+    /// and nothing else). There is no safe line to store — empty would read
+    /// back as inheritance — so the caller refuses and asks for an explicit
+    /// grant instead.
+    NothingLeft,
+}
+
 /// Whether a tool-grant list **explicitly** grants the `paypal` namespace
 /// (issue #789).
 ///
@@ -250,6 +313,37 @@ pub fn grants_search_explicit(grants: &[String]) -> bool {
     grants
         .iter()
         .any(|grant| grant == "search" || grant.starts_with("search."))
+}
+
+/// The [`GATEABLE_NAMESPACES`] a built-in tool can serve directly — the shared
+/// native-capability vocabulary both native-first routing levers key off.
+///
+/// It is `GATEABLE_NAMESPACES` minus `composio` (the third-party connection
+/// path, never a built-in tool) and minus `web` (the raw-HTTP family the
+/// Composio deflection guardrail governs). A future native tool flows into both
+/// levers by its [`namespace_of`](crate::harness::toolbelt::namespace_of) arm
+/// landing in this set; nothing here is a literal capability name.
+pub fn native_capability_namespaces() -> Vec<&'static str> {
+    GATEABLE_NAMESPACES
+        .iter()
+        .copied()
+        .filter(|ns| *ns != "composio" && *ns != "web")
+        .collect()
+}
+
+/// Whether a grant list confers the native namespace `ns`, mirroring the
+/// harness wiring gate: the real-money `search`/`media` families through their
+/// explicit grant helpers (the catch-all `*` never confers them), and every
+/// other namespace through the ordinary namespace rule a bare `*` satisfies.
+pub fn grants_confer_native(grants: &[String], ns: &str) -> bool {
+    use crate::runtime::tools::{NAMESPACE_SEPARATORS, extends_on_boundary};
+    match ns {
+        "search" => grants_search_explicit(grants),
+        "media" => grants_media_explicit(grants),
+        _ => grants
+            .iter()
+            .any(|grant| grant == "*" || extends_on_boundary(grant, ns, NAMESPACE_SEPARATORS)),
+    }
 }
 
 /// Whether a tool-grant list confers the **publishing** capability (issue #244)
@@ -483,6 +577,9 @@ pub struct Company {
     /// tiny.place `@handle`; only used when `[place].discoverable = true`.
     #[serde(default)]
     pub handle: Option<String>,
+    /// Company logo as a self-contained data:image/... URL (issue: operator-set brand logo).
+    #[serde(default)]
+    pub logo_url: Option<String>,
 }
 
 /// A `[[agent]]` roster entry.
@@ -539,8 +636,25 @@ pub struct Agent {
     #[serde(default)]
     pub model: Option<String>,
     /// Tool grant globs, intersected with `[tools].allow`.
-    #[serde(default)]
-    pub tools: Vec<String>,
+    ///
+    /// Three distinct states, made representable by issue #1804 (epic #1817,
+    /// Rung 2 — a standing grant that is real and explicit):
+    ///
+    /// * `None` — **inherit** the company's standard grant (the full
+    ///   `[tools].allow`). This is the default, and how every record written
+    ///   before #1804 (which had no `tools` key, or a `tools = []`) deserializes,
+    ///   so promoting the field changes nothing for an existing manifest.
+    /// * `Some(vec![])` — an **explicit, deliberate no-tools** grant: this
+    ///   teammate reaches nothing. Newly reachable in #1804; before it, an empty
+    ///   list was indistinguishable from an absent one and both meant "standard".
+    /// * `Some(globs)` — **narrow** to the listed globs, intersected with
+    ///   `[tools].allow` at roster-build time (narrow-only, never a widen).
+    ///
+    /// `skip_serializing_if = "Option::is_none"` keeps a standard-grant teammate
+    /// serializing exactly as it did before this field was optional (no `tools`
+    /// key), so no existing on-disk record moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
     /// Desks this agent may hand work on to (issue #176).
     ///
     /// Empty (the default) means **no delegation tools at all** — the behaviour
@@ -1312,7 +1426,11 @@ pub struct ChannelConfig {
 }
 
 /// `[tools]` — company-wide tool grants.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `PartialEq` so `runtime::builder::carry_tool_grants_override` can ask the one
+/// question the seed-wins rule turns on: did version control speak about
+/// `[tools]` since the operator's console grant was written (issue #1796)?
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tools {
     /// `openhuman` (default) | `builtin`.
     #[serde(default = "default_tool_provider")]
@@ -1401,7 +1519,7 @@ pub const DEFAULT_MAX_DELEGATION_DEPTH: u8 = 2;
 pub const MAX_DELEGATION_DEPTH_BOUNDS: std::ops::RangeInclusive<u8> = 1..=4;
 
 /// `[tools.composio]` — the per-tenant Composio toolkit allowlist (issue #110).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ComposioTools {
     /// Toolkit slugs the agent may target (e.g. `gmail`, `slack`, `github`).
     /// Empty defers to the backend's server-enforced allowlist (open mode);
@@ -1415,15 +1533,16 @@ impl Default for Tools {
         Self {
             provider: default_tool_provider(),
             // Grant the full tool belt by default: `*` covers files/docs/shell/
-            // code/web/subagent, and `media`/`composio` are listed literally
-            // because the `*` wildcard deliberately excludes those two
-            // (real-money + per-tenant-credential) namespaces. A company that
-            // wants a narrower belt overrides `[tools].allow` explicitly.
+            // code/web/subagent, while `workspace.*` and the explicit
+            // `workspace.write` grant cover the workspace read/write surface.
+            // `media`/`composio` are listed literally because the `*` wildcard
+            // deliberately excludes those two (real-money + per-tenant-
+            // credential) namespaces. A company that wants a narrower belt
+            // overrides `[tools].allow` explicitly.
             //
-            // `search` (issue #238) is deliberately NOT in this list, unlike
-            // `media`/`composio`: the #188 sign-off admitted it **opt-in**, so a
-            // company that never asked for web search never spends on it.
-            // Making it default-on is a one-word change here.
+            // `search` is now part of the authored default belt so the
+            // first-run setup flow can search without each generated agent
+            // having to rediscover the capability.
             allow: crate::globals::default_tool_allow(),
             web_allowed_domains: Vec::new(),
             composio: ComposioTools::default(),
@@ -1646,6 +1765,41 @@ pub struct Schedule {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The shared native vocabulary is exactly `GATEABLE_NAMESPACES` minus the
+    /// third-party connection path (`composio`) and the raw-HTTP family the S2
+    /// deflection governs (`web`).
+    #[test]
+    fn native_capability_vocabulary_is_gateable_minus_composio_and_web() {
+        let native: std::collections::HashSet<&str> =
+            native_capability_namespaces().into_iter().collect();
+        let expected: std::collections::HashSet<&str> = GATEABLE_NAMESPACES
+            .iter()
+            .copied()
+            .filter(|ns| *ns != "composio" && *ns != "web")
+            .collect();
+        assert_eq!(native, expected);
+        assert!(!native.contains("composio"));
+        assert!(!native.contains("web"));
+    }
+
+    /// `grants_confer_native` mirrors the harness wiring gate: the real-money
+    /// `search`/`media` families need their explicit grant (a bare `*` confers
+    /// neither), and every other native namespace rides the ordinary rule a `*`
+    /// satisfies.
+    #[test]
+    fn grants_confer_native_mirrors_the_wiring_gate() {
+        assert!(grants_confer_native(&["search".into()], "search"));
+        assert!(!grants_confer_native(&["*".into()], "search"));
+        assert!(!grants_confer_native(&["composio".into()], "search"));
+
+        assert!(grants_confer_native(&["media".into()], "media"));
+        assert!(!grants_confer_native(&["*".into()], "media"));
+
+        assert!(grants_confer_native(&["*".into()], "shell"));
+        assert!(grants_confer_native(&["shell".into()], "shell"));
+        assert!(!grants_confer_native(&["search".into()], "shell"));
+    }
 
     /// **T10 (issue #971).** A manifest that never mentions
     /// `approval_ttl_hours` parses to `None` and serializes without the key —

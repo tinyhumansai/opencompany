@@ -18,7 +18,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use oh::agent::tool_policy::GeneratedToolRuntimeContext;
 use oh::tools::traits::{
     PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolScope, ToolSpec,
     ToolTimeout,
@@ -323,8 +322,27 @@ impl Tool for CheckpointingTool {
     fn external_effect_with_args(&self, args: &Value) -> bool {
         self.inner.external_effect_with_args(args)
     }
-    fn generated_runtime_context(&self, args: &Value) -> Option<GeneratedToolRuntimeContext> {
-        self.inner.generated_runtime_context(args)
+    // Host metadata this wrapper must not swallow.
+    //
+    // `Tool` used to carry a typed `generated_runtime_context`, and this
+    // decorator forwarded it. The tinytools extraction replaced it with an
+    // ERASED pair — `host_extension` for what the tool is, `host_call_extension`
+    // for what a particular call is — because the answers are host policy
+    // (OpenCompany's generated-tool provenance, OpenHuman's pack-registry
+    // handle) and a shared vocabulary has no business naming either. The typed
+    // reader is a free function now: `oh::agent::tools::traits`'s
+    // `generated_runtime_context`, which downcasts what these return.
+    //
+    // Both must be forwarded, and forwarding is the whole job of this
+    // decorator: a wrapper that answered `None` (the default) would make every
+    // wrapped tool look like a tool with no provenance and no pack, silently,
+    // to policy that has no other way to ask.
+    fn host_extension(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.inner.host_extension()
+    }
+
+    fn host_call_extension(&self, args: &Value) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        self.inner.host_call_extension(args)
     }
     fn max_result_size_chars(&self) -> Option<usize> {
         self.inner.max_result_size_chars()
@@ -353,11 +371,23 @@ impl Tool for CheckpointingTool {
         self.checkpoint_after(result).await
     }
 
+    // `Option<&dyn ToolRunContext>`, not the concrete TinyAgents
+    // `ToolExecutionContext` this used to name. The tinytools extraction turned
+    // the context into a trait so a shared tool vocabulary need not depend on
+    // tinyagents (that would be a dependency cycle — tinyagents depends on
+    // tinytools). The trait exposes the workspace, the thread id and the output
+    // budget and nothing else; the run id, event sink and cancellation token
+    // stay harness-internal on purpose.
+    //
+    // What matters here is unchanged and is the reason this method is
+    // overridden at all: the context carries the per-worker worktree the
+    // vendored tool uses as its action dir, so it is forwarded whole. Dropping
+    // it would silently move where commands run.
     async fn execute_with_context(
         &self,
         args: Value,
         options: ToolCallOptions,
-        context: Option<&tinyagents::harness::tool::ToolExecutionContext>,
+        context: Option<&dyn oh::tools::traits::ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         let result = self
             .inner

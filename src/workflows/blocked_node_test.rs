@@ -4,7 +4,7 @@
 //!
 //! # Why the existing tests all stayed green through this
 //!
-//! Every part worked. `ApprovalPolicy` gated the call — tested.
+//! The agent explicitly called `request_approval` — tested.
 //! `park_gated_calls` opened a decidable card — tested by
 //! [`gated_tool_turn_test`](crate::workflows::gated_tool_turn_test), which is
 //! this file's direct ancestor and shares its whole fixture. The engine marked
@@ -89,7 +89,8 @@ to = "done"
     )
 }
 
-/// A company that gates `shell` under **full** autonomy.
+/// A company running with policy HITL disabled. The approval in these tests is
+/// created only by the agent's explicit tool call.
 ///
 /// The same `always_approve` choice `gated_tool_turn_test` makes and for the
 /// same reason: parking under the *strongest* tier shows the block comes from
@@ -133,6 +134,7 @@ fn record() -> CompanyRecord {
         // Added by #902's desk-level tool ceiling after this fixture was
         // written. Empty means no desk narrows anything, which is what this
         // test's manifest already describes.
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         overlay_desks: Vec::new(),
         overlay_workflows: Vec::new(),
@@ -141,6 +143,9 @@ fn record() -> CompanyRecord {
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
@@ -192,8 +197,11 @@ async fn a_blocked_node_stops_the_branch_and_never_hands_its_apology_downstream(
         dir.path(),
         vec![
             Turn::Call {
-                tool: "shell",
-                args: json!({ "command": "write-spec" }),
+                tool: "request_approval",
+                args: json!({
+                    "title": "Publish the quarterly spec",
+                    "question": "May I publish the finished spec?"
+                }),
             },
             // Verbatim the shape the issue reported: the model is refused inside
             // its own tool loop and writes prose about it, which before this
@@ -234,7 +242,10 @@ async fn a_blocked_node_stops_the_branch_and_never_hands_its_apology_downstream(
 
     // (d) Issue #395's property is unweakened: the card is still decidable.
     assert!(
-        journal.pending().iter().any(|p| p.effect.kind == "shell"),
+        journal
+            .pending()
+            .iter()
+            .any(|p| p.effect.kind == "request_approval"),
         "blocking the node must not cost the operator the card they have to decide"
     );
 
@@ -242,7 +253,7 @@ async fn a_blocked_node_stops_the_branch_and_never_hands_its_apology_downstream(
     assert_eq!(run.blocked_nodes.len(), 1, "{:?}", run.blocked_nodes);
     let blocked = &run.blocked_nodes[0];
     assert_eq!(blocked.node_id, "work");
-    assert_eq!(blocked.tools, vec!["shell".to_string()]);
+    assert_eq!(blocked.tools, vec!["request_approval".to_string()]);
     assert_eq!(
         blocked.approval_ids.len(),
         1,
@@ -263,7 +274,7 @@ async fn a_blocked_node_stops_the_branch_and_never_hands_its_apology_downstream(
     // (f) …and the run carries a receipt of what it parked (#880).
     assert_eq!(run.approvals.len(), 1, "{:?}", run.approvals);
     assert_eq!(run.approvals[0].node_id.as_deref(), Some("work"));
-    assert_eq!(run.approvals[0].tool.as_deref(), Some("shell"));
+    assert_eq!(run.approvals[0].tool.as_deref(), Some("request_approval"));
     assert_eq!(run.approvals[0].outcome, WorkflowApprovalOutcome::Parked);
     assert!(run.approvals[0].approval_id.is_some());
 
@@ -374,8 +385,11 @@ async fn a_blocked_node_under_on_error_continue_still_reports_blocked_and_lets_t
         &pipeline_graph_continues_past_a_block(),
         vec![
             Turn::Call {
-                tool: "shell",
-                args: json!({ "command": "write-spec" }),
+                tool: "request_approval",
+                args: json!({
+                    "title": "Publish the quarterly spec",
+                    "question": "May I publish the finished spec?"
+                }),
             },
             Turn::Say("The spec is in my sandbox but the hand-off is blocked again."),
             Turn::Say("Published."),
@@ -445,8 +459,11 @@ async fn a_run_that_parked_a_card_says_so_even_though_it_paused_no_gate_and_rout
         dir.path(),
         vec![
             Turn::Call {
-                tool: "shell",
-                args: json!({ "command": "publish" }),
+                tool: "request_approval",
+                args: json!({
+                    "title": "Publish the quarterly spec",
+                    "question": "May I publish the finished spec?"
+                }),
             },
             Turn::Say("Blocked on approval."),
         ],
@@ -541,11 +558,13 @@ async fn a_blocked_run_persists_the_partial_output_it_reached() {
         // `intro` node: a plain reply carrying a marker we can find in the
         // persisted snapshot — proof the earlier node's output was captured.
         Turn::Say("Introduction complete. BLOCK-MARKER-42."),
-        // `work` node: calls the gated `shell` tool, which parks for approval —
-        // the model is refused inside its tool loop and the run blocks.
+        // `work` node: explicitly asks for approval and the run blocks.
         Turn::Call {
-            tool: "shell",
-            args: json!({ "command": "write-spec" }),
+            tool: "request_approval",
+            args: json!({
+                "title": "Publish the quarterly spec",
+                "question": "May I publish the finished spec?"
+            }),
         },
         Turn::Say("The spec is blocked pending your approval."),
     ])
@@ -641,6 +660,7 @@ mod pure {
                     tools: vec!["publish_artifact".to_string()],
                     approval_ids: vec!["appr-1".to_string()],
                     unparkable: 0,
+                    blockers: 0,
                 },
                 false,
             ),
@@ -651,6 +671,7 @@ mod pure {
                     tools: vec!["publish_artifact".to_string()],
                     approval_ids: Vec::new(),
                     unparkable: 1,
+                    blockers: 0,
                 },
                 false,
             ),
@@ -661,6 +682,7 @@ mod pure {
                     tools: Vec::new(),
                     approval_ids: Vec::new(),
                     unparkable: 3,
+                    blockers: 0,
                 },
                 false,
             ),

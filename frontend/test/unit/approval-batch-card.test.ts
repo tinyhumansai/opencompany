@@ -113,7 +113,7 @@ async function render(
         approvals,
         now: T0 + 60_000,
         askerNames: new Map([["seo", "SEO Specialist"]]),
-        compact,
+        variant: compact ? ("compact" as const) : ("full" as const),
         thread,
         deciding,
         decided,

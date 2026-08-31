@@ -242,11 +242,23 @@ impl Tool for SkillTool {
         )
     }
 
+    // `Option<&dyn ToolRunContext>`, not the concrete TinyAgents
+    // `ToolExecutionContext` this used to name. The tinytools extraction turned
+    // the context into a trait so a shared tool vocabulary need not depend on
+    // tinyagents (that would be a dependency cycle — tinyagents depends on
+    // tinytools). The trait exposes the workspace, the thread id and the output
+    // budget and nothing else; the run id, event sink and cancellation token
+    // stay harness-internal on purpose.
+    //
+    // What matters here is unchanged and is the reason this method is
+    // overridden at all: the context carries the per-worker worktree the
+    // vendored tool uses as its action dir, so it is forwarded whole. Dropping
+    // it would silently move where commands run.
     async fn execute_with_context(
         &self,
         args: Value,
         options: ToolCallOptions,
-        context: Option<&tinyagents::harness::tool::ToolExecutionContext>,
+        context: Option<&dyn oh::tools::traits::ToolRunContext>,
     ) -> anyhow::Result<ToolResult> {
         self.rewrite_outcome(
             self.inner

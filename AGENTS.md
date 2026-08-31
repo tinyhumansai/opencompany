@@ -164,6 +164,13 @@ injects its environment. When developing hosted behavior, know the seams:
   application-layer only in this mode — a compromised container can reach
   every tenant's documents; db-per-tenant stays the security default. See
   `docs/spec/runtime/storage.md`. Unset (the default) is a full no-op.
+- The manager should also inject `OPENCOMPANY_DEPLOYMENT=hosted-tenant` and,
+  when product analytics is on, `OPENCOMPANY_ANALYTICS_TOKEN`. Neither is
+  required to boot: an instance that says nothing is treated as **self-hosted**
+  and reports nothing, which is the safe direction and the documented default
+  (`docs/spec/runtime/analytics.md`). `OPENCOMPANY_TENANT_ID` alone also implies
+  a hosted tenant, so shared-single-DB tenants are covered without the new
+  variable; db-per-tenant tenants need it.
 - Storage backend selection and the MongoDB backend are documented in
   `docs/spec/runtime/storage.md`; the port traits it implements are the
   entire persistence contract (`docs/spec/runtime/ports.md`).

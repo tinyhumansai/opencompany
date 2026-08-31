@@ -461,7 +461,7 @@ kind = "built_in"
                 name: "Writer".into(),
                 role: "Content Writer".into(),
                 description: None,
-                tools: Vec::new(),
+                tools: None,
                 model: None,
                 harness: None,
             }],
@@ -471,10 +471,14 @@ kind = "built_in"
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 

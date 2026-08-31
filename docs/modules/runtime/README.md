@@ -93,6 +93,18 @@ journal replay is all a continuation needs — at the documented cost that
 upstream nodes re-execute. See
 [`docs/spec/company-brain/approvals.md`](../../spec/company-brain/approvals.md).
 
+A blocked *agent node's* gated tool call (issue #1816/#1825) is a different
+shape: the parked effect carries no workflow lineage, so
+`workflow_resume.rs::spawn_blocked_node_continuation` reads the run id and
+trigger input back out of the dedicated `BlockedNodeStashed` journal record
+instead, once the last decision on that turn lands. `CompanyRuntime`'s
+`reconcile_stranded_blocked_nodes`, run once at boot from `builder.rs`, is that
+path's own restart recovery: it re-dispatches any stash the journal shows as
+decided but never spawned (or spawned but never retired), and retires a stash
+that resolved with nothing approved — the two ways a crash can land between the
+decision and this module's write. See [journal.md](../../spec/runtime/journal.md)
+for the record kinds involved.
+
 ## Background listeners
 
 One per-company background loop sits beside the scheduler, spawned in `serve`

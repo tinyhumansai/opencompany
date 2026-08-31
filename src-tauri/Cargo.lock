@@ -3604,6 +3604,7 @@ dependencies = [
  "fs2",
  "futures",
  "getrandom 0.4.3",
+ "hmac",
  "jsonwebtoken",
  "log",
  "mime_guess",
@@ -3620,6 +3621,9 @@ dependencies = [
  "tinyagents",
  "tinyflows",
  "tinymcp",
+ "tinymemory",
+ "tinymemory-api",
+ "tinymemory-remote",
  "tokio",
  "tokio-util",
  "toml 1.1.4+spec-1.1.0",
@@ -3655,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman"
-version = "0.63.17"
+version = "0.63.18"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -3717,10 +3721,12 @@ dependencies = [
  "tinymcp-bus",
  "tinymemory",
  "tinymemory-api",
+ "tinymemory-bus",
  "tinymemory-core",
  "tinymemory-tinycortex",
  "tinyplace",
  "tinyruntime-bus",
+ "tinytools",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
@@ -5473,9 +5479,9 @@ dependencies = [
 
 [[package]]
 name = "swc_core"
-version = "77.0.2"
+version = "77.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4451c5290d1358d0f8d839f48fee0d43df8d90281e25f39127d58d8a543bf336"
+checksum = "3091e904b9a20b8e26c22f748dc7408a7a6c571f45302ef4686a833efc9e0fda"
 dependencies = [
  "swc_allocator",
  "swc_atoms",
@@ -5557,9 +5563,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_parser"
-version = "45.0.0"
+version = "45.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a380e3e36a2167f1a2c6fd725c87a3aee60d404505667ea2c7c9e85763a70e"
+checksum = "52c29766d4f60c867b48e4d433a4d6c1247f86e4fd1e5ca2babcdd2128806f91"
 dependencies = [
  "bitflags 2.13.1",
  "compact_str",
@@ -5577,9 +5583,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_transforms_base"
-version = "49.0.0"
+version = "49.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4efb43c0b7a0478fc084c55849e182ce85e7123070eb61cfeba67811ab253051"
+checksum = "9c5b5b6a31a512d23854cb6fabc9347596bde4106cd3a65dc4f9072bbb0514b4"
 dependencies = [
  "better_scoped_tls",
  "indexmap 2.14.0",
@@ -6231,6 +6237,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "tinytools",
  "tokio",
  "tracing",
 ]
@@ -6415,7 +6422,7 @@ dependencies = [
 
 [[package]]
 name = "tinymemory"
-version = "1.2.0"
+version = "1.13.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6484,6 +6491,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinymemory-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tinymemory-api",
+ "tokio",
+]
+
+[[package]]
 name = "tinymemory-sources"
 version = "0.1.0"
 dependencies = [
@@ -6523,6 +6545,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "log",
+ "rusqlite",
  "serde",
  "serde_json",
  "tinycortex",
@@ -6575,6 +6598,16 @@ checksum = "b1e27c91459209c2986af3dcf603a5a74a4368754ce37414f59acc971167f643"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "tinytools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

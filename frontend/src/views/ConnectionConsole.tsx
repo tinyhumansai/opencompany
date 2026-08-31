@@ -7,7 +7,7 @@
 // the whole app to a login screen. With N connections that is the wrong shape:
 // one host being down has to redden one row and leave the others working.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
 import { OpenCompanyClient } from "@/api/client";
@@ -15,12 +15,25 @@ import type { SignIn } from "@/api/auth";
 import { ApiError, type CompanyStatus } from "@/api/types";
 import { AppShell } from "@/components/app-shell";
 import { CompanyPicker } from "@/components/company-picker";
+import {
+  CREATE_UNAVAILABLE_NOTE,
+  CreateCompanyDialog,
+  type CreateCompanyRequest,
+  canCreateCompanies,
+} from "@/components/create-company-dialog";
 import { ConsoleChrome } from "@/components/host-switcher";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConnectionScopeProvider } from "@/connections/ConnectionContext";
 import { useHosts } from "@/connections/HostsContext";
-import { adoptSession, probe, useConnection } from "@/connections/registry";
+import {
+  adoptSession,
+  clearDefaultCompany,
+  probe,
+  retargetCompanyUrlParam,
+  retargetDefaultCompany,
+  useConnection,
+} from "@/connections/registry";
 import type { ConnectionId } from "@/connections/types";
 import { withHostParam } from "@/hooks/use-host-route";
 import { Login } from "@/views/Login";
@@ -57,6 +70,23 @@ interface Props {
   notice?: string;
   /** Forces the sign-in view — a magic link that failed to redeem, say. */
   forceLogin?: boolean;
+  /**
+   * Whether THIS connection is the one `resolveConfig()` produced for the
+   * page currently loaded — `App`'s `bootstrapId === connectionId` (issue
+   * #1828 comment 3865563560).
+   *
+   * The only connection whose `?company=`/`?api=` URL params describe it. A
+   * restored, non-bootstrap profile (added in a previous session, or
+   * selected from the switcher) can carry its own `defaultCompany` just the
+   * same, but that value came from `profileStore`, not from the page's URL —
+   * so a create/reset on it must retarget the *profile* only. Rewriting the
+   * live URL for it clobbers whatever host/company the address bar actually
+   * names (the bootstrap connection's, or none at all), and the very next
+   * reload's `resolveConfig()`/`findProfile` pair mints a duplicate
+   * connection scoped to the wrong host. Defaults to `false` (the safer
+   * read) for callers that have not threaded it through yet.
+   */
+  isBootstrap?: boolean;
 }
 
 export function ConnectionConsole({
@@ -65,6 +95,7 @@ export function ConnectionConsole({
   defaultCompany,
   notice,
   forceLogin,
+  isBootstrap = false,
 }: Props) {
   const [phase, setPhase] = useState<Phase>(
     forceLogin ? { kind: "login", company: defaultCompany, notice } : { kind: "loading" },
@@ -76,6 +107,24 @@ export function ConnectionConsole({
   // (every other connection's stream died with it).
   const [bootEpoch, setBootEpoch] = useState(0);
   const connection = useConnection(connectionId);
+  // A `CompanyStatus` this component already resolved for a company id,
+  // carried across the reseat-driven reboot below rather than re-fetched.
+  //
+  // `onCompanyCreated` calls `retargetDefaultCompany` on an explicit-company
+  // connection, which `reseat`s it — a brand new client and a new
+  // `defaultCompany` — and `App` passes both straight through as this
+  // component's props. That prop change re-enters the boot effect, and since
+  // `defaultCompany` is now set it takes the "explicit company wins" branch
+  // straight into a *second* `client.status(id)` call for the company
+  // `switchCompany` already entered with a known-good status a moment
+  // earlier (`onCompanyCreated`'s own `knownStatus` argument, PR comment
+  // 3864628314 — that fix stopped `switchCompany` from re-fetching; this
+  // stops the reboot the reseat itself causes from doing the same fetch a
+  // second time, independently). Left unguarded, a transient failure on this
+  // reboot lookup — nothing needed it — replaced a fully succeeded
+  // create/reset with the generic connection-error screen (issue #1828
+  // comment 3865401542).
+  const knownStatusRef = useRef<{ company: string; status: CompanyStatus } | null>(null);
   // Read unconditionally, though only the `error` phase uses it: a hook cannot
   // hide inside a switch arm. What it decides is what a failure is allowed to
   // say — see the `error` case below.
@@ -93,16 +142,41 @@ export function ConnectionConsole({
   const reBoot = useCallback(
     (result?: SignIn) => {
       // Store the session *before* probing. A cross-origin sign-in's token is
-      // the only proof this connection has — no cookie was set — and adopting
-      // it replaces the client, so a probe that ran first would authenticate
-      // with the pre-sign-in client and conclude the host still refuses us.
-      if (result?.session) adoptSession(connectionId, result.session);
-      void probe(connectionId).then(() => {
+      // the only proof this connection has — no cookie was set — and adoption
+      // replaces the credential (in the client here, in the core on the
+      // desktop), so a probe that ran first would authenticate with the
+      // pre-sign-in credential and conclude the host still refuses us. Hence
+      // awaited, not fired: on the desktop the adoption is an IPC round trip,
+      // and "before" has to mean before.
+      void (async () => {
+        if (result?.session) {
+          try {
+            await adoptSession(connectionId, result.session);
+          } catch (error) {
+            // The session could not be kept — a locked keychain, a plain-HTTP
+            // host the core refuses to carry a credential to. Probing anyway
+            // would authenticate as nobody, 401, and land back on this screen
+            // wearing the generic "credential refused" face: a person who just
+            // signed in successfully, told their credential was wrong. So the
+            // sign-in view returns instead, carrying the refusal's own words —
+            // the core writes them for exactly this reading ("this host is not
+            // encrypted…" names an action; "sign-in failed" names nothing).
+            const reason =
+              error instanceof Error ? error.message : String(error ?? "the session could not be stored");
+            setPhase({
+              kind: "login",
+              company: defaultCompany,
+              notice: `You signed in, but this session could not be kept: ${reason}`,
+            });
+            return;
+          }
+        }
+        await probe(connectionId);
         setPhase({ kind: "loading" });
         setBootEpoch((n) => n + 1);
-      });
+      })();
     },
-    [connectionId],
+    [connectionId, defaultCompany],
   );
 
   useEffect(() => {
@@ -132,6 +206,16 @@ export function ConnectionConsole({
 
       // Explicit company wins: go straight to its console.
       if (defaultCompany) {
+        // This rerun may exist only because `reseat` changed `client`/
+        // `defaultCompany` identity out from under an already-correct
+        // console, not because anything needs rebooting — see the
+        // `knownStatusRef` comment above. Consume it once and skip the
+        // fetch entirely; the phase `switchCompany` already set stands.
+        const known = knownStatusRef.current;
+        if (known && known.company === defaultCompany) {
+          knownStatusRef.current = null;
+          return;
+        }
         try {
           const status = await client.status(defaultCompany);
           set({
@@ -175,9 +259,19 @@ export function ConnectionConsole({
   }, [client, defaultCompany, forceLogin, bootEpoch]);
 
   const switchCompany = useCallback(
-    async (id: string, companies: CompanyStatus[]) => {
+    async (id: string, companies: CompanyStatus[], knownStatus?: CompanyStatus) => {
       try {
-        const status = await client.status(id);
+        // A caller that just provisioned or reconciled `id` already holds a
+        // fresh `CompanyStatus` for it — `onCompanyCreated` below is the one
+        // today. Re-fetching it here was a second, redundant `client.status`
+        // call: on a reset the old company is already archived by this
+        // point, so a transient failure on this second lookup alone dropped
+        // the phase to a connection error despite the create having fully
+        // succeeded, and could undo a successful ambiguous-provision
+        // reconciliation (`create-company-dialog.tsx`) by failing its own
+        // second lookup right after (codex review on #1828, PR comment
+        // 3864628314).
+        const status = knownStatus ?? (await client.status(id));
         if (phase.kind === "console" && phase.company !== id) {
           clearEntityHash();
         }
@@ -195,6 +289,117 @@ export function ConnectionConsole({
       .then((companies) => setPhase({ kind: "picker", companies }))
       .catch((err: unknown) => setPhase(connectionError(client, err, null)));
   }, [client]);
+
+  // The create/reset dialog's open request (issue #1807). `null` is closed.
+  // Owned here because this is the one place that holds the picker/console phase
+  // machine and `switchCompany` — the fresh company has to be entered, and on a
+  // reset the operator's archived company has to be left, both of which are this
+  // component's job.
+  const [createRequest, setCreateRequest] = useState<CreateCompanyRequest | null>(null);
+  const canCreate = canCreateCompanies(client);
+
+  // Whichever companies the current phase knows about, so a create can drop the
+  // operator into the new one alongside the rest.
+  const knownCompanies =
+    phase.kind === "console" || phase.kind === "picker" ? phase.companies : [];
+
+  const onCompanyCreated = useCallback(
+    (status: CompanyStatus) => {
+      // On a reset the dialog has already archived this id; drop it from the
+      // list it hands `switchCompany` so the operator doesn't land back on a
+      // company that is now gone.
+      const archived =
+        createRequest?.kind === "reset" ? createRequest.company : undefined;
+      // The URL and the persisted profile both name whatever company this
+      // connection was scoped to *before* this create/reset — read it before
+      // `retargetDefaultCompany` below overwrites it. `retargetDefaultCompany`
+      // does not distinguish create from reset, so a plain "New company"
+      // triggered from inside an explicit-company console retargets the
+      // profile exactly the same way a reset does. Gating the URL fix on
+      // `archived` (reset-only) missed that case: the profile moved but the
+      // `?company=` link didn't, so the next reload's `findProfile` lookup no
+      // longer matched the retargeted profile and minted a duplicate
+      // connection back on the company the operator just left (codex review
+      // on #1828, PR comment 3864628310).
+      const priorDefaultCompany = connection?.defaultCompany ?? null;
+      setCreateRequest(null);
+      const next = [
+        ...knownCompanies.filter((c) => c.id !== status.id && c.id !== archived),
+        status,
+      ];
+      // Recorded before `retargetDefaultCompany` below, whose `reseat` is
+      // what triggers the boot effect's reboot this unblocks — see
+      // `knownStatusRef`. Harmless to set even when the retarget below is a
+      // no-op (a connection that was never company-scoped): nothing reseats,
+      // so the boot effect never reruns and never consults it.
+      knownStatusRef.current = { company: status.id, status };
+      // Retarget an explicit-company connection's boot default, or the next
+      // reload asks for the id this create/reset just left. A no-op for a
+      // connection that was never company-scoped.
+      retargetDefaultCompany(connectionId, status.id);
+      // The registry fix above does not reach a `?company=` link's own URL —
+      // see `retargetCompanyUrlParam` for why a stale param there still
+      // orphans the retargeted profile on the next reload. A no-op when the
+      // connection was never company-scoped in the first place — and,
+      // symmetrically, when this connection isn't the one the page's URL
+      // describes. A restored non-bootstrap profile's `?company=` link (if
+      // it even has one live in the address bar right now) names some other
+      // connection entirely; retargeting the persisted profile above is
+      // sufficient for it, and rewriting the URL here would instead point
+      // the address bar at a company the *bootstrap* connection never asked
+      // for (issue #1828 comment 3865563560).
+      if (isBootstrap && priorDefaultCompany) {
+        retargetCompanyUrlParam(priorDefaultCompany, status.id);
+      }
+      // Enter the new company with the status this call already has —
+      // `switchCompany`'s own `knownStatus` short-circuit skips a redundant
+      // second `client.status` fetch (PR comment 3864628314).
+      void switchCompany(status.id, next, status);
+    },
+    [connection, connectionId, createRequest, isBootstrap, knownCompanies, switchCompany],
+  );
+
+  const createDialog = (
+    <CreateCompanyDialog
+      client={client}
+      request={createRequest}
+      onClose={(archivedDuringReset) => {
+        // Read before `setCreateRequest(null)` clears it — the id this
+        // reset was archiving, needed below to know whether it is what the
+        // connection is still scoped to.
+        const archivedId = createRequest?.kind === "reset" ? createRequest.company : null;
+        setCreateRequest(null);
+        // A reset's archive leg landed before the operator backed out of the
+        // rest of it (cancelled, or gave up retrying a failed create). The
+        // picker's roster and the console's shell both still show the
+        // company this just removed, and `useCompany` does not self-correct
+        // on a later poll failure — refresh via the same roster read
+        // `backToPicker` already uses so the picker drops the archived card
+        // and the console leaves a shell that can no longer be trusted
+        // (codex review on #1828, PR comment 3863028405).
+        if (archivedDuringReset) {
+          // The in-memory roster refresh above does not reach the
+          // *persisted* bootstrap sources: an explicit-company connection's
+          // profile, and any `?company=` link, still name the id this just
+          // archived. There is no replacement to retarget to — unlike
+          // `onCompanyCreated` — so clear both instead of moving them. Left
+          // alone, the next reload takes the explicit-company boot branch
+          // straight into an id that no longer exists and lands on a
+          // connection error rather than back in the picker (codex review on
+          // #1828, PR comment 3864885215).
+          if (archivedId && connection?.defaultCompany === archivedId) {
+            clearDefaultCompany(connectionId);
+            // Same bootstrap-only gate as `onCompanyCreated` above, and for
+            // the same reason: a restored non-bootstrap profile's abandoned
+            // reset has nothing live in the URL to clear.
+            if (isBootstrap) retargetCompanyUrlParam(archivedId, null);
+          }
+          backToPicker();
+        }
+      }}
+      onCreated={onCompanyCreated}
+    />
+  );
 
   const consoleCompany = phase.kind === "console" ? phase.company : null;
   const scope = useMemo(
@@ -318,10 +523,30 @@ export function ConnectionConsole({
                 <span className="font-mono text-xs">opencompany serve --company &lt;dir&gt;</span>.
               </AlertDescription>
             </Alert>
-            <Button className="w-full" onClick={() => setPhase({ kind: "setup" })}>
+            {/* A fully-archived host lands here. Offer New company so it isn't a
+                dead end — but only when this console can actually provision;
+                otherwise say why and leave setup as the way forward. */}
+            {canCreate && (
+              <Button
+                className="w-full"
+                onClick={() => setCreateRequest({ kind: "create" })}
+                data-testid="no-company-new"
+              >
+                New company
+              </Button>
+            )}
+            <Button
+              variant={canCreate ? "outline" : "default"}
+              className="w-full"
+              onClick={() => setPhase({ kind: "setup" })}
+            >
               Open setup
             </Button>
+            {!canCreate && (
+              <p className="text-2xs text-muted-foreground">{CREATE_UNAVAILABLE_NOTE}</p>
+            )}
           </div>
+          {createDialog}
         </FullScreen>
       );
 
@@ -331,7 +556,11 @@ export function ConnectionConsole({
           <CompanyPicker
             companies={phase.companies}
             onPick={(id) => void switchCompany(id, phase.companies)}
+            onCreate={() => setCreateRequest({ kind: "create" })}
+            onReset={(c) => setCreateRequest({ kind: "reset", company: c.id, name: c.name })}
+            canCreate={canCreate}
           />
+          {createDialog}
         </ConsoleChrome>
       );
 
@@ -352,7 +581,12 @@ export function ConnectionConsole({
             companies={phase.companies}
             onSwitchCompany={(id) => void switchCompany(id, phase.companies)}
             onBackToPicker={phase.canGoBack ? backToPicker : undefined}
+            onCreateCompany={() => setCreateRequest({ kind: "create" })}
+            onResetCompany={(id, name) =>
+              setCreateRequest({ kind: "reset", company: id, name })
+            }
           />
+          {createDialog}
         </ConnectionScopeProvider>
       );
   }

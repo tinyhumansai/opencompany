@@ -6,7 +6,7 @@ What a company remembers, where it lives, and the Operator's rights over it.
 
 | Kind | Written by | Retention |
 | --- | --- | --- |
-| Compressed cycle traces | every cycle | written and exported; **not** summarized, **not** read back into a cycle, **not** evicted (issue #1175) |
+| Compressed cycle traces | every cycle | newest 32 retained and inspectable; backends that archive rather than destroy bound the archive tier to the newest 32 evicted traces too; **not** summarized or read back into a cycle (issue #1175) |
 | Task results (delegated work products) | cycles | durable |
 | Context chunks (documents, research, transcripts the brain filed) | cycles, imports | durable, content-addressed |
 | Customers, engagements, decisions, outcomes | cycles (as structured task results / context) | durable |
@@ -80,14 +80,12 @@ DB-agnosticism applies to memory exactly as to every other store.
 
 ## Compounding
 
-**Intended**: each cycle loads recent traces, so decisions and outcomes bias
-future work — the mechanism behind "memory compounds" in the
-[vision](../vision/README.md). Eviction (`evict` with an `EvictionPolicy`)
-keeps the working window bounded; evicted traces are archived, not deleted,
-until retention policy or the Operator says otherwise.
+**Intended**: compressed traces will eventually provide a compact, durable
+working-memory input that biases future work — the mechanism behind "memory
+compounds" in the [vision](../vision/README.md). That requires a real
+summariser and a consumer; neither exists today.
 
-**Today** (issue #1175), one narrower path does the compounding and the rest is
-not wired:
+**Today** (issue #1175), one narrower path does the compounding:
 
 - Before each turn the harness retrieves the top-5 prior task outcomes matching
   the incoming message from the `ContextStore` and injects them as text, then
@@ -96,11 +94,14 @@ not wired:
 - Traces are written every cycle and read by nothing. `CycleRequest` used to
   carry them; no `Brain` consumed the field, so it was removed rather than left
   looking functional.
-- `evict` is implemented on every backend and called from no production path,
-  so the trace window is unbounded. `ContextStore::delete` does exist (it is
-  what reaps an operator fact's mirror and what forgets a dropped document),
-  but nothing sweeps the chunk store on age, so it grows until something
-  deletes by name.
+- The process-wide maintenance pass retains the newest 32 traces with
+  `MemoryStore::evict(KeepRecent)`. The policy bounds trace storage — including
+  on backends whose `evict` archives rather than destroys, where the archive
+  tier is capped by the same policy — while the summaries are still
+  placeholders; it is not a claim that traces compound.
+  `ContextStore::delete` reaps an operator fact's mirror and forgets a dropped
+  document, but nothing sweeps the chunk store on age, so it grows until
+  something deletes by name.
 
 ## Dropping documents and links in (the Brain drop zone)
 
@@ -142,8 +143,11 @@ primitive against the deployment's own network.
 
 ## Operator rights (normative)
 
-- **Inspect**: `GET /api/v1/companies/{id}/memory/traces` and the exported
-  bundle expose everything remembered, human-readably.
+- **Inspect**: `GET /api/v1/companies/{id}/memory/traces` exposes the retained
+  cycle-trace window, and `GET …/memory/archives` exposes the traces a
+  provider-backed engine retained when eviction dropped them from that window
+  (a store/embedded engine keeps no archive and answers `404`). The exported
+  bundle exposes everything the selected backend retains, human-readably.
 - **Delete**: the Operator MAY delete any memory item, context chunk, or
   `FactStore` fact; deletion propagates to the backing store and is journaled
   to the `EventLog` (that a deletion happened is auditable; the content is

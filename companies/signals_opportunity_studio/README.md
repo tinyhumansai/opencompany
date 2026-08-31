@@ -38,10 +38,11 @@ Signals arrive the same way any other work does: through the studio's channels
 ## Human in the loop
 
 You keep **deciding which opportunities to fund and pursue**. The studio does
-the listening, clustering, ranking, and writing; you make the call. Spending is
-supervised — anything over $1 waits for your approval, and payments, filings,
-and anything published externally always ask first. The output of this harness
-is **a ranked weekly opportunity brief**.
+the listening, clustering, ranking, and writing; you make the call. Policy does
+not create approval prompts automatically. Before funding an opportunity,
+making a payment, filing, or publishing externally, the agent calls
+`request_approval` with the exact decision and waits for your answer. The output
+of this harness is **a ranked weekly opportunity brief**.
 
 ## Signals and the Opportunity Engine are a template, not kernel code
 

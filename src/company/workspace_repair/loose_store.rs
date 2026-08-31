@@ -62,6 +62,18 @@ impl LooseWorkspace {
         self.state.lock().expect("lock").after_move = Some(Box::new(hook));
     }
 
+    /// Pushes nodes straight into `company`'s tree, bypassing the parent-exists
+    /// check [`create`](Self::create) applies.
+    ///
+    /// A lawful create or move refuses a node whose parent is absent, so a
+    /// **dangling-parent** node — the Race-2 orphan issue #1839's reaper is aimed
+    /// at — is otherwise unconstructible through this double, exactly as a
+    /// duplicate sibling name is (which is why the double exists at all). Test
+    /// support only.
+    pub(crate) fn inject(&self, company: &CompanyId, nodes: Vec<WorkspaceNode>) {
+        self.with(company, |state, key| state.tree(&key).extend(nodes));
+    }
+
     fn with<T>(&self, company: &CompanyId, f: impl FnOnce(&mut State, String) -> T) -> T {
         let key = company.to_string();
         let mut state = self.state.lock().expect("lock");

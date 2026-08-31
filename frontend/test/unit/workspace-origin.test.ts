@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { fetchFile, fetchTree, originLabel, type WorkspaceOrigin } from "@/api/workspace";
+import { rosterNameMap } from "@/lib/roster-names";
 
 /**
  * Workspace authorship (issue #326), on the console side.
@@ -25,6 +26,22 @@ describe("originLabel", () => {
 
   it("distinguishes a seeded node from one somebody wrote", () => {
     expect(originLabel({ kind: "seed" })).toBe("Seeded");
+  });
+
+  it("names the teammate when it is given a roster to resolve against (issue #1723)", () => {
+    // The raw handle is engine plumbing — `seo_specialist` where the operator
+    // knows "SEO Specialist" — and this label sits beside names the rest of
+    // the workspace has already resolved. Routed through the one shared
+    // `rosterDisplayName` rather than a second lookup of its own.
+    const names = rosterNameMap([{ id: "seo_specialist", name: "SEO Specialist" }]);
+    expect(originLabel({ kind: "agent", id: "seo_specialist" }, names)).toBe(
+      "Teammate · SEO Specialist",
+    );
+    // An id the roster does not carry falls back to the id, never to a blank
+    // label — and a caller with no roster to hand gets exactly the string it
+    // got before the parameter existed.
+    expect(originLabel({ kind: "agent", id: "ghost" }, names)).toBe("Teammate · ghost");
+    expect(originLabel({ kind: "agent", id: "ceo" })).toBe("Teammate · ceo");
   });
 
   it("says nothing for a plain operator note", () => {

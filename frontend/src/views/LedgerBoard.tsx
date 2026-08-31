@@ -64,6 +64,15 @@
 // operator collapses it again. Nothing else may re-collapse it: a column that
 // folded itself back up while somebody was reading it would be this bug's
 // mirror image.
+//
+// # Open on the work, not on the empty lead-in (issue #1800)
+//
+// The rails make later work discoverable, but the board should still put that
+// work in front of the operator. Once the first complete set of rows is on the
+// page, the board aligns its first populated column with the viewport's left
+// edge. It does this once: a later push update must not pull the board away
+// from wherever the operator has scrolled, and an all-empty board has nowhere
+// truthful to move.
 
 import {
   useCallback,
@@ -252,6 +261,8 @@ export function LedgerBoard<T extends BoardRow>({
    * conservative answer and the one the pre-existing collapse tests assert.
    */
   const [viewport, setViewport] = useState(0);
+  /** Whether this mounted board has made its one initial positioning choice. */
+  const positionedInitially = useRef(false);
   /**
    * Whether the board is scrolled to its last column.
    *
@@ -299,6 +310,39 @@ export function LedgerBoard<T extends BoardRow>({
     for (const row of rows) buckets.get(statusOf(row))?.push(row);
     return buckets;
   }, [columns, rows, statusOf]);
+
+  /**
+   * Put the first column holding work at the start of the viewport.
+   *
+   * Waiting for a measured viewport means the empty-column rails have reached
+   * their final widths before the target's position is read. The assignment is
+   * deliberately one-shot: live row updates should never override a person's
+   * own scroll position. A loaded, all-empty board consumes the choice without
+   * moving, so the first card created later does not make the page jump.
+   */
+  useLayoutEffect(() => {
+    if (positionedInitially.current || loading || viewport === 0) return;
+    if (columns.length === 0) return;
+
+    positionedInitially.current = true;
+    const firstPopulated = columns.find(
+      (column) => (held.get(column.id)?.length ?? 0) > 0,
+    );
+    if (!firstPopulated) return;
+
+    const board = boardRef.current;
+    if (!board) return;
+    const target = Array.from(board.children).find(
+      (child): child is HTMLElement =>
+        child instanceof HTMLElement &&
+        child.dataset.column === firstPopulated.id,
+    );
+    if (!target) return;
+
+    const boardLeft = board.getBoundingClientRect().left;
+    const targetLeft = target.getBoundingClientRect().left;
+    board.scrollLeft = Math.max(0, board.scrollLeft + targetLeft - boardLeft);
+  }, [columns, held, loading, viewport]);
 
   /**
    * Whether every column would fit side by side at full width.

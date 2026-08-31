@@ -297,6 +297,7 @@ mod test {
             workflow_id: "wf".into(),
             run_id: format!("run-{n}"),
             scheduled: false,
+            started_by: None,
         }
     }
 
@@ -308,6 +309,7 @@ mod test {
             status: WorkflowNodeStatus::Ok,
             elapsed_ms: 1,
             diagnostics: Vec::new(),
+            agent_run_id: None,
         }
     }
 
@@ -502,6 +504,7 @@ mod test {
                 chat: None,
                 parent: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
             CompanyEvent::AgentReply {
                 mentions: Vec::new(),

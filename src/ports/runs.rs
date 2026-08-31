@@ -85,12 +85,40 @@ pub enum RunStatus {
     /// dependency, a rate limit, a missing credential, a retry, an operator
     /// steer-to-pause. Neither cancelled nor failed.
     Paused,
+    /// Parked on a **question for a person** the work cannot answer itself
+    /// (issue #1861): a rejected model id, an expired credential, a missing
+    /// prerequisite, or an agent's own `escalate_to_human`.
+    ///
+    /// Distinct from both neighbours on purpose. [`Paused`](Self::Paused) is
+    /// documented as waiting on something *other than a person*, which is the
+    /// opposite of a blocker. [`WaitingApproval`](Self::WaitingApproval) is a
+    /// person deciding whether an effect may happen — there is an effect, and
+    /// approving it performs it; a blocker has no effect to approve, only an
+    /// answer to supply. Folding blockers into either would make "what is this
+    /// waiting for" unanswerable from the status, which is the whole point of
+    /// the epic.
+    ///
+    /// Parked, not terminal: the answer resumes the stopped step (#1863/#1864),
+    /// and an unanswered blocker expires through the approval TTL back to
+    /// `todo` carrying its question.
+    Blocked,
     /// Terminal: the attempt completed.
     Succeeded,
     /// Terminal: the attempt failed. [`RunRecord::error`] carries why.
     Failed,
     /// Terminal: the attempt was cancelled before it could settle.
     Cancelled,
+    /// Terminal: the workflow compiler **declined by design** to automate the
+    /// work — "better done once than built into a workflow" (issue #1809).
+    ///
+    /// Neither an error nor an ordinary success: the builder was asked whether
+    /// the card should become a workflow and its honest answer was "don't". It
+    /// used to settle `Failed` — which made a correct refusal indistinguishable
+    /// from a model timeout — and then `Succeeded` (#873), which hid it among
+    /// completed work. Its own terminal state keeps the external "work that
+    /// stopped" surface from bucketing the best thing the compiler does as the
+    /// product breaking, without pretending nothing happened.
+    Declined,
 }
 
 impl RunStatus {
@@ -101,9 +129,11 @@ impl RunStatus {
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
             Self::Paused => "paused",
+            Self::Blocked => "blocked",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Declined => "declined",
         }
     }
 
@@ -120,9 +150,11 @@ impl RunStatus {
             "running" => Self::Running,
             "waiting_approval" => Self::WaitingApproval,
             "paused" => Self::Paused,
+            "blocked" => Self::Blocked,
             "succeeded" => Self::Succeeded,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
+            "declined" => Self::Declined,
             _ => return None,
         })
     }
@@ -131,7 +163,10 @@ impl RunStatus {
     /// status — a re-run is a *new* attempt with its own ordinal, never a
     /// resurrection of this one.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Declined
+        )
     }
 
     /// Which of the three coarse phases this status sits in: `active`,
@@ -170,7 +205,7 @@ impl RunStatus {
 
     /// Whether the attempt is parked awaiting something outside the cycle.
     pub fn is_parked(self) -> bool {
-        matches!(self, Self::WaitingApproval | Self::Paused)
+        matches!(self, Self::WaitingApproval | Self::Paused | Self::Blocked)
     }
 
     /// Whether a run may move from `self` to `next`.
@@ -195,10 +230,10 @@ impl RunStatus {
         match self {
             Self::Pending => next == Self::Running || next.is_terminal(),
             Self::Running => next.is_parked() || next.is_terminal(),
-            Self::WaitingApproval | Self::Paused => {
+            Self::WaitingApproval | Self::Paused | Self::Blocked => {
                 next == Self::Running || next.is_parked() || next.is_terminal()
             }
-            Self::Succeeded | Self::Failed | Self::Cancelled => false,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Declined => false,
         }
     }
 }
@@ -255,6 +290,21 @@ pub struct RunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_event_seq: Option<EventSeq>,
     /// Epoch-millis the row was minted.
+    /// The workflow run whose node spawned this attempt, when one did.
+    ///
+    /// Absent for a card dispatch and a chat turn, which is *true* rather than
+    /// merely tolerated — those attempts belong to no workflow. Additive in the
+    /// same shape `task_id`/`chat_id` took, so a row written before this field
+    /// existed loads with `None` and re-serializes byte-identically. There is no
+    /// backfill to write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+    /// The graph node within that run.
+    ///
+    /// Falls back to the agent ref on a graph compiled before nodes carried a
+    /// first-class id — the same honest fallback the blocked-node rows use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub created_at_millis: u64,
     /// Epoch-millis the cycle actually began. `None` while `Pending`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +386,19 @@ pub struct NewRun {
     /// have nothing to filter on. `None` for a dispatch, which is already
     /// reachable through its card.
     pub chat_id: Option<String>,
+    /// The workflow run whose node spawned this attempt, when one did.
+    ///
+    /// Absent for a card dispatch and a chat turn, which is *true* rather than
+    /// merely tolerated — those attempts belong to no workflow. Additive in the
+    /// same shape `task_id`/`chat_id` took, so a row written before this field
+    /// existed loads with `None` and re-serializes byte-identically. There is no
+    /// backfill to write.
+    pub workflow_run_id: Option<String>,
+    /// The graph node within that run.
+    ///
+    /// Falls back to the agent ref on a graph compiled before nodes carried a
+    /// first-class id — the same honest fallback the blocked-node rows use.
+    pub node_id: Option<String>,
 }
 
 impl NewRun {
@@ -350,6 +413,8 @@ impl NewRun {
             task_id: Some(task_id.into()),
             agent_id: agent_id.into(),
             chat_id: None,
+            workflow_run_id: None,
+            node_id: None,
         }
     }
 
@@ -364,6 +429,30 @@ impl NewRun {
             task_id: None,
             agent_id: agent_id.into(),
             chat_id: Some(chat_id.into()),
+            workflow_run_id: None,
+            node_id: None,
+        }
+    }
+
+    /// A run spawned by an `agent` node of a workflow run.
+    ///
+    /// Attempts no card and belongs to no conversation: a workflow node's turn
+    /// has neither, which is exactly why nothing could find these attempts
+    /// before — `RunStore` was joinable only by `task_id`/`chat_id`, so the run
+    /// a node spawned was addressable by nothing at all.
+    pub fn for_workflow_node(
+        id: impl Into<String>,
+        workflow_run_id: impl Into<String>,
+        node_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_id: None,
+            agent_id: agent_id.into(),
+            chat_id: None,
+            workflow_run_id: Some(workflow_run_id.into()),
+            node_id: Some(node_id.into()),
         }
     }
 }
@@ -409,6 +498,12 @@ impl RunOutcome {
 pub struct RunFilter {
     /// Only attempts at this card.
     pub task_id: Option<String>,
+    /// Only attempts spawned by this workflow run's nodes.
+    ///
+    /// The join the console needs: given a workflow run, which agent attempts
+    /// did it produce. Before this there was no handle on them at all — a
+    /// workflow node's turn has neither a card nor a conversation.
+    pub workflow_run_id: Option<String>,
     /// Only attempts dispatched to this desk/teammate.
     ///
     /// The selector behind the console's per-teammate run history (issue
@@ -472,6 +567,11 @@ impl RunFilter {
         {
             return false;
         }
+        if let Some(workflow_run_id) = &self.workflow_run_id
+            && run.workflow_run_id.as_deref() != Some(workflow_run_id.as_str())
+        {
+            return false;
+        }
         if let Some(agent_id) = &self.agent_id
             && run.agent_id != *agent_id
         {
@@ -481,6 +581,15 @@ impl RunFilter {
             return false;
         }
         true
+    }
+
+    /// Narrows to the attempts one workflow run's nodes spawned.
+    #[must_use]
+    pub fn for_workflow_run(workflow_run_id: impl Into<String>) -> Self {
+        Self {
+            workflow_run_id: Some(workflow_run_id.into()),
+            ..Self::default()
+        }
     }
 }
 
@@ -565,6 +674,28 @@ pub trait RunStore: Send + Sync {
     async fn list_run_steps(&self, company: &CompanyId, run_id: &str)
     -> Result<Vec<RunStepRecord>>;
 
+    /// Reads every run's steps in one call, keyed by run id.
+    ///
+    /// The Observatory index reads the traces of up to `limit` runs at once.
+    /// The provided implementation loops the per-run read, which is the right
+    /// shape for backends where one read is one indexed query (sqlite, MongoDB).
+    /// The filesystem backend overrides this: its per-run read scans and
+    /// deserializes the whole company-wide JSONL before filtering one run, so a
+    /// loop over N runs would rescan the company's unbounded step history N
+    /// times — quadratic in company history on the view operators poll. One
+    /// scan, indexed once, keeps the index cost linear.
+    async fn list_run_steps_for_runs(
+        &self,
+        company: &CompanyId,
+        run_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<RunStepRecord>>> {
+        let mut out = std::collections::HashMap::with_capacity(run_ids.len());
+        for id in run_ids {
+            out.insert(id.clone(), self.list_run_steps(company, id).await?);
+        }
+        Ok(out)
+    }
+
     // -- transitions (provided; legality enforced here) ----------------------
 
     /// `Pending` → `Running`, stamping the driving event's seq and the start
@@ -581,6 +712,24 @@ pub trait RunStore: Send + Sync {
         run.trigger_event_seq = Some(trigger_event_seq);
         // A resumed run keeps the moment it first started: `started_at_millis`
         // is when the attempt began, not when its latest leg did.
+        run.started_at_millis.get_or_insert_with(now_millis);
+        self.put_run(company, &run).await?;
+        Ok(run)
+    }
+
+    /// `Pending` → `Running` for an attempt that **no journal event drove**.
+    ///
+    /// A workflow `agent` node is the case this exists for: it is activated by
+    /// the engine walking a graph, not by a `TaskDispatched` the journal
+    /// recorded, so there is no seq to stamp. `trigger_event_seq` is already
+    /// `Option`, so leaving it `None` is the record's own way of saying "nothing
+    /// in the journal drove this" — passing a made-up seq (or `0`) would point
+    /// every workflow attempt at an unrelated event and quietly corrupt any
+    /// reader that follows it.
+    async fn begin_run_untriggered(&self, company: &CompanyId, id: &str) -> Result<RunRecord> {
+        let mut run = require_run(self, company, id).await?;
+        check_transition(&run, RunStatus::Running)?;
+        run.status = RunStatus::Running;
         run.started_at_millis.get_or_insert_with(now_millis);
         self.put_run(company, &run).await?;
         Ok(run)
@@ -735,14 +884,16 @@ mod test {
     /// Every status, so a table-driven test cannot silently miss a new variant
     /// (adding one without extending this list fails the exhaustiveness check
     /// in [`all_statuses_are_listed`]).
-    const ALL: [RunStatus; 7] = [
+    const ALL: [RunStatus; 9] = [
         RunStatus::Pending,
         RunStatus::Running,
         RunStatus::WaitingApproval,
         RunStatus::Paused,
+        RunStatus::Blocked,
         RunStatus::Succeeded,
         RunStatus::Failed,
         RunStatus::Cancelled,
+        RunStatus::Declined,
     ];
 
     #[test]
@@ -755,15 +906,42 @@ mod test {
                 | RunStatus::Running
                 | RunStatus::WaitingApproval
                 | RunStatus::Paused
+                | RunStatus::Blocked
                 | RunStatus::Succeeded
                 | RunStatus::Failed
-                | RunStatus::Cancelled => (),
+                | RunStatus::Cancelled
+                | RunStatus::Declined => (),
             };
         }
         let mut seen: Vec<&str> = ALL.iter().map(|s| s.as_str()).collect();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ALL.len(), "status literals must be unique");
+    }
+
+    /// Issue #1861: a blocker waits on a person, so it is **parked** — not
+    /// terminal, and not active. A terminal blocker could never be answered;
+    /// an active one would be reclaimed by the boot reaper as an orphan while
+    /// somebody was still deciding what to say.
+    #[test]
+    fn a_blocker_is_parked_not_terminal() {
+        assert!(RunStatus::Blocked.is_parked());
+        assert!(!RunStatus::Blocked.is_terminal());
+        assert!(!RunStatus::Blocked.is_active());
+        assert_eq!(RunStatus::Blocked.phase(), "parked");
+    }
+
+    /// The answer resumes the work, and an unanswered blocker settles through
+    /// the TTL — so both edges out of `Blocked` have to exist.
+    #[test]
+    fn a_blocker_can_resume_or_settle() {
+        assert!(RunStatus::Blocked.can_transition_to(RunStatus::Running));
+        assert!(RunStatus::Blocked.can_transition_to(RunStatus::Failed));
+        assert!(RunStatus::Running.can_transition_to(RunStatus::Blocked));
+        assert!(
+            !RunStatus::Succeeded.can_transition_to(RunStatus::Blocked),
+            "a finished attempt cannot start waiting on somebody"
+        );
     }
 
     #[test]
@@ -813,6 +991,7 @@ mod test {
         assert_eq!(RunStatus::Succeeded.phase(), "terminal");
         assert_eq!(RunStatus::Failed.phase(), "terminal");
         assert_eq!(RunStatus::Cancelled.phase(), "terminal");
+        assert_eq!(RunStatus::Declined.phase(), "terminal");
     }
 
     /// The trap this whole projection exists for: a parked run has **no**
@@ -918,6 +1097,8 @@ mod test {
             error: None,
             usage: TokenUsage::default(),
             step_count: 0,
+            workflow_run_id: None,
+            node_id: None,
         }
     }
 

@@ -56,6 +56,35 @@ why this is not a read/write split: [authority.md](authority.md).
 | `connections` (feature `oauth`) | `POST …/connections/{provider}/start` → dated `410` retirement bridge, `POST …/connections/{provider}/disconnect`, `GET /api/v1/oauth/callback` → dated `410` browser landing page (#838; removal #1023) |
 | `workflows` | `POST …/workflows`, `GET …/workflows`, `GET …/workflows/runs`, `POST …/workflows/cron/preview`, `GET …/workflows/{wid}`, `PUT …/workflows/{wid}`, `DELETE …/workflows/{wid}`, `POST …/workflows/{wid}/run`, `POST …/workflows/runs/{runId}/cancel` |
 
+### Chat mentions
+
+`GET …/chat/mentionables` returns the names an operator may address in that
+company: agents, signed-in people, desks, and the `@everyone` broadcast target.
+The response is company-scoped and omits the current viewer where appropriate;
+clients must treat it as a directory, not as authorization to invent targets.
+
+A chat request may include `mentions`, each with a target (`agent`, `user`,
+`desk`, or `everyone`), the literal `text` span including `@`, and its **UTF-8
+byte offset** in the submitted message. JavaScript clients may use UTF-16 indices
+while editing, but must convert them before sending. The host revalidates every
+supplied span against the live roster and exact message text. Stale, overlapping,
+duplicate, ambiguous, or over-cap entries remain renderable as `quiet` mentions
+but do not notify anyone. If the field is absent, the host extracts unambiguous
+mentions from the message while ignoring Markdown code regions.
+
+Mention routing is deliberately one-turn and has no fan-out: the first valid
+non-quiet agent mention is the responder, otherwise the desk lead (or normal
+channel fallback) answers. Responder selection is a property of the
+agent-harness brain, which runs the roster's turns; hosted and echo cognition
+reply through their own service, which does not select a roster responder, and
+the resolved mentions still render as chips on the returned message. Additional
+agent mentions, people, desks, and `@everyone` are context for that same turn;
+they do not start additional agent runs. A desk mention contributes that desk's
+context, while `@everyone` expands to the channel's visible audience for
+notification purposes. Clients should
+render the returned mention DTOs, including `label`, `mine`, and optional
+`quiet`, rather than re-resolving display text locally.
+
 ### Exporting a task's record (issue #352)
 
 `GET …/tasks/{taskId}/export` answers **one self-contained HTML file** carrying
@@ -285,6 +314,14 @@ How the run history is **paged** — why the page is cut by `seq` but displayed
 by `(atMillis, seq)`, why the cursor is server-issued rather than derived from
 the last row, and what a console must do when an older host omits it
 (issue #1012) — likewise: [run-history-paging.md](run-history-paging.md).
+
+The **authoring** surfaces — building a graph from a task card (`#580`),
+drafting one from a free-text description (`#753`), and grounding either on the
+tools a company can actually reach (`#783`, `#874`) — have their own focused
+page: [workflow-authoring-routes.md](workflow-authoring-routes.md). The files a
+past run produced, deep-linked into each card's Artifacts tab (issue #1684), are
+documented with the run routes in
+[workflow-routes.md](workflow-routes.md).
 
 ### Pausing a workflow, and the disarm rule (issue #276)
 

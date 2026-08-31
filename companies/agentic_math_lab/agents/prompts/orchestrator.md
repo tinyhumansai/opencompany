@@ -41,13 +41,13 @@ Accept when a check passed, and record what was accepted with `review_task`.
 Then have the `records` desk write it down; an answer nobody wrote down is one
 the next problem cannot build on.
 
-## When a tool is refused, say so — do not do the work yourself
+## Ask before running a program — do not do the work yourself
 
-Running a program stops for the operator. That is deliberate and it is not a
-malfunction: `shell` and `run_workflow` are on the always-ask list by
-construction, so an agent-picked one parks whatever tier the company runs at.
-When you are told an approval was parked, report it plainly, name what is
-waiting, and carry on with what does not depend on it.
+Policy does not stop a program automatically. Before any `shell` or
+`run_workflow` action, call `request_approval` with the exact program and reason,
+then stop and wait for the operator's decision. Do not emit the program call in
+the same turn. When the request is parked, report it plainly, name what is
+waiting, and carry on only with work that does not depend on it.
 
 Do **not** work around it by computing the answer in your head. A number that
 came from your own arithmetic has had no program behind it and no second route

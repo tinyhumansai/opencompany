@@ -186,6 +186,36 @@ describe("a board with room for every column", () => {
 });
 
 describe("a board whose work has moved to the later columns", () => {
+  it("opens on its first populated column", async () => {
+    widenViewportTo(5 * (COLUMN_PX + GUTTER_PX));
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function () {
+      const left = this.dataset.column === "paused" ? 164 : 24;
+      return {
+        x: left,
+        y: 0,
+        width: 0,
+        height: 0,
+        top: 0,
+        right: left,
+        bottom: 0,
+        left,
+        toJSON: () => ({}),
+      };
+    };
+
+    try {
+      await render(laterColumnsOnly());
+
+      expect(
+        container.querySelector<HTMLElement>("[data-testid=ledger-board]")
+          ?.scrollLeft,
+      ).toBe(140);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+    }
+  });
+
   it("collapses the empty columns and leaves the populated ones alone", async () => {
     await render(laterColumnsOnly());
 
@@ -211,9 +241,14 @@ describe("a board whose work has moved to the later columns", () => {
   it("collapses nothing when the board is empty everywhere", async () => {
     // Six rails and no board is a worse answer to "show me the work" than the
     // three honest zeros this issue is about.
+    widenViewportTo(5 * (COLUMN_PX + GUTTER_PX));
     await render([]);
 
     for (const held of COLUMNS) expect(isCollapsed(held.id)).toBe(false);
+    expect(
+      container.querySelector<HTMLElement>("[data-testid=ledger-board]")
+        ?.scrollLeft,
+    ).toBe(0);
   });
 
   it("keeps a column open when its header slot holds a control", async () => {

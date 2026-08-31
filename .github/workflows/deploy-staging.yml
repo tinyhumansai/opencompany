@@ -29,12 +29,21 @@ name: Deploy tenant image to staging
 on:
   push:
     branches: [main]
+    # Every path the image is actually built from. A file that reaches the
+    # image but is absent here merges to main and changes nothing in staging
+    # until some unrelated selected path happens to move — so the rule for
+    # adding one is simply: is it `COPY`ed by the Dockerfile, or read by
+    # something that is?
     paths:
       - 'src/**'
       - 'frontend/**'
       - 'companies/**'
+      - 'skills/**' # COPYed into the runtime image (Dockerfile) as the shared library
+      - 'docker/**' # entrypoint.sh, which is COPYed and is the container's ENTRYPOINT
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'build.rs' # embeds the bundles and the globals, and stamps the build commit
+      - 'rust-toolchain.toml' # COPYed into the builder; it picks the compiler
       - 'Dockerfile'
       - '.dockerignore'
       - 'vendor/**'
@@ -72,7 +81,18 @@ env:
   # `tinymemory` is the hosted-memory contract: `OPENCOMPANY_MEMORY=remote` +
   # `OPENCOMPANY_MEMORY_DRIVER=supermemory|mem0|cognee` (plus `null`), inert
   # until an operator sets those.
-  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,medulla,sidecar,chargebee,paypal,tinymemory
+  #
+  # `analytics` (issue #1739) is the Mixpanel transport, and this list is the
+  # only place it is ever compiled: product analytics reports from **hosted
+  # tenants only**, so the image built here is the one build that needs it,
+  # while the desktop and self-hosted builds deliberately do not have it.
+  # Without it every tenant compiles the `cfg(not(feature = "analytics"))` arm
+  # of `mixpanel::build`, installs a `NullTracker`, and reports nothing however
+  # the deployment kind and token are injected. It costs the image nothing —
+  # `analytics = ["dep:reqwest"]`, and `reqwest` is already here via `openhuman`
+  # — and stays inert until the manager injects `OPENCOMPANY_ANALYTICS_TOKEN`
+  # (`docs/spec/runtime/analytics.md`).
+  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,medulla,sidecar,chargebee,paypal,tinymemory,analytics
 
 jobs:
   deploy:
@@ -103,7 +123,7 @@ jobs:
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -113,8 +133,14 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # `.dockerignore` excludes `.git` and `GITHUB_SHA` does not cross
+          # into a build context, so the build script has no way to work out
+          # which revision it is compiling — every hosted tenant would report
+          # `unknown` forever. `actions/checkout` checked out `github.sha`, so
+          # this names the commit that was actually built.
           build-args: |
             FEATURES=${{ env.TENANT_FEATURES }}
+            OPENCOMPANY_BUILD_COMMIT=${{ github.sha }}
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:staging-${{ github.sha }}

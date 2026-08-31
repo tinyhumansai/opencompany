@@ -1820,8 +1820,6 @@ mod tests {
         .await
         .expect("a stored token resolves");
         assert_eq!(staged.backend_url, "https://staging-api.tinyhumans.ai");
-
-        unsafe { std::env::remove_var("TINYHUMANS_API_KEY") };
     }
 
     /// Issue #586: the company's own TinyHumans key sits between its pasted

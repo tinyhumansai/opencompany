@@ -245,3 +245,32 @@ field names are the decode contract for already-journaled events.
 Run detail is **refresh-on-read**: steps persist incrementally, so re-reading a
 live attempt shows the progress since. Streaming would widen the harness turn
 stream for something a re-read already answers.
+
+## The workflow-run join
+
+`RunRecord` carries `workflow_run_id` and `node_id`, both optional.
+
+A workflow `agent` node's turn has **neither a card nor a conversation**, so
+before these existed `RunStore` — keyed on exactly those two — could not name the
+attempt at all. It was not that the join column was missing; the *row* was
+missing, because `run_background` took no `RunTraceSink` and the node therefore
+minted nothing. A node was green or red and that was the whole of what could be
+known about it.
+
+Both fields are additive in the same shape `task_id`/`chat_id` took: a row
+written before they existed loads with `None` and re-serializes byte-identically.
+**There is no backfill**, and that is not a shortcut — a pre-existing run
+genuinely belongs to no workflow, so `None` is true rather than tolerated.
+
+`RunFilter::for_workflow_run` selects one run's nodes; `GET {scope}/runs?workflow_run=`
+exposes it over REST, and `Company.agentRuns(workflowRunId:)` over GraphQL.
+
+### `begin_run_untriggered`
+
+`begin_run` stamps the seq of the journal event that drove the attempt. A
+workflow node is activated by the engine walking a graph, not by a
+`TaskDispatched` the journal recorded, so there is no seq to stamp.
+`trigger_event_seq` is already `Option`, so leaving it `None` is the record's own
+way of saying "nothing in the journal drove this" — passing a made-up seq (or
+`0`) would point every workflow attempt at an unrelated event and quietly corrupt
+any reader that follows it. Transition legality is identical.

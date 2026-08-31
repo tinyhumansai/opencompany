@@ -126,5 +126,6 @@ operator or the unconfined orchestrator.
 
 Sign-off on filings, in the manifest's words — every return, every remittance,
 every set of accounts, and any advice a client would act on.
-`[policy].mode = "auto"` runs the roster's own sandbox writes and outward reads
-unattended and parks everything that leaves the firm or spends money.
+`[policy].mode = "auto"` does not request sign-off by itself. Before any action covered by the human boundary above, including one that
+leaves the company or spends money, call `request_approval` with the exact
+decision and wait for the operator's answer.

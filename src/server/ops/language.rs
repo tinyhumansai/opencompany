@@ -38,6 +38,35 @@ pub const MANIFEST_DESK_MEMBER_DELETE: &str =
 pub const MANIFEST_DESK_DELETE: &str =
     "This desk is part of your company's blueprint and can't be deleted here.";
 
+/// The name of the company-wide channel, rendered after the `#` in the console
+/// (`frontend/src/lib/desks.ts` `GENERAL_CHANNEL`). Not a desk id: every
+/// spelling of it folds to the General conversation through
+/// [`is_general_chat`](crate::server::chat_history::is_general_chat), which is
+/// what makes it addressable without anything being stored for it.
+pub const GENERAL_CHANNEL: &str = "general";
+
+/// Error shown when a write aims a desk mutation at the built-in `#general`
+/// channel — a delete, a membership add or removal, or a hierarchy reorder.
+///
+/// `#general` is not a desk. It has no lead and no hierarchy, and its
+/// membership is the whole roster computed at read time, so there is nothing
+/// for any of those writes to change. The refusal says which of the three it is
+/// declining rather than reporting a bare "not found": an id the host
+/// deliberately reserves is a very different fact from an id nobody ever
+/// created (issue #1743).
+pub const GENERAL_CHANNEL_IMMUTABLE: &str = concat!(
+    "#general is the company-wide channel every teammate is in. ",
+    "It isn't a desk — it has no lead and no membership of its own — ",
+    "so it can't be deleted, staffed, or reordered.",
+);
+
+/// Error shown when a desk create asks for an id that would shadow the built-in
+/// `#general` channel.
+pub const GENERAL_CHANNEL_RESERVED: &str = concat!(
+    "That id is reserved for the built-in #general channel. ",
+    "Give the desk another name.",
+);
+
 /// Error shown when a workspace move would create a cycle.
 pub const WORKSPACE_CYCLE: &str = "You can't move a folder into itself.";
 

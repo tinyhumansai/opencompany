@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { useHashView } from "@/hooks/use-hash-view";
 import { isNavigationActive, VIEWS, type View } from "@/lib/console-routes";
+import { REWRITE_RETIRED } from "@/lib/console-route-rewrites";
 
 /**
  * Every surface the console renders has to answer at its own address.
@@ -61,13 +62,14 @@ describe("resolving an address", () => {
   let container: HTMLDivElement;
   let root: Root;
   let seen: [View, string | null];
+  let rewrite: typeof REWRITE_RETIRED | undefined;
 
-  // No `rewrite` argument: this asks what the allow-list alone resolves, which
-  // is the property #1311 broke. The shell's `REWRITE_RETIRED` — which sends
-  // bare `#/tasks` and `#/team` elsewhere before the allow-list is consulted —
-  // is `task-route.test.ts`'s subject, not this file's.
+  // Most assertions exercise the allow-list alone. The unknown-address case
+  // opts into the shell's policy below; bare Tasks and Team are deliberately
+  // rewritten retired routes, so applying it to every view would make this
+  // table assert the opposite of their contracts.
   function Probe() {
-    const [view, sub] = useHashView<View>(VIEWS, "overview");
+    const [view, sub] = useHashView<View>(VIEWS, "overview", rewrite);
     seen = [view, sub];
     return null;
   }
@@ -91,6 +93,7 @@ describe("resolving an address", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
+    rewrite = undefined;
   });
 
   afterEach(async () => {
@@ -116,16 +119,78 @@ describe("resolving an address", () => {
     expect(window.location.hash).toBe("#/team/agent-1");
   });
 
-  it("still collapses an address that names nothing onto Overview", async () => {
-    // The fallback is what makes a typo or a genuinely retired address safe;
-    // widening the allow-list must not have widened it into accepting anything.
+  it("explains an address that names nothing instead of silently showing Overview (#1417)", async () => {
+    // The route remains safe — an unknown head is never accepted as a real
+    // page — but it now reaches a named explanation rather than pretending the
+    // operator asked for Overview.
+    rewrite = REWRITE_RETIRED;
     await visit("#/nope");
-    expect(seen).toEqual(["overview", null]);
-    expect(window.location.hash).toBe("#/overview");
+    expect(seen).toEqual(["not-found", "nope"]);
+    expect(window.location.hash).toBe("#/not-found/nope");
+  });
+
+  // Retired top-level addresses keep working through `REWRITE_RETIRED`. Each
+  // has a real replacement; asserting the replacement (and that the address bar
+  // follows it) is what keeps a bookmark or habit written before the move alive.
+  it.each([
+    ["#/connections", "settings", "oauth"],
+    ["#/oauth", "settings", "oauth"],
+    ["#/mcp", "settings", "mcp"],
+    ["#/people", "settings", "people"],
+    ["#/work", "ledgers", "tasks"],
+    ["#/settings/not-a-page", "settings", "general"],
+  ])("rewrites retired %s onto its replacement", async (hash, view, sub) => {
+    rewrite = REWRITE_RETIRED;
+    await visit(hash);
+    expect(seen).toEqual([view, sub]);
+    expect(window.location.hash).toBe(`#/${view}/${sub}`);
+  });
+
+  // Brain's two former addresses, which rewrite onto a view with no sub-page —
+  // so the replacement hash is bare, not `#/<view>/<sub>`. `#/memory` was the
+  // surface's first name; `#/settings/brain` is where it lived for as long as
+  // it was a settings sub-page, and that is the one an operator is most likely
+  // to have bookmarked.
+  it.each(["#/memory", "#/settings/brain"])(
+    "rewrites %s onto the Brain nav row",
+    async (hash) => {
+      rewrite = REWRITE_RETIRED;
+      await visit(hash);
+      expect(seen).toEqual(["brain", null]);
+      expect(window.location.hash).toBe("#/brain");
+    },
+  );
+
+  // #1867 review: `#/work` is a bare-only alias onto the ledgers board — the
+  // Work surface's real sub-pages are addressed under `#/ledgers/...` (for
+  // example `#/ledgers/manage`), never under `#/work/...`. Before this test,
+  // the rewrite ignored `sub` entirely, so a plausible-looking deep link like
+  // `#/work/manage` silently collapsed onto the bare board instead of the
+  // named page. That is worse than the address simply being unknown: it looks
+  // like it worked. An address with a sub-segment is unknown here and falls
+  // through to the same not-found handling any other unrecognized head gets.
+  it("does not swallow a deep link under the bare-only #/work alias (#1797)", async () => {
+    rewrite = REWRITE_RETIRED;
+    await visit("#/work/manage");
+    expect(seen).toEqual(["not-found", "work"]);
+    expect(window.location.hash).toBe("#/not-found/work");
+  });
+
+  // A trailing slash with nothing after it (`#/work/`) is not a deep link —
+  // `readSegments` in `use-hash-view.ts` filters the empty final segment out,
+  // so this is indistinguishable from the bare `#/work` and resolves the same
+  // way. Asserted explicitly so the decision is a passing test, not something
+  // left to fall out of string-splitting.
+  it("treats a trailing slash on #/work the same as the bare address (#1797)", async () => {
+    rewrite = REWRITE_RETIRED;
+    await visit("#/work/");
+    expect(seen).toEqual(["ledgers", "tasks"]);
+    expect(window.location.hash).toBe("#/ledgers/tasks");
   });
 
   it("sends an empty address to the operator overview (#1321)", async () => {
-    await visit("");
+    rewrite = undefined;
+    await visit("/");
 
     expect(seen).toEqual(["overview", null]);
     expect(window.location.hash).toBe("#/overview");

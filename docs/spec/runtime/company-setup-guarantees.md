@@ -1,7 +1,7 @@
 # First-run setup: what the host enforces
 
 The product decisions behind first-run setup live in
-[company-setup.md](company-setup.md). This file holds the five things the host
+[company-setup.md](company-setup/overview.md). This file holds the five things the host
 *enforces* rather than requests, and why each is a boundary instead of a line in
 a prompt.
 
@@ -56,7 +56,7 @@ nothing.
 job shape rather than a tool.**
 
 `manifest_from_setup` builds from a name-only manifest, so `[tools]` took the
-globals default `["*", "media", "composio"]` — and an agent whose `tools` list is
+globals `default_allow` — and an agent whose `tools` list is
 empty inherits the company belt whole. Every teammate a first-run operator
 created therefore held shell, code, web, subagent, files, docs, **media** (real
 money) and **composio** (per-tenant credentials), for a company described in
@@ -70,27 +70,42 @@ Each proposed agent now carries an `AgentFocus`, named for what the teammate
 names a tool. Tool grants are a permission boundary, and letting free text a
 stranger typed reach `[tools]` would put that boundary inside the prompt's blast
 radius; a closed enum means the worst a hostile answer achieves is the wrong belt
-from a list the host wrote. `media`, `composio`, `search`, `repo` and
-`shell` are unreachable from every focus, and a test quantifies over the whole
-vocabulary so a focus added later cannot quietly widen it.
+from a list the host wrote. No focus may name the catch-all `*`, and a test
+quantifies over the whole vocabulary so a focus added later cannot turn a belt
+back into an inheritance.
 
-Six of the eight share one belt, which is what let the vocabulary grow without
-moving anybody's reach. The enum does two jobs — it picks a belt and it picks
-the standing instructions below — and the second wants a finer grain than the
-first: `operations` alone covered 13 of the 30 curated profiles, so a QA
-engineer and an account manager were told the same thing. Splitting it is a
-change to instructions only; every belt is byte-identical either side of it.
-`build` is the case worth naming: the obvious reading of "makes the product" is
-`repo` and `shell`, and it gets neither, because a teammate invented from three
-sentences does not get a shell on the strength of a word the model chose.
+Every shape starts from one base belt — `workspace.read`, `docs.*`, `files.*`,
+`web.*`, `search`, `mcp:*` — and adds what its own work needs: workspace writes
+for the shapes that produce rather than report, `media` for `design`,
+`composio` for `operations` and `support`, `subagent` for the two that move
+work between people, and `shell` + `code` for `build` alone.
+
+The belts used to stop at the workspace, documents and files, and that is the
+thing this decision changed. A teammate a first-run operator created could not
+search the web, could not call an MCP server the operator had installed, and —
+because `workspace.*` confers *reads*, not writes — could not write the
+workspace it was told it owned. Each of those reached the operator as the
+teammate reporting its own tools as "not enabled", and as a Team screen listing
+the ask under "asked for but not granted". Withholding by default only works
+when somebody is standing there to grant it; on a company minted from three
+sentences in a wizard, nobody is. The narrowing that remains is the one that
+can be acted on: an agent's `tools` line is intersected with `[tools].allow`,
+so a company drops a namespace from that one list and every teammate loses it
+at once.
+
+`repo` is the exception, and for a reason that is not a preference: a host on
+filesystem storage refuses to boot a company whose allow-list names it, so it
+is absent from the default grant and from every belt. A MongoDB-backed company
+that wants it adds `repo.*` to both.
 
 An unrecognised focus gets the narrowest working belt, never an empty list. It
 used to inherit, on the reasoning that an unknown value should degrade to the
 pre-focus behaviour — and that inverted the control, because an empty `tools` list
 means *inherit the company belt*. An **invalid** focus therefore produced a wider
 agent than any valid one, and the operator's free text reaches a model that writes
-that string. Fail closed: the failure mode is a teammate that cannot browse, not
-one holding a spend authority.
+that string. Fail closed: `writing`'s belt is the floor, which is the base belt
+plus workspace writes — so a tampered focus still reaches no shell, no code, no
+repository, no media budget and no Composio credential.
 
 The curated templates declare a focus too. An operator with no credential must
 not end up with the *wider* company.
@@ -102,7 +117,7 @@ instructions, and the model authors none of them.**
 
 `manifest_from_setup` set `id`, `role`, `description` and `tools` and left
 `prompt` unset. So everything a setup-built teammate was ever told was what
-`persona_prompt` assembles — "You are Ops, the Operations Manager at Acme. Speak
+`persona_prompt` assembles — "You are Fulfillment, the Fulfillment Manager at Acme. Speak
 in the first person as this role." plus a mandate capped at 200 characters.
 Around 150 characters of instruction, sitting on the same roster as a globals
 teammate carrying 500–600 (`globals/agents/*.toml`). The mandate says what a

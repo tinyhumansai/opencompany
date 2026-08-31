@@ -194,6 +194,7 @@ mod tests {
             workflow_proposal: None,
             origin_run_id: None,
             origin_workflow_id: None,
+            bounced: None,
         }
     }
 
@@ -216,6 +217,8 @@ mod tests {
                 ..TokenUsage::default()
             },
             step_count: 0,
+            workflow_run_id: None,
+            node_id: None,
         }
     }
 

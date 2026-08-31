@@ -27,7 +27,7 @@
     "e2e:visual": "PW_VISUAL=1 playwright test",
     "e2e:visual:update": "PW_VISUAL=1 playwright test --update-snapshots",
     "tauri:dev": "../scripts/desktop-dev.sh",
-    "tauri:build": "npm run build && cd ../src-tauri && ../frontend/node_modules/.bin/tauri build"
+    "tauri:build": "npm run build && cd ../src-tauri && ../frontend/node_modules/.bin/tauri build -- --features opencompany/acp,opencompany/composio"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.16",

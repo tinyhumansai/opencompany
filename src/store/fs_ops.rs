@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -27,6 +28,7 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ledger::{LedgerEvent, LedgerSpec};
 use crate::ports::artifacts::{ArtifactRecord, ArtifactStore};
+use crate::ports::deep_trace::{DeepTraceStore, MAX_DEEP_RUNS_PER_COMPANY, RunStepDetailRecord};
 use crate::ports::facts::{FactKind, FactRecord, FactStore};
 use crate::ports::ledgers::LedgerStore;
 use crate::ports::login_codes::{LoginCodeRecord, LoginCodeStore};
@@ -60,12 +62,20 @@ use crate::store::paths::Bundle;
 #[derive(Clone)]
 pub struct FsOps {
     root: PathBuf,
+    /// Run ids known to live in each company's deep-trace file, so a compaction
+    /// is triggered exactly when a new run pushes the count past the cap — not
+    /// on every append (issue #1679). Seeded from disk on the first deep-trace
+    /// write of a process and rebuilt after each compaction or purge.
+    deep_runs: Arc<tokio::sync::Mutex<HashMap<PathBuf, HashSet<String>>>>,
 }
 
 impl FsOps {
     /// Creates an ops store rooted at `root` (the OpenCompany home).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            deep_runs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     fn bundle(&self, id: &CompanyId) -> Bundle {
@@ -776,6 +786,189 @@ fn prune_run_outputs(all: &mut Vec<WorkflowRunOutputRecord>) {
 }
 
 // ---------------------------------------------------------------------------
+// DeepTraceStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl DeepTraceStore for FsOps {
+    async fn append_step_detail(
+        &self,
+        company: &CompanyId,
+        record: &RunStepDetailRecord,
+    ) -> Result<()> {
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.deep_trace_jsonl();
+        // The per-path lock makes append and compact atomic against a
+        // concurrent step write — process-local, the documented fs-backend
+        // assumption everywhere in this file.
+        let lock = path_lock(&path);
+        let _guard = lock.lock().await;
+        // A genuine append, exactly like `run_steps`: the read side folds a
+        // repeated `(run_id, step_seq)` to its last line (`list_step_details`),
+        // so a flush that rewrites an existing ordinal converges rather than
+        // stacks. The old whole-file read-prune-rewrite per step was quadratic
+        // in a long company's history — every event rewrote everything.
+        append_line(&path, &serde_json::to_string(record)?).await?;
+        // Compaction is deferred until it is actually required. The known set
+        // is seeded from disk on the first deep-trace write of a process, so a
+        // file that already exceeded the cap is corrected immediately; after
+        // that, a fresh run id pushing the count past the cap triggers one
+        // read-prune-rewrite, and the set is rebuilt from the survivors.
+        let mut by_path = self.deep_runs.lock().await;
+        let runs = by_path.entry(path.clone()).or_default();
+        if runs.is_empty() {
+            let mut all = read_jsonl::<RunStepDetailRecord>(&path).await?;
+            let before = all.len();
+            prune_deep_trace(&mut all);
+            *runs = all.iter().map(|r| r.run_id.clone()).collect();
+            if all.len() < before {
+                rewrite_jsonl(&path, &all).await?;
+            }
+            return Ok(());
+        }
+        if runs.insert(record.run_id.clone()) && runs.len() > MAX_DEEP_RUNS_PER_COMPANY {
+            let mut all = read_jsonl::<RunStepDetailRecord>(&path).await?;
+            prune_deep_trace(&mut all);
+            rewrite_jsonl(&path, &all).await?;
+            *runs = all.iter().map(|r| r.run_id.clone()).collect();
+        }
+        Ok(())
+    }
+
+    async fn list_step_details(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<RunStepDetailRecord>> {
+        let all =
+            read_jsonl::<RunStepDetailRecord>(&self.bundle(company).deep_trace_jsonl()).await?;
+        let mut mine: Vec<RunStepDetailRecord> = Vec::new();
+        for record in all {
+            if record.run_id != run_id {
+                continue;
+            }
+            // Last-write-wins on read too: two lines can share an ordinal after
+            // a crash between append and rewrite, and the later one is the truth.
+            match mine.iter_mut().find(|r| r.step_seq == record.step_seq) {
+                Some(existing) => *existing = record,
+                None => mine.push(record),
+            }
+        }
+        mine.sort_by_key(|r| r.step_seq);
+        Ok(mine)
+    }
+
+    async fn list_step_details_for_runs(
+        &self,
+        company: &CompanyId,
+        run_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<RunStepDetailRecord>>> {
+        // One scan of the company-wide file; the per-run alternative rescans it
+        // once per listed run on the Observatory index.
+        let all =
+            read_jsonl::<RunStepDetailRecord>(&self.bundle(company).deep_trace_jsonl()).await?;
+        let mut by_run: std::collections::HashMap<String, Vec<RunStepDetailRecord>> =
+            run_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+        for record in all {
+            if let Some(mine) = by_run.get_mut(&record.run_id) {
+                mine.push(record);
+            }
+        }
+        for (run_id, mine) in by_run.iter_mut() {
+            // Last-write-wins per step_seq, oldest first — the same settling the
+            // single-run read applies (see `list_step_details`).
+            let mut by_seq: std::collections::HashMap<u32, RunStepDetailRecord> =
+                std::collections::HashMap::new();
+            for record in std::mem::take(mine) {
+                if &record.run_id != run_id {
+                    continue;
+                }
+                by_seq.insert(record.step_seq, record);
+            }
+            let mut settled: Vec<RunStepDetailRecord> = by_seq.into_values().collect();
+            settled.sort_by_key(|r| r.step_seq);
+            *mine = settled;
+        }
+        Ok(by_run)
+    }
+
+    async fn purge_deep_trace(&self, company: &CompanyId, run_id: Option<&str>) -> Result<u64> {
+        let path = self.bundle(company).deep_trace_jsonl();
+        let lock = path_lock(&path);
+        let _guard = lock.lock().await;
+        let mut all = read_jsonl::<RunStepDetailRecord>(&path).await?;
+        // `removed` is the number of *records* the reader would have seen —
+        // distinct `(run_id, step_seq)` pairs — not physical lines. A completion
+        // row for an ordinal the start row already covered is one record, folded
+        // exactly as the read side folds it, so the count agrees with a backend
+        // that stores one row per ordinal.
+        let mut doomed: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+        for record in all.iter() {
+            match run_id {
+                Some(id) if record.run_id == id => {
+                    doomed.insert((record.run_id.clone(), record.step_seq));
+                }
+                None => {
+                    doomed.insert((record.run_id.clone(), record.step_seq));
+                }
+                _ => {}
+            }
+        }
+        let removed = doomed.len() as u64;
+        if removed > 0 {
+            match run_id {
+                Some(id) => all.retain(|r| r.run_id != id),
+                None => all.clear(),
+            }
+            rewrite_jsonl(&path, &all).await?;
+        }
+        // Keep the in-memory run set in step: a purged run is gone, so a later
+        // append of that id must count as fresh again, and a company-wide purge
+        // empties the file entirely.
+        let mut by_path = self.deep_runs.lock().await;
+        if let Some(runs) = by_path.get_mut(&path) {
+            match run_id {
+                Some(id) => {
+                    runs.remove(id);
+                }
+                None => runs.clear(),
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Trims `all` to the newest [`MAX_DEEP_RUNS_PER_COMPANY`] runs, dropping every
+/// record belonging to an older one.
+///
+/// Prunes by **run**, not by record: dropping the oldest N rows would leave a
+/// run holding a torn half of its own trace, which reads as "the agent stopped
+/// thinking here" rather than "this run's bodies were pruned". Recency is the
+/// newest `at_millis` any of a run's records carries, so a long run is ranked by
+/// when it last wrote rather than when it started.
+fn prune_deep_trace(all: &mut Vec<RunStepDetailRecord>) {
+    let mut newest: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for record in all.iter() {
+        let entry = newest.entry(record.run_id.as_str()).or_insert(0);
+        *entry = (*entry).max(record.at_millis);
+    }
+    if newest.len() <= MAX_DEEP_RUNS_PER_COMPANY {
+        return;
+    }
+    let mut ranked: Vec<(&str, u64)> = newest.into_iter().collect();
+    // Newest first, with the run id as a tiebreaker so a prune is deterministic
+    // when two runs share a millisecond.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let keep: std::collections::HashSet<String> = ranked
+        .into_iter()
+        .take(MAX_DEEP_RUNS_PER_COMPANY)
+        .map(|(id, _)| id.to_string())
+        .collect();
+    all.retain(|r| keep.contains(&r.run_id));
+}
+
+// ---------------------------------------------------------------------------
 // RunStore
 // ---------------------------------------------------------------------------
 
@@ -818,6 +1011,8 @@ impl RunStore for FsOps {
             task_id: spec.task_id,
             agent_id: spec.agent_id,
             chat_id: spec.chat_id,
+            workflow_run_id: spec.workflow_run_id,
+            node_id: spec.node_id,
             attempt,
             status: RunStatus::Pending,
             trigger_event_seq: None,
@@ -883,6 +1078,29 @@ impl RunStore for FsOps {
     ) -> Result<Vec<RunStepRecord>> {
         let steps = read_jsonl::<RunStepRecord>(&self.bundle(company).run_steps_jsonl()).await?;
         Ok(dedup_steps(steps, run_id))
+    }
+
+    async fn list_run_steps_for_runs(
+        &self,
+        company: &CompanyId,
+        run_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<RunStepRecord>>> {
+        // One scan of the company-wide file, then the same per-run dedup the
+        // single-read applies — the Observatory index would otherwise rescan
+        // the whole history once per listed run.
+        let all = read_jsonl::<RunStepRecord>(&self.bundle(company).run_steps_jsonl()).await?;
+        let mut by_run: std::collections::HashMap<String, Vec<RunStepRecord>> =
+            run_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+        for step in all {
+            if let Some(mine) = by_run.get_mut(&step.run_id) {
+                mine.push(step);
+            }
+        }
+        let mut out = std::collections::HashMap::with_capacity(by_run.len());
+        for (id, steps) in by_run {
+            out.insert(id.clone(), dedup_steps(steps, &id));
+        }
+        Ok(out)
     }
 }
 
@@ -1285,6 +1503,10 @@ impl crate::ports::notifications::NotificationStore for FsOps {
             .collect();
         let mut out: Vec<_> = records
             .into_iter()
+            // Only what this person is addressed by. The rule lives on
+            // `Notification::visible_to` so all three backends read it from one
+            // place rather than each re-deriving it.
+            .filter(|n| n.visible_to(user))
             .map(|n| {
                 let read_at = mine.get(n.id.as_str()).copied();
                 crate::ports::notifications::NotificationView {
@@ -1328,7 +1550,14 @@ impl crate::ports::notifications::NotificationStore for FsOps {
                 .filter(|n| ids.iter().any(|i| i == &n.id))
                 .map(|n| n.id.as_str())
                 .collect(),
-            None => records.iter().map(|n| n.id.as_str()).collect(),
+            // Only what this person can see: a marker on a colleague's targeted
+            // row is inert, but writing one makes "mark all read" mean
+            // something different per backend.
+            None => records
+                .iter()
+                .filter(|n| n.visible_to(user))
+                .map(|n| n.id.as_str())
+                .collect(),
         };
         let now = crate::ports::now_millis();
         let mut changed = false;
@@ -1356,6 +1585,7 @@ impl crate::ports::notifications::NotificationStore for FsOps {
         // Still-unread count for this person: records with no marker of theirs.
         let unread = records
             .iter()
+            .filter(|n| n.visible_to(user))
             .filter(|n| {
                 !reads
                     .iter()
@@ -1523,7 +1753,16 @@ impl WorkspaceStore for FsOps {
                 }
             }
         }
-        if let Some(existing) = existing_folder_claim(index.values(), parent, name)? {
+        if let Some(mut existing) = existing_folder_claim(index.values(), parent, name)? {
+            // Stamp the adoption lease under the same index lock every other
+            // writer takes (issue #1839), so it is durable before this returns
+            // and a concurrent `delete_if_empty` cannot miss it. Authorship is
+            // untouched — adoption still does not rewrite whose folder it is.
+            if !existing.adopted {
+                existing.adopted = true;
+                index.insert(existing.id.clone(), existing.clone());
+                self.save_index(company, &index).await?;
+            }
             return Ok(FolderClaim::Adopted(existing));
         }
         let node = new_folder(name, parent, origin);
@@ -1847,6 +2086,57 @@ impl WorkspaceStore for FsOps {
         Ok(true)
     }
 
+    /// Checked and removed under the single per-company index lock every
+    /// writer here takes — `create`, `write`, `delete` and this method all
+    /// serialize on the same `path_lock(workspace_index_json)` guard, so a
+    /// concurrent `create` either lands its write entirely before this method
+    /// takes the lock (and is seen by the fresh `load_index` below) or waits
+    /// for this method to finish first. There is no window between the
+    /// emptiness check and the removal for it to land in.
+    async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let path = self.bundle(company).workspace_index_json();
+        let lock = path_lock(&path);
+        let _guard = lock.lock().await;
+        let mut index = self.load_index(company).await?;
+        let Some(node) = index.get(id) else {
+            return Ok(false);
+        };
+        // An adopted folder has a second writer whose create has not landed yet
+        // (issue #1839). The flag-write and this check both take the index lock
+        // above, so they serialize: once an adoption has stamped `adopted`, this
+        // refuses — closing Race 1 on this backend rather than narrowing it.
+        if node.adopted {
+            return Ok(false);
+        }
+        if index
+            .values()
+            .any(|node| node.parent_id.as_deref() == Some(id))
+        {
+            return Ok(false);
+        }
+        let physical = self.physical_path(company, &index, id)?;
+        index.remove(id);
+        if tokio::fs::try_exists(&physical).await.unwrap_or(false) {
+            let meta = tokio::fs::symlink_metadata(&physical)
+                .await
+                .map_err(|e| io_err(&physical, e))?;
+            if meta.is_dir() {
+                // Non-recursive: the check above, taken under this same lock,
+                // already proved nothing parents to `id`, so there is nothing
+                // beneath it for a recursive sweep to find.
+                tokio::fs::remove_dir(&physical)
+                    .await
+                    .map_err(|e| io_err(&physical, e))?;
+            } else {
+                tokio::fs::remove_file(&physical)
+                    .await
+                    .map_err(|e| io_err(&physical, e))?;
+            }
+        }
+        self.save_index(company, &index).await?;
+        Ok(true)
+    }
+
     async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
         Ok(self.load_index(company).await?.is_empty())
     }
@@ -2142,6 +2432,7 @@ mod test {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 
@@ -2341,6 +2632,123 @@ mod test {
         conformance::assert_run_store(Arc::new(FsOps::new(&root))).await;
     }
 
+    #[tokio::test]
+    async fn conformance_deep_trace_store() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_deep_trace_store(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store_workflow_join() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_run_store_workflow_join(Arc::new(FsOps::new(&root))).await;
+    }
+
+    /// The prune drops whole runs, never a torn half of one.
+    ///
+    /// Backend-specific because it reaches past the cap, which would make the
+    /// shared conformance suite write thousands of rows on every backend to
+    /// assert a property one implementation owns.
+    #[tokio::test]
+    async fn deep_trace_prune_keeps_whole_runs() {
+        use crate::ports::deep_trace::{
+            DeepTraceStore, MAX_DEEP_RUNS_PER_COMPANY, RunStepDetailRecord, TurnStepDetail,
+        };
+
+        let root_dir = tmp_root();
+        let ops = FsOps::new(root_dir.path());
+        let company = CompanyId::new("alpha");
+
+        // One run past the cap, two steps each, oldest first.
+        let runs = MAX_DEEP_RUNS_PER_COMPANY + 1;
+        for run in 0..runs {
+            for seq in 0..2u32 {
+                ops.append_step_detail(
+                    &company,
+                    &RunStepDetailRecord {
+                        run_id: format!("run-{run:04}"),
+                        step_seq: seq,
+                        at_millis: (run as u64 + 1) * 1000,
+                        detail: TurnStepDetail {
+                            reasoning: Some(format!("run {run} step {seq}")),
+                            ..TurnStepDetail::default()
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // The oldest run went entirely...
+        assert!(
+            ops.list_step_details(&company, "run-0000")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the oldest run's bodies were pruned"
+        );
+        // ...and every survivor kept BOTH of its steps. A prune that dropped the
+        // oldest N *rows* would leave a run holding half its own trace, which
+        // reads as the agent stopping mid-thought.
+        for run in 1..runs {
+            assert_eq!(
+                ops.list_step_details(&company, &format!("run-{run:04}"))
+                    .await
+                    .unwrap()
+                    .len(),
+                2,
+                "run {run} kept a torn half of its trace"
+            );
+        }
+    }
+
+    /// Appends are O(1): a flush that rewrites an existing ordinal appends a
+    /// line and lets the read side fold it, rather than rewriting the whole
+    /// company file per step (issue #1679). The raw file therefore carries both
+    /// lines, and the read returns the later one.
+    #[tokio::test]
+    async fn deep_trace_append_folds_at_read_not_at_write() {
+        use crate::ports::deep_trace::{DeepTraceStore, RunStepDetailRecord, TurnStepDetail};
+
+        let root_dir = tmp_root();
+        let ops = FsOps::new(root_dir.path());
+        let company = CompanyId::new("alpha");
+        let record = |reasoning: &str, at: u64| RunStepDetailRecord {
+            run_id: "run-a".to_string(),
+            step_seq: 1,
+            at_millis: at,
+            detail: TurnStepDetail {
+                reasoning: Some(reasoning.to_string()),
+                ..TurnStepDetail::default()
+            },
+        };
+
+        ops.append_step_detail(&company, &record("first", 10))
+            .await
+            .unwrap();
+        ops.append_step_detail(&company, &record("second", 20))
+            .await
+            .unwrap();
+
+        // The read folds last-write-wins per ordinal...
+        let got = ops.list_step_details(&company, "run-a").await.unwrap();
+        assert_eq!(got.len(), 1, "a re-write replaces rather than stacking");
+        assert_eq!(got[0].detail.reasoning.as_deref(), Some("second"));
+
+        // ...because the file still physically holds both lines: no rewrite
+        // happened between appends.
+        let path = ops.bundle(&company).deep_trace_jsonl();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            2,
+            "a same-ordinal append must not rewrite the whole file"
+        );
+    }
+
     /// A run row written before `task_id` could be absent still loads
     /// (issue #983). Backend-independent — see the assertion's own docs — so it
     /// is driven from the one backend every lane builds.
@@ -2467,6 +2875,13 @@ mod test {
         conformance::assert_workspace_sibling_names(Arc::new(FsOps::new(&root))).await;
     }
 
+    #[tokio::test]
+    async fn conformance_workspace_adoption_lease() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_workspace_adoption_lease(Arc::new(FsOps::new(&root))).await;
+    }
+
     /// Issue #887, and the backend the case was written against: this is the
     /// one that failed it. Node content was written with a bare
     /// `tokio::fs::write`, so a reader inside the `O_TRUNC` window saw a
@@ -2503,6 +2918,7 @@ mod test {
                 mime: None,
                 size: None,
                 sha256: None,
+                adopted: false,
             },
             None,
         )
@@ -2522,6 +2938,7 @@ mod test {
                 mime: None,
                 size: None,
                 sha256: None,
+                adopted: false,
             },
             Some("# Voice"),
         )

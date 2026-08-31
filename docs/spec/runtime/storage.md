@@ -277,3 +277,19 @@ OPENCOMPANY_TEST_MONGODB_URI=mongodb://127.0.0.1:27017 \
 ```
 
 Each test creates (and drops) a uniquely named throwaway database.
+
+## Deep trace
+
+Each backend gains one store for the unredacted companion of a run's steps —
+fs `deep-trace.jsonl`, sqlite `run_step_details`, one mongodb collection of the
+same name — all keyed `(company_id, run_id, step_seq)` and held to
+`assert_deep_trace_store` in the shared conformance suite. See
+[deep-trace.md](deep-trace.md) for what it holds, its caps, and why it is a
+sibling of the run store rather than part of it.
+
+`runs` also gains a `workflow_run_id` mirror for the workflow-node join
+(see [ports-runs.md](ports-runs.md)). On sqlite the column is added by
+`add_column_if_missing` and its index created **after** the `#983` table rebuild
+— that rebuild recreates `runs` from a fixed column list, so an index declared in
+`MIGRATIONS` would fail outright on exactly the legacy databases the additive
+step exists for.

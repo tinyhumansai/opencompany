@@ -169,8 +169,12 @@ test("every column of the list shares one vertical edge", async ({ page }) => {
   expect(timeRights, `time right edges: ${timeRights.join(", ")}`).toHaveLength(1);
 
   // The three columns are in the order the operator reads them, and each one
-  // holds what it says it does.
-  const [name, description, status] = rows[0];
+  // holds what it says it does. Located by name rather than index 0: issue
+  // #1683 sorts the index by most-recently-run, so which row that fixture
+  // lands in is no longer "whichever is first in the fixture array".
+  const featurePipelineRow = rows.find((cells) => cells[0].text.includes("Feature pipeline"));
+  expect(featurePipelineRow, "the Feature pipeline row is rendered").toBeDefined();
+  const [name, description, status] = featurePipelineRow!;
   expect(name.right).toBeLessThan(description.left);
   expect(description.right).toBeLessThan(status.left);
   expect(name.text).toContain("Feature pipeline");
@@ -196,7 +200,11 @@ test("the description is the column that yields when the list narrows", async ({
   // item at all and the name takes the space it left.
   expect(distinct(rows.map((cells) => cells.length)).sort()).toEqual([2, 3]);
 
-  const [name, status] = rows[0];
+  // Located by name rather than index 0 — see the comment on the same lookup
+  // above.
+  const featurePipelineRow = rows.find((cells) => cells[0].text.includes("Feature pipeline"));
+  expect(featurePipelineRow, "the Feature pipeline row is rendered").toBeDefined();
+  const [name, status] = featurePipelineRow!;
   expect(name.text).toContain("Feature pipeline");
   expect(status.text).toContain("Manual run blocked");
   expect(rows.some((cells) => cells.some((cell) => cell.text.includes("A feature request goes")))).toBe(false);

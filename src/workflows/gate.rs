@@ -250,6 +250,7 @@ pub(crate) struct GatedCall {
 /// The policy instance is private to this pass, so the declaration cannot leak
 /// onto the agent path: no other caller shares it, and
 /// [`ApprovalPolicy::new`] yields the strict path.
+#[allow(dead_code)] // retained for audit/migration tests while production HITL is disabled
 pub(crate) async fn apply_policy_gates(
     graph: &mut WorkflowGraph,
     record: &CompanyRecord,
@@ -297,6 +298,16 @@ pub(crate) async fn apply_policy_gates_with_policy(
     }
 
     gated
+}
+
+/// Production migration mode: do not add policy-generated HITL gates.
+///
+/// Authored `requires_approval = true` flags already present on `graph` are
+/// deliberately untouched; they are explicit workflow design, not a policy
+/// interception. The returned policy metadata is empty because no policy gate
+/// was added.
+pub(crate) fn policy_hitl_disabled(_graph: &mut WorkflowGraph) -> Vec<GatedCall> {
+    Vec::new()
 }
 
 /// Which of `graph`'s nodes the company's policy would stop — **classification
@@ -658,10 +669,14 @@ description = "Runs Acme."
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 

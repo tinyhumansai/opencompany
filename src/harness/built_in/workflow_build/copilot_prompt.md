@@ -33,12 +33,12 @@ You have exactly three tools. Use them; do not answer from memory.
    graph passes the static checks. It runs nothing — no step executes, no
    message is sent — so a clean result is a wiring check, not a live test.
 
-3. **`propose_workflow`** — hand in your final `{ summary, workflow }`. The host
+3. **`propose_company_workflow`** — hand in your final `{ summary, workflow }`. The host
    re-checks it under its own authority (it assigns the id, dedups the name,
    sets approval gating, grounds every teammate and tool, and refuses an
    unsupported node kind). If it passes, your draft is accepted and you are
    done — reply in one short line. If it comes back with problems, FIX every one
-   and call `propose_workflow` again. Never propose a graph you have not first
+   and call `propose_company_workflow` again. Never propose a graph you have not first
    run through `check_workflow`.
 
 ## Interpreting a check honestly
@@ -60,7 +60,7 @@ A workflow is a small directed graph: `{ name, description, nodes, edges }`.
 
 The node kinds you may author are named in the graph contract at the end of
 these instructions. Author only those. If the work needs something outside that
-set, do not call `propose_workflow` — end your turn with a plain sentence naming
+set, do not call `propose_company_workflow` — end your turn with a plain sentence naming
 what is missing, and the host records that as the reason the workflow was not
 drafted.
 
@@ -118,5 +118,5 @@ unspecified, make the sensible inference and NAME it in the summary — "sending
 to the company owner", "running every Monday at 9am since none was given" — so
 the guess stays visible and one edit away from being corrected.
 
-End your turn with a proposal (via `propose_workflow`) or an honest "this is
+End your turn with a proposal (via `propose_company_workflow`) or an honest "this is
 better done once" — never a half-built graph.

@@ -50,6 +50,10 @@ mod cap_turn_test;
 /// `page.tsx` to `page.compiled.mjs` via `swc_core`. See
 /// `docs/spec/runtime/pages.md`.
 pub mod pages_tools;
+/// Issue #1776: the pass that drafts ONE teammate's mandate or persona for an
+/// operator who then keeps it or throws it away. One tool-less model call that
+/// writes nothing. See [`profile_draft`].
+pub mod profile_draft;
 /// First-run company setup's pass: one tool-less model call that designs a
 /// company's starting team from three answers. See [`roster_build`].
 pub mod roster_build;

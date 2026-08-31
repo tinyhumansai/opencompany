@@ -55,6 +55,8 @@ import {
   type WorkspaceFile,
   type WorkspaceOrigin,
 } from "@/api/workspace";
+import { cachedAvatarNodeIds, forgetAvatarNode } from "@/lib/avatar";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -91,7 +93,12 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Skeleton } from "@/components/ui/skeleton";
-import { rosterDisplayName, rosterNameMap, type RosterNames } from "@/lib/roster-names";
+import {
+  rosterDisplayName,
+  rosterIdKey,
+  rosterNameMap,
+  type RosterNames,
+} from "@/lib/roster-names";
 import { fromDto } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { createSaveBuffer, createUnloadGuard, type SaveBuffer } from "@/lib/workspace-save-buffer";
@@ -101,6 +108,7 @@ import {
   breadcrumbOf,
   childrenOf,
   clearLegacyLocal,
+  countNotes,
   declineLegacyImport,
   DERIVED_LABEL,
   DERIVED_REASON,
@@ -122,13 +130,13 @@ import {
   pathOf,
   readLegacyLocalNodes,
   renameAudienceWarning,
+  rosterOwnerOf,
   SECRETS_LABEL,
   SECRETS_REASON,
   sortedFolders,
   subtreeCounts,
   subtreeIds,
-  titleOf,
-} from "@/lib/workspace";
+  titleOf, headerNoteCount } from "@/lib/workspace";
 import { useLocalScope } from "@/connections/ConnectionContext";
 import { MoveAudienceConfirm } from "@/views/workspace/MoveAudienceConfirm";
 import { SearchResults } from "@/views/workspace/SearchResults";
@@ -175,6 +183,30 @@ interface Props {
 
 /** How long typing settles before the editor pushes a save to the host. */
 const AUTOSAVE_DELAY_MS = 800;
+
+/** Browser-local width of the workspace explorer (issue #1755). */
+const WORKSPACE_LIST_WIDTH_KEY = "oc.workspace.listWidth";
+const DEFAULT_WORKSPACE_LIST_WIDTH = 256;
+const MIN_WORKSPACE_LIST_WIDTH = 200;
+const MAX_WORKSPACE_LIST_WIDTH = 560;
+const WORKSPACE_LIST_KEYBOARD_STEP = 16;
+
+function clampWorkspaceListWidth(width: number): number {
+  return Math.min(MAX_WORKSPACE_LIST_WIDTH, Math.max(MIN_WORKSPACE_LIST_WIDTH, width));
+}
+
+/** Restore a usable saved width without letting blocked storage break the view. */
+function initialWorkspaceListWidth(): number {
+  if (typeof window === "undefined") return DEFAULT_WORKSPACE_LIST_WIDTH;
+  try {
+    const saved = Number(window.localStorage.getItem(WORKSPACE_LIST_WIDTH_KEY));
+    return Number.isFinite(saved) && saved > 0
+      ? clampWorkspaceListWidth(saved)
+      : DEFAULT_WORKSPACE_LIST_WIDTH;
+  } catch {
+    return DEFAULT_WORKSPACE_LIST_WIDTH;
+  }
+}
 
 /**
  * How long the search box waits after the last keystroke before asking the host
@@ -421,7 +453,21 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   // Which (connection, company) this subtree's browser-local state belongs to.
   const scope = useLocalScope();
   const [nodes, setNodes] = useState<FsNode[]>([]);
+  // Ref mirror used by async tree refreshes: comparing the last authoritative
+  // tree with the new one must not make `loadTree` depend on state and replay
+  // every live-write effect. It also lets remote deletions invalidate cached
+  // uploaded faces, not only deletes initiated by this view.
+  const nodesRef = useRef<FsNode[]>([]);
   const [loading, setLoading] = useState(true);
+  /**
+   * Has a tree ever actually loaded?
+   *
+   * Distinct from `!loading`, which a non-silent refresh sets back to `true`
+   * over a tree already on screen, and from `nodes.length`, which cannot tell
+   * "not fetched yet" from "fetched, and empty" — the two states the header
+   * count has to keep apart (codex review on #1785).
+   */
+  const [treeKnown, setTreeKnown] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The roster names the `agents/` folders resolve against (issue #973). Best
@@ -465,6 +511,13 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   const [prompt, setPrompt] = useState<PromptState | null>(null);
   const [moving, setMoving] = useState<FsNode | null>(null);
   const [showExplorer, setShowExplorer] = useState(true);
+  const [listWidth, setListWidth] = useState(initialWorkspaceListWidth);
+  const [resizingList, setResizingList] = useState(false);
+  const listResize = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const [legacy, setLegacy] = useState<FsNode[]>([]);
   // Whether this connection already said "not now" to the migration offer.
   // Read once per company rather than per render, because the answer lives in
@@ -499,6 +552,15 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   const legacyFiles = useMemo(() => legacy.filter((n) => n.kind === "file"), [legacy]);
   const uploadRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WORKSPACE_LIST_WIDTH_KEY, String(listWidth));
+    } catch {
+      // Storage can be blocked by browser policy; resizing should still work
+      // for the current visit.
+    }
+  }, [listWidth]);
+
   // Generation tokens so a response from a previous company scope (or from a
   // file that has since been closed) can never overwrite the current one.
   const treeGen = useRef(0);
@@ -525,6 +587,21 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
       try {
         const tree = await fetchTree(client, company);
         if (mine !== treeGen.current) return null;
+        const nextIds = new Set(tree.map((node) => node.id));
+        for (const previous of nodesRef.current) {
+          if (!nextIds.has(previous.id)) forgetAvatarNode(client, company, previous.id);
+        }
+        // On a fresh mount there is no previous tree to diff — the ref starts
+        // empty — so a face whose node was deleted while this view was
+        // unmounted would otherwise stay cached for the life of the tab. The
+        // module cache is revalidated against this authoritative tree once;
+        // from the next load the diff above carries the job.
+        if (nodesRef.current.length === 0) {
+          for (const id of cachedAvatarNodeIds(client, company)) {
+            if (!nextIds.has(id)) forgetAvatarNode(client, company, id);
+          }
+        }
+        nodesRef.current = tree;
         setNodes(tree);
         setError(null);
         if (!expandedSeeded.current) {
@@ -537,6 +614,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
             ),
           );
         }
+        setTreeKnown(true);
         return tree;
       } catch (e) {
         if (mine !== treeGen.current) return null;
@@ -629,6 +707,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   // Mount / company change: reset every scoped piece of state, then load.
   useEffect(() => {
     expandedSeeded.current = false;
+    nodesRef.current = [];
     setNodes([]);
     setOpenId(null);
     setOpenFile(null);
@@ -1234,6 +1313,11 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
     try {
       await deleteNodeApi(client, company, node.id);
       setNodes((all) => all.filter((n) => !removed.has(n.id)));
+      nodesRef.current = nodesRef.current.filter((n) => !removed.has(n.id));
+      // A deleted node may be somebody's chosen face (`blob:<nodeId>`); drop
+      // it from the avatar cache so the next render degrades to the tone
+      // tile rather than keeping a face whose file just ceased to exist.
+      for (const id of removed) forgetAvatarNode(client, company, id);
       if (openId && removed.has(openId)) {
         buffer.clear();
         setOpenId(null);
@@ -1409,19 +1493,74 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
    * the tree never scrolled to it.
    */
   const secretNote = isSecretNode(nodes, openId);
+  /**
+   * How many notes the workspace holds, for the header's count.
+   *
+   * Memoised rather than filtered inline: this component re-renders on every
+   * keystroke in the editor (the draft is state), and `nodes` is the whole
+   * tree — so an inline scan would walk every node in the workspace once per
+   * character typed, to recompute a number that only changes when the tree
+   * does.
+   */
+  const noteCount = useMemo(() => countNotes(nodes), [nodes]);
 
   return (
-    <div className="flex flex-1 overflow-hidden">
-      {/* The file tree and editor are the page, with no title of their own
-          (issue #1221) — this names the page for a screen reader the same
-          way every other view's title does. */}
-      <h1 className="sr-only">Workspace</h1>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {/*
+        Issue #1763: Workspace was the one console page with no header at all.
+        It opened straight into the `EXPLORER` toolbar, so the first heading an
+        operator's eye landed on was a column label for the left rail, and the
+        only thing naming the page was the nav row they arrived from.
+
+        It had an `sr-only` title (issue #1221) on the reasoning that "the file
+        tree and editor are the page". That is true of Chat and Inbox, where the
+        content starts at the top edge and fills the frame. It is not true here:
+        the pane beside the tree is empty until a note is opened, so the page
+        opened on an unnamed toolbar over blank space. This was the omission,
+        not the decision.
+
+        The count is the notes, not the folders — a folder is how the tree is
+        arranged rather than a thing the workspace holds.
+      */}
+      <PageHeader
+        title="Workspace"
+        count={headerNoteCount(noteCount, treeKnown)}
+        /*
+          Not "every note this company's teammates can read and write", which
+          the tree contradicts in two places: `secrets/` is the one folder the
+          agents cannot list, read, search or write (`SECRETS_REASON`, #1465),
+          and `derived/` is written by a ledger and re-derived over any edit
+          (`DERIVED_REASON`, #1222). A header that claims universal read/write
+          is worst exactly where it matters most — over a folder holding
+          credentials.
+
+          It describes the surface and points at where the rule is stated
+          rather than restating it. The per-folder rules already appear on the
+          tree row, in the move dialog and on the note itself, in one wording
+          each on purpose (see `SECRETS_LABEL`); a fourth phrasing up here is
+          how an operator comes to believe there are four rules. The
+          conditional also stays true of a workspace that has neither folder,
+          which an "…and two folders are exceptions" sentence would not.
+        */
+        description="Every note this company holds, in one shared tree. Where a folder is read-only or hidden from the agents, the tree says so."
+        data-testid="workspace-header"
+      />
+      {/*
+        `min-w-0 max-w-full` is #1767's, kept: it is what stops the resizable
+        explorer column pushing the editor past the viewport. It was on the
+        one wrapper this view had; #1763 splits that into a column (header
+        above, panes below), and the classes belong on the row holding the
+        `aside`, which is this one rather than the element outside it.
+      */}
+      <div className="flex min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
       {/* Explorer */}
       <aside
+        id="workspace-explorer"
         className={cn(
-          "w-64 shrink-0 flex-col border-r bg-card/40 md:flex",
+          "min-w-0 shrink-0 flex-col overflow-hidden bg-card/40 md:flex",
           showExplorer ? "flex" : "hidden",
         )}
+        style={{ width: listWidth }}
       >
         <div className="flex items-center gap-1 border-b px-2 py-2">
           <span className="flex-1 px-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
@@ -1549,6 +1688,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
               loading={searching || searchQuery !== searchInput.trim()}
               error={searchError}
               onOpen={(hit) => void openHit(hit)}
+              rosterNames={rosterNames}
             />
           ) : loading ? (
             <div className="space-y-2 px-2 py-2">
@@ -1596,9 +1736,74 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
         </div>
       </aside>
 
+      {/* On small screens the explorer and note are mutually exclusive, so a
+          divider only has meaning from the two-pane breakpoint onward. */}
+      <div
+        role="separator"
+        aria-label="Resize workspace explorer"
+        aria-orientation="vertical"
+        aria-controls="workspace-explorer workspace-content"
+        aria-valuemin={MIN_WORKSPACE_LIST_WIDTH}
+        aria-valuemax={MAX_WORKSPACE_LIST_WIDTH}
+        aria-valuenow={listWidth}
+        aria-valuetext={`${listWidth} pixels`}
+        tabIndex={0}
+        data-testid="workspace-list-resizer"
+        className={cn(
+          "relative w-1.5 shrink-0 touch-none cursor-col-resize bg-border outline-none transition-colors select-none motion-reduce:transition-none",
+          "hover:bg-primary/50 focus-visible:bg-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          resizingList && "bg-primary/70",
+          showExplorer ? "hidden md:block" : "hidden",
+        )}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          listResize.current = {
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startWidth: listWidth,
+          };
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setResizingList(true);
+        }}
+        onPointerMove={(e) => {
+          const drag = listResize.current;
+          if (!drag || drag.pointerId !== e.pointerId) return;
+          setListWidth(clampWorkspaceListWidth(drag.startWidth + e.clientX - drag.startX));
+        }}
+        onPointerUp={(e) => {
+          if (listResize.current?.pointerId !== e.pointerId) return;
+          listResize.current = null;
+          setResizingList(false);
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        }}
+        onPointerCancel={(e) => {
+          if (listResize.current?.pointerId !== e.pointerId) return;
+          listResize.current = null;
+          setResizingList(false);
+        }}
+        onLostPointerCapture={() => {
+          listResize.current = null;
+          setResizingList(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+          e.preventDefault();
+          const delta =
+            e.key === "ArrowLeft" ? -WORKSPACE_LIST_KEYBOARD_STEP : WORKSPACE_LIST_KEYBOARD_STEP;
+          setListWidth((width) => clampWorkspaceListWidth(width + delta));
+        }}
+      />
+
       {/* Note pane */}
       <section
-        className={cn("flex-1 flex-col overflow-hidden", showExplorer ? "hidden md:flex" : "flex")}
+        id="workspace-content"
+        className={cn(
+          "min-w-0 flex-1 flex-col overflow-hidden",
+          showExplorer ? "hidden md:flex" : "flex",
+        )}
       >
         {legacy.length > 0 && !importDeclined && (
           <Alert className="m-3 mb-0 w-auto" data-testid="workspace-migration-banner">
@@ -1732,6 +1937,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
                 <Authorship
                   createdBy={openFile?.createdBy ?? openNode.createdBy}
                   updatedBy={openFile?.updatedBy ?? openNode.updatedBy}
+                  rosterNames={rosterNames}
                 />
               )}
               {/* Labelled (issue #1382). A bare "2 days ago" beside the title
@@ -1900,6 +2106,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
           />
         )}
       </section>
+      </div>
 
       <NamePrompt
         nodes={nodes}
@@ -2084,10 +2291,20 @@ interface TreeProps {
  * {@link childrenOf} sorts everywhere else (issue #973). The pre-#686 ULID ids
  * all sort before every readable slug under the plain id ordering, which is
  * not an order an operator can read anything into.
+ *
+ * Most-recently-modified still comes first here (issue #1687) — `Tree` routes
+ * a roster root through this comparator instead of {@link childrenOf}'s, so
+ * without its own `updatedAt` check the two visible roots that need id
+ * resolution the most would be the two the MRU fix never reached, and stayed
+ * alphabetical underneath it.
  */
 function sortRosterFolders(items: FsNode[], names: RosterNames): FsNode[] {
   return [...items].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+    if (a.updatedAt != null && b.updatedAt != null) {
+      const updatedAt = b.updatedAt - a.updatedAt;
+      if (updatedAt !== 0) return updatedAt;
+    }
     // Only a roster folder's name is an id worth resolving. A direct file
     // under `agents/` is unusual but not impossible, and its raw name could
     // coincidentally collide with a roster id — that must not reorder it by
@@ -2133,12 +2350,17 @@ const ORIGIN_STYLES: Record<WorkspaceOrigin["kind"], string> = {
 function Authorship({
   createdBy,
   updatedBy,
+  rosterNames,
 }: {
   createdBy: WorkspaceOrigin;
   updatedBy: WorkspaceOrigin;
+  /** The roster read, so an agent origin reads as a name (issue #1723). */
+  rosterNames: RosterNames;
 }) {
-  const created = originLabel(createdBy);
-  const edited = sameOrigin(createdBy, updatedBy) ? null : originLabel(updatedBy);
+  const created = originLabel(createdBy, rosterNames);
+  const edited = sameOrigin(createdBy, updatedBy)
+    ? null
+    : originLabel(updatedBy, rosterNames);
   if (!created && !edited) return null;
   return (
     <span className="flex shrink-0 items-center gap-1.5" data-testid="workspace-authorship">
@@ -2183,6 +2405,25 @@ function TreeRow({ node, ...props }: TreeProps & { node: FsNode }) {
   // a roster id one level below one of those two roots.
   const isRosterFolder = isFolder && isRosterRoot(nodeById(nodes, node.parentId));
   const displayName = isRosterFolder ? rosterDisplayName(node.name, rosterNames) : node.name;
+  /**
+   * The provenance pill for this row, resolved — or `null` when there is
+   * nothing worth saying (issue #1723).
+   *
+   * Suppressed inside the author's own `agents/`/`artifacts/` subtree, where
+   * the enclosing folder already attributes everything under it: on the
+   * teammate's own folder the pill would repeat the row's own label back
+   * verbatim, and on the `<task>/` folders and files beneath it, the same pill
+   * four times down the pane — each one taking the width the name needs.
+   * Everywhere else it is the one place the tree says who wrote a node, which
+   * is the whole of #326's marker, and a node one teammate wrote inside
+   * another's folder still wears it.
+   */
+  const owner = rosterOwnerOf(nodes, node.id);
+  const agentBadge =
+    node.createdBy.kind === "agent" &&
+    (owner === undefined || rosterIdKey(owner) !== rosterIdKey(node.createdBy.id))
+      ? { id: node.createdBy.id, name: rosterDisplayName(node.createdBy.id, rosterNames) }
+      : null;
   /** What this row is actually called on screen. */
   const label = isFolder ? displayName : titleOf(node);
   /**
@@ -2334,15 +2575,24 @@ function TreeRow({ node, ...props }: TreeProps & { node: FsNode }) {
           {/* Agent-created nodes get a marker in the tree itself, so "what has
               the company been writing" is answerable by scanning rather than by
               opening each note. Only the agent case — badging the operator's
-              own notes back at them says nothing. */}
-          {node.createdBy.kind === "agent" && (
+              own notes back at them says nothing.
+
+              The pill reads the teammate's NAME, through the same
+              `rosterDisplayName` the row label one line up already goes through
+              (issue #1723). It used to print the raw roster handle —
+              `seo_specialist` beside a row already labelled "SEO Specialist" —
+              which is #1688's and #1369's leak on the one surface those fixes
+              did not cover. The handle is still reachable, on `title`, because
+              it is the folder's real name and the identity every artifact is
+              stamped with. */}
+          {agentBadge && (
             <Badge
               variant="outline"
               className={cn("shrink-0 px-1 py-0 text-3xs", ORIGIN_STYLES.agent)}
-              title={`Created by teammate ${node.createdBy.id}`}
+              title={`Created by teammate ${agentBadge.id}`}
               data-testid="workspace-tree-agent-badge"
             >
-              {node.createdBy.id}
+              {agentBadge.name}
             </Badge>
           )}
         </button>

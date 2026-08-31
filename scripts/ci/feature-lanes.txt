@@ -49,7 +49,7 @@ oauth          | tested       | (default)                       | In the default
 platform-jwt   | tested       | (default)                       | In the default set (see Cargo.toml for why it ships by default).
 documents      | tested       | (default)                       | In the default set: the Brain drop zone is a console surface, so a shipped build must read a dropped PDF (see Cargo.toml).
 openhuman      | tested       | openhuman                       | `rust-gated` runs `--tests`, which selects lib+bin units and every tests/ target.
-tinymemory     | partial      | acp,runner,tinymemory | store::memory store::select
+tinymemory     | tested       | (default)                       | In the default set, so the bare `cargo test --locked` runs its tests unfiltered (see Cargo.toml for why the memory-engine catalog must not ship half-disabled).
 tinyplace      | tested       | tinyplace                       | Runs the whole `--lib` deliberately (issue #477) — it gates code across the tree.
 
 # --- Partial: a lane exists, but filtered ----------------------------------
@@ -67,6 +67,7 @@ smtp           | partial      | imap,smtp                       | send_then_rece
 chargebee      | partial      | openhuman,chargebee,paypal,composio | chargebee server::ops::finance
 paypal         | partial      | openhuman,chargebee,paypal,composio | paypal server::ops::finance
 sidecar        | partial      | sidecar                         | brain::sidecar
+analytics      | partial      | analytics                       | analytics
 
 # --- Owed a lane: gated tests exist, and they are currently RED -------------
 #

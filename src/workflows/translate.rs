@@ -204,6 +204,16 @@ fn translate_node(def: &WorkflowNodeDef) -> Node {
     if let Some(requires_approval) = def.requires_approval {
         config.insert("requires_approval".to_string(), json!(requires_approval));
     }
+    // Issue #1866: the deterministic postcondition, lowered the same way
+    // `retry` is — a typed model field becomes the exact config key
+    // `HarnessAgentRunner::run_turn` reads (`caps::postcondition`).
+    if let Some(postcondition) = &def.postcondition {
+        config.insert(
+            "postcondition".to_string(),
+            serde_json::to_value(postcondition)
+                .expect("WorkflowPostconditionDef always serializes"),
+        );
+    }
 
     Node {
         id: def.id.clone(),
@@ -524,6 +534,7 @@ mod tests {
             id: "wf".into(),
             name: "WF".into(),
             description: None,
+            owner_desk: None,
             nodes: vec![WorkflowNodeDef {
                 id: "worker".into(),
                 kind: WorkflowNodeKind::Agent,
@@ -537,6 +548,7 @@ mod tests {
                 requires_approval: None,
                 repeatable: None,
                 destination: None,
+                postcondition: None,
             }],
             edges: Vec::new(),
         };
@@ -579,6 +591,69 @@ mod tests {
         assert_eq!(call.config["retry"]["max_attempts"], 3);
         assert_eq!(call.config["retry"]["backoff_ms"], 250);
         assert_eq!(call.config["retry"]["backoff"], "exponential");
+    }
+
+    /// Issue #1866: an agent node's declared `postcondition` lands as the
+    /// exact config key `HarnessAgentRunner::run_turn` reads it back from —
+    /// the same first-class-field-becomes-config-key contract `retry` and
+    /// `requires_approval` already have, pinned above.
+    #[test]
+    fn postcondition_lands_as_an_engine_config_key() {
+        let src = r#"
+            id = "wf"
+            name = "WF"
+            [[node]]
+            id = "start"
+            kind = "trigger"
+            name = "Start"
+            [[node]]
+            id = "worker"
+            kind = "agent"
+            name = "Worker"
+            agent = "researcher"
+            [node.postcondition]
+            require = "field_present"
+            field = "json.items"
+            [[edge]]
+            from = "start"
+            to = "worker"
+        "#;
+        let graph = translate(&parse_workflow(src).expect("parses"));
+        let worker = graph.nodes.iter().find(|n| n.id == "worker").unwrap();
+        assert_eq!(worker.config["postcondition"]["require"], "field_present");
+        assert_eq!(worker.config["postcondition"]["field"], "json.items");
+    }
+
+    /// The other half of the same contract: a node with no `postcondition`
+    /// declared carries no `postcondition` key at all — translation of an
+    /// unchanged (pre-#1866) file stays byte-identical, matching every other
+    /// first-class field's `Option<T>` -> `if let Some` -> config-key
+    /// pattern above.
+    #[test]
+    fn a_node_without_a_postcondition_carries_no_postcondition_key() {
+        let src = r#"
+            id = "wf"
+            name = "WF"
+            [[node]]
+            id = "start"
+            kind = "trigger"
+            name = "Start"
+            [[node]]
+            id = "worker"
+            kind = "agent"
+            name = "Worker"
+            agent = "researcher"
+            [[edge]]
+            from = "start"
+            to = "worker"
+        "#;
+        let graph = translate(&parse_workflow(src).expect("parses"));
+        let worker = graph.nodes.iter().find(|n| n.id == "worker").unwrap();
+        assert!(
+            worker.config.get("postcondition").is_none(),
+            "an undeclared postcondition must not appear in the lowered config at all: {:?}",
+            worker.config
+        );
     }
 
     /// An "error"-labeled edge leaving a routing node maps onto the engine's
@@ -644,6 +719,7 @@ mod tests {
             id: "wf".into(),
             name: "WF".into(),
             description: None,
+            owner_desk: None,
             nodes: vec![
                 WorkflowNodeDef {
                     id: "gate".into(),
@@ -658,6 +734,7 @@ mod tests {
                     requires_approval: None,
                     repeatable: None,
                     destination: None,
+                    postcondition: None,
                 },
                 node_stub("yes_path"),
                 node_stub("no_path"),
@@ -710,6 +787,7 @@ mod tests {
                 id: "wf".into(),
                 name: "WF".into(),
                 description: None,
+                owner_desk: None,
                 nodes: vec![WorkflowNodeDef {
                     id: "n".into(),
                     kind: oc,
@@ -723,6 +801,7 @@ mod tests {
                     requires_approval: None,
                     repeatable: None,
                     destination: None,
+                    postcondition: None,
                 }],
                 edges: Vec::new(),
             };
@@ -740,6 +819,7 @@ mod tests {
             id: "wf".into(),
             name: "WF".into(),
             description: None,
+            owner_desk: None,
             nodes: vec![
                 WorkflowNodeDef {
                     id: "sw".into(),
@@ -754,6 +834,7 @@ mod tests {
                     requires_approval: None,
                     repeatable: None,
                     destination: None,
+                    postcondition: None,
                 },
                 node_stub("paid"),
                 node_stub("error_case"),
@@ -861,6 +942,7 @@ to = "done"
             requires_approval: None,
             repeatable: None,
             destination: None,
+            postcondition: None,
         }
     }
 

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { approvalAction, grantHeadline, payloadLeadTruncated, payloadLines, toolAction } from "@/lib/language";
+import {
+  approvalAction,
+  decisionLabel,
+  grantHeadline,
+  payloadLeadTruncated,
+  payloadLines,
+  toolAction,
+} from "@/lib/language";
 import type { ApprovalSummary, StandingGrant } from "@/api/types";
 
 /**
@@ -18,8 +25,16 @@ import type { ApprovalSummary, StandingGrant } from "@/api/types";
  * nobody.
  */
 
-function approval(over: Partial<ApprovalSummary> & Pick<ApprovalSummary, "kind">): ApprovalSummary {
-  return { id: "a1", amount_usd: null, at_millis: 1_000, agent: "ceo", ...over };
+function approval(
+  over: Partial<ApprovalSummary> & Pick<ApprovalSummary, "kind">,
+): ApprovalSummary {
+  return {
+    id: "a1",
+    amount_usd: null,
+    at_millis: 1_000,
+    agent: "ceo",
+    ...over,
+  };
 }
 
 /** What each per-call tool gate asks for, keyed by the kind it parks under. */
@@ -50,7 +65,9 @@ describe("an approval card for a gated tool", () => {
 
   it("never leaves one of them on the generic fallback", () => {
     for (const kind of [...Object.keys(PER_CALL), ...Object.keys(GRANTABLE)]) {
-      expect(approvalAction(approval({ kind }))).not.toBe("Use one of its tools");
+      expect(approvalAction(approval({ kind }))).not.toBe(
+        "Use one of its tools",
+      );
     }
   });
 
@@ -58,7 +75,9 @@ describe("an approval card for a gated tool", () => {
     // Rung 1 is unchanged by #701 — nothing was added to EFFECT_LABELS, and a
     // tool label that shadowed one of its entries would be a silent rewording of
     // a card that has read the same way since #372.
-    expect(approvalAction(approval({ kind: "payment.send" }))).toBe("Send a payment");
+    expect(approvalAction(approval({ kind: "payment.send" }))).toBe(
+      "Send a payment",
+    );
     expect(approvalAction(approval({ kind: "mcp_registry_tool_call" }))).toBe(
       "Use a connected tool",
     );
@@ -66,7 +85,10 @@ describe("an approval card for a gated tool", () => {
 });
 
 describe("the standing permissions list", () => {
-  for (const [kind, sentence] of Object.entries({ ...PER_CALL, ...GRANTABLE })) {
+  for (const [kind, sentence] of Object.entries({
+    ...PER_CALL,
+    ...GRANTABLE,
+  })) {
     it(`names \`${kind}\` without an approval to read it from`, () => {
       expect(toolAction(kind)).toBe(sentence);
     });
@@ -90,30 +112,292 @@ describe("the payload block underneath the label", () => {
     const lines = payloadLines(
       approval({
         kind: "http_request",
-        payload: { headers: { Authorization: "…" }, body: "{}", url: "https://x.test", method: "POST" },
+        payload: {
+          headers: { Authorization: "…" },
+          body: "{}",
+          url: "https://x.test",
+          method: "POST",
+        },
       }),
     );
-    expect(lines.map((l) => l.label)).toStrictEqual(["url", "method", "headers", "body"]);
+    expect(lines.map((l) => l.label)).toStrictEqual([
+      "url",
+      "method",
+      "headers",
+      "body",
+    ]);
   });
 
   it("leads a download with its address", () => {
     const lines = payloadLines(
-      approval({ kind: "curl", payload: { dest_path: "out.bin", url: "https://x.test/f" } }),
+      approval({
+        kind: "curl",
+        payload: { dest_path: "out.bin", url: "https://x.test/f" },
+      }),
     );
     expect(lines.map((l) => l.label)).toStrictEqual(["url", "dest_path"]);
   });
 
   it("leads a git call with the operation it is about to run", () => {
     const lines = payloadLines(
-      approval({ kind: "git_operations", payload: { message: "wip", operation: "commit" } }),
+      approval({
+        kind: "git_operations",
+        payload: { message: "wip", operation: "commit" },
+      }),
     );
     expect(lines[0]).toStrictEqual({ label: "operation", value: "commit" });
   });
 });
 
+describe("the decide buttons' label (#1411)", () => {
+  const askers = new Map([["ceo", "Sam"]]);
+  // Sixty seconds after the default `at_millis: 1_000` — a bucket the hidden
+  // card tests can also read off (`composed 1m ago`).
+  const NOW = 61_000;
+
+  it("names the request behind the action, not just its kind", () => {
+    expect(
+      decisionLabel(
+        approval({ kind: "shell", payload: { command: "make release" } }),
+        askers,
+        NOW,
+      ),
+    ).toBe("Run a terminal command — make release — asked by Sam");
+  });
+
+  it("tells two same-kind cards apart when their payloads differ", () => {
+    // The whole point of the label: two shell commands with the same action
+    // phrase must still offer distinguishable decide buttons.
+    const first = decisionLabel(
+      approval({ kind: "shell", payload: { command: "make release" } }),
+      askers,
+      NOW,
+    );
+    const second = decisionLabel(
+      approval({ kind: "shell", payload: { command: "npm run deploy" } }),
+      askers,
+      NOW,
+    );
+    expect(first).not.toBe(second);
+  });
+
+  it("omits the asker when the card has no agent", () => {
+    expect(
+      decisionLabel(
+        approval({
+          kind: "shell",
+          payload: { command: "make release" },
+          agent: null,
+        }),
+        askers,
+        NOW,
+      ),
+    ).toBe("Run a terminal command — make release");
+  });
+
+  it("omits the payload lead when the card has none", () => {
+    expect(decisionLabel(approval({ kind: "payment.send" }), askers, NOW)).toBe(
+      "Send a payment — asked by Sam",
+    );
+  });
+
+  it("falls back to the asker id when the roster does not know it", () => {
+    expect(
+      decisionLabel(
+        approval({ kind: "shell", payload: { command: "make" } }),
+        new Map(),
+        NOW,
+      ),
+    ).toBe("Run a terminal command — make — asked by ceo");
+  });
+
+  it("tells same-first-lines cards apart by the dropped argument, not the id", () => {
+    // Two `http_request`s sharing url, method and headers differ only in the
+    // body, which is what the line cap omits. The button must name that body's
+    // start rather than the opaque card id — the same words the card body uses.
+    const first = decisionLabel(
+      approval({
+        kind: "http_request",
+        payload: {
+          url: "https://x.test",
+          method: "POST",
+          headers: "a: b",
+          body: '{"q": 1}',
+        },
+      }),
+      askers,
+      NOW,
+    );
+    const second = decisionLabel(
+      approval({
+        kind: "http_request",
+        payload: {
+          url: "https://x.test",
+          method: "POST",
+          headers: "a: b",
+          body: '{"q": 2}',
+        },
+      }),
+      askers,
+      NOW,
+    );
+    expect(first).not.toBe(second);
+    expect(first).toContain('body: {"q": 1}');
+    expect(second).toContain('body: {"q": 2}');
+    expect(first).not.toContain("card a1");
+  });
+
+  it("keeps unmapped-tool cards apart when their first argument name differs", () => {
+    // Two same-kind approvals whose first argument NAME differs but whose
+    // value is the same must not read alike: `{path: "/tmp/a"}` and
+    // `{destination: "/tmp/a"}` are different requests, and a bounded label
+    // that dropped the name would hand both cards the same button text (#1411).
+    const withPath = decisionLabel(
+      approval({
+        kind: "some_tool_nobody_declared",
+        payload: { path: "/tmp/a" },
+      }),
+      askers,
+      NOW,
+    );
+    const withDestination = decisionLabel(
+      approval({
+        kind: "some_tool_nobody_declared",
+        payload: { destination: "/tmp/a" },
+      }),
+      askers,
+      NOW,
+    );
+    expect(withPath).not.toBe(withDestination);
+    expect(withPath).toContain("path: /tmp/a");
+    expect(withDestination).toContain("destination: /tmp/a");
+  });
+
+  it("says why there is no lead when the host withheld the contents", () => {
+    // A non-admin's withheld card has no payload to lead with, but it must not
+    // read as an ordinary no-argument approval — the resolve route accepts any
+    // member, and the phrase is the one `ApprovalRow` already uses. The exact
+    // timestamp appears once, inside the composition phrase; the caller's own
+    // `request <timestamp>` suffix is what is omitted on redacted cards.
+    expect(
+      decisionLabel(
+        approval({ kind: "payment.send", contents_hidden: true }),
+        askers,
+        NOW,
+      ),
+    ).toBe(
+      "Send a payment — details hidden by your role — composed 1m ago (1000) — asked by Sam",
+    );
+  });
+
+  it("keeps same-bucket hidden cards apart by the exact timestamp", () => {
+    // The relative phrase is bucketed, so two hidden cards composed in the same
+    // bucket read the same "composed 1m ago" — the exact timestamp in
+    // parentheses is the discriminator that still tells their buttons apart.
+    const first = decisionLabel(
+      approval({ kind: "payment.send", contents_hidden: true }),
+      askers,
+      61_000,
+    );
+    const second = decisionLabel(
+      approval({
+        kind: "payment.send",
+        contents_hidden: true,
+        at_millis: 2_000,
+      }),
+      askers,
+      61_000,
+    );
+    expect(first).not.toBe(second);
+    expect(first).toContain("(1000)");
+    expect(second).toContain("(2000)");
+    expect(first).not.toContain("request 1000");
+  });
+
+  it("keeps two hidden cards' decide buttons apart by their composition time", () => {
+    // Withheld contents are redacted to the same phrase on every card, so two
+    // hidden approvals of the same kind from the same asker would read alike —
+    // the composition time (non-sensitive, already on the card body) is what
+    // tells their buttons apart (#1411).
+    const earlier = decisionLabel(
+      approval({ kind: "payment.send", contents_hidden: true }),
+      askers,
+      61_000,
+    );
+    const later = decisionLabel(
+      approval({ kind: "payment.send", contents_hidden: true }),
+      askers,
+      3_601_000,
+    );
+    expect(earlier).not.toBe(later);
+    expect(earlier).toContain("composed 1m ago");
+    expect(later).toContain("composed 1h ago");
+  });
+
+  it("bounds one long value instead of becoming a wall of text", () => {
+    // The host bounds each value at 2,000 characters, so a long shell command
+    // must not stretch the button name into one. The clip keeps the command's
+    // start and end, with an ellipsis for the middle.
+    const label = decisionLabel(
+      approval({ kind: "shell", payload: { command: "x".repeat(2_000) } }),
+      askers,
+      NOW,
+    );
+    expect(label.length).toBeLessThanOrEqual(160);
+    expect(label.startsWith("Run a terminal command — ")).toBe(true);
+    expect(label.endsWith(" — asked by Sam")).toBe(true);
+    const lead = label.slice(
+      "Run a terminal command — ".length,
+      -" — asked by Sam".length,
+    );
+    expect(lead.startsWith("x".repeat(59))).toBe(true);
+    expect(lead.endsWith("…" + "x".repeat(59))).toBe(true);
+  });
+
+  it("tells cards apart by a dropped entry past the first", () => {
+    // Five payload entries with the first four identical: the first dropped
+    // line (index 3) is the same, so a label carrying only it would leave both
+    // cards indistinguishable. The further dropped entry rides along too.
+    const first = decisionLabel(
+      approval({
+        kind: "http_request",
+        payload: {
+          url: "https://x.test",
+          method: "POST",
+          headers: "a: b",
+          body: '{"q": 1}',
+          extra1: "alpha",
+        },
+      }),
+      askers,
+      NOW,
+    );
+    const second = decisionLabel(
+      approval({
+        kind: "http_request",
+        payload: {
+          url: "https://x.test",
+          method: "POST",
+          headers: "a: b",
+          body: '{"q": 1}',
+          extra1: "beta",
+        },
+      }),
+      askers,
+      NOW,
+    );
+    expect(first).not.toBe(second);
+    expect(first).toContain("extra1: alpha");
+    expect(second).toContain("extra1: beta");
+  });
+});
+
 describe("whether a payload lead was cut to fit the compact row", () => {
   const request = (body: string) =>
-    approval({ kind: "http_request", payload: { url: "https://x.test", method: "POST", body } });
+    approval({
+      kind: "http_request",
+      payload: { url: "https://x.test", method: "POST", body },
+    });
 
   it("is false when no promoted extra is previewed", () => {
     expect(payloadLeadTruncated(request("small"))).toBe(false);
@@ -133,30 +417,36 @@ describe("whether a payload lead was cut to fit the compact row", () => {
 
   it("is false for a kind that promotes nothing past the lead", () => {
     expect(
-      payloadLeadTruncated(approval({ kind: "web_fetch", payload: { url: "x".repeat(500) } })),
+      payloadLeadTruncated(
+        approval({ kind: "web_fetch", payload: { url: "x".repeat(500) } }),
+      ),
     ).toBe(false);
   });
 
   it("is false when there is no payload to show", () => {
-    expect(payloadLeadTruncated(approval({ kind: "http_request" }))).toBe(false);
+    expect(payloadLeadTruncated(approval({ kind: "http_request" }))).toBe(
+      false,
+    );
   });
 });
 
 describe("a kind nobody has named", () => {
   it("says a teammate wants a tool rather than inventing one", () => {
-    expect(approvalAction(approval({ kind: "some_tool_nobody_declared" }))).toBe(
-      "Use one of its tools",
-    );
+    expect(
+      approvalAction(approval({ kind: "some_tool_nobody_declared" })),
+    ).toBe("Use one of its tools");
   });
 
   it("says less again when there is no teammate to name", () => {
-    expect(approvalAction(approval({ kind: "some.native.effect", agent: null }))).toBe(
-      "Do something that needs your sign-off",
-    );
+    expect(
+      approvalAction(approval({ kind: "some.native.effect", agent: null })),
+    ).toBe("Do something that needs your sign-off");
   });
 
   it("falls back the same way from the permissions list", () => {
-    expect(toolAction("some_tool_nobody_declared")).toBe("Use one of its tools");
+    expect(toolAction("some_tool_nobody_declared")).toBe(
+      "Use one of its tools",
+    );
   });
 });
 
@@ -171,7 +461,9 @@ describe("a kind nobody has named", () => {
  * Both kinds are asserted here on purpose: the toolkit case alone is what CI and
  * review already had, and it stayed green through the whole of #785.
  */
-function grant(over: Partial<StandingGrant> & Pick<StandingGrant, "tool">): StandingGrant {
+function grant(
+  over: Partial<StandingGrant> & Pick<StandingGrant, "tool">,
+): StandingGrant {
   return {
     id: "g1",
     agent: "ceo",
@@ -185,9 +477,9 @@ function grant(over: Partial<StandingGrant> & Pick<StandingGrant, "tool">): Stan
 
 describe("what a standing permission covers", () => {
   it("keeps a host scope verbatim, scheme and all", () => {
-    expect(grantHeadline(grant({ tool: "web_fetch", scope: "https://docs.rs" }))).toBe(
-      "Fetch a web page — https://docs.rs only",
-    );
+    expect(
+      grantHeadline(grant({ tool: "web_fetch", scope: "https://docs.rs" })),
+    ).toBe("Fetch a web page — https://docs.rs only");
   });
 
   it("keeps the scheme of every origin shape the host can mint", () => {
@@ -206,19 +498,25 @@ describe("what a standing permission covers", () => {
 
   it("still spells a toolkit slug out for an operator", () => {
     expect(
-      grantHeadline(grant({ tool: "composio_execute", scope: "microsoft_teams" })),
+      grantHeadline(
+        grant({ tool: "composio_execute", scope: "microsoft_teams" }),
+      ),
     ).toBe("Act in one of its connected accounts — Microsoft Teams only");
   });
 
   it("says only the action when the grant narrows to nothing", () => {
-    expect(grantHeadline(grant({ tool: "file_write" }))).toBe("Write a file in its workspace");
+    expect(grantHeadline(grant({ tool: "file_write" }))).toBe(
+      "Write a file in its workspace",
+    );
   });
 
   it("prefaces a standing refusal with 'Don't allow'", () => {
     // Issue #1458: the grants list now carries denials too, and the headline
     // has to say the permission is a refusal, not an allowance.
     expect(
-      grantHeadline(grant({ tool: "web_fetch", verdict: "deny", scope: "https://docs.rs" })),
+      grantHeadline(
+        grant({ tool: "web_fetch", verdict: "deny", scope: "https://docs.rs" }),
+      ),
     ).toBe("Don't allow Fetch a web page — https://docs.rs only");
     expect(grantHeadline(grant({ tool: "file_write", verdict: "deny" }))).toBe(
       "Don't allow Write a file in its workspace",

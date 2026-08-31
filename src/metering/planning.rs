@@ -68,7 +68,14 @@ use super::inference::{UNATTRIBUTED_AGENT, inference_ledger_entry};
 /// `agent` is not a parameter. Attribution to [`UNATTRIBUTED_AGENT`] is the
 /// rule this module exists to hold (see the module docs), so a caller cannot
 /// pass a teammate id in and quietly bill planning to a desk.
-pub fn planning_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample> {
+///
+/// `model` is the classified [`ModelSlug`](crate::metering::ModelSlug) the pass
+/// ran against, or `None` when the caller cannot name one (issue #1749).
+pub fn planning_sample(
+    usage: &TokenUsage,
+    provider: &str,
+    model: Option<crate::metering::ModelSlug>,
+) -> Option<UsageSample> {
     if usage.is_zero() {
         return None;
     }
@@ -82,6 +89,7 @@ pub fn planning_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample
         cost_usd: usage.cost_usd,
         kind: SampleKind::PlanningCall,
         run_id: None,
+        model,
     })
 }
 
@@ -99,6 +107,7 @@ pub fn planning_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample
 pub async fn record_planning_usage(
     usage: &TokenUsage,
     provider: &str,
+    model: Option<crate::metering::ModelSlug>,
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: &dyn UsageMeter,
@@ -124,7 +133,7 @@ pub async fn record_planning_usage(
             "[usage] failed to append the planning spend entry; the plan itself was written"
         );
     }
-    if let Some(sample) = planning_sample(usage, provider)
+    if let Some(sample) = planning_sample(usage, provider, model)
         && let Err(err) = meter.record(company, &sample).await
     {
         tracing::warn!(
@@ -155,7 +164,8 @@ mod test {
     /// daily cap must not be unable to have work planned for it.
     #[test]
     fn a_planning_sample_is_charged_to_the_company_with_no_run() {
-        let sample = planning_sample(&usage_with(0.4), "managed").expect("a real pass meters");
+        let sample =
+            planning_sample(&usage_with(0.4), "managed", None).expect("a real pass meters");
         assert_eq!(sample.agent, UNATTRIBUTED_AGENT);
         assert_eq!(sample.agent, "company");
         assert_eq!(sample.kind, SampleKind::PlanningCall);
@@ -175,9 +185,9 @@ mod test {
     /// backend.
     #[test]
     fn the_provider_slug_is_normalised() {
-        let sample = planning_sample(&usage_with(0.1), "  MANAGED ").expect("sample");
+        let sample = planning_sample(&usage_with(0.1), "  MANAGED ", None).expect("sample");
         assert_eq!(sample.provider, "managed");
-        let blank = planning_sample(&usage_with(0.1), "").expect("sample");
+        let blank = planning_sample(&usage_with(0.1), "", None).expect("sample");
         assert_eq!(blank.provider, crate::metering::UNKNOWN_PROVIDER);
     }
 
@@ -186,7 +196,7 @@ mod test {
     /// real free call.
     #[test]
     fn a_zero_pass_writes_no_sample() {
-        assert!(planning_sample(&TokenUsage::default(), "managed").is_none());
+        assert!(planning_sample(&TokenUsage::default(), "managed", None).is_none());
         // Cost alone is enough to be worth recording, and so are tokens alone.
         assert!(
             planning_sample(
@@ -194,7 +204,8 @@ mod test {
                     cost_usd: 0.01,
                     ..TokenUsage::default()
                 },
-                "managed"
+                "managed",
+                None
             )
             .is_some()
         );
@@ -204,7 +215,8 @@ mod test {
                     input: 1,
                     ..TokenUsage::default()
                 },
-                "managed"
+                "managed",
+                None
             )
             .is_some()
         );

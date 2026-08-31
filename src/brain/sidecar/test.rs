@@ -113,8 +113,10 @@ fn operator_request() -> CycleRequest {
             by: None,
             chat: None,
             deliverable: None,
+            attachments: Vec::new(),
         }],
         event_seqs: Vec::new(),
+        policy: None,
     }
 }
 
@@ -384,6 +386,40 @@ async fn duplicate_frame_is_handled_once() {
 }
 
 #[tokio::test]
+async fn request_approval_refuses_later_effect_and_tool_frames() {
+    let transport = Arc::new(MockSidecarTransport::new());
+    transport.script_cycle(
+        cid(),
+        vec![
+            tool_call_frame(
+                crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND,
+                0,
+                json!({ "title": "Send the message", "question": "May I send it?" }),
+            ),
+            effect_frame(
+                "send_dm",
+                1,
+                json!({ "to": "operator", "body": "too early" }),
+            ),
+            tool_call_frame("noop", 2, json!({ "too": "late" })),
+        ],
+    );
+    let brain = brain(transport.clone(), Arc::new(MockInferenceClient::new()));
+    let host = RecordingHost::executing();
+
+    let result = brain.run_cycle(operator_request(), &host).await.unwrap();
+
+    assert!(result.channel_responses.is_empty());
+    assert!(host.effects.lock().unwrap().is_empty());
+    assert_eq!(host.tool_calls.lock().unwrap().len(), 1);
+    assert_eq!(transport.acks().len(), 1);
+    assert!(!transport.acks()[0].ok);
+    assert_eq!(transport.tool_answers().len(), 2);
+    assert!(transport.tool_answers()[0].ok);
+    assert!(!transport.tool_answers()[1].ok);
+}
+
+#[tokio::test]
 async fn max_passes_caps_inference_frames() {
     let transport = Arc::new(MockSidecarTransport::new());
     transport.script_cycle(
@@ -435,7 +471,6 @@ fn debug_does_not_expose_internals_beyond_labels() {
 // ---------------------------------------------------------------------------
 
 use crate::company::CompanyManifest;
-use crate::ports::types::{Actor, ActorKind, Verdict};
 use crate::runtime::RuntimeBuilder;
 
 fn tmp_home() -> tempfile::TempDir {
@@ -514,6 +549,7 @@ async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
             by: None,
             chat: None,
             deliverable: None,
+            attachments: Vec::new(),
         }])
         .await
         .unwrap();
@@ -547,7 +583,7 @@ async fn e2e_inference_then_gated_send_dm_drives_a_channel_response() {
 }
 
 #[tokio::test]
-async fn e2e_supervised_effect_parks_through_the_real_gate() {
+async fn e2e_supervised_effect_runs_without_policy_hitl() {
     let home_dir = tmp_home();
     let home = home_dir.path().to_path_buf();
     let transport = Arc::new(MockSidecarTransport::new());
@@ -571,6 +607,7 @@ async fn e2e_supervised_effect_parks_through_the_real_gate() {
             by: None,
             chat: None,
             deliverable: None,
+            attachments: Vec::new(),
         }])
         .await
         .unwrap();
@@ -581,30 +618,19 @@ async fn e2e_supervised_effect_parks_through_the_real_gate() {
         transport.unmatched_cycles()
     );
 
-    // The Sign-group effect parked under supervised policy: an approval is
-    // queued and no channel response emitted.
-    assert_eq!(report.parked.len(), 1);
-    assert_eq!(rt.pending_approvals().len(), 1);
+    // Policy HITL is disabled on the production runtime gate. The Sign-group
+    // effect executes immediately even under supervised mode; only an explicit
+    // approval-producing tool creates a card.
+    assert!(report.parked.is_empty());
+    assert!(rt.pending_approvals().is_empty());
+    assert_eq!(report.executed_effects.len(), 1);
     assert!(report.responses.is_empty());
 
-    // The sidecar was told the effect is pending, not that it succeeded.
+    // The sidecar is told the effect succeeded rather than receiving a pending
+    // approval disposition.
     let acks = transport.acks();
     assert_eq!(acks.len(), 1);
-    assert!(!acks[0].ok);
-
-    // Resolving the approval drains the queue.
-    let approval_id = report.parked[0].clone();
-    rt.resolve_approval(
-        &approval_id,
-        Verdict::Approve,
-        Actor {
-            kind: ActorKind::Operator,
-            id: "owner".into(),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(rt.pending_approvals().is_empty());
+    assert!(acks[0].ok);
 }
 
 /// The trap that hid #800 for as long as the sidecar lane went unrun.

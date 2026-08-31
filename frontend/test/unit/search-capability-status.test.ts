@@ -38,6 +38,13 @@ describe("searchStatus", () => {
     ).toEqual({ label: "Not granted", variant: "secondary" });
   });
 
+  it("reports an omitted grant as unknown, never as not granted", () => {
+    expect(searchStatus(granted({ searchGranted: undefined }))).toEqual({
+      label: "Couldn't check",
+      variant: "outline",
+    });
+  });
+
   /** The regression this file exists for. */
   it("reports a company on its own provider as working with no managed credential", () => {
     const status = searchStatus(

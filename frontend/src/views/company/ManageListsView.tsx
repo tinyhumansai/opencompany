@@ -36,6 +36,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -75,9 +76,34 @@ export function ManageListsView({ client, company, ledgerNav, onBack }: Props) {
   }, []);
 
   if (!company) {
+    /*
+      Named even here (codex review, #1785): this return used to run above the
+      header, so the page had no `h1` at all. No `actions` — "New list" needs a
+      company to declare one in — but the Back control stays, because
+      `history.back()` is the one thing that still works from this state.
+    */
     return (
-      <div className="p-6 text-sm text-muted-foreground">
-        Pick a company to manage its lists.
+      <div className="flex h-full min-h-0 flex-col gap-4 p-6">
+        <PageHeader
+          title="Manage lists"
+          className="-mx-6 -mt-6"
+          gutter="px-6"
+          leading={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2.5"
+              onClick={onBack}
+              data-testid="lists-back"
+            >
+              <ArrowLeft className="size-4" />
+              Back
+            </Button>
+          }
+        />
+        <p className="text-sm text-muted-foreground">
+          Pick a company to manage its lists.
+        </p>
       </div>
     );
   }
@@ -101,30 +127,47 @@ export function ManageListsView({ client, company, ledgerNav, onBack }: Props) {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 p-6">
-      <header className="space-y-2">
-        {/* `history.back()`, not a fixed destination (issue #1284): this
-            screen is reached from wherever a list's own switcher was open,
-            not from one canonical parent, so the way back has to be
-            wherever the operator actually came from. */}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="w-fit"
-          onClick={onBack}
-          data-testid="lists-back"
-        >
-          <ArrowLeft className="mr-2 size-4" />
-          Back
-        </Button>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="text-xl font-semibold">Manage lists</h1>
-            <p className="text-sm text-muted-foreground">
-              Every list this company tracks — its own board, plus whatever else
-              it records. Reach any of them from the switcher on its own title;
-              retire one here.
-            </p>
-          </div>
+      <PageHeader
+        title="Manage lists"
+        className="-mx-6 -mt-6"
+        // The bleed puts the bar on the surface's own edges; the body sits on
+        // the surface's `p-6`, so the row has to as well or the title and the
+        // first card disagree by 8px.
+        gutter="px-6"
+        leading={
+          /* `history.back()`, not a fixed destination (issue #1284): this
+             screen is reached from wherever a list's own switcher was open,
+             not from one canonical parent, so the way back has to be
+             wherever the operator actually came from.
+
+             Inside the header's row (`leading`) rather than above it. As a
+             preceding sibling it was the header's `-mx-6 -mt-6` bleed that
+             broke: that bleed assumes the header is the first child of the
+             `p-6` surface, and with the button in front of it the -24px top
+             margin pulled the bar over the button instead of over the
+             surface's padding. Measured in Chromium on 2026-08-26: the bar's
+             top edge sat 16px above the button's bottom edge and the `h1`
+             box overlapped the button's by 4px. `leading` is the shape
+             `PageHeader` documents for exactly this. */
+          <Button
+            variant="ghost"
+            size="sm"
+            className="-ml-2.5"
+            onClick={onBack}
+            data-testid="lists-back"
+          >
+            <ArrowLeft className="size-4" />
+            Back
+          </Button>
+        }
+        description={
+          <>
+            Every list this company tracks — its own board, plus whatever else
+            it records. Reach any of them from the switcher on its own title;
+            retire one here.
+          </>
+        }
+        actions={
           <Button
             size="sm"
             onClick={() => setDeclaring(true)}
@@ -138,8 +181,8 @@ export function ManageListsView({ client, company, ledgerNav, onBack }: Props) {
             <Plus className="mr-2 size-4" />
             New list
           </Button>
-        </div>
-      </header>
+        }
+      />
 
       {faults.length > 0 && (
         <Alert>
@@ -165,8 +208,8 @@ export function ManageListsView({ client, company, ledgerNav, onBack }: Props) {
           </div>
         ) : (
           ordered.map((held) => (
-            <Card key={held.slug}>
-              <CardContent className="flex flex-wrap items-center justify-between gap-3 py-2">
+            <Card key={held.slug} size="sm">
+              <CardContent className="flex flex-wrap items-center justify-between gap-3">
                 <a
                   href={withHostParam(`ledgers/${held.slug}`)}
                   data-testid={`managed-ledger-${held.slug}`}

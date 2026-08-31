@@ -41,9 +41,9 @@ documents, and does nothing else. Each agent's own `tools` narrows that further,
 so `search` has to appear on the scout, the analyst and the research agent
 individually — a company grant alone leaves an agent silently searchless.
 
-`[policy].mode = "supervised"` parks every consequential action, and
-`publish_artifact` is named in `always_approve` so it keeps being parked even if
-the studio is ever moved to a looser tier.
+Neither `[policy].mode = "supervised"` nor `always_approve` creates approval
+requests. Before publishing needs human sign-off, call `request_approval` with
+the exact decision and wait for the operator's answer.
 
 ## Ledgers
 
@@ -116,5 +116,7 @@ them into pains, rank the opportunities, deliver the digest. The
 
 ## What stops and waits for a person
 
-Deciding which opportunities to fund and pursue — plus, under `supervised`,
-every publish and every spend over a dollar.
+Deciding which opportunities to fund and pursue, every publish, and every spend
+over a dollar. Before any of these, call `request_approval` with the exact
+decision and wait for the operator's answer; `supervised` does not pause them
+automatically.

@@ -1047,6 +1047,7 @@ impl CompanyPages {
                     mime: None,
                     size: None,
                     sha256: None,
+                    adopted: false,
                 };
                 self.store.create(&self.company, &node, Some(content)).await
             }
@@ -1082,6 +1083,7 @@ impl CompanyPages {
                     mime: Some(COMPILED_MIME.to_string()),
                     size: None,
                     sha256: None,
+                    adopted: false,
                 };
                 self.store
                     .create_binary(&self.company, &node, bytes)

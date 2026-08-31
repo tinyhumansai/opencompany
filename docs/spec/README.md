@@ -91,6 +91,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/events.md](runtime/events.md) | `CompanyEvent` vocabulary + journal correlation rules |
 | [runtime/manifest.md](runtime/manifest.md) | `company.toml` schema, `agents.toml` compatibility |
 | [runtime/harnesses.md](runtime/harnesses.md) | Named execution engines: `built_in` vs `acp`, transports, per-agent binding |
+| [runtime/harnesses-acp.md](runtime/harnesses-acp.md) | The ACP transports in detail: `local` vs `runner`, readiness probing, resuming a teammate's session across a restart, and streaming its execution state while the turn runs |
 | [runtime/providers.md](runtime/providers.md) | Inference providers, dual-mode OpenRouter, per-harness credentials |
 | [runtime/globals.md](runtime/globals.md) | The global baseline every company gets: agents, workflows, skills, the starting tool belt, and `[globals].disable` |
 | [runtime/lifecycle.md](runtime/lifecycle.md) | Company state machine and durability |
@@ -115,6 +116,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/desktop-instances.md](runtime/desktop-instances.md) | Several local hosts on one machine: the roster, onboarding, dev runs |
 | [runtime/connectors.md](runtime/connectors.md) | Connectors: choosing where the runtime runs — this computer, TinyHumans Cloud, a remote gateway, or over SSH |
 | [runtime/offline.md](runtime/offline.md) | Running with no network: the configuration, what is not local, and the CI lane that proves it |
+| [runtime/analytics.md](runtime/analytics.md) | Product analytics: hosted tenants only, opaque identity, shape-not-content payloads, and the switch that turns it off |
 | [runtime/hub-console.md](runtime/hub-console.md) | One console deployment operating many hosts on other origins |
 | [security/agent-isolation.md](security/agent-isolation.md) | What confines an agent and what does not — enforced controls, the gaps, and the capability that survives every planned control |
 | [company-as-agent/README.md](company-as-agent/README.md) | Companies as economy citizens |

@@ -483,6 +483,24 @@ impl Bundle {
         self.dir.join("run-outputs.jsonl")
     }
 
+    /// Path to the unredacted step-detail log (`deep-trace.jsonl`, one
+    /// [`RunStepDetailRecord`] per line; last-write-wins per
+    /// `(run_id, step_seq)`, prune-to-newest-N runs per company).
+    ///
+    /// A sibling of [`run_steps_jsonl`](Self::run_steps_jsonl) rather than a
+    /// widening of it: the skeleton there is safe to render anywhere, this holds
+    /// raw arguments and raw output, and keeping them in separate files is what
+    /// lets the bodies be purged without touching run history.
+    ///
+    /// One shared log rather than a file per run, for the same reason its
+    /// siblings are: a run id is caller-minted and must never become a path
+    /// component the store did not mint.
+    ///
+    /// [`RunStepDetailRecord`]: crate::ports::deep_trace::RunStepDetailRecord
+    pub fn deep_trace_jsonl(&self) -> PathBuf {
+        self.dir.join("deep-trace.jsonl")
+    }
+
     /// The per-company schedule-fire claim subdirectory
     /// (`schedule_fires/<hashed-schedule-id>/<minute>`, one empty-ish marker
     /// file per claimed instant; #241).

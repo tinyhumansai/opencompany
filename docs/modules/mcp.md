@@ -76,27 +76,26 @@ role = "Researcher"
 tools = ["mcp:notion", "mcp:linear"]   # or "mcp:*"
 ```
 
-`mcp_call_tool` runs under a permissive OpenHuman `SecurityPolicy`; the
-company's own `ApprovalPolicy` tool policy remains the real per-call gate.
+`mcp_call_tool` runs under a permissive OpenHuman `SecurityPolicy`. It is still
+classified for audit, but policy-generated HITL is disabled.
 
-## What parks for approval
+## Approval behavior
 
-`mcp_call_tool` parks under the default `supervised` mode and is denied under
-`readonly`: it can perform any effect the remote server advertises, and it can
-never be granted standing for the same reason.
+`mcp_call_tool` does not automatically park under `supervised`. An agent that
+needs sign-off calls `request_approval` explicitly before invoking it.
+`readonly` remains a hard denial.
 
-`mcp_list_servers` and `mcp_list_tools` **never** park (issue #443). They read
+`mcp_list_servers` and `mcp_list_tools` do not require approval. They read
 local registration state with credentials already redacted and reach nothing.
 This matters more than one saved prompt: the persona brief appended to every
 MCP-granted agent *instructs* it to answer capability questions from a live
-`mcp_list_servers` call rather than from memory, so while these parked, the
-guidance written to stop stale answers could only be followed by interrupting an
-operator. An agent's very first move parked, before it had done anything.
+`mcp_list_servers` call rather than from memory. These reads must remain
+uninterrupted so the guidance that prevents stale answers is usable on an
+agent's first move.
 
-Both verdicts are declared in [`policy::consequence`](../../src/policy/consequence.rs)
-alongside every other tool, and a test builds the live toolbelt and fails if a
-wired tool has no declaration — so a new read-only bridge tool cannot quietly
-start asking for permission.
+The classifications remain declared in
+[`policy::consequence`](../../src/policy/consequence.rs) for audit and for a
+future policy-HITL mode.
 
 ## HTTP surface
 

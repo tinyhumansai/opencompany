@@ -407,6 +407,15 @@ impl WorkspaceStore for QuotaEnforcedWorkspace {
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         self.inner.delete(company, id).await
     }
+
+    /// Forwards to `self.inner.delete_if_empty` rather than the default trait
+    /// method — quota has nothing to say about a delete, but the default
+    /// would otherwise resolve `tree()`/`delete()` back through this
+    /// decorator as two separate calls and lose whatever tighter guarantee
+    /// the wrapped store provides. See the port doc.
+    async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        self.inner.delete_if_empty(company, id).await
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +442,7 @@ mod test {
             mime: Some("image/png".to_string()),
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 
@@ -606,6 +616,7 @@ mod test {
         let lying = WorkspaceNode {
             size: Some(1),
             sha256: Some("deadbeef".to_string()),
+            adopted: false,
             ..png("img", "hero.png")
         };
         store

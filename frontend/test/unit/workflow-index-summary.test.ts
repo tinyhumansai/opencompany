@@ -4,7 +4,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { WorkflowSummary } from "@/api/workflows";
+import type { WorkflowRunOutcome, WorkflowSummary } from "@/api/workflows";
 import {
   WorkflowIndex,
   workflowTriggerLine,
@@ -38,12 +38,15 @@ afterEach(() => {
   container.remove();
 });
 
-function render(mode: "cards" | "list") {
+function render(
+  mode: "cards" | "list",
+  runsByWorkflow: Map<string, WorkflowRunOutcome[]> = new Map(),
+) {
   act(() => {
     root.render(
       createElement(WorkflowIndex, {
         workflows: WORKFLOWS,
-        runsByWorkflow: new Map(),
+        runsByWorkflow,
         onSelect: () => {},
         mode,
         loading: false,
@@ -81,6 +84,31 @@ describe("workflow index summary facts", () => {
       expect(older.textContent).not.toContain("0 steps");
     });
   }
+
+  it("orders list rows by the latest run and puts workflows without runs last", () => {
+    const run = (workflowId: string, atMillis: number): WorkflowRunOutcome => ({
+      seq: atMillis,
+      atMillis,
+      workflowId,
+      scheduled: false,
+      deliveries: [],
+      pendingApprovals: [],
+    });
+
+    render(
+      "list",
+      new Map([
+        ["scheduled", [run("scheduled", 1_000)]],
+        ["manual", [run("manual", 3_000)]],
+      ]),
+    );
+
+    expect(
+      Array.from(container.querySelectorAll('[data-testid="workflow-list-row"]')).map((row) =>
+        row.querySelector("span[title]")?.getAttribute("title"),
+      ),
+    ).toEqual(["Manual review", "Scheduled digest", "Older host row"]);
+  });
 });
 
 describe("workflowTriggerLine", () => {

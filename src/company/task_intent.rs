@@ -70,6 +70,30 @@
 //!
 //! [`INFERENCE_TIERS`]: crate::company::INFERENCE_TIERS
 
+/// The greetings [`small_talk`] answers without a turn — a bare "hi" and its
+/// spellings, matched against the whole message like [`GREETINGS`] is.
+///
+/// A strict subset of [`GREETINGS`] (pinned by
+/// `every_pleasantry_is_also_a_greeting`), because the fast path may only ever
+/// fire on a message the triage already calls
+/// [`Chatter`](MessageTriage::Chatter). Widening this list can therefore never
+/// take a card away from a message that was getting one.
+const HELLOS: &[&str] = &[
+    "hi",
+    "hii",
+    "hey",
+    "hello",
+    "yo",
+    "sup",
+    "gm",
+    "good morning",
+    "good evening",
+];
+
+/// The thanks [`small_talk`] answers without a turn. Same subset rule as
+/// [`HELLOS`].
+const THANKS: &[&str] = &["thanks", "thank you", "ty", "thx", "cheers"];
+
 /// Bare greeting / acknowledgement messages that must never open a card, matched
 /// against the whole message (punctuation stripped). Kept short and exact so a
 /// longer message that merely *starts* with "ok" ("ok now build the page")
@@ -407,6 +431,21 @@ impl TriageOutcome {
     pub fn abstained(&self) -> bool {
         matches!(self.confidence, TriageConfidence::Abstained)
     }
+
+    /// Whether a rule *recognised* this message as chatter — a bare greeting
+    /// or acknowledgement (rule 2) or an empty message (rule 1) — as opposed to
+    /// `Chatter` being chosen because no rule matched at all (rule 6, the
+    /// abstention default; see [`abstained`](Self::abstained)).
+    ///
+    /// The distinction matters to callers that want to act on a *positive*
+    /// chatter classification (issue #1725's greeting fast path): an abstained
+    /// `Chatter` carries no claim about the message and is the escalation
+    /// trigger instead, so treating the two alike would fire the fast path on
+    /// every unclassifiable message, not just the ones the lexical layer
+    /// actually recognised as conversation.
+    pub fn is_matched_chatter(&self) -> bool {
+        self.confidence == TriageConfidence::Matched && self.triage == MessageTriage::Chatter
+    }
 }
 
 /// [`triage_message`], plus whether the answer was decided or fallen back to.
@@ -428,7 +467,7 @@ pub fn triage_message_detailed(text: &str) -> TriageOutcome {
 
     let lower = trimmed.to_lowercase();
     // Whole-message greeting/ack check (strip trailing punctuation first).
-    let bare = lower.trim_end_matches(['.', '!', '?', ' ']).trim();
+    let bare = bare_message(&lower);
     if GREETINGS.contains(&bare) {
         return matched(MessageTriage::Chatter);
     }
@@ -453,6 +492,70 @@ pub fn triage_message_detailed(text: &str) -> TriageOutcome {
         triage: MessageTriage::Chatter,
         confidence: TriageConfidence::Abstained,
     }
+}
+
+/// A lowercased message reduced to what the whole-message lists are matched
+/// against: trailing punctuation and spaces removed.
+///
+/// One implementation, because [`triage_message_detailed`] and [`small_talk`]
+/// must agree on what "the whole message" is — a fast path that normalised
+/// differently could answer a message the triage had not called
+/// [`Chatter`](MessageTriage::Chatter).
+fn bare_message(lower: &str) -> &str {
+    lower.trim_end_matches(['.', '!', '?', ' ']).trim()
+}
+
+/// A pleasantry that a turn adds nothing to (issue #1725).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmallTalk {
+    /// "hi", "hello", "good morning" — an opening, with no ask under it.
+    Hello,
+    /// "thanks", "cheers" — a closing, with no ask under it.
+    Thanks,
+}
+
+impl SmallTalk {
+    /// The one-line answer this pleasantry gets, in place of a turn.
+    ///
+    /// Deliberately generic and deliberately short. It carries no claim about
+    /// the company's state, so it cannot be wrong, and it names no capability,
+    /// so it cannot promise one — the two ways a canned reply goes bad.
+    pub fn reply(self) -> &'static str {
+        match self {
+            Self::Hello => "Hey! What can I help you with?",
+            Self::Thanks => "Anytime — just say the word if you need anything else.",
+        }
+    }
+}
+
+/// Whether `text` is a bare pleasantry that deserves an answer but no turn
+/// (issue #1725).
+///
+/// # Why this is narrower than [`GREETINGS`]
+///
+/// [`GREETINGS`] also holds acknowledgements — "yes", "no", "sure", "done",
+/// "ok". Those look like small talk in isolation and are nothing of the kind in
+/// a conversation: "yes" answering a teammate's *"shall I ship it?"* is an
+/// instruction, and short-circuiting it would drop a decision on the floor. The
+/// two lists this matches — [`HELLOS`] and [`THANKS`] — are the ones that mean
+/// the same thing whatever was said before them.
+///
+/// Both are subsets of [`GREETINGS`], so anything this answers is already
+/// [`MessageTriage::Chatter`]: the fast path can never take a card away from a
+/// message that was getting one.
+pub fn small_talk(text: &str) -> Option<SmallTalk> {
+    let lower = text.trim().to_lowercase();
+    let bare = bare_message(&lower);
+    if bare.is_empty() {
+        return None;
+    }
+    if HELLOS.contains(&bare) {
+        return Some(SmallTalk::Hello);
+    }
+    if THANKS.contains(&bare) {
+        return Some(SmallTalk::Thanks);
+    }
+    None
 }
 
 /// Returns a cleaned task title when `text` is an actionable request, else
@@ -1025,5 +1128,93 @@ mod tests {
     fn ack_prefix_then_request_still_fires() {
         // "ok" as a whole message is an ack, but not as a prefix of a real ask.
         assert!(detect_task_intent("ok now build the dashboard").is_some());
+    }
+
+    // ── Issue #1725: the small-talk fast path's own classifier ──
+
+    /// The reported message. "hi" is a pleasantry, in every spelling and
+    /// whatever punctuation and case it arrives in.
+    #[test]
+    fn a_bare_greeting_is_small_talk() {
+        for text in ["hi", "Hi", "  hi  ", "hi!", "Hello.", "hey", "Good morning"] {
+            assert_eq!(
+                small_talk(text),
+                Some(SmallTalk::Hello),
+                "{text:?} should be a greeting"
+            );
+        }
+        for text in ["thanks", "Thank you!", "cheers", "ty"] {
+            assert_eq!(
+                small_talk(text),
+                Some(SmallTalk::Thanks),
+                "{text:?} should be thanks"
+            );
+        }
+    }
+
+    /// The narrowing that keeps the fast path honest. An acknowledgement is
+    /// small talk on its own and an *instruction* in a conversation — "yes"
+    /// answering "shall I ship it?" must reach the turn that asked.
+    #[test]
+    fn an_acknowledgement_is_not_small_talk() {
+        for text in [
+            "yes", "no", "sure", "ok", "okay", "done", "lgtm", "got it", "nvm", "cool",
+        ] {
+            assert_eq!(small_talk(text), None, "{text:?} must still run a turn");
+        }
+    }
+
+    /// A greeting with an ask under it is an ask. The fast path matches the
+    /// whole message for exactly this reason.
+    #[test]
+    fn a_greeting_with_a_request_under_it_is_not_small_talk() {
+        for text in [
+            "hi, build the landing page",
+            "hey can you check the numbers?",
+            "thanks — now ship it",
+            "hi there team",
+        ] {
+            assert_eq!(small_talk(text), None, "{text:?} must still run a turn");
+        }
+    }
+
+    /// Nothing said is not a pleasantry: there is no one to greet back.
+    #[test]
+    fn an_empty_message_is_not_small_talk() {
+        assert_eq!(small_talk(""), None);
+        assert_eq!(small_talk("   "), None);
+        assert_eq!(small_talk("..."), None);
+    }
+
+    /// The subset invariant the fast path rests on: everything it answers is
+    /// already `Chatter`, so it can never take a card away from a message that
+    /// was getting one.
+    #[test]
+    fn every_pleasantry_is_also_a_greeting() {
+        for word in HELLOS.iter().chain(THANKS.iter()) {
+            assert!(
+                GREETINGS.contains(word),
+                "{word:?} is answered by the fast path but is not in GREETINGS"
+            );
+            assert_eq!(
+                triage_message(word),
+                MessageTriage::Chatter,
+                "{word:?} must triage as Chatter"
+            );
+            assert!(
+                !triage_message_detailed(word).abstained(),
+                "{word:?} must be a decision, not an abstention"
+            );
+        }
+    }
+
+    /// The canned replies say nothing that can go stale.
+    #[test]
+    fn the_canned_replies_are_short_and_claim_nothing() {
+        for talk in [SmallTalk::Hello, SmallTalk::Thanks] {
+            let reply = talk.reply();
+            assert!(!reply.trim().is_empty());
+            assert!(reply.chars().count() <= 80, "{reply:?} is too long");
+        }
     }
 }

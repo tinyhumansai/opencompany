@@ -30,7 +30,6 @@ use oh::mcp::registry::types::{ConnStatus, InstalledServer, McpTool};
 use oh::security::{SecurityPolicy, ToolOperation};
 use oh::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 
-use crate::company::Agent as ManifestAgent;
 use crate::company::mcp::{AuthMaterial, McpServerDecl, stdio_install_refusal};
 use crate::error::OpenCompanyError;
 use crate::harness::mcp_probe::{
@@ -38,7 +37,7 @@ use crate::harness::mcp_probe::{
 };
 use crate::ports::types::CompanyId;
 use crate::ports::usage::UsageMeter;
-use crate::runtime::tools::{grant_matches, grants_cover_server};
+use crate::runtime::tools::grants_cover_server;
 
 /// Builds a registry from a set of decls, keeping only the enabled ones.
 ///
@@ -93,22 +92,18 @@ pub fn registry_for_agent(
     }
 }
 
-/// Whether `agent`'s tool grants reach the MCP server named `name`, using the
-/// same glob semantics as every other tool grant (`mcp:*` = all, `mcp:notion` =
-/// exact).
-fn agent_grants_server(agent: &ManifestAgent, name: &str) -> bool {
-    let want = format!("mcp:{name}");
-    agent.tools.iter().any(|grant| grant_matches(grant, &want))
-}
-
 /// The credential substrings from the (enabled, grant-matched) servers this
 /// agent reaches — the known-secret set fed to
 /// [`scrub`](crate::harness::mcp_probe::scrub) so no configured credential can
-/// survive into an agent-visible error. Never serialized anywhere.
-pub fn granted_secrets(decls: &[McpServerDecl], agent: &ManifestAgent) -> Vec<String> {
+/// survive into an agent-visible error. `grants` must be the same effective
+/// grants passed to [`registry_for_agent`], rather than the raw manifest
+/// request, because an empty request inherits the company belt and therefore
+/// reaches every server that belt grants.
+/// Never serialized anywhere.
+pub fn granted_secrets(decls: &[McpServerDecl], grants: &[String]) -> Vec<String> {
     decls
         .iter()
-        .filter(|decl| decl.enabled && agent_grants_server(agent, &decl.name))
+        .filter(|decl| decl.enabled && grants_cover_server(grants, &decl.name))
         .flat_map(|decl| decl.auth.secret_values())
         .collect()
 }
@@ -499,7 +494,15 @@ impl Tool for OcMcpCallTool {
                     )
                     .await;
                 }
-                let mut result: ToolResult = result.rendered.into();
+                // A free function, not `.into()`. `ToolResult` moved into the
+                // shared `tinytools` vocabulary, and `McpToolResult` belongs to
+                // `tinymcp-bus` — two foreign types, so the orphan rule forbids
+                // the `From` impl this used to call. OpenHuman spells the
+                // conversion once, in `skills::types`, rather than at each call
+                // site, because written out by hand it is three chances to get
+                // the error flag the wrong way round.
+                let mut result: ToolResult =
+                    oh::skills::types::tool_result_from_mcp(result.rendered);
                 if options.prefer_markdown && result.markdown_formatted.is_none() {
                     result.markdown_formatted = Some(result.output());
                 }
@@ -524,7 +527,19 @@ fn required_string_arg(args: &Value, key: &str) -> anyhow::Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing required `{key}`"))?;
-    Ok(value.to_string())
+    // Models routinely wrap identifiers in markdown emphasis when they answer
+    // in prose style (`server: \`werkplaats\``). A trailing backtick is part of
+    // the markdown, not the name: strip wrapping / trailing fence characters
+    // so the registry lookup matches the configured server name. Only *leading
+    // and trailing* occurrences are removed — a legitimate name never starts
+    // or ends with one of these, so stripping cannot mangle a real id.
+    let cleaned = value
+        .trim_start_matches(['`', '*', '_'])
+        .trim_end_matches(['`', '*', '_', '.', ',', ';', ':', '!']);
+    if cleaned.is_empty() {
+        return Err(anyhow::anyhow!("missing required `{key}`"));
+    }
+    Ok(cleaned.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -870,32 +885,25 @@ mod tests {
         g.iter().map(|s| s.to_string()).collect()
     }
 
-    fn agent(grants: &[&str]) -> ManifestAgent {
-        ManifestAgent {
-            global: false,
-            id: "ceo".into(),
-            role: "Chief".into(),
-            name: None,
-            description: None,
-            tier: None,
-            harness: None,
-            tools: grants.iter().map(|g| g.to_string()).collect(),
-            delegates_to: vec![],
-            context: None,
-            budget_usd_daily: None,
-            prompt: None,
-            prompt_files: Vec::new(),
-            prompt_files_resolved: Vec::new(),
-            classes: Vec::new(),
-            ledgers: None,
-            can_declare_ledgers: true,
-            model: None,
-        }
-    }
-
     #[test]
     fn empty_decls_yield_no_registry() {
         assert!(registry_for_agent(&[], &grants(&["mcp:*"])).is_none());
+    }
+
+    #[test]
+    fn server_name_strips_markdown_fences() {
+        // Models wrap identifiers in markdown when answering in prose style;
+        // the fence characters belong to the answer, not the server name
+        // (seen live: server="werkplaats`" -> "unknown mcp server `werkplaats``").
+        let mk = |v: &str| serde_json::json!({ "server": v });
+        let parsed = |v: &str| required_string_arg(&mk(v), "server").unwrap();
+        assert_eq!(parsed("werkplaats"), "werkplaats");
+        assert_eq!(parsed("werkplaats`"), "werkplaats");
+        assert_eq!(parsed("`werkplaats`"), "werkplaats");
+        assert_eq!(parsed("*werkplaats*"), "werkplaats");
+        assert_eq!(parsed("werkplaats."), "werkplaats");
+        assert_eq!(parsed("werk"), "werk");
+        assert!(required_string_arg(&mk("```"), "server").is_err());
     }
 
     #[test]
@@ -1084,6 +1092,21 @@ mod tests {
         assert!(result.output().contains("remote ran ok"));
     }
 
+    /// An empty raw request inherits the company belt at the builder seam. The
+    /// scrubber must receive those effective grants too, or an MCP credential
+    /// echoed by a server can reach the agent-visible failure even though the
+    /// registry correctly wires that server.
+    #[test]
+    fn granted_secrets_follows_effective_grants() {
+        let mut server = decl("fixture", "http://127.0.0.1:1/mcp");
+        server.auth = AuthMaterial::Bearer("inherited-canary".into());
+        let inherited = granted_secrets(std::slice::from_ref(&server), &grants(&["*", "mcp:*"]));
+        assert_eq!(inherited, vec!["inherited-canary"]);
+
+        let omitted = granted_secrets(std::slice::from_ref(&server), &grants(&["*"]));
+        assert!(omitted.is_empty());
+    }
+
     /// SECURITY CANARY: a server that **reflects the submitted credential** in a
     /// non-401 error body must not leak it anywhere the `OcMcpCallTool` decorator
     /// surfaces — not the agent-visible result, and not the drained failure. This
@@ -1148,8 +1171,7 @@ mod tests {
         let endpoint = format!("http://{addr}/mcp");
         let mut d = decl("fixture", &endpoint);
         d.auth = AuthMaterial::Bearer(CANARY.into());
-        let agent = agent(&["mcp:*"]);
-        let secrets = granted_secrets(std::slice::from_ref(&d), &agent);
+        let secrets = granted_secrets(std::slice::from_ref(&d), &grants(&["mcp:*"]));
         let registry = registry_for_agent(&[d], &grants(&["mcp:*"])).expect("registry");
 
         let queue = McpFailureQueue::default();

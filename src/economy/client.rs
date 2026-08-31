@@ -750,7 +750,7 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, slot) in w.iter_mut().enumerate().take(16) {
             let b = i * 4;

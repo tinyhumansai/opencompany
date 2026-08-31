@@ -21,6 +21,10 @@
 pub mod acp;
 pub mod commands;
 pub mod embedded;
+/// Who is sitting at this machine, as the OS already knows — read once, to
+/// prefill a profile nobody has filled in yet. See the module docs for why it is
+/// a suggestion and never an import.
+pub mod identity;
 pub mod keychain;
 pub mod local;
 pub mod proxy;
@@ -111,12 +115,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::oc_connect,
             commands::oc_pair_device,
+            commands::oc_adopt_session,
             commands::oc_forget_device,
             commands::oc_disconnect,
             commands::oc_connections,
             commands::oc_request,
             commands::oc_subscribe,
             commands::oc_embedded,
+            commands::oc_device_identity,
             commands::oc_local_instances,
             commands::oc_create_local_instance,
             commands::oc_start_local_instance,

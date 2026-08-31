@@ -190,8 +190,10 @@ pub fn dump(manifest: &CompanyManifest) -> Vec<AgentPrompt> {
 }
 
 fn dump_agent(manifest: &CompanyManifest, agent: &Agent, orchestrator: bool) -> AgentPrompt {
-    let grants =
-        crate::runtime::builder::agent_effective_grants(&manifest.tools.allow, &agent.tools);
+    let grants = crate::runtime::builder::agent_effective_grants(
+        &manifest.tools.allow,
+        agent.tools.as_deref(),
+    );
     let mut sections = Vec::new();
     let mut deferred = Vec::new();
 
@@ -379,6 +381,32 @@ fn harness_sections(
         title: "MCP capability brief".to_string(),
         reason: "appended only when this agent is granted an enabled MCP server, which needs a configured registry".to_string(),
     });
+
+    // Issue #1759: the connected-integration grounding + Composio-routing brief.
+    // Appended by `build_agent` only when the Composio tools are actually wired
+    // (an explicit `composio` grant AND a credential resolved for this company),
+    // and its text names this company's connected toolkits — neither of which a
+    // manifest alone can know, so it is reported deferred rather than guessed at.
+    //
+    // PR #1780 review: the composition call site in `build_agent` is compiled
+    // only under `#[cfg(feature = "composio")]` (`harness/built_in/build.rs`),
+    // so a binary built without that feature — the standard
+    // `scripts/dump-prompt.sh` invocation enables only `openhuman` — can never
+    // include this brief, no matter what the grant or credential state is at
+    // runtime. Saying "may appear once the grant and credential resolve" in
+    // that build misdescribes a compile-time absence as a runtime-deferred
+    // one. Mirror the `#[cfg(not(feature = "openhuman"))]` split below: name
+    // the missing feature instead of implying the section is reachable.
+    #[cfg(feature = "composio")]
+    deferred.push(Deferred {
+        title: "Connected integrations brief".to_string(),
+        reason: "appended only when this agent explicitly grants `composio` and a Composio credential resolves for the company; its toolkit list needs the live connection state".to_string(),
+    });
+    #[cfg(not(feature = "composio"))]
+    deferred.push(Deferred {
+        title: "Connected integrations brief".to_string(),
+        reason: "this binary was built without `--features composio`, so the harness that composes this brief is not linked; rebuild with `--features openhuman,composio` to see it".to_string(),
+    });
 }
 
 #[cfg(not(feature = "openhuman"))]
@@ -538,5 +566,73 @@ mod tests {
         let fenced = fence("before\n```rust\nlet x = 1;\n```\nafter");
         assert!(fenced.starts_with("````text\n"), "{fenced}");
         assert!(fenced.trim_end().ends_with("````"), "{fenced}");
+    }
+
+    /// PR #1780 review: `build_agent`'s call site for the connected-integrations
+    /// brief is compiled only under `#[cfg(feature = "composio")]`
+    /// (`harness/built_in/build.rs`), so in a binary built without that
+    /// feature — the standard `scripts/dump-prompt.sh` invocation enables only
+    /// `openhuman` — the brief can never be appended, no matter what the grant
+    /// or credential state is at runtime. The deferred reason must say the
+    /// feature is missing, not describe compile-time absence as something that
+    /// "may appear once the grant and credential resolve".
+    ///
+    /// Same feature gate as the sandbox tests above: `harness_sections` under
+    /// `#[cfg(feature = "openhuman")]` is the only place that pushes this
+    /// entry, and this test needs `composio` compiled *out* to reach the
+    /// branch it is checking.
+    #[test]
+    #[cfg(all(feature = "openhuman", not(feature = "composio")))]
+    fn without_composio_the_connected_integrations_brief_names_the_missing_feature() {
+        let manifest = manifest(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"pm\"\nrole = \"Product Manager\"\n",
+        );
+        let dumped = dump(&manifest);
+        let entry = dumped[0]
+            .deferred
+            .iter()
+            .find(|d| d.title == "Connected integrations brief")
+            .expect("always deferred outside a live build");
+        assert!(
+            entry.reason.contains("--features composio"),
+            "a binary without `composio` can never compile in the call site that appends \
+             this brief, so the reason must name the missing feature: {}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("credential resolves"),
+            "must not describe this as runtime-deferred when a `composio`-less binary can \
+             never include it regardless of grant or credential state: {}",
+            entry.reason
+        );
+    }
+
+    /// The inverse of the test above: once `composio` IS compiled in, the
+    /// section really is runtime-deferred (an explicit grant plus a resolved
+    /// credential decide it), so the reason must keep describing that instead
+    /// of claiming the feature is missing.
+    #[test]
+    #[cfg(feature = "composio")]
+    fn with_composio_the_connected_integrations_brief_stays_runtime_deferred() {
+        let manifest = manifest(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"pm\"\nrole = \"Product Manager\"\n",
+        );
+        let dumped = dump(&manifest);
+        let entry = dumped[0]
+            .deferred
+            .iter()
+            .find(|d| d.title == "Connected integrations brief")
+            .expect("always deferred outside a live build");
+        assert!(
+            entry.reason.contains("credential resolves"),
+            "a `composio`-enabled binary can still include this brief once the grant and \
+             credential resolve, so the reason must keep saying so: {}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("--features composio"),
+            "must not claim the feature is missing when it is compiled in: {}",
+            entry.reason
+        );
     }
 }

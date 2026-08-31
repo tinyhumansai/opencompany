@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, ChevronRight, Loader2, LogIn, Search, Unplug } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronRight,
+  Loader2,
+  LogIn,
+  Search,
+  ShieldCheck,
+  Unplug,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -56,6 +65,18 @@ interface Props {
   degraded: string | null;
   /** The host has not answered yet. */
   loading: boolean;
+  /**
+   * Grant the `composio` tool namespace (issue #1796).
+   *
+   * A callback rather than a write of its own, for the reason stated below: this
+   * grid decides nothing and calls nothing. What it contributes is the *place* —
+   * the operator reading "connected" next to a tile is the one who needs to know
+   * their agents still cannot use it, and the fix belongs where the complaint
+   * is, not only in a section further up the page.
+   */
+  onGrant?: () => void;
+  /** Whether that grant is in flight, so the control can say so. */
+  granting?: boolean;
   onConnect: (provider: GridProvider) => void;
   onDisconnect: (provider: GridProvider) => void;
   /** Open a connected provider's detail view (issue #404). */
@@ -95,6 +116,8 @@ export function ProvidersSection({
   openMode,
   degraded,
   loading,
+  onGrant,
+  granting = false,
   onConnect,
   onDisconnect,
   onOpen,
@@ -134,7 +157,7 @@ export function ProvidersSection({
     <section className="space-y-3">
       <SectionHeading count={connectedCount} />
       <Card>
-        <CardContent className="space-y-2 py-4">
+        <CardContent className="space-y-2">
           {noCredential && (
             <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
               {canManage
@@ -149,15 +172,37 @@ export function ProvidersSection({
             // still cannot use it. The connection itself is real — the grant
             // governs the tool belt, not the handshake (issue #582). Fires only
             // on an explicit not-granted, never on an unchecked grant (#1478).
-            <p className="flex items-start gap-2 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
-              <AlertTriangle className="mt-px size-3 shrink-0" />
-              <span>
-                These accounts are connected, but this company does not grant the{" "}
-                <span className="font-mono">composio</span> tool namespace, so its teammates will
-                not receive their tools yet. Add <span className="font-mono">composio</span> to the
-                company&apos;s tool grants.
+            <div
+              className="flex flex-col gap-2 rounded-md bg-muted/40 p-2 text-xs text-muted-foreground"
+              data-testid="providers-not-granted"
+            >
+              <span className="flex items-start gap-2">
+                <AlertTriangle className="mt-px size-3 shrink-0" />
+                <span>
+                  These accounts are connected, but this company does not grant the{" "}
+                  <span className="font-mono">composio</span> tool namespace, so its teammates will
+                  not receive their tools yet.
+                </span>
               </span>
-            </p>
+              {canManage && onGrant ? (
+                <div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={granting}
+                    onClick={onGrant}
+                    data-testid="providers-not-granted-action"
+                  >
+                    {granting ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="size-4" />
+                    )}
+                    Grant composio
+                  </Button>
+                </div>
+              ) : null}
+            </div>
           )}
           {grant === "unknown" && connectedCount > 0 && (
             // Couldn't read the grant (issue #1478). Neither assert it is granted

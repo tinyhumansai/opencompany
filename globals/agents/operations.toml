@@ -11,13 +11,17 @@ tier = "reasoning"
 # teammate that company never wrote. A request is intersected with
 # `[tools].allow`, so this can only ever be narrower than what the company
 # permits, never wider.
-# Workspace writes included: keeping the record current is the job.
+# `workspace.*` is the read coverage; the exact `workspace.write` token beside
+# it is what confers writes — only the bare `workspace` grant or the literal
+# `workspace.write` satisfy `grants_workspace_write_explicit`, so the glob
+# alone would leave this teammate read-only. Workspace writes included: keeping
+# the record current is the job.
 # `search` rides along for the same reason the researcher asks for it — an
 # overdue item is often blocked on something outside this company (a vendor's
 # status page, a policy, a filing deadline), and a teammate that cannot look it
 # up reports "blocked" without saying on what. Admitted only by an explicit
 # company grant, so it costs nothing where nobody opted in.
-tools = ["workspace.*", "docs.*", "files.*", "search"]
+tools = ["workspace.*", "workspace.write", "docs.*", "files.*", "search"]
 
 prompt = """
 You are the company's operations teammate. You keep the record straight: what

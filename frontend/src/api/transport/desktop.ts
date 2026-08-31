@@ -102,6 +102,44 @@ export function registerConnection(
 }
 
 /**
+ * Hands a sign-in's session to the core, as `id`'s credential (issue #1855).
+ *
+ * The desktop cannot hold a session the way a hub console does: the proxy
+ * strips a webview-supplied `x-opencompany-session` (`RESERVED_HEADERS`) and
+ * the event stream never takes caller headers at all — both on purpose, so the
+ * page never decides what a request authenticates as. The one place a sign-in's
+ * token can live and work is the core, which is where pairing always kept it.
+ *
+ * Sequenced behind whatever is parked under this id, like `forgetConnection`:
+ * an adoption racing an in-flight `oc_connect` would otherwise be overwritten
+ * by a registration that read the keychain before the session was in it.
+ *
+ * The returned promise REJECTS on failure, unlike `registerConnection`'s
+ * swallowed one, because this caller is a sign-in with a person behind it — a
+ * session that could not be stored must surface where they can retry, not as a
+ * mysterious 401 three requests later. The map entry parks the settled-either-
+ * way promise so later calls still sequence and nothing resurfaces.
+ */
+export function adoptSessionIntoCore(id: string, session: string): Promise<void> {
+  const desktop = tauriCore();
+  if (!desktop) return Promise.resolve();
+  const previous = registrations.get(id) ?? Promise.resolve();
+  const adopted = previous.then(() =>
+    desktop.invoke<void>("oc_adopt_session", { connectionId: id, session }),
+  );
+  registrations.set(
+    id,
+    adopted.then(
+      () => undefined,
+      (error: unknown) => {
+        console.error(`[desktop] could not adopt the session for ${id}`, error);
+      },
+    ),
+  );
+  return adopted;
+}
+
+/**
  * Drops a host from the core.
  *
  * Sequenced after any registration still in flight. This and

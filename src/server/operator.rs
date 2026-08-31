@@ -25,21 +25,24 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::AppState;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::events::EventStreamItem;
+use crate::ports::store::company_write_lock;
 use crate::ports::types::{
-    Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, EventSeq, OutboundMessage, OverlayDesk,
-    OverlayDeskMember, OverlayDeskOrder, StoredEvent, TurnStep, Verdict,
+    Actor, ActorKind, ApprovalId, Attachment, CompanyEvent, CompanyId, CompanyRecord, EventSeq,
+    OutboundMessage, OverlayDesk, OverlayDeskMember, OverlayDeskOrder, ResponderMode, StoredEvent,
+    TurnStep, Verdict,
 };
 use crate::runtime::grants::{GrantId, GrantScope, MAX_STANDING_GRANT_MILLIS};
 use crate::runtime::types::{ApprovalSummary, CompanyStatus, CycleReport};
 use crate::server::chat_history::{
-    CHAT_HISTORY_PAGE_LIMIT, MentionView, MessageView, ReactionView, Viewer,
-    channel_attributed_replies, history_for_desk,
+    CHAT_HISTORY_PAGE_LIMIT, MentionView, MessageView, ReactionView, Viewer, author_labels,
+    channel_attributed_replies, history_for_desk, project_mentions,
 };
 use crate::server::error::ApiError;
 use crate::server::graphql::auth::GqlAuth;
@@ -70,6 +73,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/companies/{id}/approvals/{aid}",
             post(resolve_approval),
         )
+        .route(
+            "/api/v1/companies/{id}/approvals/{aid}/extend",
+            post(extend_approval),
+        )
         // Single-company aliases (no id; resolved via the sole registered company).
         .route("/api/v1/company/chat", post(operator_chat_single))
         .route("/api/v1/company/chat/history", get(chat_history_single))
@@ -82,6 +89,10 @@ pub fn router() -> Router<AppState> {
             post(react_to_message_single),
         )
         .route("/api/v1/company/approvals", get(list_approvals_single))
+        .route(
+            "/api/v1/company/approvals/{aid}/extend",
+            post(extend_approval_single),
+        )
         .route(
             "/api/v1/company/approvals/{aid}",
             post(resolve_approval_single),
@@ -103,6 +114,11 @@ pub fn router() -> Router<AppState> {
         // Desk member ordering / hierarchy (issue #131): set the operator's
         // explicit member order for a desk. Registered under both scope forms.
         .merge(scoped("/desks/{desk_id}/order", put(set_desk_order)))
+        // The always-present, durable Operator feed — its own surface, not a
+        // desk (issue #1757 rework). Read-only identity lookup: the console
+        // pins it below a divider in the chat rail rather than folding it
+        // into `GET {scope}/desks`.
+        .merge(scoped("/operator-channel", get(operator_channel)))
         // The company → operator attention feed (issue #66): a live SSE stream of
         // the attention-worthy events already on the company's event log, under
         // both scope forms.
@@ -136,6 +152,15 @@ struct DeskDto {
     /// the blueprint and cannot be removed at runtime). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     overlay_members: Vec<String>,
+    /// How this desk's unmentioned messages find their answerer (issue #1835):
+    /// `"lead"` — `members[0]` leads and answers — or `"auto"`, a channel with
+    /// **no lead**, whose answerer is picked per message by best fit over the
+    /// membership. Omitted when `lead` (which is every manifest desk and every
+    /// desk created before the field existed), so old consoles and old wire
+    /// shapes are byte-for-byte unchanged. The console reads this to suppress
+    /// every lead affordance — crown, badge, Make-lead — on `auto` channels.
+    #[serde(skip_serializing_if = "ResponderMode::is_lead")]
+    responder: ResponderMode,
     /// Whether the whole desk was operator-created (an overlay desk) rather than
     /// declared in the manifest blueprint. The console offers a delete action
     /// only for these — blueprint desks cannot be deleted at runtime. Omitted
@@ -169,31 +194,145 @@ async fn list_desks(scope: ScopedCompany) -> Result<Json<Vec<DeskDto>>, crate::s
                     description: chat.description.clone(),
                     members,
                     overlay_members,
+                    // Manifest desks are always lead-routed — the blueprint
+                    // syntax carries no responder field (issue #1835).
+                    responder: ResponderMode::Lead,
                     overlay_created: false,
                 }
             });
-            let overlay_desks = record.overlay_desks.iter().map(|desk| {
-                let members = record.effective_desk_members(&desk.id);
-                // For an overlay desk the founding members are `desk.members`;
-                // anything beyond them came from the desk-member overlay.
-                let overlay_members = members
-                    .iter()
-                    .filter(|m| !desk.members.contains(m))
-                    .cloned()
-                    .collect();
-                DeskDto {
-                    id: desk.id.clone(),
-                    name: desk.name.clone(),
-                    description: desk.description.clone(),
-                    members,
-                    overlay_members,
-                    overlay_created: true,
-                }
-            });
+            // An overlay desk whose own **id** is a General spelling is not
+            // projected (issue #1781 review, Codex P2) — the grandfathered
+            // shape `POST .../desks` accepted `general` / `main` ids under
+            // before issue #1743 reserved them. `CompanyRecord::resolve_desk_id`
+            // already excludes exactly this desk from routing (see its own
+            // filter, same `is_general_chat(Some(&d.id))` check), so listing it
+            // here would show the console a desk `buildChannels` treats as the
+            // company-wide line — offering edit/delete controls and a member
+            // list that has nothing to do with where a message to it actually
+            // routes (the built-in `#general`, per `resolve_desk_id`'s
+            // fallback). Nothing is lost by hiding it: its transcript is
+            // already folded into `#general` by `is_general_chat`, and that
+            // channel's membership is the whole roster, a superset of whatever
+            // this desk held.
+            let overlay_desks = record
+                .overlay_desks
+                .iter()
+                .filter(|desk| !crate::server::chat_history::is_general_chat(Some(&desk.id)))
+                .map(|desk| {
+                    let members = record.effective_desk_members(&desk.id);
+                    // For an overlay desk the founding members are `desk.members`;
+                    // anything beyond them came from the desk-member overlay.
+                    let overlay_members = members
+                        .iter()
+                        .filter(|m| !desk.members.contains(m))
+                        .cloned()
+                        .collect();
+                    DeskDto {
+                        id: desk.id.clone(),
+                        name: desk.name.clone(),
+                        description: desk.description.clone(),
+                        members,
+                        overlay_members,
+                        responder: desk.responder,
+                        overlay_created: true,
+                    }
+                });
             manifest_desks.chain(overlay_desks).collect()
         })
+        // A company that failed to load surfaces no desks — the console falls
+        // back to its static default threads (issue #1757 rework: the Operator
+        // feed is its own surface now, fetched through `GET
+        // {scope}/operator-channel` rather than injected here).
         .unwrap_or_default();
     Ok(Json(desks))
+}
+
+/// The identity of the company's always-present, durable Operator feed
+/// (issue #1757 rework). Mirrors `OperatorChannelDto` in
+/// `frontend/src/api/types.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperatorChannelDto {
+    /// The channel id — the `desk` query param `GET
+    /// {scope}/chat/history?desk=<id>` reads its transcript through.
+    id: String,
+    /// Always "Operator" — the console's pinned-row label.
+    name: String,
+    /// The channel's purpose line, shown under the name in the pinned row.
+    description: String,
+}
+
+/// `GET {scope}/operator-channel` — the identity of the company's dedicated,
+/// durable Operator feed: where "what happened and what needs you" workflow
+/// reports and the owner/no-mailbox fallback land. A pinned surface, not a
+/// desk — the console renders it as its own row below a divider rather than
+/// folding it into `GET {scope}/desks`, and it carries no member or mutation
+/// routes.
+///
+/// `id` resolves through
+/// [`CompanyRecord::operator_feed_channel`](crate::ports::types::CompanyRecord::operator_feed_channel)
+/// — ordinarily [`OPERATOR_CHANNEL`](crate::runtime::OPERATOR_CHANNEL), or
+/// [`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK)
+/// for the one grandfathered company shape where a roster teammate already
+/// owns that id — so this and delivery
+/// (`workflows::delivery::send_to_channel_adapter`) always agree on where the
+/// feed lives. A company with no record yet still gets the default id, so the
+/// console always has a channel to point its history read at — but a store
+/// read failure is propagated as an error rather than silently answered with
+/// the default id: for the grandfathered collision-fallback company, treating
+/// a transient failure as "no record" would label the operator's real
+/// `operator-feed` transcript as `operator` while delivery keeps targeting the
+/// collision-aware address once the store recovers.
+async fn operator_channel(
+    scope: ScopedCompany,
+) -> Result<Json<OperatorChannelDto>, crate::server::Rejection> {
+    let id = scope
+        .runtime
+        .store()
+        .load(scope.id())
+        .await?
+        .map(|record| record.operator_feed_channel().to_string())
+        .unwrap_or_else(|| crate::runtime::OPERATOR_CHANNEL.to_string());
+    Ok(Json(OperatorChannelDto {
+        id,
+        name: "Operator".to_string(),
+        description: "Workflow reports and notifications — what happened and what needs you"
+            .to_string(),
+    }))
+}
+
+/// Whether `desk_id` names the built-in `#general` channel rather than a desk
+/// (issue #1743; restored PR #1781 review, CodeRabbit P2 — see below).
+///
+/// `#general` is the company-wide conversation this host has always folded
+/// every General spelling into — `general`, `General`, `main`, and the empty
+/// string all name it, which is exactly what
+/// [`is_general_chat`](crate::server::chat_history::is_general_chat) decides.
+/// It is deliberately **not** a desk: it has no lead, no hierarchy, and its
+/// membership is the whole roster derived at read time, so there is nothing
+/// for a desk mutation to change.
+///
+/// Guarded on **manifest** desks only, not `desk_exists` (id in manifest *or*
+/// overlay) as this predicate's original `da98130c1` shape checked: a company
+/// whose blueprint really does declare a `[[group_chat]]` with one of those
+/// ids keeps behaving exactly as it did, but an *overlay* desk can only ever
+/// hold a reserved id by predating the id/name guards `create_desk` has
+/// carried since `da98130c1` and `16dcce235` — the exact grandfathered shape
+/// `list_desks` and [`CompanyRecord::resolve_desk_id`] already keep out of the
+/// desk list and out of routing (`0c07873db`). Treating it as a real,
+/// mutable desk here would contradict that: every other surface already
+/// agrees it shadows General, not that it is a desk.
+///
+/// That read/list-side exclusion (`0c07873db`) is where the gap actually
+/// starts: this mutation-side guard (originally `da98130c1`) was dropped by
+/// an unrelated refactor (`3cbdb7a5f`) and never restored alongside it — a
+/// direct `POST`/`DELETE`/`PUT` to `.../desks/{id}` could still staff,
+/// reorder, or delete a desk no read surface exposes, and a write against a
+/// bare General spelling with no legacy overlay row regressed from this 409
+/// to a misleading 404.
+fn is_general_channel(record: &CompanyRecord, desk_id: &str) -> bool {
+    crate::server::chat_history::is_general_chat(Some(desk_id))
+        && !record.manifest.group_chats.iter().any(|c| c.id == desk_id)
 }
 
 /// The path of a desk sub-resource (`desk_id`).
@@ -240,12 +379,31 @@ async fn add_desk_member(
     Json(body): Json<AddDeskMember>,
 ) -> Result<StatusCode, ApiError> {
     let _guard = scope.runtime.serial.lock().await;
+    // Also take `company_write_lock`: this is a load-modify-save cycle over
+    // the whole record, exactly the shape every console `ops` writer
+    // serializes with that lock. `serial` alone only keeps this out of the
+    // way of a live agent cycle — it does nothing against a concurrent
+    // `ops` writer (e.g. `patch_company`'s rename), so without this a desk
+    // write that loaded the record before the rename landed can save the
+    // whole record back afterwards and silently revert it (PR #1875 review
+    // finding).
+    let write_lock = company_write_lock(scope.id());
+    let _write_guard = write_lock.lock().await;
     let mut record = scope
         .runtime
         .store()
         .load(scope.id())
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
+    // The built-in `#general` channel is not a desk and never was — refuse the
+    // write with the reason rather than letting it fall through to the
+    // desk-not-found answer below (issue #1743; restored PR #1781 review,
+    // CodeRabbit P2 — see `is_general_channel`'s own doc).
+    if is_general_channel(&record, &desk_id) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::GENERAL_CHANNEL_IMMUTABLE.to_string(),
+        )));
+    }
     // The desk must exist — either a manifest blueprint group chat or an
     // operator-created overlay desk (#140). A manifest-only check meant a desk
     // created in the console could be reordered and deleted but never staffed
@@ -297,12 +455,31 @@ async fn set_desk_order(
     Json(body): Json<SetDeskOrder>,
 ) -> Result<StatusCode, ApiError> {
     let _guard = scope.runtime.serial.lock().await;
+    // Also take `company_write_lock`: this is a load-modify-save cycle over
+    // the whole record, exactly the shape every console `ops` writer
+    // serializes with that lock. `serial` alone only keeps this out of the
+    // way of a live agent cycle — it does nothing against a concurrent
+    // `ops` writer (e.g. `patch_company`'s rename), so without this a desk
+    // write that loaded the record before the rename landed can save the
+    // whole record back afterwards and silently revert it (PR #1875 review
+    // finding).
+    let write_lock = company_write_lock(scope.id());
+    let _write_guard = write_lock.lock().await;
     let mut record = scope
         .runtime
         .store()
         .load(scope.id())
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
+    // The built-in `#general` channel is not a desk and never was — refuse the
+    // write with the reason rather than letting it fall through to the
+    // desk-not-found answer below (issue #1743; restored PR #1781 review,
+    // CodeRabbit P2 — see `is_general_channel`'s own doc).
+    if is_general_channel(&record, &desk_id) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::GENERAL_CHANNEL_IMMUTABLE.to_string(),
+        )));
+    }
     // The desk must exist — either a manifest blueprint group chat or an
     // operator-created overlay desk (#140). `desk_exists` covers both (the same
     // check `effective_desk_members` uses), so an operator-created desk can be
@@ -353,12 +530,31 @@ async fn remove_desk_member(
     Path(DeskMemberPath { desk_id, agent_id }): Path<DeskMemberPath>,
 ) -> Result<StatusCode, ApiError> {
     let _guard = scope.runtime.serial.lock().await;
+    // Also take `company_write_lock`: this is a load-modify-save cycle over
+    // the whole record, exactly the shape every console `ops` writer
+    // serializes with that lock. `serial` alone only keeps this out of the
+    // way of a live agent cycle — it does nothing against a concurrent
+    // `ops` writer (e.g. `patch_company`'s rename), so without this a desk
+    // write that loaded the record before the rename landed can save the
+    // whole record back afterwards and silently revert it (PR #1875 review
+    // finding).
+    let write_lock = company_write_lock(scope.id());
+    let _write_guard = write_lock.lock().await;
     let mut record = scope
         .runtime
         .store()
         .load(scope.id())
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
+    // The built-in `#general` channel is not a desk and never was — refuse the
+    // write with the reason rather than letting it fall through to the
+    // desk-not-found answer below (issue #1743; restored PR #1781 review,
+    // CodeRabbit P2 — see `is_general_channel`'s own doc).
+    if is_general_channel(&record, &desk_id) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::GENERAL_CHANNEL_IMMUTABLE.to_string(),
+        )));
+    }
     // First validate that the desk exists at all — otherwise a caller supplying
     // an unknown desk_id gets a desk-scoped 404 rather than a confusing
     // member-scoped one (Greptile feedback). Existence spans both blueprint and
@@ -419,11 +615,18 @@ struct CreateDesk {
     /// omitted.
     #[serde(default)]
     id: Option<String>,
-    /// The desk's founding member ids, in order (the first becomes the lead).
+    /// The desk's founding member ids, in order (the first becomes the lead —
+    /// unless `responder` is `"auto"`, in which case order carries no rank).
     /// Each must resolve to a roster teammate. Optional — a desk can start empty
     /// and gain members through the desk-member overlay.
     #[serde(default)]
     members: Vec<String>,
+    /// How the desk routes its unmentioned messages (issue #1835). Absent means
+    /// `"lead"` — today's model, and what every existing caller sends — so the
+    /// org chart's create is unchanged. `"auto"` creates a leadless channel
+    /// whose answerer is picked per message.
+    #[serde(default)]
+    responder: ResponderMode,
 }
 
 /// Derives a snake_case desk id from a display name: lowercase, runs of
@@ -472,6 +675,16 @@ async fn create_desk(
     Json(body): Json<CreateDesk>,
 ) -> Result<(StatusCode, Json<DeskDto>), ApiError> {
     let _guard = scope.runtime.serial.lock().await;
+    // Also take `company_write_lock`: this is a load-modify-save cycle over
+    // the whole record, exactly the shape every console `ops` writer
+    // serializes with that lock. `serial` alone only keeps this out of the
+    // way of a live agent cycle — it does nothing against a concurrent
+    // `ops` writer (e.g. `patch_company`'s rename), so without this a desk
+    // write that loaded the record before the rename landed can save the
+    // whole record back afterwards and silently revert it (PR #1875 review
+    // finding).
+    let write_lock = company_write_lock(scope.id());
+    let _write_guard = write_lock.lock().await;
     let mut record = scope
         .runtime
         .store()
@@ -495,6 +708,75 @@ async fn create_desk(
             "invalid desk id {id:?} — use lowercase letters, digits, and underscores"
         ))));
     }
+    // A desk that claimed one of the General spellings would shadow the
+    // built-in `#general` channel: the console would show two `#general` rows
+    // and the host would route messages addressed to it at this desk's lead
+    // instead of the orchestrator (issue #1743). Refused at creation, which
+    // costs nothing — no manifest can reach this path, so no existing company
+    // loses a desk.
+    //
+    // The **display name** is reserved for the same reason and not a weaker
+    // one: `resolve_desk_id` matches a desk by id *or* by case-insensitive
+    // name, so `{"id": "ops", "name": "General"}` shadows the channel just as
+    // thoroughly — `everyone_desk` folds the built-in `main` thread to
+    // `General`, that lookup then selects this desk, and `@everyone` on the
+    // company-wide line expands to its members instead of the roster.
+    if crate::server::chat_history::is_general_chat(Some(&id))
+        || crate::server::chat_history::is_general_chat(Some(&name))
+    {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::GENERAL_CHANNEL_RESERVED.to_string(),
+        )));
+    }
+    // Issue #1757: `operator` is reserved for the built-in, read-only Operator
+    // system channel — `desk_exists` alone would miss this, since the system
+    // channel is never a manifest or overlay desk. Without this, a created
+    // overlay desk with this id would collide with the system channel in the
+    // desk list, and every message to it would be refused by the read-only
+    // guard in `chat_and_emit`, which treats any `chat_id == OPERATOR_CHANNEL`
+    // as the system feed regardless of where it came from.
+    //
+    // The **display name** is reserved for the same reason the General
+    // display name is, above, and not a weaker one (PR #1781 review,
+    // CodeRabbit P2 follow-up to `316bc9229`): `CompanyRecord::resolve_desk_id`
+    // matches an overlay desk by id *or* case-insensitive name, so
+    // `{"id": "ops", "name": "Operator"}` resolves a `?desk=Operator` selector
+    // to this desk exactly as thoroughly as claiming the literal id would.
+    // Refused at creation like the General case above, for the same reason:
+    // no manifest can reach this API path, so no existing company loses a
+    // desk — a *newly created* overlay desk can never reach the shape below.
+    //
+    // A **manifest** desk grandfathered onto this name from before
+    // `316bc9229` — the case this creation guard cannot cover, since it
+    // already existed — used to hit exactly the mismatch this paragraph
+    // warned about: `ensure_desk_writable` (`company/runtime.rs`) checked the
+    // *raw* selector string against `OPERATOR_CHANNEL` before any resolution
+    // ran, so a write addressed to the desk's `Operator` alias was refused as
+    // the read-only system feed while a write addressed to its real id sailed
+    // straight through. Fixed (issue #1781 review, Codex P1 follow-up):
+    // `ensure_desk_writable` now resolves the raw selector through
+    // `resolve_desk_id` first, so it agrees with the read path on which desk
+    // a caller meant. The fallback address
+    // (`OPERATOR_CHANNEL_COLLISION_FALLBACK`, "operator-feed")
+    // is reserved by name for the identical reason `316bc9229` reserved it on
+    // the manifest side — `resolve_desk` folds a `?desk=` selector against it
+    // the same way — but not by id: `is_valid_desk_id` above already rejects
+    // any hyphen, so no `id` can ever equal the hyphenated fallback constant.
+    if id == crate::runtime::OPERATOR_CHANNEL
+        || name.eq_ignore_ascii_case(crate::runtime::OPERATOR_CHANNEL)
+    {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            "the id \"operator\" is reserved for the built-in Operator channel — choose a different id"
+                .to_string(),
+        )));
+    }
+    if name.eq_ignore_ascii_case(crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            "the name \"operator-feed\" is reserved for the built-in Operator channel's \
+             fallback feed — choose a different name"
+                .to_string(),
+        )));
+    }
     if record.desk_exists(&id) {
         return Err(ApiError(OpenCompanyError::Conflict(format!(
             "a desk with id {id:?} already exists"
@@ -513,6 +795,18 @@ async fn create_desk(
         }
     }
 
+    // An `auto` channel with nobody in it is unroutable by construction
+    // (issue #1835, codex review): the selector has no candidates and the
+    // first-member fallback has no first member, so an unmentioned message
+    // there would fall through to the orchestrator — contradicting the
+    // channel's own stated model. A *lead* desk may still start empty and be
+    // staffed from the org chart, exactly as before.
+    if !body.responder.is_lead() && members.is_empty() {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "a channel with per-message routing needs at least one member — with nobody in it, there is nobody to pick"
+                .to_string(),
+        )));
+    }
     let description = body
         .description
         .map(|d| d.trim().to_string())
@@ -522,6 +816,7 @@ async fn create_desk(
         name: name.clone(),
         description: description.clone(),
         members: members.clone(),
+        responder: body.responder,
     };
     record.overlay_desks.push(desk);
     scope.runtime.store().save(&record).await?;
@@ -535,6 +830,7 @@ async fn create_desk(
             description,
             members: effective,
             overlay_members: Vec::new(),
+            responder: body.responder,
             overlay_created: true,
         }),
     ))
@@ -550,6 +846,16 @@ async fn delete_desk(
     Path(DeskPath { desk_id }): Path<DeskPath>,
 ) -> Result<StatusCode, ApiError> {
     let _guard = scope.runtime.serial.lock().await;
+    // Also take `company_write_lock`: this is a load-modify-save cycle over
+    // the whole record, exactly the shape every console `ops` writer
+    // serializes with that lock. `serial` alone only keeps this out of the
+    // way of a live agent cycle — it does nothing against a concurrent
+    // `ops` writer (e.g. `patch_company`'s rename), so without this a desk
+    // write that loaded the record before the rename landed can save the
+    // whole record back afterwards and silently revert it (PR #1875 review
+    // finding).
+    let write_lock = company_write_lock(scope.id());
+    let _write_guard = write_lock.lock().await;
     let mut record = scope
         .runtime
         .store()
@@ -557,11 +863,32 @@ async fn delete_desk(
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(scope.id().to_string()))?;
 
+    // The built-in `#general` channel is not a desk and never was — refuse the
+    // write with the reason rather than letting it fall through to the
+    // desk-not-found answer below (issue #1743; restored PR #1781 review,
+    // CodeRabbit P2 — see `is_general_channel`'s own doc).
+    if is_general_channel(&record, &desk_id) {
+        return Err(ApiError(OpenCompanyError::Conflict(
+            language::GENERAL_CHANNEL_IMMUTABLE.to_string(),
+        )));
+    }
     // A manifest desk belongs to the blueprint — never deletable at runtime.
     if record.manifest.group_chats.iter().any(|c| c.id == desk_id) {
         return Err(ApiError(OpenCompanyError::Conflict(
             language::MANIFEST_DESK_DELETE.to_string(),
         )));
+    }
+    // Tombstone the operator-feed divert before it can be lost (issue #1781
+    // review, Codex P2): `operator_feed_channel` currently diverts only while
+    // *something* live holds the id or display name `operator`, and the desk
+    // this call is about to remove may be that something. Recorded here,
+    // before the removal, while the live check can still see it — see
+    // `CompanyRecord::divert_operator_feed_permanently`'s doc for why this
+    // has to survive the desk being gone.
+    if record.operator_feed_channel()
+        == crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK
+    {
+        record.divert_operator_feed_permanently();
     }
     let before = record.overlay_desks.len();
     record.overlay_desks.retain(|d| d.id != desk_id);
@@ -578,11 +905,76 @@ async fn delete_desk(
 
 /// Logs SSE stream teardown when the subscriber disconnects. Held inside the
 /// projection closure so it drops exactly when the response body is dropped.
-struct SseStreamGuard(CompanyId);
+///
+/// Also owns the label-refresh task's handle, so the periodic roster re-read
+/// dies with its connection instead of leaking for the process's lifetime.
+struct SseStreamGuard {
+    company: CompanyId,
+    /// One-shot stop signal for the label-refresh task. Sent before the handle
+    /// is aborted so the loop exits at its next sleep boundary rather than
+    /// waking once more to write a roster map nobody will read.
+    cancel: Option<oneshot::Sender<()>>,
+    label_refresh: Option<JoinHandle<()>>,
+}
 
 impl Drop for SseStreamGuard {
     fn drop(&mut self) {
-        tracing::debug!(company = %self.0, "operator SSE stream closed");
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(handle) = self.label_refresh.take() {
+            handle.abort();
+        }
+        tracing::debug!(company = %self.company, "operator SSE stream closed");
+    }
+}
+
+/// How often an open SSE stream re-reads the roster, so a mention chip for a
+/// user added or renamed after the stream opened picks up the new label.
+const LABEL_REFRESH_EVERY: Duration = Duration::from_secs(60);
+
+/// Re-derives whether `actor` (the human behind an open SSE connection) still
+/// holds admin access, for [`company_events`]'s periodic refresh AND its
+/// per-item revalidation of an owner-fallback report.
+///
+/// Fixes issue #1781 review (Codex P1): the `is_admin` this feeds used to be
+/// captured once at stream-open time and never reconsidered, so a mid-stream
+/// demotion kept projecting the admin-only owner-fallback report to the
+/// now-non-admin user for as long as their tab stayed open — `PATCH
+/// …/users/{id}` updates the stored role without revoking sessions on a plain
+/// demotion (only a suspension does that; see `src/server/users/admin.rs`'s
+/// `update_user`), and an already-open SSE response performs no further
+/// authentication of its own.
+///
+/// Returns `previous` unchanged only for the machine principal (`actor:
+/// None`, unrestricted by construction per [`ScopedCompany::is_admin`]'s own
+/// doc) — every other outcome (`Ok(None)`, the user record has gone missing,
+/// or `Err`, the store read itself failed) returns `false` (issue #1781
+/// review, Codex P1 follow-up to this fix). Fail-open on a lookup failure was
+/// the original shape, on the reasoning that "a transient read failure
+/// should not flip a live connection's access either way" — true for the
+/// periodic refresh alone, which only ever *feeds* a decision, but
+/// [`is_admin_for_item`] also calls this synchronously, per item, as the
+/// actual gate on the one admin-only content class this whole mechanism
+/// exists to protect. There, `previous` is exactly the stale cached value a
+/// demotion may have already invalidated — failing open on top of a store
+/// hiccup would hand a demoted, now-unconfirmable actor the benefit of the
+/// doubt on the read that was supposed to catch the demotion. A human
+/// principal whose current role cannot be confirmed is treated as not admin;
+/// only the always-safe machine principal keeps its unconditional pass.
+async fn refreshed_is_admin(
+    runtime: &CompanyRuntime,
+    actor: Option<&Actor>,
+    previous: bool,
+) -> bool {
+    let Some(actor) = actor else {
+        return previous;
+    };
+    match runtime.users().get_user(runtime.id(), &actor.id).await {
+        Ok(Some(user)) => {
+            user.role.may_administer() && user.status == crate::ports::users::UserStatus::Active
+        }
+        _ => false,
     }
 }
 
@@ -602,18 +994,93 @@ async fn company_events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let company = scope.id().clone();
     tracing::debug!(company = %company, "operator SSE stream opening");
-    let guard = SseStreamGuard(company.clone());
-    let durable = scope
-        .runtime
-        .events()
-        .subscribe(&company)
-        .filter_map(move |item| {
-            // Keep the teardown guard alive for the life of the stream.
-            let _ = &guard;
-            let event = project_stream_item(&item)
-                .map(|value| Ok(Event::default().data(value.to_string())));
-            std::future::ready(event)
-        });
+    let viewer = scope
+        .actor
+        .as_ref()
+        .map(|actor| Viewer::User(actor.id.clone()))
+        .unwrap_or(Viewer::Operator);
+    // Threaded into the projection below so a live `AgentReply` from the
+    // owner-fallback pseudo-author is gated the same way a reload's
+    // `history_for_desk` already gates it (issue #1781 review, Codex P1) — a
+    // non-admin must never see the admin-only report just because they had
+    // the stream open when it landed.
+    //
+    // Held in a shared cell, not a captured `bool`: `scope.is_admin` is only
+    // this connection's role *at open time*, and this stream can outlive a
+    // demotion. `PATCH …/users/{id}` updates the stored role without
+    // revoking sessions on a plain demotion (only a suspension does that),
+    // and an already-open SSE response performs no further authentication —
+    // so a captured `true` would keep projecting the owner-fallback report to
+    // a now-non-admin user for as long as their tab stayed open (issue #1781
+    // review, Codex P1). The periodic refresh below re-derives it from the
+    // live user record, the same bounded staleness window the label refresh
+    // just below already accepts for mention chips.
+    let is_admin = Arc::new(std::sync::atomic::AtomicBool::new(scope.is_admin));
+    let subscription = scope.runtime.events().subscribe(&company);
+    // Roster display labels for mention chips. Held in a shared lock rather
+    // than captured once: the stream outlives membership changes that can add
+    // or rename a user, and a transiently failed initial read must not fix the
+    // map empty for the rest of the connection. A background task refreshes it
+    // on an interval, and the guard above aborts that task when the stream
+    // closes.
+    let authors: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> = Arc::new(
+        std::sync::RwLock::new(author_labels(&scope.runtime).await.unwrap_or_default()),
+    );
+    let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let label_refresh = {
+        let runtime = scope.runtime.clone();
+        let shared = Arc::clone(&authors);
+        let is_admin_cell = Arc::clone(&is_admin);
+        let actor = scope.actor.clone();
+        tokio::spawn(async move {
+            let mut cancel = cancel_rx;
+            loop {
+                // The guard's one-shot fires when the stream closes, so the
+                // loop stops at the next boundary instead of waking once more
+                // to attempt a write nobody will read.
+                tokio::select! {
+                    _ = tokio::time::sleep(LABEL_REFRESH_EVERY) => {}
+                    _ = &mut cancel => return,
+                }
+                if let Ok(fresh) = author_labels(&runtime).await {
+                    *shared
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                }
+                let previous = is_admin_cell.load(std::sync::atomic::Ordering::Relaxed);
+                let refreshed = refreshed_is_admin(&runtime, actor.as_ref(), previous).await;
+                is_admin_cell.store(refreshed, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    let guard = SseStreamGuard {
+        company: company.clone(),
+        cancel: Some(cancel),
+        label_refresh: Some(label_refresh),
+    };
+    // A second handle on the same runtime/actor the label-refresh task above
+    // captured its own clones of — needed here too, for the per-item
+    // revalidation below (issue #1781 review, Codex P1 follow-up).
+    let runtime = scope.runtime.clone();
+    let actor = scope.actor.clone();
+    let durable = subscription.filter_map(move |item| {
+        // Keep the teardown guard alive for the life of the stream.
+        let _ = &guard;
+        let authors = Arc::clone(&authors);
+        let is_admin_cell = Arc::clone(&is_admin);
+        let runtime = runtime.clone();
+        let actor = actor.clone();
+        let viewer = viewer.clone();
+        async move {
+            let cached = is_admin_cell.load(std::sync::atomic::Ordering::Relaxed);
+            let is_admin = is_admin_for_item(&item, &runtime, actor.as_ref(), cached).await;
+            let authors = authors
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            project_stream_item_for_viewer(&item, &authors, &viewer, is_admin)
+                .map(|value| Ok(Event::default().data(value.to_string())))
+        }
+    });
     // Merge the transient live turn-progress bus (tool_call/tool_result frames a
     // turn emits while it runs — see [`crate::turn_stream`]) onto the same feed.
     // These are ephemeral and never journaled; the console switches on `type`
@@ -662,11 +1129,62 @@ fn is_own_typing_frame(frame: &crate::turn_stream::LiveFrame, self_id: Option<&s
     )
 }
 
+/// Whether `item` is the one content class [`company_events`]'s `is_admin`
+/// gates: an owner-fallback [`AgentReply`](CompanyEvent::AgentReply) —
+/// journaled under
+/// [`OWNER_FALLBACK_REPORT_AUTHOR`](crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+/// (issue #1781 review, Codex P1 follow-up).
+///
+/// A cheap, synchronous pre-check so `company_events`'s per-item revalidation
+/// only spends a store read on the one content class that needs fresher-than-
+/// `LABEL_REFRESH_EVERY` staleness — every other event (and a stream `Gap`)
+/// keeps using the cached snapshot with no store read added to its path.
+fn is_owner_fallback_report(item: &EventStreamItem) -> bool {
+    matches!(
+        item,
+        EventStreamItem::Event(StoredEvent {
+            event: CompanyEvent::AgentReply { agent_id, .. },
+            ..
+        }) if agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR
+    )
+}
+
+/// The `is_admin` value [`company_events`] projects `item` under (issue #1781
+/// review, Codex P1 follow-up).
+///
+/// `cached` is the periodic `LABEL_REFRESH_EVERY`-bounded snapshot every other
+/// event uses unchanged. An owner-fallback report is revalidated fresh
+/// instead — the P1 finding's fix: without this, a demotion landing after the
+/// last periodic refresh still let an already-open stream project an
+/// admin-only report for up to another `LABEL_REFRESH_EVERY` (60s), since
+/// `cached` alone would not see the demotion until its own next tick.
+/// Revalidating only for this one content class keeps every other event on
+/// the cheap cached read — no store lookup added to the hot path.
+async fn is_admin_for_item(
+    item: &EventStreamItem,
+    runtime: &CompanyRuntime,
+    actor: Option<&Actor>,
+    cached: bool,
+) -> bool {
+    if is_owner_fallback_report(item) {
+        refreshed_is_admin(runtime, actor, cached).await
+    } else {
+        cached
+    }
+}
+
 /// Projects a live subscription item into the operator stream's safe wire
 /// shape. A gap is an unpersisted control frame, deliberately structural-only.
-fn project_stream_item(item: &EventStreamItem) -> Option<serde_json::Value> {
+fn project_stream_item_for_viewer(
+    item: &EventStreamItem,
+    authors: &std::collections::HashMap<String, String>,
+    viewer: &Viewer,
+    is_admin: bool,
+) -> Option<serde_json::Value> {
     match item {
-        EventStreamItem::Event(stored) => project_event(stored),
+        EventStreamItem::Event(stored) => {
+            project_event_for_viewer(stored, authors, viewer, is_admin)
+        }
         EventStreamItem::Gap { missed } => Some(serde_json::json!({
             "type": "stream_gap",
             "missed": missed,
@@ -691,7 +1209,35 @@ fn project_stream_item(item: &EventStreamItem) -> Option<serde_json::Value> {
 ///
 /// Adding a variant to [`CompanyEvent`] therefore drops it by default; it
 /// reaches the console only by being listed here on purpose.
+///
+/// [`Viewer::Operator`] is always admin here, same as `Chat.history`'s
+/// GraphQL resolver treats the platform bearer (issue #1781 review, Codex
+/// P1) — this test helper's callers all use that viewer.
+#[cfg(test)]
 fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
+    project_event_for_viewer(
+        stored,
+        &std::collections::HashMap::new(),
+        &Viewer::Operator,
+        true,
+    )
+}
+
+/// `is_admin` gates an owner-fallback `AgentReply` — journaled under
+/// [`OWNER_FALLBACK_REPORT_AUTHOR`](crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+/// — the same way [`history_for_desk`](crate::server::chat_history::history_for_desk)
+/// already gates it for a reload (issue #1781 review, Codex P1): a non-admin
+/// viewer must never see the admin-only report just because it landed while
+/// their SSE stream was open. The row is dropped outright rather than
+/// projected with a redacted body — this stream has no partial-reveal shape
+/// for any other event either, and a live listener that cannot see the row on
+/// reload should not see it live.
+fn project_event_for_viewer(
+    stored: &StoredEvent,
+    authors: &std::collections::HashMap<String, String>,
+    viewer: &Viewer,
+    is_admin: bool,
+) -> Option<serde_json::Value> {
     use serde_json::json;
 
     let envelope = |ty: &str| {
@@ -713,6 +1259,11 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             mentions,
             ..
         } => {
+            // See this fn's doc: an owner-fallback report is admin-only, live
+            // exactly as it is on reload (issue #1781 review, Codex P1).
+            if !is_admin && agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR {
+                return None;
+            }
             let mut o = envelope("agent_reply");
             o["chatId"] = json!(chat_id);
             o["agentId"] = json!(agent_id);
@@ -734,26 +1285,15 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             if let Some(task_id) = task_id {
                 o["taskId"] = json!(task_id);
             }
-            // Mention spans, so a console watching live draws the same chips a
-            // reload would rather than rendering the reply flat and then
-            // re-rendering it on refresh.
-            //
-            // **Spans only — deliberately no targets.** A `Mention` carries an
-            // agent id or a *user* id, and this stream has no per-viewer
-            // projection to resolve either into a label; that is the same
-            // reason `ReactionToggled` is dropped here entirely (issue #364).
-            // A chip needs the range and whether it pings, and nothing else, so
-            // that is all this projects. `chat/history` remains the one surface
-            // that answers *who*, per viewer, with labels rather than ids.
-            if !mentions.is_empty() {
+            // Project the same viewer-relative metadata as chat/history. The
+            // stream must carry complete ChatMentionDto values because the live
+            // row is already durable and hydration intentionally skips it.
+            let projected = project_mentions(mentions, authors, viewer);
+            if !projected.is_empty() {
                 o["mentions"] = json!(
-                    mentions
-                        .iter()
-                        .map(|m| json!({
-                            "text": m.text,
-                            "offset": m.offset,
-                            "quiet": m.quiet,
-                        }))
+                    projected
+                        .into_iter()
+                        .map(ChatMentionDto::from)
                         .collect::<Vec<_>>()
                 );
             }
@@ -1102,11 +1642,18 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             workflow_id,
             run_id,
             scheduled,
+            started_by,
         } => {
             let mut o = envelope("workflow_run_started");
             o["workflowId"] = json!(workflow_id);
             o["runId"] = json!(run_id);
             o["scheduled"] = json!(scheduled);
+            // Issue #1862 prerequisite: forwarded only when present, so a run
+            // journaled before this field existed (or one that genuinely has
+            // no sender) projects exactly as it did before.
+            if let Some(started_by) = started_by {
+                o["startedBy"] = json!(started_by);
+            }
             o
         }
         // Issue #382: the live per-node START bracket, the counterpart of the
@@ -1137,6 +1684,7 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             // stays the three structural scalars it already was — the console
             // surfaces diagnostics from the run-detail drawer, not this stream.
             diagnostics: _,
+            agent_run_id,
         } => {
             let mut o = envelope("workflow_node_finished");
             o["workflowId"] = json!(workflow_id);
@@ -1144,6 +1692,15 @@ fn project_event(stored: &StoredEvent) -> Option<serde_json::Value> {
             o["nodeId"] = json!(node_id);
             o["status"] = json!(status);
             o["elapsedMs"] = json!(elapsed_ms);
+            // A fourth structural id, on the same terms as the three above: it
+            // is reachable by this same operator through `GET {scope}/runs`, and
+            // it is what lets a console watching the canvas open the node's step
+            // trace directly rather than searching for which attempt was its.
+            // Omitted entirely when the node opened none, so a frame for a
+            // non-agent node is byte-identical to what it was.
+            if let Some(agent_run_id) = agent_run_id {
+                o["agentRunId"] = json!(agent_run_id);
+            }
             o
         }
         // Issue #983: a turn was accepted, so a console watching the
@@ -1359,6 +1916,22 @@ struct ChatMessage {
     /// console against a newer host gets extraction too.
     #[serde(default)]
     mentions: Option<Vec<crate::ports::types::Mention>>,
+    /// The workspace node ids of files attached to this message (issue #1682).
+    ///
+    /// **Ids only, and nothing else is trusted.** The client uploads each file
+    /// first (`POST {scope}/chat/upload`), gets back a `node_id`, and lists
+    /// those ids here. The host re-resolves each within this company's own
+    /// workspace and takes the name / mime / size from the store — so a foreign
+    /// or spoofed reference cannot cross a company boundary or misdescribe its
+    /// payload (see `resolve_attachments`). An id that resolves to no binary
+    /// node in this company is a `400`.
+    ///
+    /// Additive in both directions: this struct has no `deny_unknown_fields`,
+    /// so a newer console against an older host has its ids ignored and its
+    /// message still posts, and an older console omits the field entirely — an
+    /// absent list is an empty one, the exact pre-#1682 wire shape.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// A chat or approval-resolution response: the company's channel replies.
@@ -1731,6 +2304,7 @@ async fn run_chat(
             // then carries forever.
             origin_run_id: accepted.turn_id.clone(),
             origin_workflow_id: None,
+            bounced: None,
         };
         if let Err(err) = runtime.upsert_task(&record).await {
             tracing::warn!(error = %err, "failed to open task card for chat request");
@@ -1801,6 +2375,206 @@ struct AcceptedTurn {
 /// Best-effort on the row and on the transcript line, never on the append: the
 /// message is the thing the operator can lose, and the other two are how we
 /// describe it.
+/// Resolves the client's attachment `node_id`s to durable [`Attachment`]s
+/// (issue #1682).
+///
+/// The whole security posture of chat attachments lives here. The client hands
+/// this route ids only; every name / mime / size on the journaled event is read
+/// from the company's own workspace tree, never from the request — so a client
+/// cannot claim a `report.pdf` is a `photo.png`, nor pretend a two-byte file is
+/// two gigabytes. Each id must resolve to a **binary** node in *this* company's
+/// tree: a foreign id (the IDOR a shared, guessable ULID would otherwise open),
+/// one that names a prose note, or one that names nothing is a `400`, on the
+/// same terms a bad thread `parent` is. The tree scan is the same read
+/// `upload()` does to re-fetch a just-stored node, so no new store surface is
+/// introduced.
+///
+/// Preserves the caller's order and refuses on the first bad id, so the message
+/// is never journaled with a partial or reordered attachment list.
+///
+/// Also reads and extracts each attachment's text where the format and size
+/// allow it (issue #1682, codex review finding) — see
+/// [`extracted_attachment_text`]. A sequential loop rather than
+/// `node_ids.iter().map(..).collect()`: extraction reads bytes and must
+/// `.await`, and a chat message carries at most a small handful of
+/// attachments, so there is no throughput this would meaningfully cost.
+async fn resolve_attachments(
+    runtime: &Arc<CompanyRuntime>,
+    id: &CompanyId,
+    node_ids: &[String],
+) -> Result<Vec<Attachment>, ApiError> {
+    if node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Codex review finding: an unbounded, unduplicated list turns one `/chat`
+    // POST into an attacker-controlled multiplier on the extraction work
+    // below — each id, however many times it repeats, is a tree scan plus up
+    // to `MAX_ATTACHMENT_EXTRACT_BYTES` of reads and a parse. Refused before
+    // either cost is paid, on the same terms a malformed `parent` is.
+    if node_ids.len() > MAX_CHAT_ATTACHMENTS {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+            "a message may carry at most {MAX_CHAT_ATTACHMENTS} attachments, got {}",
+            node_ids.len()
+        ))));
+    }
+    // Deduplicated, order preserved: attaching the same file twice to one
+    // message is never a meaningful distinct attachment, so a repeated id
+    // resolves — and, more to the point, extracts — exactly once rather than
+    // once per repetition.
+    let mut seen = std::collections::HashSet::with_capacity(node_ids.len());
+    let node_ids: Vec<&String> = node_ids.iter().filter(|id| seen.insert(*id)).collect();
+    let tree = runtime.workspace().tree(id).await?;
+    let mut resolved = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let node = tree
+            .iter()
+            .find(|n| &n.id == node_id && n.is_binary())
+            .ok_or_else(|| {
+                ApiError(OpenCompanyError::InvalidRequest(format!(
+                    "attachment {node_id} is not a file in this company's workspace"
+                )))
+            })?;
+        let extracted_text = extracted_attachment_text(runtime, id, node).await;
+        resolved.push(Attachment {
+            node_id: node.id.clone(),
+            name: node.name.clone(),
+            // A binary node always carries both — `is_binary()` is exactly
+            // `mime.is_some()`, and the store computes `size` alongside it —
+            // so the defaults are unreachable and exist only to keep this
+            // total without an `unwrap` a later store change could break.
+            mime: node.mime.clone().unwrap_or_default(),
+            size: node.size.unwrap_or(0),
+            extracted_text,
+        });
+    }
+    Ok(resolved)
+}
+
+/// The most attachments one chat message may carry (codex review finding).
+///
+/// The composer stages one file at a time (v1), so this is nowhere near the
+/// operator's own path — it exists to bound what an unbounded client
+/// request could otherwise force `resolve_attachments` to do: a tree scan
+/// and an extraction pass per id, and extraction is not free
+/// ([`MAX_ATTACHMENT_EXTRACT_BYTES`] of reads and a parse). Generous enough
+/// for the multi-file UI the wire shape (`Vec<Attachment>`) already allows
+/// room for, small enough that even the worst case — every id resolving and
+/// maxing out the extraction cap — stays bounded per request.
+const MAX_CHAT_ATTACHMENTS: usize = 20;
+
+/// The largest attachment [`resolve_attachments`] reads for extraction, in
+/// bytes.
+///
+/// Well below [`crate::ingest::MAX_DOCUMENT_BYTES`] on purpose — that cap is
+/// for the dedicated memory-drop page, where reading a large document is the
+/// whole point of the request. A chat attachment's extraction instead runs
+/// inline in the synchronous `/chat` POST, so it stays small enough that an
+/// otherwise-instant send never feels stuck parsing a PDF.
+const MAX_ATTACHMENT_EXTRACT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most extracted text one attachment contributes to the wire, in chars.
+///
+/// [`crate::brain::medulla::wire::WireEvent::body`] caps at 200000 chars and
+/// carries the operator's own words too, so no single attachment may be free
+/// to crowd out the rest of the turn.
+const MAX_ATTACHMENT_EXTRACT_CHARS: usize = 6_000;
+
+/// Reads and extracts one binary node's text where the format and size allow
+/// it, `None` otherwise (issue #1682, codex review finding).
+///
+/// `None` covers three cases alike — an image or other format nothing here
+/// parses, a scan with no text layer, and a payload over
+/// [`MAX_ATTACHMENT_EXTRACT_BYTES`] — because for "does the brain have
+/// something to read" a caller does not need to tell them apart. Reuses
+/// [`crate::ingest::extract`], the same PDF/DOCX/PPTX/XLSX/plain-text
+/// pipeline the memory-drop page already runs, so a chat attachment's actual
+/// words ride the durable [`Attachment`] rather than leaving a hosted or
+/// sidecar brain with only a node id and no device tool that resolves it.
+///
+/// Best-effort: any read failure (a race with a delete, a transient store
+/// error) answers `None` rather than failing the send — the reference alone
+/// still reaches the transcript and the journal.
+async fn extracted_attachment_text(
+    runtime: &Arc<CompanyRuntime>,
+    id: &CompanyId,
+    node: &crate::ports::workspace::WorkspaceNode,
+) -> Option<String> {
+    let size = node.size?;
+    if size == 0 || size > MAX_ATTACHMENT_EXTRACT_BYTES {
+        return None;
+    }
+    let (_, stream) = runtime
+        .workspace()
+        .read_bytes(id, &node.id)
+        .await
+        .ok()
+        .flatten()?;
+    let bytes = drain_bounded(stream, MAX_ATTACHMENT_EXTRACT_BYTES).await?;
+    // The extraction pipeline is synchronous CPU work — PDF/DOCX/PPTX/XLSX
+    // parsing — that can run for a while on a document near the size cap, and
+    // this runs inline in the `/chat` POST. Dispatch it to the blocking pool
+    // rather than stalling a Tokio worker (codex review finding). The owned
+    // pieces are cloned out of the borrowed node first: `spawn_blocking`
+    // requires its closure's captures to be `'static`.
+    let name = node.name.clone();
+    let mime = node.mime.clone();
+    tokio::task::spawn_blocking(move || {
+        match crate::ingest::extract(&name, mime.as_deref(), &bytes) {
+            crate::ingest::Extracted::Text(text) => Some(crate::ledger::budget::truncate(
+                &text,
+                MAX_ATTACHMENT_EXTRACT_CHARS,
+            )),
+            crate::ingest::Extracted::Empty | crate::ingest::Extracted::Unsupported(_) => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Drains a [`BlobStream`](crate::ports::workspace::BlobStream) into a
+/// buffer, `None` if it ever exceeds `cap` or errors partway through (codex
+/// review finding).
+///
+/// Split out from [`extracted_attachment_text`] so the one property that
+/// matters here — a stream error discards what was read, rather than handing
+/// extraction a truncated payload that looks complete — is directly testable
+/// against a synthetic stream, without a real workspace store behind it.
+///
+/// A stream error mid-read used to fall straight through to extraction on
+/// whatever partial bytes had been collected: `while let Ok(Some(chunk)) =
+/// stream.try_next().await` cannot tell "the stream ended" from "the stream
+/// errored", so it just stopped accumulating either way. A truncated payload
+/// is not a smaller version of the file; it can parse into plausible-looking
+/// but wrong or incomplete text (a document missing its ending, a multi-byte
+/// sequence cut mid-codepoint) with nothing marking it as partial once it
+/// reaches the brain. "No readable text" is honest; a guess dressed as a
+/// read is not.
+async fn drain_bounded(
+    mut stream: crate::ports::workspace::BlobStream,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    use futures::TryStreamExt;
+
+    let mut bytes = Vec::new();
+    loop {
+        match stream.try_next().await {
+            Ok(Some(chunk)) => {
+                bytes.extend_from_slice(&chunk);
+                // Belt-and-braces against a store whose streamed length
+                // disagrees with the metadata length its caller expected —
+                // never buffer past the cap just because the node claimed to
+                // be under it.
+                if bytes.len() as u64 > cap {
+                    return None;
+                }
+            }
+            Ok(None) => return Some(bytes),
+            Err(_) => return None,
+        }
+    }
+}
+
 async fn accept_chat_turn(
     runtime: &Arc<CompanyRuntime>,
     id: &CompanyId,
@@ -1811,6 +2585,12 @@ async fn accept_chat_turn(
 ) -> Result<AcceptedTurn, ApiError> {
     runtime.ensure_running().await?;
     runtime.ensure_accepting().map_err(ApiError)?;
+
+    // Issue #1682: resolve the client's attachment ids to durable references
+    // before the journal write, so a bad reference refuses the send outright —
+    // on the same terms a malformed `parent` does — rather than journaling a
+    // message that points at a file this company does not have.
+    let attachments = resolve_attachments(runtime, id, &message.attachments).await?;
 
     let message_event = CompanyEvent::OperatorMessage {
         text: message.text.clone(),
@@ -1834,12 +2614,36 @@ async fn accept_chat_turn(
         mentions: runtime
             .resolve_mentions(&message.text, message.mentions.clone(), by)
             .await,
+        // Issue #1682: the store-resolved references, so the durable record
+        // carries the name/mime/size the store computed and never the client's
+        // claim. Empty on a message with no attachment, which skips the field.
+        attachments,
     };
     let message_seq = runtime
         .events()
         .append(id, message_event.clone())
         .await
         .map_err(ApiError)?;
+
+    // The durable half of a mention (issue: mentions).
+    //
+    // The SSE feed only reaches a browser that is open, so without this a
+    // mention is invisible to everyone who was not watching when it landed —
+    // which is most of the point of mentioning somebody. Filed here, right
+    // after the journal write, so the notification and the message share a
+    // sequence and a turn that later fails still leaves the mention recorded.
+    //
+    // Deliberately not fatal: a notification store that will not answer must
+    // not fail somebody's message. The mention still renders as a chip and is
+    // still in the transcript; only the badge is missing, and the warning says
+    // so.
+    if let CompanyEvent::OperatorMessage { mentions, .. } = &message_event
+        && !mentions.is_empty()
+    {
+        runtime
+            .notify_mentions(id, mentions, &message_seq, by, desk)
+            .await;
+    }
 
     let turn_id = crate::ports::generate_id();
     let turn_id = match runtime
@@ -1959,6 +2763,18 @@ async fn chat_and_emit(
         .chat
         .clone()
         .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string());
+    // Issue #1757: the Operator channel is a **read-only** aggregation surface —
+    // a "what happened" feed of workflow reports, not a conversation. Refuse a
+    // send addressed to it rather than journaling an `OperatorMessage` under the
+    // `operator` line (which would both make it writable and mix chatter into the
+    // report feed). The frontend hides its send box; this is the safety net.
+    //
+    // The check (migration carve-outs, error text) lives on `CompanyRuntime`
+    // itself now — `ensure_desk_writable` — so the ACP `session/prompt` route
+    // (issue #1781 review, Codex P1), which journals straight to
+    // `runtime.events()` without ever calling this function, runs the exact
+    // same guard rather than a second hand-copied one that could drift.
+    runtime.ensure_desk_writable(&desk).await?;
     // Issue #364: a thread reply names its parent by id. Rejected here rather
     // than dropped, so a console sending a malformed parent learns that its
     // reply would have landed in the channel instead of quietly finding it
@@ -2052,6 +2868,7 @@ async fn chat_and_emit(
     }
 
     let (report, feedback_note) = join_chat_turn(turn).await?;
+    let responses = report.responses.clone();
     emit_cycle_webhooks(state, id, &report).await;
     if let Some(note) = feedback_note {
         emit_feedback_webhook(state, id, &note).await;
@@ -2060,7 +2877,7 @@ async fn chat_and_emit(
         // The operator's own message is the cycle's single input event, so its
         // sequence is the first the cycle journaled (issue #364).
         message_id: report.input_seqs.first().map(|seq| seq.value().to_string()),
-        responses: report.responses,
+        responses,
         // A chat turn is nobody's sign-off, so this stays absent here.
         still_awaiting: None,
         turn_id,
@@ -2114,6 +2931,40 @@ fn spawn_chat_turn(turn: ChatTurn) -> JoinHandle<Result<(CycleReport, Option<Str
         let (mut report, feedback_note) = match outcome {
             Ok(both) => both,
             Err(err) => {
+                // A turn that aborts — most often a tool call that exceeded its
+                // wall-clock budget — was only ever logged server-side. To the
+                // operator watching the thread, the teammate simply vanished
+                // mid-answer with no word. Journal a visible system line in the
+                // same desk thread the reply would have gone to, naming the
+                // failure and what to do next. Same shape and author as the
+                // continuation-failure notice (SYSTEM_AUTHOR): a direct
+                // `AgentReply` so it round-trips through history like any other
+                // reply, and is distinguishable on disk from a real teammate
+                // bubble. `err.0` is the inner error (it carries `Display`);
+                // the `ApiError` newtype does not.
+                let notice = CompanyEvent::AgentReply {
+                    parent,
+                    chat_id: desk.clone(),
+                    agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
+                    text: format!(
+                        "This turn couldn't be finished — something went wrong or \
+                         a step took too long ({}). Nothing was left half-done. \
+                         Send the message again to retry; if it keeps failing, \
+                         try breaking it into a smaller request.",
+                        err.0
+                    ),
+                    steps: Vec::new(),
+                    task_id: None,
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                };
+                if let Err(journal_err) = runtime.events().append(&company, notice).await {
+                    tracing::warn!(
+                        company = %company,
+                        error = %journal_err,
+                        "an aborted chat turn could not be reported to the operator"
+                    );
+                }
                 settle_chat_turn(&runtime, &company, turn_id.as_deref(), Some(&err)).await;
                 return Err(err);
             }
@@ -2143,7 +2994,7 @@ async fn join_chat_turn(
 ///
 /// Runs inside the spawned turn (issue #882) so the record survives a client or
 /// proxy that gave up waiting.
-async fn journal_chat_replies(
+pub(crate) async fn journal_chat_replies(
     runtime: &Arc<CompanyRuntime>,
     id: &CompanyId,
     desk: &str,
@@ -2184,7 +3035,7 @@ async fn journal_chat_replies(
                     // Who this reply names. Rendered as chips and — unlike an
                     // operator message's — never consulted by dispatch, which
                     // is the mention-loop fuse.
-                    mentions: reply_mentions,
+                    mentions: reply_mentions.clone(),
                     // Zero, and stays zero while that edge does not exist.
                     mention_depth: 0,
                     // The answer joins the thread its question was asked in,
@@ -2222,7 +3073,20 @@ async fn journal_chat_replies(
         // its durable id, which the console reads as "not saved" and refuses to
         // thread or react on — the honest degradation.
         match journaled {
-            Ok(seq) => response.message_id = Some(seq.value().to_string()),
+            Ok(seq) => {
+                response.message_id = Some(seq.value().to_string());
+                // The durable half of a reply's mention, same as an operator
+                // message's (issue: mentions). Without this an `@user` an agent
+                // types back renders as a chip and nothing else — the badge and
+                // the notification both silently missing for whoever it named,
+                // which is worst for exactly the person it is meant to reach:
+                // offline when the reply lands.
+                if !reply_mentions.is_empty() {
+                    runtime
+                        .notify_mentions(id, &reply_mentions, &seq, None, desk)
+                        .await;
+                }
+            }
             Err(err) => tracing::warn!(
                 error = %err,
                 "failed to journal a chat reply; the bubble has no durable id"
@@ -2355,6 +3219,16 @@ struct ChatHistoryMessageDto {
     at_millis: f64,
     /// Whether it is the operator's own message.
     mine: bool,
+    /// Whether a **person** wrote this line rather than the runtime (issue
+    /// #1734). See [`MessageView::by_person`] for why nothing downstream can
+    /// derive it — in particular why `channel == "operator"` cannot, the echo
+    /// brain naming its own outbound channel that too.
+    ///
+    /// Omitted when `false`, which is every agent reply and every message
+    /// journaled before the field existed, so the legacy shape is unchanged and
+    /// a console reading `undefined` gets today's behaviour.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    by_person: bool,
     /// The scrubbed processing steps behind a company reply, so a rehydrated
     /// transcript renders the same timeline the live turn showed. Omitted when
     /// empty (operator messages, tool-less replies) — keeps the legacy shape.
@@ -2381,6 +3255,44 @@ struct ChatHistoryMessageDto {
     /// legacy shape is unchanged.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mentions: Vec<ChatMentionDto>,
+    /// Files attached to this message (issue #1682), each a reference into the
+    /// company workspace with the store-computed name / mime / size. Omitted
+    /// when the message carries none — which is every reply, every system pill,
+    /// and every operator message journaled before the field existed — so the
+    /// legacy shape is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<ChatAttachmentDto>,
+}
+
+/// One file attached to a history message (issue #1682). Mirrors `Attachment`
+/// in `frontend/src/lib/chat.ts`, and carries only store-authored metadata —
+/// the id the payload is reachable at, and the name / mime / size the store
+/// computed. The bytes are fetched separately through the hardened
+/// `GET …/workspace/blob/{nodeId}` route.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachmentDto {
+    /// The workspace node id the payload is stored under — what the console
+    /// hands the blob route to download or preview it.
+    node_id: String,
+    /// The stored file's display name.
+    name: String,
+    /// The stored payload's media type, so the console decides download-vs-
+    /// preview without fetching the bytes.
+    mime: String,
+    /// The stored payload's exact length in bytes.
+    size: u64,
+}
+
+impl From<Attachment> for ChatAttachmentDto {
+    fn from(attachment: Attachment) -> Self {
+        Self {
+            node_id: attachment.node_id,
+            name: attachment.name,
+            mime: attachment.mime,
+            size: attachment.size,
+        }
+    }
 }
 
 /// One mention on a history message. Mirrors `Mention` in
@@ -2447,6 +3359,7 @@ impl From<MessageView> for ChatHistoryMessageDto {
             text: view.text,
             at_millis: view.at_millis,
             mine: view.mine,
+            by_person: view.by_person,
             steps: view.steps,
             task_id: view.task_id,
             parent_id: view.parent_id,
@@ -2459,6 +3372,11 @@ impl From<MessageView> for ChatHistoryMessageDto {
                 .mentions
                 .into_iter()
                 .map(ChatMentionDto::from)
+                .collect(),
+            attachments: view
+                .attachments
+                .into_iter()
+                .map(ChatAttachmentDto::from)
                 .collect(),
         }
     }
@@ -2494,21 +3412,50 @@ async fn resolve_desk(
     })
 }
 
-/// Resolves who is reading a desk's history, for the `mine` flag. Reuses
-/// [`chat_actor`]'s auth (session cookie or platform credential, tenant
-/// address-authorization, temporary-password gate) so a history read can
-/// never see more than a matching chat send could.
+/// Resolves who is reading a desk's history, for the `mine` flag, plus
+/// whether they may see an [`MessageView::admin_only`] row (issue #1781
+/// review, Codex P1). Reuses [`chat_actor`]'s auth (session cookie or platform
+/// credential, tenant address-authorization, temporary-password gate) for the
+/// `Viewer` itself, so a history read can never see more than a matching chat
+/// send could.
+///
+/// The admin check is a **second**, independent lookup
+/// ([`current_user`](crate::server::users::routes::current_user)) rather than
+/// widening [`Actor`] with a role: `Actor` is shared with the *send* path
+/// (`OperatorMessage::by`), where a role has no bearing on whether a
+/// signed-in human may post, so adding one there would be dead weight on every
+/// other caller. Safe to run after `chat_actor` already succeeded — this can
+/// only **narrow** what the viewer sees (gate an extra row), never widen
+/// their access, so it needs none of `chat_actor`'s own refusal gates
+/// (address authorization, temporary-password) repeated: those already ran
+/// for this exact request via `chat_actor`, and a `current_user` that somehow
+/// disagreed would only make `is_admin` `false`, the fail-safe direction.
 async fn history_viewer(
     headers: &HeaderMap,
     state: &AppState,
     company: &CompanyId,
     peer: Option<std::net::SocketAddr>,
-) -> Result<Viewer, crate::server::Rejection> {
+) -> Result<(Viewer, bool), crate::server::Rejection> {
     let actor = chat_actor(headers, state, company, peer).await?;
-    Ok(match actor {
+    let is_admin = match &actor {
+        // A signed-in human: only an active admin sees an admin-only row.
+        Some(actor) if actor.kind == ActorKind::User => {
+            crate::server::users::routes::current_user(headers, state, company, peer)
+                .await
+                .is_some_and(|principal| principal.role.may_administer())
+        }
+        // No person behind this credential — a platform/machine bearer, or
+        // (pre-attribution) nobody at all. `Viewer::Operator` already carries
+        // full, unrestricted access everywhere else this type is used; an
+        // admin-only row is not a narrower case than the rest of a company's
+        // history, which this same credential can already read in full.
+        _ => true,
+    };
+    let viewer = match actor {
         Some(actor) if actor.kind == ActorKind::User => Viewer::User(actor.id),
         _ => Viewer::Operator,
-    })
+    };
+    Ok((viewer, is_admin))
 }
 
 /// Shared body for both scope forms of `GET .../chat/history`.
@@ -2520,14 +3467,22 @@ async fn chat_history_response(
     peer: Option<std::net::SocketAddr>,
     query: ChatHistoryQuery,
 ) -> Result<Json<Vec<ChatHistoryMessageDto>>, crate::server::Rejection> {
-    let viewer = history_viewer(headers, state, company, peer).await?;
+    let (viewer, is_admin) = history_viewer(headers, state, company, peer).await?;
     let (desk_id, desk_name) = resolve_desk(&runtime, query.desk.as_deref()).await?;
     let limit = query
         .limit
         .unwrap_or(CHAT_HISTORY_PAGE_LIMIT)
         .min(CHAT_HISTORY_PAGE_LIMIT);
-    let messages =
-        history_for_desk(&runtime, &desk_id, &desk_name, &viewer, query.before, limit).await?;
+    let messages = history_for_desk(
+        &runtime,
+        &desk_id,
+        &desk_name,
+        &viewer,
+        query.before,
+        limit,
+        is_admin,
+    )
+    .await?;
     Ok(Json(
         messages
             .into_iter()
@@ -2594,13 +3549,13 @@ async fn attribution_audit_response(
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
 ) -> Result<Json<AttributionAuditDto>, crate::server::Rejection> {
-    let _viewer = history_viewer(headers, state, company, peer).await?;
+    let (_viewer, is_admin) = history_viewer(headers, state, company, peer).await?;
     let record = runtime
         .store()
         .load(runtime.id())
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(company.to_string()))?;
-    let audit = channel_attributed_replies(&runtime, &record).await?;
+    let audit = channel_attributed_replies(&runtime, &record, is_admin).await?;
     Ok(Json(AttributionAuditDto {
         replies: audit.replies,
         affected: audit.affected,
@@ -2698,21 +3653,52 @@ async fn react_to_message(
     // has never existed — none of which any reader could render, and all of
     // which would sit in the log forever claiming otherwise.
     let target = runtime.events().read_from(company, message_seq, 1).await?;
-    let is_message = target
-        .first()
-        .filter(|stored| stored.seq == message_seq)
-        .is_some_and(|stored| {
-            matches!(
-                stored.event,
-                CompanyEvent::OperatorMessage { .. } | CompanyEvent::AgentReply { .. }
-            )
-        });
+    let matched = target.first().filter(|stored| stored.seq == message_seq);
+    let is_message = matched.is_some_and(|stored| {
+        matches!(
+            stored.event,
+            CompanyEvent::OperatorMessage { .. } | CompanyEvent::AgentReply { .. }
+        )
+    });
     if !is_message {
         return Err(
             ApiError(OpenCompanyError::NotFound(format!("no chat message {seq}")))
                 .into_response()
                 .into(),
         );
+    }
+    // An owner-fallback report is admin-only exactly as it is on reload
+    // (`history_for_desk`) and over the live SSE feed (`project_event_for_viewer`,
+    // issue #1781 review, Codex P1) — a Member must not be able to react to a
+    // message they cannot read. Refused with the same 404 the missing-target
+    // branch above answers, not a 403: distinguishing "hidden" from "does not
+    // exist" would let a Member enumerate which sequence numbers hold an
+    // admin-only report by probing this endpoint, which is exactly the gap the
+    // sequence-id-based `seq` param opens (PR #1781 review).
+    let admin_only = matches!(
+        matched.map(|stored| &stored.event),
+        Some(CompanyEvent::AgentReply { agent_id, .. })
+            if agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR
+    );
+    if admin_only {
+        let is_admin = match &by {
+            Some(actor) if actor.kind == ActorKind::User => {
+                crate::server::users::routes::current_user(headers, state, company, peer)
+                    .await
+                    .is_some_and(|principal| principal.role.may_administer())
+            }
+            // No person behind this credential — a platform/machine bearer —
+            // already carries full, unrestricted access everywhere else this
+            // distinction is drawn (`history_viewer`, `ScopedCompany::is_admin`).
+            _ => true,
+        };
+        if !is_admin {
+            return Err(
+                ApiError(OpenCompanyError::NotFound(format!("no chat message {seq}")))
+                    .into_response()
+                    .into(),
+            );
+        }
     }
     runtime
         .events()
@@ -2768,10 +3754,13 @@ async fn list_approvals(
     }
     let runtime = lookup(&state, &id)?;
     // Membership got you the list; role decides whether you may read what is in
-    // it (issue #618).
+    // it (issue #618). Ownership is resolved before either (#1891): the queue
+    // is joined to cards by its consumers, and since the board card decides in
+    // place, handing out the raw park stamp would let an operator resolve
+    // another card's request from this one.
     Ok(Json(crate::server::approval_visibility::for_principal(
         &auth,
-        runtime.pending_approvals(),
+        runtime.pending_approvals_resolved().await,
     )))
 }
 
@@ -2786,12 +3775,13 @@ async fn list_approvals_single(
     if let Some(resp) = authorize_address(&state, &auth, runtime.id()) {
         return Err(resp.into());
     }
-    // Same contents rule as the `{id}` form (issue #618) — the two handlers are
-    // the same read behind two addressing forms, and a redaction applied to one
-    // of them would be a hole rather than a boundary.
+    // Same contents rule as the `{id}` form (issue #618) — and the same
+    // ownership resolution (#1891). The two handlers are the same read behind
+    // two addressing forms, and either applied to only one of them would be a
+    // hole rather than a boundary.
     Ok(Json(crate::server::approval_visibility::for_principal(
         &auth,
-        runtime.pending_approvals(),
+        runtime.pending_approvals_resolved().await,
     )))
 }
 
@@ -2943,6 +3933,16 @@ struct StandingGrantDto {
     /// the pre-#457 shape is byte-identical for every other tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
+    /// The authored workflow allowed to redeem it (issue #1098), when the grant
+    /// is to a workflow rather than a teammate.
+    ///
+    /// On the wire for the same reason `scope` is: `agent` is empty on a
+    /// workflow permission, so without this the console would read the row as a
+    /// nameless teammate and could not tell two workflows holding the same
+    /// tool/scope apart. Absent — not `null` — on every teammate grant, so the
+    /// pre-#1098 wire shape is byte-identical for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<String>,
 }
 
 impl From<crate::runtime::grants::StandingGrant> for StandingGrantDto {
@@ -2956,6 +3956,7 @@ impl From<crate::runtime::grants::StandingGrant> for StandingGrantDto {
             at_millis: g.at_millis,
             expires_at_millis: g.expires_at_millis,
             scope: g.scope,
+            workflow: g.workflow,
         }
     }
 }
@@ -3190,6 +4191,74 @@ async fn resolve_approval_single(
         .map_err(|error| IntoResponse::into_response(error).into())
 }
 
+/// The answer to an extend: the approval's new deadline, so the console can
+/// redraw the countdown without re-fetching the whole approvals list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtendReceiptDto {
+    /// Always `true` — a failure is an error response instead. Present so the
+    /// body is self-describing rather than an empty object.
+    extended: bool,
+    /// The approval's new default-deny instant (epoch-millis), the extension
+    /// time plus the gate's current TTL — the same number the card now projects.
+    expires_at_millis: f64,
+}
+
+async fn run_extend(
+    runtime: Arc<CompanyRuntime>,
+    approval_id: String,
+    actor: Actor,
+) -> Result<Response, ApiError> {
+    runtime.ensure_running().await?;
+    let id = ApprovalId::new(approval_id);
+    // `extend_approval` refuses an unknown/already-decided id with `NotFound`,
+    // which maps to 404 — so an operator extending something that has since
+    // resolved or expired is told, not silently answered 200.
+    let expires_at_millis = runtime.extend_approval(&id, actor).await?;
+    Ok(Json(ExtendReceiptDto {
+        extended: true,
+        expires_at_millis: expires_at_millis as f64,
+    })
+    .into_response())
+}
+
+/// `POST /api/v1/companies/{id}/approvals/{aid}/extend` (issue #1805).
+async fn extend_approval(
+    CompanyAuth(auth): CompanyAuth,
+    State(state): State<AppState>,
+    Path((id, aid)): Path<(String, String)>,
+) -> Result<Response, crate::server::Rejection> {
+    let company = CompanyId::new(&id);
+    if let Some(resp) = authorize_address(&state, &auth, &company) {
+        return Err(resp.into());
+    }
+    let runtime = lookup(&state, &id)?;
+    let actor = resolving_actor(auth);
+    run_extend(runtime, aid, actor)
+        .await
+        .map_err(|error| IntoResponse::into_response(error).into())
+}
+
+/// `POST /api/v1/company/approvals/{aid}/extend` (single-company alias).
+async fn extend_approval_single(
+    CompanyAuth(auth): CompanyAuth,
+    State(state): State<AppState>,
+    Path(aid): Path<String>,
+) -> Result<Response, crate::server::Rejection> {
+    let runtime = sole(&state)?;
+    let id = runtime.id().clone();
+    if let Some(resp) = authorize_address(&state, &auth, &id) {
+        return Err(resp.into());
+    }
+    if let Some(resp) = refuse_until_password_changed(&auth) {
+        return Err(resp.into());
+    }
+    let actor = resolving_actor(auth);
+    run_extend(runtime, aid, actor)
+        .await
+        .map_err(|error| IntoResponse::into_response(error).into())
+}
+
 #[cfg(test)]
 mod test {
     use axum::body::{Body, to_bytes};
@@ -3263,10 +4332,14 @@ mod test {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -3361,10 +4434,14 @@ mod test {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -3394,7 +4471,10 @@ mod test {
                     .uri("/api/v1/company/chat")
                     .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"text":"hi"}"#))
+                    // Issue #1725: not "hi". A bare pleasantry is answered by
+                    // the runtime without a turn, so the echo brain — which is
+                    // what this asserts is wired up — never sees it.
+                    .body(Body::from(r#"{"text":"ship the landing page"}"#))
                     .unwrap(),
             )
             .await
@@ -3403,7 +4483,10 @@ mod test {
 
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["responses"][0]["text"], "You said: hi");
+        assert_eq!(
+            value["responses"][0]["text"],
+            "You said: ship the landing page"
+        );
         assert_eq!(value["responses"][0]["channel"], "operator");
     }
 
@@ -3466,6 +4549,60 @@ mod test {
         assert_eq!(tasks.len(), 1, "a greeting must not open a card");
     }
 
+    /// Issue #1725, through the route an operator actually hits: "hi" comes
+    /// back answered, with no card, no steps, and no turn behind it.
+    ///
+    /// The unit-level proof that the brain is not called lives in
+    /// `runtime::cycle`'s `a_bare_greeting_answers_without_calling_the_brain`,
+    /// where a counting brain can be injected. This one pins that the chat
+    /// handler reaches that path at all — the two are separate failures, and a
+    /// correct fast path nothing routes to leaves the bug where it was.
+    ///
+    /// The echo brain answers `"You said: <text>"`, so the assertion below is
+    /// also the evidence: a canned greeting means the brain never ran.
+    #[tokio::test]
+    async fn a_bare_greeting_is_answered_without_a_turn() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["responses"][0]["text"],
+            crate::company::task_intent::SmallTalk::Hello.reply(),
+            "a greeting is answered by the runtime, not by a turn"
+        );
+        // The console showed "1 step" for a greeting on staging. There is no
+        // step to show, so the field is omitted entirely.
+        assert!(
+            value["responses"][0]["steps"].is_null(),
+            "no tool ran: {}",
+            value["responses"][0]
+        );
+        assert!(
+            runtime.tasks().list(&id).await.unwrap().is_empty(),
+            "a greeting opens no card"
+        );
+    }
+
     // ── Issue #982: the card goes to whoever was addressed ──────────────────
 
     /// A roster with three teammates and one desk, so a chat can be addressed
@@ -3526,14 +4663,170 @@ mode = "full"
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
         let runtime = RuntimeBuilder::new(home.to_path_buf(), roster_manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+        state
+    }
+
+    /// [`roster_manifest`] plus a **memberless** desk — one that exists on the
+    /// roster but has nobody seated on it, the `EmptyDesk` shape `mention_context`
+    /// still has to canonicalize.
+    fn memberless_desk_manifest() -> CompanyManifest {
+        toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "product_manager"
+role = "Product Manager"
+
+[[agent]]
+id = "backend_engineer"
+role = "Backend Engineer"
+
+[[group_chat]]
+id = "engineering"
+name = "Engineering"
+members = ["backend_engineer"]
+
+[[group_chat]]
+id = "sales"
+name = "Sales"
+members = []
+
+[policy]
+mode = "full"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// [`roster_manifest`] plus a desk **literally named** `dm:engineering`,
+    /// beside the ordinary `engineering` desk — the shape `mention_context`
+    /// must resolve **as sent** instead of stripping the `dm:` prefix away.
+    fn dm_prefixed_desk_manifest() -> CompanyManifest {
+        toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "product_manager"
+role = "Product Manager"
+
+[[agent]]
+id = "backend_engineer"
+role = "Backend Engineer"
+
+[[group_chat]]
+id = "engineering"
+name = "Engineering"
+members = ["backend_engineer"]
+
+[[group_chat]]
+id = "dm:engineering"
+name = "Dm Engineering"
+members = ["backend_engineer"]
+
+[policy]
+mode = "full"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// [`state_with_roster`] over [`memberless_desk_manifest`].
+    async fn state_with_memberless_desk(home: &std::path::Path) -> AppState {
+        let store = FsCompanyStore::new(home.to_path_buf());
+        let id = CompanyId::new("acme");
+        use crate::ports::CompanyStore;
+        store
+            .save(&CompanyRecord {
+                overlay_retired_agents: Vec::new(),
+                overlay_agent_edits: Vec::new(),
+                id: id.clone(),
+                manifest: memberless_desk_manifest(),
+                ledger: Vec::new(),
+                lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
+                overlay_policy: None,
+                overlay_tool_grants: None,
+                overlay_desk_tools: Default::default(),
+                disabled_workflows: Vec::new(),
+                template_provenance: None,
+                setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
+            })
+            .await
+            .unwrap();
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), memberless_desk_manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+        state
+    }
+
+    /// [`state_with_roster`] over [`dm_prefixed_desk_manifest`].
+    async fn state_with_dm_prefixed_desk(home: &std::path::Path) -> AppState {
+        let store = FsCompanyStore::new(home.to_path_buf());
+        let id = CompanyId::new("acme");
+        use crate::ports::CompanyStore;
+        store
+            .save(&CompanyRecord {
+                overlay_retired_agents: Vec::new(),
+                overlay_agent_edits: Vec::new(),
+                id: id.clone(),
+                manifest: dm_prefixed_desk_manifest(),
+                ledger: Vec::new(),
+                lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
+                overlay_policy: None,
+                overlay_tool_grants: None,
+                overlay_desk_tools: Default::default(),
+                disabled_workflows: Vec::new(),
+                template_provenance: None,
+                setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
+            })
+            .await
+            .unwrap();
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), dm_prefixed_desk_manifest())
             .with_id(id.clone())
             .build()
             .await
@@ -3996,6 +5289,7 @@ mode = "full"
                 parent: None,
                 deliverable: None,
                 detach: false,
+                attachments: Vec::new(),
             };
             let accepted = accept_chat_turn(
                 &runtime,
@@ -4056,10 +5350,14 @@ mode = "full"
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         };
         FsCompanyStore::new(home.to_path_buf())
             .save(&record)
@@ -4067,6 +5365,7 @@ mode = "full"
             .unwrap();
 
         let deps = HarnessDeps {
+            notifications: None,
             ledgers: None,
             ledger_registry: Default::default(),
             run_supervisor: crate::runtime::RunSupervisor::default(),
@@ -4116,6 +5415,8 @@ mode = "full"
             search: None,
             tenant_search: None,
             workspace: None,
+            workflow_runs: None,
+            deep_trace: None,
         };
         let brain = HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record);
 
@@ -4137,7 +5438,10 @@ mode = "full"
                     .uri("/api/v1/company/chat")
                     .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"text":"hi"}"#))
+                    // Issue #1725: not "hi". A bare pleasantry is answered by
+                    // the runtime without a turn, so it would reach no brain at
+                    // all — which is the opposite of what this asserts.
+                    .body(Body::from(r#"{"text":"ship the landing page"}"#))
                     .unwrap(),
             )
             .await
@@ -4148,15 +5452,18 @@ mode = "full"
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let text = value["responses"][0]["text"].as_str().unwrap();
         // The mock provider's `mock: ` prefix proves the message went through an
-        // openhuman agent turn; the trailing `hi` is the operator message the
-        // agent forwarded (the agent prepends a date/time context line). Crucially
-        // it is NOT the echo brain's `"You said: hi"`.
+        // openhuman agent turn; the trailing words are the operator message the
+        // agent forwarded (the agent prepends a date/time context line).
+        // Crucially it is NOT the echo brain's `"You said: …"`.
         assert!(text.starts_with("mock: "), "not an agent reply: {text:?}");
         assert!(
-            text.trim_end().ends_with("hi"),
+            text.trim_end().ends_with("ship the landing page"),
             "message not forwarded: {text:?}"
         );
-        assert_ne!(text, "You said: hi", "still routing through the echo brain");
+        assert_ne!(
+            text, "You said: ship the landing page",
+            "still routing through the echo brain"
+        );
         assert_eq!(value["responses"][0]["channel"], "operator");
     }
 
@@ -4192,10 +5499,14 @@ mode = "full"
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -4258,6 +5569,493 @@ mode = "full"
         assert_eq!(desks[0]["members"][0], "ceo");
         assert_eq!(desks[0]["members"][1], "eng");
         assert_eq!(desks[0]["overlayMembers"][0], "eng");
+    }
+
+    /// Issue #1781 review (Codex P2): an overlay desk whose own id is a
+    /// General spelling (`general` or `main`) must not appear in `GET
+    /// .../desks` — `POST .../desks` has refused those ids since issue #1743,
+    /// so the only way one exists is a company upgraded from before that
+    /// guard, and `CompanyRecord::resolve_desk_id` already excludes exactly
+    /// this desk from routing. Listing it anyway would let `buildChannels`
+    /// (frontend) treat it as the company-wide line and suppress the real
+    /// built-in `#general` — showing edit/delete controls and a membership
+    /// list that has nothing to do with where a message actually lands.
+    ///
+    /// Seeded directly on the stored record, not through `POST .../desks`:
+    /// that route's own guard means this shape can only be reached by data
+    /// that predates it, exactly the grandfathered case this proves.
+    #[tokio::test]
+    async fn list_desks_hides_an_overlay_desk_shadowing_general() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut record = runtime.store().load(&id).await.unwrap().unwrap();
+        record.overlay_desks.push(OverlayDesk {
+            id: "general".to_string(),
+            name: "General".to_string(),
+            description: None,
+            members: vec!["ceo".to_string()],
+            responder: ResponderMode::Lead,
+        });
+        record.overlay_desks.push(OverlayDesk {
+            id: "main".to_string(),
+            name: "Front office".to_string(),
+            description: None,
+            members: vec!["eng".to_string()],
+            responder: ResponderMode::Lead,
+        });
+        runtime.store().save(&record).await.unwrap();
+
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let desks = get_desks(&app, &cookie).await;
+        let ids: Vec<&str> = desks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            !ids.contains(&"general"),
+            "an overlay desk at the reserved `general` id must not be listed: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"main"),
+            "an overlay desk at the reserved `main` id must not be listed: {ids:?}"
+        );
+        // The manifest desk and a non-shadowing overlay desk are unaffected —
+        // this narrows one id, it does not hide desks generally.
+        assert!(ids.contains(&"studio"), "unrelated desk dropped: {ids:?}");
+    }
+
+    /// Every desk mutation aimed at a bare General spelling — no legacy
+    /// overlay row at all — is refused with a reason, under **every** spelling
+    /// the host folds into the General conversation (issue #1743; restored PR
+    /// #1781 review, CodeRabbit P2).
+    ///
+    /// This is the `is_general_channel` guard originally added by `da98130c1`
+    /// and its own regression test; an unrelated refactor (`3cbdb7a5f`) deleted
+    /// the guard, the four call sites, and this test together, and only the
+    /// read-side projection filter (`list_desks`/`resolve_desk_id`) was ever
+    /// restored (`0c07873db`) — this proves the write side is closed again.
+    ///
+    /// The point of the assertion is the pair: a `409` **and** the sentence.
+    /// Before this guard, each of these was a bare `404`/`CompanyNotFound` —
+    /// "there is no such desk" — which is a different and wrong claim.
+    /// `#general` is not missing; it is reserved, and the caller needs to be
+    /// told which.
+    #[tokio::test]
+    async fn every_desk_mutation_aimed_at_a_bare_general_spelling_is_refused_with_a_reason() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        for spelling in ["general", "General", "GENERAL", "main", "Main"] {
+            let cases: [(&str, String, &str); 4] = [
+                ("DELETE", format!("/api/v1/company/desks/{spelling}"), ""),
+                (
+                    "POST",
+                    format!("/api/v1/company/desks/{spelling}/members"),
+                    r#"{"agent_id":"eng"}"#,
+                ),
+                (
+                    "DELETE",
+                    format!("/api/v1/company/desks/{spelling}/members/ceo"),
+                    "",
+                ),
+                (
+                    "PUT",
+                    format!("/api/v1/company/desks/{spelling}/order"),
+                    r#"{"ordered_member_ids":["ceo"]}"#,
+                ),
+            ];
+            for (method, uri, body) in cases {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(&uri)
+                            .header("cookie", &cookie)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::CONFLICT,
+                    "{method} {uri} must be refused, not answered 404"
+                );
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    text.contains("company-wide channel"),
+                    "{method} {uri} must say why: got {text}"
+                );
+            }
+        }
+    }
+
+    /// Sibling to [`list_desks_hides_an_overlay_desk_shadowing_general`]: the
+    /// same grandfathered overlay desk at the reserved `general` id — which
+    /// that test proves is hidden from `GET .../desks` and unroutable through
+    /// [`CompanyRecord::resolve_desk_id`] — must also be unreachable through
+    /// every desk *mutation* (issue #1781 review, CodeRabbit P2). Before this
+    /// guard was restored, `desk_exists("general")` was `true` for exactly this
+    /// desk (it really is in `overlay_desks`), so `add_desk_member`,
+    /// `remove_desk_member`, `set_desk_order`, and `delete_desk` — which
+    /// checked only `desk_exists` — would staff, reorder, or delete a desk no
+    /// read surface exposes at all.
+    ///
+    /// Seeded directly on the stored record, the same way the read-side sibling
+    /// test is: `POST .../desks` has refused this id since issue #1743, so the
+    /// only way this shape exists is data that predates that guard.
+    #[tokio::test]
+    async fn desk_mutations_refuse_a_grandfathered_overlay_desk_shadowing_general() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut record = runtime.store().load(&id).await.unwrap().unwrap();
+        record.overlay_desks.push(OverlayDesk {
+            id: "general".to_string(),
+            name: "General".to_string(),
+            description: None,
+            members: vec!["ceo".to_string()],
+            responder: ResponderMode::Lead,
+        });
+        runtime.store().save(&record).await.unwrap();
+
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let cases: [(&str, &str, &str); 4] = [
+            ("DELETE", "/api/v1/company/desks/general", ""),
+            (
+                "POST",
+                "/api/v1/company/desks/general/members",
+                r#"{"agent_id":"eng"}"#,
+            ),
+            ("DELETE", "/api/v1/company/desks/general/members/ceo", ""),
+            (
+                "PUT",
+                "/api/v1/company/desks/general/order",
+                r#"{"ordered_member_ids":["ceo"]}"#,
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "{method} {uri} must be refused even though the desk really \
+                 exists in the overlay — desk_exists alone is not enough"
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("company-wide channel"),
+                "{method} {uri} must say why: got {text}"
+            );
+        }
+    }
+
+    /// `add_desk_member` must serialize its load-modify-save cycle against
+    /// `company_write_lock`, exactly like every other console load-modify-save
+    /// write (`put_logo`, `set_lifecycle`, `patch_company`) — otherwise it can
+    /// silently revert a concurrent rename: `patch_company` is guarded by
+    /// `company_write_lock` alone, so a desk write racing in on only the
+    /// unrelated `serial` cycle lock can load the pre-rename record and save
+    /// the whole thing back after the rename lands (PR #1875 review finding).
+    /// Proven the same way `put_logo_serializes_against_the_company_write_lock`
+    /// proves it: hold the lock externally, drive the real handler through the
+    /// router, and demand it cannot finish while the lock is held.
+    #[tokio::test]
+    async fn add_desk_member_serializes_against_the_company_write_lock() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let id = CompanyId::new("acme");
+
+        let lock = company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let app_for_task = app.clone();
+        let cookie_for_task = cookie.clone();
+        let mut task = tokio::spawn(async move {
+            app_for_task
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/company/desks/studio/members")
+                        .header("cookie", &cookie_for_task)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"agent_id":"eng"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+
+        // The handler must be blocked behind the held lock — give it every
+        // chance to (wrongly) race ahead before declaring it stuck.
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "add_desk_member completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-modify-save cycle \
+             against concurrent `ops` writers"
+        );
+
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("add_desk_member never resumed after the lock was released")
+            .expect("add_desk_member task panicked");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// `set_desk_order` must serialize against `company_write_lock` too — same
+    /// load-modify-save shape and same finding as `add_desk_member`'s own test
+    /// above (PR #1875 review finding, round 9: the earlier fix covered five
+    /// handlers but this coverage only proved it for one).
+    #[tokio::test]
+    async fn set_desk_order_serializes_against_the_company_write_lock() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let id = CompanyId::new("acme");
+        seed_overlay_eng(&app, &cookie).await;
+
+        let lock = company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let app_for_task = app.clone();
+        let cookie_for_task = cookie.clone();
+        let mut task = tokio::spawn(async move {
+            put_desk_order(
+                &app_for_task,
+                &cookie_for_task,
+                "studio",
+                r#"{"ordered_member_ids":["eng","ceo"]}"#,
+            )
+            .await
+        });
+
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "set_desk_order completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-modify-save cycle \
+             against concurrent `ops` writers"
+        );
+
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("set_desk_order never resumed after the lock was released")
+            .expect("set_desk_order task panicked");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// `remove_desk_member` must serialize against `company_write_lock` too
+    /// (PR #1875 review finding, round 9 — see
+    /// `set_desk_order_serializes_against_the_company_write_lock`'s own doc).
+    #[tokio::test]
+    async fn remove_desk_member_serializes_against_the_company_write_lock() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let id = CompanyId::new("acme");
+        seed_overlay_eng(&app, &cookie).await;
+
+        let lock = company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let app_for_task = app.clone();
+        let cookie_for_task = cookie.clone();
+        let mut task = tokio::spawn(async move {
+            app_for_task
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/api/v1/company/desks/studio/members/eng")
+                        .header("cookie", &cookie_for_task)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "remove_desk_member completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-modify-save cycle \
+             against concurrent `ops` writers"
+        );
+
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("remove_desk_member never resumed after the lock was released")
+            .expect("remove_desk_member task panicked");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    /// `create_desk` must serialize against `company_write_lock` too (PR #1875
+    /// review finding, round 9 — see
+    /// `set_desk_order_serializes_against_the_company_write_lock`'s own doc).
+    #[tokio::test]
+    async fn create_desk_serializes_against_the_company_write_lock() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let id = CompanyId::new("acme");
+
+        let lock = company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let app_for_task = app.clone();
+        let cookie_for_task = cookie.clone();
+        let mut task = tokio::spawn(async move {
+            app_for_task
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/company/desks")
+                        .header("cookie", &cookie_for_task)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"name":"Growth","members":["eng"]}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "create_desk completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-modify-save cycle \
+             against concurrent `ops` writers"
+        );
+
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("create_desk never resumed after the lock was released")
+            .expect("create_desk task panicked");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    /// `delete_desk` must serialize against `company_write_lock` too (PR #1875
+    /// review finding, round 9 — see
+    /// `set_desk_order_serializes_against_the_company_write_lock`'s own doc).
+    #[tokio::test]
+    async fn delete_desk_serializes_against_the_company_write_lock() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let id = CompanyId::new("acme");
+
+        // Create the overlay desk to delete before taking the lock — this
+        // test proves serialization on the delete path, not the create path.
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/desks")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Growth","members":["eng"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let lock = company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let app_for_task = app.clone();
+        let cookie_for_task = cookie.clone();
+        let mut task = tokio::spawn(async move {
+            app_for_task
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/api/v1/company/desks/growth")
+                        .header("cookie", &cookie_for_task)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "delete_desk completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-modify-save cycle \
+             against concurrent `ops` writers"
+        );
+
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("delete_desk never resumed after the lock was released")
+            .expect("delete_desk task panicked");
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     /// Removing an overlay member drops it from the merged view; a manifest
@@ -4518,16 +6316,129 @@ mode = "full"
         assert_eq!(body["members"][1], "ceo");
 
         // The list now carries the manifest desk and the created overlay desk.
+        // The Operator feed is its own surface (issue #1757 rework) — it is
+        // fetched through `GET {scope}/operator-channel`, not injected here.
         let desks = get_desks(&app, &cookie).await;
         let arr = desks.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 2, "{arr:?}");
         assert_eq!(arr[0]["id"], "studio"); // manifest desk first
         assert_eq!(arr[1]["id"], "growth_desk");
         assert_eq!(arr[1]["overlayCreated"], true);
     }
 
+    /// Issue #1835, both wire directions. A create that never mentions
+    /// `responder` — every existing caller, and the org chart today — answers
+    /// and lists with **no** `responder` key at all, so old consoles see the
+    /// pre-#1835 shape byte-for-byte. A create with `responder: "auto"`
+    /// answers and lists `"auto"`, and the mode survives the store round-trip
+    /// rather than collapsing back to a lead desk.
+    #[tokio::test]
+    async fn create_desk_carries_the_responder_mode_and_omits_the_default() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let post = |body: &'static str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/company/desks")
+                            .header("cookie", &cookie)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        let lead = post(r#"{"name":"Growth desk","members":["eng"]}"#).await;
+        assert!(
+            lead.get("responder").is_none(),
+            "a mode never stated must not appear on the wire: {lead}"
+        );
+        let auto =
+            post(r#"{"name":"Launch week","members":["eng","ceo"],"responder":"auto"}"#).await;
+        assert_eq!(auto["responder"], "auto", "{auto}");
+
+        // The list re-reads the store, so this is the round-trip half: the
+        // manifest desk and the defaulted create stay keyless, the channel
+        // keeps its mode.
+        let desks = get_desks(&app, &cookie).await;
+        let arr = desks.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(arr[0].get("responder").is_none(), "manifest desk: {desks}");
+        assert!(
+            arr[1].get("responder").is_none(),
+            "defaulted create: {desks}"
+        );
+        assert_eq!(arr[2]["responder"], "auto", "{desks}");
+    }
+
+    /// Issue #1835, codex review: an `auto` channel cannot be created empty —
+    /// the selector would have no candidates and the first-member fallback no
+    /// first member, so its unmentioned messages would silently fall to the
+    /// orchestrator, contradicting the channel's own model. A **lead** desk
+    /// keeps its right to start empty and be staffed from the org chart.
+    /// Revert the guard in `create_desk` and the first assertion answers 201.
+    #[tokio::test]
+    async fn an_auto_channel_cannot_be_created_empty_but_a_lead_desk_still_can() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let post = |body: &'static str| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/company/desks")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let refused = post(r#"{"name":"Launch week","responder":"auto"}"#).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(
+            body.contains("at least one member"),
+            "the refusal names the reason, not a generic 400: {body}"
+        );
+
+        let empty_lead = post(r#"{"name":"Someday desk"}"#).await;
+        assert_eq!(
+            empty_lead.status(),
+            StatusCode::CREATED,
+            "an empty lead desk is still legal — it gains members from the org chart"
+        );
+    }
+
     /// Create-desk validation: an empty name is 400, an id colliding with a
-    /// manifest desk is 409, and an unknown member is 400.
+    /// manifest desk is 409, an unknown member is 400, and — issue #1757 — an
+    /// id (explicit or name-derived) colliding with the reserved `operator`
+    /// system channel is 409 even though it is not a manifest or overlay desk
+    /// `desk_exists` would otherwise catch.
     #[tokio::test]
     async fn create_desk_validates_name_id_and_members() {
         let home_dir = home();
@@ -4543,6 +6454,30 @@ mode = "full"
                 r#"{"name":"Ghost desk","members":["ghost"]}"#,
                 StatusCode::BAD_REQUEST,
             ),
+            (
+                r#"{"name":"Operator","id":"operator"}"#,
+                StatusCode::CONFLICT,
+            ),
+            (r#"{"name":"operator"}"#, StatusCode::CONFLICT),
+            // PR #1781 review (CodeRabbit P2 follow-up to `316bc9229`): the id
+            // guard alone lets a display-name collision through — `{"id":
+            // "ops", "name": "Operator"}` never touches the reserved id, but
+            // `resolve_desk_id` would still fold a `?desk=Operator` selector
+            // onto this desk exactly as it would onto one literally named
+            // `operator`. Same shape for the collision-fallback display name.
+            (r#"{"name":"Operator","id":"ops"}"#, StatusCode::CONFLICT),
+            (
+                r#"{"name":"operator-feed","id":"ops2"}"#,
+                StatusCode::CONFLICT,
+            ),
+            // Issue #1743 / PR #1781 review: a desk claiming a General
+            // spelling — by id or by display name — would shadow the
+            // built-in `#general` channel exactly as an `operator`-id desk
+            // shadows the Operator feed.
+            (r#"{"name":"Ops","id":"general"}"#, StatusCode::CONFLICT),
+            (r#"{"name":"Ops","id":"main"}"#, StatusCode::CONFLICT),
+            (r#"{"name":"General"}"#, StatusCode::CONFLICT),
+            (r#"{"name":"Main"}"#, StatusCode::CONFLICT),
         ];
         for (body, want) in cases {
             let response = app
@@ -4617,8 +6552,11 @@ mode = "full"
         assert_eq!(delete.status(), StatusCode::NO_CONTENT);
 
         let desks = get_desks(&app, &cookie).await;
-        assert_eq!(desks.as_array().unwrap().len(), 1);
-        assert_eq!(desks[0]["id"], "studio");
+        // Only the manifest desk remains — the Operator feed is its own
+        // surface now (issue #1757 rework), not injected into this list.
+        let arr = desks.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["id"], "studio");
 
         // Deleting it again is a 404.
         let gone = app
@@ -4634,6 +6572,77 @@ mode = "full"
             .await
             .unwrap();
         assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #1781 review (Codex P2): deleting a legacy overlay desk that was
+    /// holding `operator_feed_channel()` on the fallback address must not let
+    /// it revert to `OPERATOR_CHANNEL`.
+    ///
+    /// `desk_exists`/`resolve_desk_id` are live checks — with no tombstone,
+    /// removing the colliding desk makes them stop matching, so the divert
+    /// would silently flip back the moment `delete_desk` succeeds. Seeded
+    /// directly on the stored record rather than through `POST .../desks`
+    /// (as `list_desks_hides_an_overlay_desk_shadowing_general` does for its
+    /// own General case): `create_desk`'s own guard has refused the id and
+    /// name `operator` since `316bc9229`, so this shape can only be reached
+    /// by an overlay desk that predates it — exactly what this proves stays
+    /// safe to delete.
+    #[tokio::test]
+    async fn delete_desk_keeps_the_operator_feed_diverted_after_the_collision_is_gone() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut record = runtime.store().load(&id).await.unwrap().unwrap();
+        record.overlay_desks.push(OverlayDesk {
+            id: "operator".to_string(),
+            name: "Legacy Ops".to_string(),
+            description: None,
+            members: vec![],
+            responder: ResponderMode::Lead,
+        });
+        runtime.store().save(&record).await.unwrap();
+
+        let reloaded = runtime.store().load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.operator_feed_channel(),
+            crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "fixture must start in the collision state this test exercises"
+        );
+
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+        let delete = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/company/desks/operator")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+        let after = runtime.store().load(&id).await.unwrap().unwrap();
+        assert!(
+            !after.desk_exists(crate::runtime::channel::OPERATOR_CHANNEL),
+            "the colliding desk must actually be gone, or this is not \
+             exercising the live-check-flips-back failure mode at all"
+        );
+        assert_eq!(
+            after.operator_feed_channel(),
+            crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "the feed address must stay on the fallback once the desk that \
+             caused the collision is deleted — flipping back to \
+             OPERATOR_CHANNEL would orphan every report already journaled \
+             under the fallback and let the deleted desk's own historical \
+             transcript (chat_id == \"operator\") resurface as system-feed \
+             content"
+        );
     }
 
     /// Add-member validation: an unknown desk is 404, an unknown teammate is
@@ -4895,8 +6904,11 @@ mode = "full"
 
     #[tokio::test]
     async fn desks_route_returns_the_company_desks() {
-        // The default test manifest defines no group chats, so the route answers
-        // 200 with an empty list (the console then falls back to its defaults).
+        // The default test manifest defines no group chats, so the route
+        // answers 200 with an empty list — the console falls back to its
+        // static default threads. The Operator feed is a separate surface
+        // (issue #1757 rework), fetched through `GET
+        // {scope}/operator-channel`, and no longer folded into this list.
         let home_dir = home();
         let home = home_dir.path().to_path_buf();
         let state = state_with_company(&home, "running").await;
@@ -4915,7 +6927,589 @@ mode = "full"
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value.as_array().unwrap().len(), 0);
+        let desks = value.as_array().unwrap();
+        assert!(desks.is_empty(), "{desks:?}");
+    }
+
+    async fn get_operator_channel(app: &axum::Router, cookie: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/operator-channel")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Issue #1757 rework: `GET {scope}/operator-channel` returns the
+    /// dedicated feed's identity — never folded into `list_desks` any more —
+    /// and `list_desks` carries zero operator logic: the real desks are all
+    /// it returns.
+    #[tokio::test]
+    async fn operator_channel_route_returns_the_feed_identity_and_is_absent_from_desks() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let channel = get_operator_channel(&app, &cookie).await;
+        assert_eq!(channel["id"], "operator");
+        assert_eq!(channel["name"], "Operator");
+        assert!(
+            channel["description"]
+                .as_str()
+                .unwrap()
+                .contains("what happened"),
+            "{channel}"
+        );
+
+        let desks = get_desks(&app, &cookie).await;
+        assert!(
+            desks
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|d| d["id"] != "operator"),
+            "list_desks must carry zero operator logic: {desks:?}"
+        );
+    }
+
+    /// Issue #1757 rework: the always-present Operator feed is its own
+    /// surface — `GET {scope}/operator-channel` names it, `list_desks` never
+    /// does — and posting to it is still refused (it is a read-only report
+    /// feed).
+    #[tokio::test]
+    async fn the_operator_channel_is_a_separate_surface_and_stays_read_only() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let desks = get_desks(&app, &cookie).await;
+        let desks = desks.as_array().unwrap();
+        let ids: Vec<&str> = desks.iter().map(|d| d["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["studio"], "list_desks carries only real desks");
+
+        let channel = get_operator_channel(&app, &cookie).await;
+        assert_eq!(channel["id"], "operator");
+        assert_eq!(channel["name"], "Operator");
+
+        // A send addressed to it is refused (read-only), never journaled.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hi","chat":"operator"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "posting to the operator channel must be refused, got {}",
+            response.status()
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_lowercase();
+        assert!(body.contains("read-only"), "{body}");
+    }
+
+    /// Issue #1781 review (CodeRabbit): `CompanyRuntime::ensure_desk_writable`
+    /// re-loads the record on every operator-channel send (to catch a
+    /// grandfathered desk/teammate colliding with the reserved id) and
+    /// propagates a real `store().load` failure with `?` rather than folding
+    /// it into "no real recipient". Collapsing it would misreport a store
+    /// outage as the ordinary read-only refusal — same 4xx, same message,
+    /// same "read-only" wording an operator would wrongly believe.
+    ///
+    /// Corrupting `company.toml` on disk after the app is built (rather than
+    /// mocking `CompanyStore`) exercises the real `FsCompanyStore::load`
+    /// error path — `Err(OpenCompanyError::Store("invalid company.toml: …"))`
+    /// — which has no `Store` arm in `ApiError::status` and therefore falls
+    /// to the catch-all `INTERNAL_SERVER_ERROR`. A collapsed-to-`false` read
+    /// would instead surface as `InvalidRequest` (400) with the read-only
+    /// wording, so the status code and body together distinguish the two.
+    #[tokio::test]
+    async fn a_failing_store_load_is_not_collapsed_into_the_read_only_refusal() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // Corrupt the on-disk manifest so the next `store().load()` — the one
+        // `ensure_desk_writable` runs fresh on every send — fails instead of
+        // returning `Some(record)`.
+        let toml_path = crate::store::Bundle::new(&home, &CompanyId::new("acme")).company_toml();
+        tokio::fs::write(&toml_path, b"not valid toml [[[")
+            .await
+            .expect("corrupt company.toml");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hi","chat":"operator"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a store load failure must propagate as itself, not the read-only 4xx"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_lowercase();
+        assert!(
+            !body.contains("read-only"),
+            "a store outage must not be misreported as the ordinary read-only refusal: {body}"
+        );
+    }
+
+    /// CodeRabbit review (PR #1781, P2): `operator_channel` used to fold a
+    /// `store().load()` failure into "no record" via `.ok().flatten()`, and
+    /// answer the default `operator` id anyway. For an upgraded company whose
+    /// grandfathered `operator` teammate requires the `operator-feed`
+    /// collision address, that silently mislabels the teammate's `operator`
+    /// transcript as the system feed while a transient outage lasts — and the
+    /// console would show it as healthy the whole time. This proves the fix:
+    /// a real load failure now propagates as an error instead of defaulting.
+    ///
+    /// Corrupts `company.toml` on disk after the app is built (rather than
+    /// mocking `CompanyStore`) to exercise the real `FsCompanyStore::load`
+    /// error path — same technique as
+    /// `a_failing_store_load_is_not_collapsed_into_the_read_only_refusal`
+    /// above.
+    #[tokio::test]
+    async fn operator_channel_propagates_a_store_load_failure_instead_of_defaulting() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_manifest(&home, desk_manifest()).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // Baseline: before any corruption, the route answers the default id.
+        let channel = get_operator_channel(&app, &cookie).await;
+        assert_eq!(channel["id"], "operator");
+
+        // Corrupt the on-disk manifest so the next `store().load()` fails
+        // instead of returning `Some(record)` or `None`.
+        let toml_path = crate::store::Bundle::new(&home, &CompanyId::new("acme")).company_toml();
+        tokio::fs::write(&toml_path, b"not valid toml [[[")
+            .await
+            .expect("corrupt company.toml");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/company/operator-channel")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a store load failure must propagate as itself, not the default operator id"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(
+            body["id"], "operator",
+            "a store outage must not be silently answered as the healthy default channel: {body}"
+        );
+    }
+
+    /// Issue #1757 migration: `operator` was not a reserved id before this
+    /// issue, and a stored manifest is never re-validated on load
+    /// (`CompanyManifest::from_stored_toml` skips validation on purpose, so
+    /// tightening a rule never strands an already-running company) — so a
+    /// company provisioned earlier can already have a real `[[group_chat]]`
+    /// using that id. Built directly with `toml::from_str` (bypassing
+    /// `into_validated`, the same way a stored manifest reaches
+    /// `CompanyRuntime` without going through it) to stand in for exactly
+    /// that: data that predates the guard. Without the carve-outs in
+    /// `list_desks` and `chat_and_emit`, this desk would be shadowed by a
+    /// synthetic, read-only duplicate under the same id the moment this
+    /// feature shipped, and every send to it would be refused. This proves
+    /// it is grandfathered instead: listed once, not flagged `system`, and
+    /// still writable.
+    #[tokio::test]
+    async fn a_manifest_desk_predating_the_reserved_operator_id_stays_writable() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[group_chat]]\nid = \"operator\"\nname = \"Ops Room\"\nmembers = [\"ceo\"]\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let desks = get_desks(&app, &cookie).await;
+        let desks = desks.as_array().unwrap();
+        assert_eq!(desks.len(), 1, "no duplicate synthetic entry: {desks:?}");
+        assert_eq!(desks[0]["id"], "operator");
+        assert_eq!(
+            desks[0]["name"], "Ops Room",
+            "the real desk's own name, not the synthetic channel's: {desks:?}"
+        );
+        assert!(
+            desks[0].get("system").is_none(),
+            "grandfathered desk is a real desk (system defaults false and is \
+             omitted), not the system channel: {desks:?}"
+        );
+
+        // A send addressed to it must go through — this is the pre-existing
+        // desk's own line, not the (absent) synthetic system channel.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"text":"ship the landing page","chat":"operator"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "a pre-existing desk that already owns the `operator` id must stay \
+             writable, got {}",
+            response.status()
+        );
+    }
+
+    /// The name-collision sibling of the id-collision test above (issue #1781
+    /// review, Codex P1 follow-up): a manifest desk grandfathered onto the
+    /// **display name** `Operator` (`{ id = "legacy_ops", name = "Operator" }`)
+    /// rather than the literal id. `resolve_desk_id` — what every *read*
+    /// already resolves a `?desk=` selector through — matches this desk by
+    /// name just as thoroughly as the id-collision desk above is matched by
+    /// id, but `ensure_desk_writable` used to check the *raw* selector string
+    /// against `OPERATOR_CHANNEL` before any such resolution ran, so a send
+    /// addressed to the desk's own supported alias (`chat: "Operator"`,
+    /// case-insensitive) was refused as the read-only system feed — reachable
+    /// by name for reads, refused by name for writes, the exact mismatch
+    /// `create_desk`'s reservation comment (above) warns a desk can never be
+    /// addressed consistently under. A send addressed to the desk's real id
+    /// (`legacy_ops`) already sailed through either way, which this also
+    /// covers as the negative control.
+    #[tokio::test]
+    async fn a_manifest_desk_grandfathered_onto_the_operator_name_stays_writable() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[group_chat]]\nid = \"legacy_ops\"\nname = \"Operator\"\nmembers = [\"ceo\"]\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // The desk's own real id still works — this was never broken.
+        let by_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"by id","chat":"legacy_ops"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            by_id.status().is_success(),
+            "a send addressed to the grandfathered desk's real id must stay writable, got {}",
+            by_id.status()
+        );
+
+        // The desk's supported display-name alias must now work too.
+        let by_name = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"by name","chat":"Operator"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            by_name.status().is_success(),
+            "a send addressed to the grandfathered desk's own case-insensitive \
+             `Operator` alias must resolve to the real desk, not the read-only \
+             system feed, got {}",
+            by_name.status()
+        );
+    }
+
+    /// The fallback-address sibling of the test above (issue #1781 review,
+    /// Codex P2 follow-up): a manifest desk grandfathered onto the display
+    /// name `operator-feed` — `OPERATOR_CHANNEL_COLLISION_FALLBACK` itself —
+    /// rather than `Operator`. No desk or teammate here claims the *primary*
+    /// `operator` id or name, so `operator_feed_channel()` stays on the
+    /// literal address and never diverts; the fallback is purely this desk's
+    /// own pre-#1757 display name. `ensure_desk_writable` used to refuse the
+    /// fallback constant unconditionally, without resolving it through
+    /// `resolve_desk_id` first the way the primary branch does — so a send
+    /// addressed to this desk's own supported case-insensitive alias
+    /// (`chat: "operator-feed"`) was refused as if it named the synthetic
+    /// read-only system desk, even though nothing here is actually diverted.
+    /// A send to the desk's real id (`ops`) already sailed through either
+    /// way, which this also covers as the negative control.
+    #[tokio::test]
+    async fn a_manifest_desk_grandfathered_onto_the_fallback_name_stays_writable() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[group_chat]]\nid = \"ops\"\nname = \"operator-feed\"\nmembers = [\"ceo\"]\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+        let record = runtime.store().load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            record.operator_feed_channel(),
+            crate::runtime::channel::OPERATOR_CHANNEL,
+            "fixture must NOT be in the diverted state — this proves the \
+             fallback name is refused even with no primary collision at all, \
+             which the diverted case above does not exercise"
+        );
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // The desk's own real id still works — this was never broken.
+        let by_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"by id","chat":"ops"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            by_id.status().is_success(),
+            "a send addressed to the grandfathered desk's real id must stay writable, got {}",
+            by_id.status()
+        );
+
+        // The desk's supported display-name alias must now work too.
+        let by_name = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"by name","chat":"operator-feed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            by_name.status().is_success(),
+            "a send addressed to the grandfathered desk's own case-insensitive \
+             `operator-feed` alias must resolve to the real desk, not the \
+             read-only system feed, got {}",
+            by_name.status()
+        );
+    }
+
+    /// Issue #1757 migration, the other namespace: a **teammate**, not a desk,
+    /// already named `operator`. `ChatView` addresses a DM by the teammate's
+    /// bare id (issue #364), so a message meant for this person also arrives
+    /// here as `chat == "operator"` — the same shape as a send meant for the
+    /// system feed. `desk_exists` alone cannot tell them apart: it only walks
+    /// `group_chats` and `overlay_desks`, never the roster, so a company that
+    /// named a manifest agent "Operator" before this feature shipped would
+    /// find that teammate's DM permanently refused, with the console giving no
+    /// way to rename or migrate out of the collision (`RESERVED_AGENT_IDS` and
+    /// `mint_agent_id` only stop a *future* mint). `is_roster_agent` closes the
+    /// same gap `desk_exists` closes for desks.
+    #[tokio::test]
+    async fn a_manifest_agent_predating_the_reserved_operator_id_stays_dm_able() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"operator\"\nrole = \"Chief of Staff\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // A DM addressed to the grandfathered teammate — by its bare id, the
+        // same address `ChatView` sends — must go through rather than be
+        // refused as a send to the read-only system channel.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"text":"status update please","chat":"operator"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "a pre-existing teammate that already owns the `operator` id must \
+             stay DM-able, got {}",
+            response.status()
+        );
+    }
+
+    /// Issue #1757 rework, the read side of the grandfather case the test
+    /// above covers on the write side: a company whose roster names a
+    /// teammate `operator` (no desk of the same id) must have `GET
+    /// {scope}/operator-channel` answer at the disjoint collision-fallback
+    /// id, not the literal `operator` one — a direct post to the visible
+    /// read-only feed and the teammate's own DM must stay distinguishable
+    /// (`chat_id == "operator"` for the DM, the fallback id for the feed) —
+    /// and that fallback id must itself stay refused as read-only.
+    #[tokio::test]
+    async fn the_operator_channel_diverts_off_a_grandfathered_teammates_operator_line() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"operator\"\nrole = \"Chief of Staff\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let app = router(state.clone());
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let channel = get_operator_channel(&app, &cookie).await;
+        assert_eq!(
+            channel["id"],
+            crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "the feed must not claim the literal `operator` id once a \
+             teammate already holds it: {channel:?}"
+        );
+
+        // list_desks carries no operator logic at all, so it is untouched by
+        // this collision either way — nothing to assert there but its
+        // absence of the teammate, which the DM test above already covers.
+
+        // The disjoint fallback id is unmintable and system-only: a direct post
+        // to it must stay refused exactly like the literal `operator` id is,
+        // even though nothing minted it as a desk.
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"text":"hello","chat":"{}"}}"#,
+                        crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the disjoint system-feed address must stay read-only"
+        );
+    }
+
+    /// PR #1781 review (CodeRabbit): the same divert as the test above, for
+    /// the *other* grandfather shape — a real **desk** already owning
+    /// `operator` (see `a_manifest_desk_predating_the_reserved_operator_id_stays_writable`
+    /// for the write side of this same fixture). Left undiverted, `GET
+    /// {scope}/operator-channel` and `GET {scope}/desks` would answer the
+    /// same id for two different things: the console appends the pinned
+    /// Operator row *after* the desk section (`operatorSection`,
+    /// `frontend/src/views/ChatView.tsx`), so `findChannel` — first-section-match
+    /// — would resolve the pinned row to the desk, and every workflow report
+    /// would journal onto the desk's own transcript instead of a
+    /// distinguishable feed.
+    #[tokio::test]
+    async fn the_operator_channel_diverts_off_a_grandfathered_desks_own_operator_line() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let legacy_manifest: CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+             [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+             [[group_chat]]\nid = \"operator\"\nname = \"Ops Room\"\nmembers = [\"ceo\"]\n",
+        )
+        .unwrap();
+        let state = state_with_manifest(&home, legacy_manifest).await;
+        let app = router(state);
+        let cookie = crate::server::test_support::fixed_cookie("acme");
+
+        let desks = get_desks(&app, &cookie).await;
+        let desks = desks.as_array().unwrap();
+        assert_eq!(desks.len(), 1);
+        assert_eq!(
+            desks[0]["id"], "operator",
+            "the desk itself must keep its own literal id: {desks:?}"
+        );
+
+        let channel = get_operator_channel(&app, &cookie).await;
+        assert_eq!(
+            channel["id"],
+            crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK,
+            "the pinned Operator row must not claim the literal `operator` id \
+             once a desk already holds it — otherwise the console shows two \
+             rows sharing one id and `findChannel` always resolves the pinned \
+             row to the desk: {channel:?}"
+        );
     }
 
     /// Issue #65: the console's default thread addresses sends with
@@ -5094,6 +7688,7 @@ mode = "full"
                     workflow_proposal: None,
                     origin_run_id: None,
                     origin_workflow_id: None,
+                    bounced: None,
                 },
             )
             .await
@@ -5816,6 +8411,60 @@ mode = "full"
         );
     }
 
+    /// PR #1781 review: `history_for_desk` (reload) and `project_event_for_viewer`
+    /// (live SSE) both already hide an owner-fallback report from a non-admin —
+    /// this proves the reaction route agrees, rather than letting a Member
+    /// react to (and thereby confirm the existence and sequence position of) a
+    /// report they cannot read. Answered with the same 404 an unknown sequence
+    /// gets, not a 403, so probing this endpoint cannot distinguish "hidden"
+    /// from "never existed".
+    #[tokio::test]
+    async fn reactions_refuse_a_target_that_is_an_admin_only_report() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home, "running").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        let report = runtime
+            .events()
+            .append(
+                runtime.id(),
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: "operator".into(),
+                    agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+                    text: "no admin has a mailbox".into(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+        let app = router(state);
+        let member_cookie = crate::server::test_support::member_cookie("acme");
+        let admin_cookie = crate::server::test_support::fixed_cookie("acme");
+
+        // A Member gets the same 404 an unknown message would.
+        assert_eq!(
+            post_reaction(
+                &app,
+                &member_cookie,
+                &report.value().to_string(),
+                "👍",
+                true
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        // An admin may react to it normally.
+        assert_eq!(
+            post_reaction(&app, &admin_cookie, &report.value().to_string(), "👍", true).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
     /// Regression for the third acceptance item of #364, which the console's
     /// own scoping already satisfied but nothing pinned: a message posted in one
     /// channel must be absent from another, end to end through the route — not
@@ -6367,6 +9016,138 @@ mode = "full"
         resolve_request_scoped("/api/v1/company", approval_id, body)
     }
 
+    // -- Extend the deadline (issue #1805) -----------------------------------
+
+    /// Parks one effect in BOTH the gate and the journal under a fixed id, at a
+    /// controllable instant — the gate is what `extend_approval` asks whether an
+    /// id is live, and the journal is what projects the deadline, so an extend
+    /// test needs both seeded exactly as a real park leaves them.
+    async fn park_for_extend(
+        runtime: &Arc<CompanyRuntime>,
+        id: &str,
+        at_millis: u64,
+    ) -> ApprovalId {
+        use crate::runtime::journal::{ApprovalConversation, TaskLink};
+        let approval = ApprovalId::new(id);
+        let effect = crate::ports::types::Effect {
+            kind: "payment.send".into(),
+            group: crate::ports::types::EffectGroup::Spend,
+            amount_usd: Some(1_200.0),
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "to": "vendor@example.test" }),
+            agent: Some("ceo".into()),
+            run_id: None,
+        };
+        runtime
+            .approval_gate
+            .rehydrate(approval.clone(), effect.clone(), at_millis);
+        runtime
+            .journal
+            .record_parked(
+                &approval,
+                &effect,
+                at_millis,
+                TaskLink::Unlinked,
+                ApprovalConversation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        approval
+    }
+
+    fn extend_request_with_cookie(approval_id: &ApprovalId, cookie: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/company/approvals/{approval_id}/extend"))
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn extend_request(approval_id: &ApprovalId) -> Request<Body> {
+        extend_request_with_cookie(
+            approval_id,
+            crate::server::test_support::fixed_cookie("acme"),
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The keystone (issue #1805): extending a parked approval pushes its
+    /// deadline out to a fresh full window, and the receipt names the new one —
+    /// the console can redraw the countdown without re-fetching the list.
+    #[tokio::test]
+    async fn extending_a_parked_approval_moves_its_deadline() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        // Parked long ago, so its original deadline is `1_000 + ttl`.
+        let id = park_for_extend(&runtime, "appr-ext", 1_000).await;
+        let before = runtime.pending_approvals()[0]
+            .expires_at_millis
+            .expect("a deadline is projected");
+
+        let app = router(state);
+        let response = app.oneshot(extend_request(&id)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+
+        let after = runtime.pending_approvals()[0]
+            .expires_at_millis
+            .expect("a deadline is still projected");
+        assert!(
+            after > before,
+            "the deadline moved out: before={before} after={after}"
+        );
+        assert!(body["extended"].as_bool().unwrap());
+        assert_eq!(
+            body["expiresAtMillis"].as_f64().unwrap() as u64,
+            after,
+            "the receipt's deadline is the one the card now projects"
+        );
+    }
+
+    /// Extending something that is not parked — an unknown id, or one already
+    /// resolved or expired — is a 404, not a 200 over nothing.
+    #[tokio::test]
+    async fn extending_an_unknown_approval_is_404() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let app = router(state);
+        let response = app
+            .oneshot(extend_request(&ApprovalId::new("does-not-exist")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The route is guarded by the same company auth as resolve: a member — an
+    /// authenticated user of the company — may extend a deadline, exactly as
+    /// they may resolve. Keeping a stalled run alive is not an admin-only lever.
+    #[tokio::test]
+    async fn a_member_may_extend_an_approval_deadline() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+        let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+        let id = park_for_extend(&runtime, "appr-member-ext", 1_000).await;
+
+        let app = router(state);
+        let response = app
+            .oneshot(extend_request_with_cookie(
+                &id,
+                crate::server::test_support::member_cookie("acme"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// Whether the stalled brain's follow-up turn has journaled its marker yet.
     fn continued(runtime: &Arc<CompanyRuntime>) -> bool {
         runtime
@@ -6533,6 +9314,7 @@ mode = "full"
                         text: SLOW_TURN_REPLY.into(),
                         steps: Vec::new(),
                         reply_to: None,
+                        mentions: Vec::new(),
                     });
                 }
             }
@@ -6713,6 +9495,7 @@ mode = "full"
                         text: format!("answered: {text}"),
                         steps: Vec::new(),
                         reply_to: None,
+                        mentions: Vec::new(),
                     });
                 }
             }
@@ -7468,8 +10251,13 @@ mode = "full"
 
     #[test]
     fn projects_a_gap_with_structural_fields_only() {
-        let value = super::project_stream_item(&EventStreamItem::Gap { missed: 44 })
-            .expect("a gap must reach the console");
+        let value = super::project_stream_item_for_viewer(
+            &EventStreamItem::Gap { missed: 44 },
+            &std::collections::HashMap::new(),
+            &Viewer::Operator,
+            true,
+        )
+        .expect("a gap must reach the console");
         assert_eq!(
             value,
             serde_json::json!({ "type": "stream_gap", "missed": 44 })
@@ -7510,10 +10298,97 @@ mode = "full"
         assert!(v.get("parentId").is_none(), "unexpected parentId: {v}");
     }
 
-    /// A threaded reply carries its parent onto the live frame (issue #364), so
-    /// a console watching the stream folds it under the same row a reload would
-    /// — otherwise a thread answer arrives live in the channel and then jumps
-    /// into the thread on the next refresh.
+    #[test]
+    fn projects_agent_reply_with_viewer_mention_metadata() {
+        use crate::ports::types::{Mention, MentionTarget};
+        let stored = stored(CompanyEvent::AgentReply {
+            mentions: vec![
+                Mention {
+                    target: MentionTarget::User { id: "u-1".into() },
+                    text: "@Ada".into(),
+                    offset: 0,
+                    quiet: false,
+                },
+                Mention {
+                    target: MentionTarget::Everyone,
+                    text: "@everyone".into(),
+                    offset: 5,
+                    quiet: true,
+                },
+            ],
+            mention_depth: 0,
+            parent: None,
+            task_id: None,
+            chat_id: "General".into(),
+            agent_id: "ceo".into(),
+            text: "@Ada @everyone".into(),
+            steps: Vec::new(),
+        });
+        let authors = std::collections::HashMap::from([(String::from("u-1"), String::from("Ada"))]);
+        let value =
+            super::project_event_for_viewer(&stored, &authors, &Viewer::User("u-1".into()), false)
+                .expect("agent_reply is an attention signal");
+        assert_eq!(
+            value["mentions"],
+            serde_json::json!([
+                { "text": "@Ada", "offset": 0, "label": "Ada", "mine": true },
+                { "text": "@everyone", "offset": 5, "label": "everyone", "mine": true, "quiet": true },
+            ])
+        );
+    }
+
+    /// Issue #1781 review, Codex P1: `history_for_desk` already hides an
+    /// owner-fallback report from a non-admin on reload; this proves the live
+    /// SSE projection agrees, rather than handing a non-admin console the full
+    /// admin-only text the instant it lands.
+    #[test]
+    fn drops_owner_fallback_report_from_a_non_admin_viewer() {
+        let event = stored(CompanyEvent::AgentReply {
+            mentions: Vec::new(),
+            mention_depth: 0,
+            parent: None,
+            task_id: None,
+            chat_id: "operator".into(),
+            agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+            text: "no admin has a mailbox".into(),
+            steps: Vec::new(),
+        });
+
+        let non_admin = super::project_event_for_viewer(
+            &event,
+            &std::collections::HashMap::new(),
+            &Viewer::User("member-1".into()),
+            false,
+        );
+        assert!(
+            non_admin.is_none(),
+            "a non-admin viewer must not receive the admin-only report live: {non_admin:?}"
+        );
+
+        let admin = super::project_event_for_viewer(
+            &event,
+            &std::collections::HashMap::new(),
+            &Viewer::User("admin-1".into()),
+            true,
+        )
+        .expect("an admin viewer still receives the report live");
+        assert_eq!(
+            admin["agentId"],
+            crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR
+        );
+
+        // The Operator viewer (issue #66's original, unrestricted principal)
+        // must see it too — same as `project_event`'s `is_admin: true` default.
+        let operator = super::project_event_for_viewer(
+            &event,
+            &std::collections::HashMap::new(),
+            &Viewer::Operator,
+            true,
+        )
+        .expect("the operator viewer still receives the report live");
+        assert_eq!(operator["text"], "no admin has a mailbox");
+    }
+
     #[test]
     fn projects_agent_reply_with_its_thread_parent() {
         let v = super::project_event(&stored(CompanyEvent::AgentReply {
@@ -7613,6 +10488,7 @@ mode = "full"
                 chat: Some("General".into()),
                 parent: None,
                 deliverable: None,
+                attachments: Vec::new(),
             }))
             .is_none(),
             "the operator's own message must not reach the console over SSE"
@@ -8236,12 +11112,31 @@ mode = "full"
             workflow_id: "digest".into(),
             run_id: "run-1".into(),
             scheduled: true,
+            started_by: None,
         }))
         .expect("workflow_run_started reaches the console");
         assert_eq!(started["type"], "workflow_run_started");
         assert_eq!(started["workflowId"], "digest");
         assert_eq!(started["runId"], "run-1");
         assert_eq!(started["scheduled"], true);
+        assert!(
+            started.get("startedBy").is_none(),
+            "no sender projects no key: {started}"
+        );
+
+        // Issue #1862 prerequisite: when the journal carries a sender, the SSE
+        // frame forwards it under `startedBy`.
+        let started_with_sender = super::project_event(&stored(CompanyEvent::WorkflowRunStarted {
+            workflow_id: "digest".into(),
+            run_id: "run-1".into(),
+            scheduled: false,
+            started_by: Some(crate::ports::types::StartedBy::Agent("ceo".into())),
+        }))
+        .expect("workflow_run_started reaches the console");
+        assert_eq!(
+            started_with_sender["startedBy"],
+            serde_json::json!({"agent": "ceo"})
+        );
 
         let node = super::project_event(&stored(CompanyEvent::WorkflowNodeFinished {
             workflow_id: "digest".into(),
@@ -8250,6 +11145,7 @@ mode = "full"
             status: crate::ports::types::WorkflowNodeStatus::Error,
             elapsed_ms: 1234,
             diagnostics: Vec::new(),
+            agent_run_id: None,
         }))
         .expect("workflow_node_finished reaches the console");
         assert_eq!(node["type"], "workflow_node_finished");
@@ -8376,6 +11272,7 @@ mode = "full"
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
             CompanyEvent::WebhookReceived {
                 channel: "email".into(),
@@ -8783,6 +11680,10 @@ mode = "full"
         /// the park records the shape a workflow node's gated tool call has:
         /// explicitly unlinked from any card, and carrying a run.
         run_id: Option<String>,
+        /// An `@mention` to append to every continuation reply. Exercises the
+        /// durable half of a reply's mention: the re-issue's reply journaling
+        /// must badge the person it names, same as the `/chat` path.
+        continuation_mention: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -8824,14 +11725,20 @@ mode = "full"
                             continue;
                         };
                         rt.grants.consume(&grant.agent, &grant.tool, &grant.args);
+                        let mut text = format!("re-issued {approval_id}");
+                        if let Some(mention) = &self.continuation_mention {
+                            text.push(' ');
+                            text.push_str(mention);
+                        }
                         responses.push(crate::ports::types::OutboundMessage {
                             message_id: None,
                             task_id: None,
                             channel: grant.agent.clone(),
                             agent: None,
-                            text: format!("re-issued {approval_id}"),
+                            text,
                             steps: Vec::new(),
                             reply_to: None,
+                            mentions: Vec::new(),
                         });
                     }
                     _ => {}
@@ -8864,7 +11771,7 @@ mode = "full"
         chat: Option<&str>,
         fail_continuation: bool,
     ) -> MultiParkCompany {
-        multi_park_company_run(home, parks, chat, fail_continuation, None).await
+        multi_park_company_run(home, parks, chat, fail_continuation, None, None).await
     }
 
     /// [`multi_park_company`], with the parked effects stamped as a workflow
@@ -8875,6 +11782,7 @@ mode = "full"
         chat: Option<&str>,
         fail_continuation: bool,
         run_id: Option<&str>,
+        continuation_mention: Option<&str>,
     ) -> MultiParkCompany {
         let decisions = Arc::new(std::sync::Mutex::new(Vec::new()));
         let cycles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8891,6 +11799,7 @@ mode = "full"
                 rt: rt_slot.clone(),
                 fail_continuation,
                 run_id: run_id.map(str::to_string),
+                continuation_mention: continuation_mention.map(str::to_string),
             })),
         )
         .await;
@@ -9146,7 +12055,8 @@ mode = "full"
     #[tokio::test]
     async fn a_workflow_parks_continuation_answers_on_the_run_not_in_a_dm() {
         let home_dir = home();
-        let c = multi_park_company_run(home_dir.path(), 1, None, false, Some("run-1092")).await;
+        let c =
+            multi_park_company_run(home_dir.path(), 1, None, false, Some("run-1092"), None).await;
 
         let response = c
             .app
@@ -9169,6 +12079,102 @@ mode = "full"
         assert_ne!(
             chat_id, "ceo",
             "the re-issue must not be journaled as a DM from the teammate that ran it"
+        );
+    }
+
+    /// **Codex P1 (pass 2).** A continuation's reply is journaled through
+    /// `publish_continuation`, not the `/chat` turn — so a mention an agent
+    /// types back in an approval follow-up used to render as a chip and
+    /// nothing else: no badge, no durable row, exactly the person it is meant
+    /// to reach (offline when the reply lands) getting neither.
+    ///
+    /// Both paths file through the same writer now; this pins that an `@user`
+    /// in a continuation reply lands as a mention notification whose audience
+    /// carries the person named, under the chat the continuation answered in.
+    #[tokio::test]
+    async fn a_continuation_reply_that_mentions_a_user_files_a_notification() {
+        let home_dir = home();
+        let c = multi_park_company_run(
+            home_dir.path(),
+            1,
+            Some("sales"),
+            false,
+            None,
+            Some("@harness-admin"),
+        )
+        .await;
+
+        let users = c
+            .runtime
+            .users()
+            .list_users(&CompanyId::new("acme"))
+            .await
+            .unwrap();
+        let admin = users
+            .iter()
+            .find(|u| u.email == "harness-admin@example.test")
+            .expect("the fixed admin is seeded");
+        assert_eq!(
+            admin.status,
+            crate::ports::users::UserStatus::Active,
+            "the admin must be an active, mentionable target"
+        );
+
+        let response = c
+            .app
+            .clone()
+            .oneshot(approve_detached(&c.approvals[0]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        settle(&c.runtime, 1).await;
+        // The notification is filed inside `publish_continuation`, after the
+        // reply is journaled — `settle` only waits for the reply. A loaded CI
+        // runner can reach this point before the notification append finishes,
+        // so poll for it (issue #1665, Codex P1 regression).
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notes = c
+                    .runtime
+                    .notifications()
+                    .list(&CompanyId::new("acme"), &admin.id)
+                    .await
+                    .unwrap();
+                if notes.iter().any(|n| n.notification.kind == "mention") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mention notification never appeared");
+
+        let notes = c
+            .runtime
+            .notifications()
+            .list(&CompanyId::new("acme"), &admin.id)
+            .await
+            .unwrap();
+        let mentions: Vec<_> = notes
+            .into_iter()
+            .filter(|n| n.notification.kind == "mention")
+            .collect();
+        assert_eq!(
+            mentions.len(),
+            1,
+            "the continuation's mention must badge the person it names"
+        );
+        let note = &mentions[0].notification;
+        assert_eq!(note.context.as_deref(), Some("sales"));
+        assert_eq!(
+            note.title, "Someone mentioned you in sales",
+            "a continuation has no author, so the generic label is the honest one"
+        );
+        assert!(
+            note.audience
+                .as_ref()
+                .is_some_and(|a| a.contains(&admin.id)),
+            "the named user must be in the notification's audience"
         );
     }
 
@@ -9295,5 +12301,667 @@ mode = "full"
             vec![crate::ports::SYSTEM_AUTHOR.to_string()],
             "the runtime authored this notice, so it must not be stored under its destination"
         );
+    }
+
+    /// Codex review finding: a stream that errors mid-read used to fall
+    /// straight through to extraction on whatever partial bytes it had
+    /// collected. This pins the fix directly against a synthetic stream,
+    /// without needing a real workspace store behind it — a chunk, then an
+    /// error, must discard everything read so far rather than handing back
+    /// a truncated payload that looks complete.
+    #[tokio::test]
+    async fn drain_bounded_discards_everything_on_a_mid_stream_error() {
+        use bytes::Bytes;
+        use futures::stream;
+
+        let items: Vec<crate::error::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"the first chunk read fine")),
+            Err(crate::error::OpenCompanyError::Store(
+                "transient read failure".to_string(),
+            )),
+        ];
+        let synthetic: crate::ports::workspace::BlobStream = Box::pin(stream::iter(items));
+
+        assert_eq!(drain_bounded(synthetic, 1_000_000).await, None);
+    }
+
+    /// The success twin: a stream with no error drains to its bytes, in
+    /// order, across however many chunks it arrives in.
+    #[tokio::test]
+    async fn drain_bounded_concatenates_every_chunk_when_the_stream_never_errors() {
+        use bytes::Bytes;
+        use futures::stream;
+
+        let items: Vec<crate::error::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let synthetic: crate::ports::workspace::BlobStream = Box::pin(stream::iter(items));
+
+        assert_eq!(
+            drain_bounded(synthetic, 1_000_000).await,
+            Some(b"hello world".to_vec())
+        );
+    }
+
+    /// A stream that never errors but exceeds the cap is also discarded, not
+    /// truncated — the belt-and-braces the doc comment describes.
+    #[tokio::test]
+    async fn drain_bounded_discards_when_the_stream_exceeds_the_cap() {
+        use bytes::Bytes;
+        use futures::stream;
+
+        let items: Vec<crate::error::Result<Bytes>> =
+            vec![Ok(Bytes::from_static(b"way more than the cap allows"))];
+        let synthetic: crate::ports::workspace::BlobStream = Box::pin(stream::iter(items));
+
+        assert_eq!(drain_bounded(synthetic, 4).await, None);
+    }
+
+    /// A brain whose every reply names `@everyone` — the fixed shape for
+    /// proving an agent reply's mentions file a notification, same as an
+    /// operator message's already does.
+    struct MentioningReplyBrain;
+
+    #[async_trait::async_trait]
+    impl crate::ports::brain::Brain for MentioningReplyBrain {
+        async fn run_cycle(
+            &self,
+            req: crate::ports::types::CycleRequest,
+            _host: &dyn crate::ports::brain::CycleHost,
+        ) -> crate::Result<crate::ports::types::CycleResult> {
+            let mut channel_responses = Vec::new();
+            for event in &req.events {
+                if matches!(event, CompanyEvent::OperatorMessage { .. }) {
+                    channel_responses.push(crate::ports::types::OutboundMessage {
+                        message_id: None,
+                        task_id: None,
+                        channel: "operator".into(),
+                        agent: None,
+                        text: "cc @everyone on this".into(),
+                        steps: Vec::new(),
+                        reply_to: None,
+                        mentions: Vec::new(),
+                    });
+                }
+            }
+            Ok(crate::ports::types::CycleResult {
+                channel_responses,
+                new_traces: vec![crate::ports::types::CompressedTrace::now(
+                    &req.cycle_id,
+                    "mentioning reply",
+                )],
+                ledger_deltas: Vec::new(),
+                token_usage: crate::ports::types::TokenUsage::default(),
+            })
+        }
+    }
+
+    /// **The Codex P1 finding:** `journal_chat_replies` resolved an agent
+    /// reply's mentions and stored them on `CompanyEvent::AgentReply`, but never
+    /// called `notify_mentions` — so an `@user` an agent typed *back* rendered
+    /// as a chip and left the named person with no durable notification and no
+    /// rail badge, unlike the operator's own message a few lines above it in
+    /// the very same function. Missing it worst for exactly the person it is
+    /// meant to reach: offline when the reply lands.
+    #[tokio::test]
+    async fn a_mention_in_an_agent_reply_notifies_the_person_it_names() {
+        let home_dir = home();
+        let state = build_state_with_brain(
+            home_dir.path(),
+            "running",
+            AppConfig::default(),
+            Some(Arc::new(MentioningReplyBrain)),
+        )
+        .await;
+        // A second person for `@everyone` to reach — the sender is always
+        // excluded from their own broadcast, so proving this needs somebody
+        // else on the roster.
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+        let app = router(state.clone());
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        let member_id = runtime
+            .users()
+            .list_users(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|u| u.email == "harness-member@example.test")
+            .expect("seeded member")
+            .id;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/company/chat")
+                    .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"status?"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let notified = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notes = runtime.notifications().list(&id, &member_id).await.unwrap();
+                if !notes.is_empty() {
+                    return notes;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the mentioned member was notified");
+
+        assert_eq!(notified.len(), 1);
+        assert_eq!(
+            notified[0].notification.kind, "mention",
+            "the reply's @everyone mention has to file the same kind of row an \
+             operator message's does"
+        );
+    }
+
+    /// **The Codex P1 finding:** the context a DM mention stores was decided by
+    /// the human user directory, but a DM's thread id is a roster teammate's
+    /// agent id — which no user record has — so a mention in a normal DM stored
+    /// the bare id. The console's rail keys a DM by `dm:<teammate-id>` (and the
+    /// console sends that bare id as the `chat` for a DM), so no rail row
+    /// displayed the badge and opening the DM could neither match nor clear it.
+    #[tokio::test]
+    async fn a_mention_in_a_dm_stores_the_console_dm_channel_id() {
+        let home_dir = home();
+        let state = state_with_roster(home_dir.path()).await;
+        // A second person for the broadcast to reach — the author is always
+        // excluded from their own `@everyone`.
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+        let app = router(state.clone());
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        let member_id = runtime
+            .users()
+            .list_users(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|u| u.email == "harness-member@example.test")
+            .expect("seeded member")
+            .id;
+
+        // A message addressed to the `designer` DM thread — the bare roster
+        // teammate id, exactly what the console sends for a DM.
+        let response = app
+            .clone()
+            .oneshot(chat_to("cc @everyone on this", Some("designer")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let notified = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notes = runtime.notifications().list(&id, &member_id).await.unwrap();
+                if !notes.is_empty() {
+                    return notes;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the mentioned member was notified");
+
+        // The offline echo brain answers the same text, so `@everyone` may land
+        // twice — once for the operator's message, once for the echoed reply.
+        // The count is incidental; the invariant is that *every* mention filed
+        // out of this exchange is keyed to the console's `dm:designer` channel,
+        // not the bare roster thread id.
+        assert!(!notified.is_empty(), "the mentioned member was notified");
+        let contexts: Vec<_> = notified
+            .iter()
+            .map(|n| n.notification.context.as_deref())
+            .collect();
+        assert!(
+            contexts.iter().all(|c| *c == Some("dm:designer")),
+            "every mention in a DM has to store the console's DM channel id, \
+             not the bare roster thread id — got {contexts:?}"
+        );
+    }
+
+    /// [`mention_context`] canonicalizes a **`dm:`-prefixed** noncanonical key
+    /// too. An API client can address a DM with the console's channel shape but
+    /// a noncanonical payload — `dm:BACKEND_ENGINEER` for the teammate whose id
+    /// is `backend_engineer`. The routing resolves that case-insensitively, so
+    /// the stored context has to carry the canonical agent id: filing the raw
+    /// key under `dm:BACKEND_ENGINEER` badges a rail channel that does not
+    /// exist, and opening the actual DM can never clear it. Pre-fix, the
+    /// `dm:`-prefixed branch returned the key verbatim and bypassed
+    /// `assignee::resolve` entirely.
+    #[tokio::test]
+    async fn mention_context_canonicalizes_prefixed_dm_keys() {
+        let home_dir = home();
+        let state = state_with_roster(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        // A case-variant of the teammate's id, carrying the `dm:` prefix the
+        // console mints.
+        assert_eq!(
+            runtime
+                .mention_context(&id, &[], "dm:BACKEND_ENGINEER")
+                .await,
+            "dm:backend_engineer",
+            "a `dm:`-prefixed noncanonical teammate key has to store dm:<agent-id>"
+        );
+        // The already-canonical shape stays unchanged — the resolution must
+        // not move a key that was already right.
+        assert_eq!(
+            runtime
+                .mention_context(&id, &[], "dm:backend_engineer")
+                .await,
+            "dm:backend_engineer",
+            "a canonical dm:<teammate-id> key is kept as-is"
+        );
+        // A `dm:` key whose bare half names a desk (the desk-first ordering the
+        // routing uses) files under the desk id, not a nonexistent `dm:<desk>`.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "dm:Engineering").await,
+            "engineering",
+            "a `dm:` key that resolves to a desk has to store the desk id"
+        );
+    }
+
+    /// A desk id that collides with a **human user id** still files under the
+    /// desk. `assignee::resolve`'s desk-first ordering — the same one
+    /// `responder_for` uses — outranks the user directory, and the directory
+    /// must not get a say ahead of it. Pre-fix, a `users` pre-check ran before
+    /// the resolution and returned `dm:<id>` for any bare key matching a human,
+    /// so a mention aimed at a desk whose id happened to match a human id would
+    /// badge a nonexistent DM channel and could never be cleared from the desk
+    /// it was meant for.
+    #[tokio::test]
+    async fn mention_context_a_human_id_matching_a_desk_id_stays_a_desk() {
+        let home_dir = home();
+        let state = state_with_roster(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        // A human whose id collides with the `engineering` desk's id. The human
+        // directory must not win: the message is aimed at the desk.
+        let human = crate::ports::users::UserRecord {
+            id: "engineering".to_string(),
+            email: "human@example.test".to_string(),
+            display_name: None,
+            avatar: None,
+            role: crate::ports::users::UserRole::Member,
+            status: crate::ports::users::UserStatus::Active,
+            password_hash: None,
+            must_change_password: false,
+            created_at_millis: crate::ports::now_millis(),
+            last_seen_at_millis: None,
+            updated_at_millis: crate::ports::now_millis(),
+        };
+
+        assert_eq!(
+            runtime
+                .mention_context(&id, std::slice::from_ref(&human), "engineering")
+                .await,
+            "engineering",
+            "a desk id that matches a human id files under the desk, not dm:<id>"
+        );
+        assert_eq!(
+            runtime
+                .mention_context(&id, std::slice::from_ref(&human), "dm:engineering")
+                .await,
+            "engineering",
+            "the same collision through a dm:-prefixed key still files under the desk"
+        );
+        // A DM the human is actually a teammate of still badges as a DM.
+        assert_eq!(
+            runtime
+                .mention_context(&id, &[human], "dm:backend_engineer")
+                .await,
+            "dm:backend_engineer",
+            "a real DM channel is unaffected by the collision guard"
+        );
+    }
+
+    /// [`mention_context`] resolves a `dm:`-prefixed key **as sent** before
+    /// stripping the prefix, so a desk literally named `dm:engineering` keeps
+    /// that id. Pre-fix, the unconditional strip resolved `engineering` instead
+    /// and filed the badge under the wrong transcript — the exact claim
+    /// [`assignee::dm_key`]'s contract warns about.
+    #[tokio::test]
+    async fn mention_context_a_desk_literally_named_dm_prefix_keeps_its_id() {
+        let home_dir = home();
+        let state = state_with_dm_prefixed_desk(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        // The literal `dm:engineering` desk resolves as sent; stripping would
+        // misroute to the plain `engineering` desk.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "dm:engineering").await,
+            "dm:engineering",
+            "a desk literally named dm:<…> keeps its id — the raw key resolves first"
+        );
+        // The un-prefixed desk is untouched by the collision.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "engineering").await,
+            "engineering",
+            "the un-prefixed desk still resolves to its own id"
+        );
+        // A genuine DM still re-keys onto the rail's DM channel.
+        assert_eq!(
+            runtime
+                .mention_context(&id, &[], "dm:backend_engineer")
+                .await,
+            "dm:backend_engineer",
+            "a real DM channel is unaffected by the literal dm: desk"
+        );
+    }
+
+    /// [`mention_context`] stores the **canonical** id for a key typed in a
+    /// noncanonical shape — a desk by its display name, a teammate by a
+    /// case-variant of their id. `assignee::resolve` already returns canonical
+    /// ids (issue #214); storing the raw key instead would file the badge under
+    /// a channel id the rail never has, so it could neither render nor clear.
+    #[tokio::test]
+    async fn mention_context_stores_canonical_ids_for_noncanonical_keys() {
+        let home_dir = home();
+        let state = state_with_roster(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        // A desk addressed by its display name files under the desk's id —
+        // `"Engineering"` names the desk whose id is `engineering`.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "Engineering").await,
+            "engineering",
+            "a desk named by its display name has to store the desk id, not the raw key"
+        );
+        // A teammate addressed by a case-variant of their id files under the
+        // canonical agent id, re-keyed into the console's DM channel space.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "BACKEND_ENGINEER").await,
+            "dm:backend_engineer",
+            "a teammate named by a noncanonical key has to store dm:<agent-id>"
+        );
+    }
+
+    /// [`mention_context`] files a mention in the General desk — the default an
+    /// unaddressed message lands in — under the console's canonical main-thread
+    /// id even when this company has no desk named/id `General`. This fixture's
+    /// only desk is `engineering`, so every general-chat spelling would
+    /// otherwise fall through to the raw string and badge a rail row that does
+    /// not exist (issue #1665 follow-up).
+    #[tokio::test]
+    async fn mention_context_maps_unresolvable_general_spellings_to_main() {
+        let home_dir = home();
+        let state = state_with_roster(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        for general in ["General", "general", "main", ""] {
+            assert_eq!(
+                runtime.mention_context(&id, &[], general).await,
+                crate::server::chat_history::MAIN_THREAD_ID,
+                "a mention in the General desk ({general:?}) has to store the console's \
+                 main-thread id, which the rail aliases onto its first rendered desk \
+                 channel"
+            );
+        }
+        // A desk that does resolve keeps its canonical id — the general-chat
+        // mapping must not swallow a real desk.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "Engineering").await,
+            "engineering",
+            "a real desk keeps its canonical id even when its name looks general"
+        );
+    }
+
+    /// [`mention_context`] canonicalizes a **memberless** desk too. A desk that
+    /// exists but has nobody seated on it is still a real desk with a real rail
+    /// channel, so a key typed as its display name must file under its canonical
+    /// id: `"Sales"` has to badge `#sales`, and opening `#sales` has to clear it.
+    /// Pre-fix, `EmptyDesk` fell through the same wildcard as `Unknown` and
+    /// stored the raw key — a channel id no desk renders, so the badge was
+    /// invisible and could never clear.
+    #[tokio::test]
+    async fn mention_context_canonicalizes_a_memberless_desk() {
+        let home_dir = home();
+        let state = state_with_memberless_desk(home_dir.path()).await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).expect("company registered");
+
+        assert_eq!(
+            runtime.mention_context(&id, &[], "Sales").await,
+            "sales",
+            "a memberless desk named by its display name has to store the desk id, \
+             not the raw key — the rail's channel id is `sales`"
+        );
+        // The desk that does have a lead keeps behaving as before.
+        assert_eq!(
+            runtime.mention_context(&id, &[], "Engineering").await,
+            "engineering",
+            "a desk with a lead still stores its canonical id"
+        );
+    }
+
+    /// Issue #1781 review (Codex P1): [`company_events`]'s periodic refresh
+    /// must re-derive admin access from the live user record, not keep
+    /// answering with whatever it was when the SSE stream opened. Proven
+    /// directly against [`refreshed_is_admin`] — the seam that refresh loop
+    /// calls on every tick — rather than the SSE handler itself, since the
+    /// handler's own timing (a real `EventSource`, a 60s interval) is not
+    /// what this bug is about.
+    #[tokio::test]
+    async fn refreshed_is_admin_reflects_a_mid_stream_demotion() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut user = crate::ports::users::UserRecord {
+            id: "u1".to_string(),
+            email: "admin@acme.test".to_string(),
+            display_name: None,
+            avatar: None,
+            role: crate::ports::users::UserRole::Admin,
+            status: crate::ports::users::UserStatus::Active,
+            password_hash: None,
+            must_change_password: false,
+            created_at_millis: crate::ports::now_millis(),
+            last_seen_at_millis: None,
+            updated_at_millis: crate::ports::now_millis(),
+        };
+        runtime
+            .users()
+            .upsert_user(runtime.id(), &user)
+            .await
+            .unwrap();
+        let actor = Actor {
+            kind: ActorKind::User,
+            id: user.id.clone(),
+        };
+
+        assert!(
+            refreshed_is_admin(&runtime, Some(&actor), false).await,
+            "an active admin's record must resolve to admin, even starting from a stale `false`"
+        );
+
+        // The demotion itself: same shape `PATCH …/users/{id}` writes, and —
+        // critically — it does not touch sessions, so a connection opened
+        // before this write stays open exactly as it would in production.
+        user.role = crate::ports::users::UserRole::Member;
+        runtime
+            .users()
+            .upsert_user(runtime.id(), &user)
+            .await
+            .unwrap();
+
+        assert!(
+            !refreshed_is_admin(&runtime, Some(&actor), true).await,
+            "a demoted user's live record must flip a stale `true` to `false` — this is \
+             exactly the check `company_events` failed to make before this fix, leaking the \
+             owner-fallback admin-only report to a demoted viewer for the rest of their stream"
+        );
+
+        // Suspension revokes admin the same way, even if role were untouched.
+        user.role = crate::ports::users::UserRole::Admin;
+        user.status = crate::ports::users::UserStatus::Suspended;
+        runtime
+            .users()
+            .upsert_user(runtime.id(), &user)
+            .await
+            .unwrap();
+
+        assert!(
+            !refreshed_is_admin(&runtime, Some(&actor), true).await,
+            "a suspended admin must not keep admin-only visibility either"
+        );
+    }
+
+    /// Issue #1781 review, Codex P1 second follow-up: a human actor whose
+    /// current role cannot be confirmed — `Ok(None)` because the user record
+    /// has gone missing, folded in here with a genuine store error since both
+    /// hit the same match arm — must resolve to `false`, not `previous`.
+    ///
+    /// `previous: true` here stands in for exactly the dangerous case: a
+    /// cached "was admin" value from before whatever made this actor
+    /// unconfirmable, revalidated at the one call site
+    /// (`is_admin_for_item`) that gates the admin-only owner-fallback report
+    /// on this result directly. Before this fix, an actor deleted out from
+    /// under an open SSE stream — or a transient read failure landing at the
+    /// exact moment a report needed gating — fell back to `previous` and kept
+    /// leaking the report, silently, for as long as the failure (or the
+    /// missing record) persisted.
+    #[tokio::test]
+    async fn refreshed_is_admin_fails_closed_when_the_user_record_cannot_be_found() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        // Never upserted — `get_user` answers `Ok(None)`, the "record has
+        // gone missing" half of the case this proves.
+        let actor = Actor {
+            kind: ActorKind::User,
+            id: "ghost".to_string(),
+        };
+
+        assert!(
+            !refreshed_is_admin(&runtime, Some(&actor), true).await,
+            "a human actor with no resolvable user record must read as not-admin \
+             even when the cached value being revalidated was `true` — trusting \
+             `previous` here is exactly the fail-open gap this fix closes"
+        );
+    }
+
+    /// Issue #1781 review, Codex P1 follow-up: even with the periodic refresh
+    /// the test above covers, `company_events` still only re-checked on its
+    /// own `LABEL_REFRESH_EVERY` (60s) tick — a demotion landing right after
+    /// one tick left an open SSE stream projecting an owner-fallback report
+    /// under a stale cached `true` for up to another 60s. `is_admin_for_item`
+    /// is the fix: it revalidates fresh for that one content class instead of
+    /// trusting `cached`, no matter how long ago the last periodic tick was —
+    /// proven here by feeding it a `cached: true` that is already wrong the
+    /// instant this call happens, with no `sleep` at all.
+    ///
+    /// The second half is the other side of the same fix: an *ordinary* event
+    /// must keep using `cached` untouched, or every SSE item would pay a
+    /// store read regardless of content — the whole reason the fix is scoped
+    /// to the owner-fallback content class rather than revalidating every
+    /// item.
+    #[tokio::test]
+    async fn is_admin_for_item_revalidates_only_the_owner_fallback_report() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        let mut user = crate::ports::users::UserRecord {
+            id: "u1".to_string(),
+            email: "admin@acme.test".to_string(),
+            display_name: None,
+            avatar: None,
+            role: crate::ports::users::UserRole::Admin,
+            status: crate::ports::users::UserStatus::Active,
+            password_hash: None,
+            must_change_password: false,
+            created_at_millis: crate::ports::now_millis(),
+            last_seen_at_millis: None,
+            updated_at_millis: crate::ports::now_millis(),
+        };
+        runtime
+            .users()
+            .upsert_user(runtime.id(), &user)
+            .await
+            .unwrap();
+        let actor = Actor {
+            kind: ActorKind::User,
+            id: user.id.clone(),
+        };
+
+        // The demotion: no wait, no periodic tick — the very next item must
+        // already see it for the gated content class.
+        user.role = crate::ports::users::UserRole::Member;
+        runtime
+            .users()
+            .upsert_user(runtime.id(), &user)
+            .await
+            .unwrap();
+
+        let owner_fallback_item = EventStreamItem::Event(stored(CompanyEvent::AgentReply {
+            mentions: Vec::new(),
+            mention_depth: 0,
+            parent: None,
+            task_id: None,
+            chat_id: "operator".into(),
+            agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+            text: "no admin has a mailbox".into(),
+            steps: Vec::new(),
+        }));
+        assert!(
+            !super::is_admin_for_item(&owner_fallback_item, &runtime, Some(&actor), true).await,
+            "an owner-fallback report must revalidate fresh and see the demotion \
+             immediately — a stale cached `true` must never leak this content, \
+             regardless of when the last periodic refresh ran"
+        );
+
+        let ordinary_item = EventStreamItem::Event(stored(CompanyEvent::AgentReply {
+            mentions: Vec::new(),
+            mention_depth: 0,
+            parent: None,
+            task_id: None,
+            chat_id: "General".into(),
+            agent_id: "ceo".into(),
+            text: "ordinary reply".into(),
+            steps: Vec::new(),
+        }));
+        assert!(
+            super::is_admin_for_item(&ordinary_item, &runtime, Some(&actor), true).await,
+            "an ordinary event must keep using the cached snapshot untouched — \
+             revalidating every item, not just the gated content class, would \
+             add a store read to the hot path for no reason"
+        );
+    }
+
+    /// The machine principal has no user record to look up — `actor: None` —
+    /// and [`ScopedCompany::is_admin`]'s own doc says it is unrestricted by
+    /// construction, so the refresh must leave it alone rather than treating
+    /// a missing actor as "look up nothing, therefore not admin".
+    #[tokio::test]
+    async fn refreshed_is_admin_leaves_the_machine_principal_unchanged() {
+        let home_dir = home();
+        let state = state_with_company(home_dir.path(), "running").await;
+        let id = CompanyId::new("acme");
+        let runtime = state.registry().get(&id).unwrap();
+
+        assert!(refreshed_is_admin(&runtime, None, true).await);
+        assert!(!refreshed_is_admin(&runtime, None, false).await);
     }
 }

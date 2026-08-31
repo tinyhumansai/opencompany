@@ -113,7 +113,13 @@ pub(crate) fn grant_matches(grant: &str, tool: &str) -> bool {
 /// first, never the raw per-agent `tools`.
 pub(crate) fn grants_cover_server(grants: &[String], name: &str) -> bool {
     let want = format!("mcp:{name}");
-    grants.iter().any(|grant| grant_matches(grant, &want))
+    // MCP is an explicit company opt-in. The generic matcher deliberately
+    // treats `*` as universal, but carrying that rule into this namespace would
+    // make a wildcard-only company reach every installed server.
+    grants
+        .iter()
+        .filter(|grant| grant.as_str() != "*")
+        .any(|grant| grant_matches(grant, &want))
 }
 
 #[async_trait]
@@ -214,6 +220,14 @@ mod test {
         assert!(grant_matches("composio_list*", "composio_list_toolkits"));
         assert!(!grant_matches("composio_list*", "composio_listen"));
         assert!(!grant_matches("composio_list*", "composio_execute"));
+    }
+
+    #[test]
+    fn wildcard_does_not_cover_mcp_servers() {
+        assert!(!grants_cover_server(&["*".into()], "notion"));
+        assert!(grants_cover_server(&["mcp:*".into()], "notion"));
+        assert!(grants_cover_server(&["mcp:notion".into()], "notion"));
+        assert!(!grants_cover_server(&["mcp:notion".into()], "linear"));
     }
 
     /// Every grant shape the shipped `companies/*/company.toml` manifests use

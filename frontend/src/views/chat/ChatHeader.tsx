@@ -114,20 +114,24 @@ export function ChatHeader({
         )}
       </div>
 
-      <Button
-        variant="ghost"
-        size="sm"
-        className={cn(
-          "h-7 gap-1.5 rounded-full border px-2.5 text-xs",
-          membersOpen ? "bg-accent" : "bg-muted/60",
-        )}
-        onClick={onToggleMembers}
-        aria-pressed={membersOpen}
-      >
-        <Users className="size-3.5" />
-        <span className="tabular-nums">{memberCount}</span>
-        <span className="sr-only">{membersOpen ? "Hide" : "Show"} teammates</span>
-      </Button>
+      {/* Issue #1757: the Operator system channel is a read-only report feed
+          with no members, so it offers no teammate pane. */}
+      {!channel.system && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(
+            "h-7 gap-1.5 rounded-full border px-2.5 text-xs",
+            membersOpen ? "bg-accent" : "bg-muted/60",
+          )}
+          onClick={onToggleMembers}
+          aria-pressed={membersOpen}
+        >
+          <Users className="size-3.5" />
+          <span className="tabular-nums">{memberCount}</span>
+          <span className="sr-only">{membersOpen ? "Hide" : "Show"} teammates</span>
+        </Button>
+      )}
     </header>
   );
 }

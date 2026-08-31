@@ -25,6 +25,7 @@ import {
 import { ApiError, type AgentDetailDto, type EditAgentInput, type HarnessDto } from "@/api/types";
 import { TeammateAvatar } from "@/components/teammate-avatar";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -49,21 +50,32 @@ import { Switch } from "@/components/ui/switch";
 import { useHashFlag } from "@/hooks/use-hash-flag";
 import {
   agentEdits,
+  companyCovers,
   draftFrom,
   draftIsValid,
+  missingRequired,
   emptyDraft,
+  grantCeiling,
   harnessEdit,
   harnessOptionLabel,
   isEditable,
   modelEdit,
+  parseToolGlobs,
   resolvedHarnessKind,
   summarizeGrants,
   tierLabel,
+  toolGlobsDiffer,
   type AgentDraft,
   type AgentFieldKey,
 } from "@/lib/agent";
+import { draftAgentField } from "@/api/agent-copilot";
+import { getInferenceStatus, type CognitionPath } from "@/api/inference";
+import { FieldCopilot } from "@/views/team/FieldCopilot";
 import { fetchBoardColumns } from "@/lib/board-columns";
-import { avatarFor, roleSubtitle, toneFor } from "@/lib/team";
+import { avatarRef } from "@/lib/avatar";
+import { AvatarPicker } from "@/components/avatar-picker";
+import { personName } from "@/lib/person";
+import { roleSubtitle, toneFor } from "@/lib/team";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
 import { cn } from "@/lib/utils";
 import { AgentFields } from "@/views/team/AgentFields";
@@ -193,6 +205,21 @@ export function AgentDetailView({
   const [draft, setDraft] = useState<AgentDraft>(emptyDraft());
   const [saving, setSaving] = useState(false);
   /**
+   * The cognition path this company booted onto (issue #1776).
+   *
+   * Gates the copilot the same way `WorkflowCreateDialog` gates its Draft
+   * button: on the offline `echo` brain there is no model to draft with, so the
+   * control is disabled with a sentence saying why rather than failing on click.
+   * `null` until the check settles, and on a host without the route — which
+   * leaves it enabled, because refusing to draft on a host we could not ask
+   * would break the control everywhere it actually works.
+   */
+  const [cognition, setCognition] = useState<CognitionPath | null>(null);
+  /** An icon save is in flight — the picker is disabled until it settles, so two
+      avatar PATCHes for the same teammate can never be pending at once and
+      resolve out of order (the older one overwriting the newer choice). */
+  const [avatarSaving, setAvatarSaving] = useState(false);
+  /**
    * What this teammate is on and carrying (issue #1141), or `null` when the
    * board could not be read — in which case the header states neither rather
    * than an invented "idle · 0 open".
@@ -237,6 +264,7 @@ export function AgentDetailView({
   const [people, setPeople] = useState<Person[]>([]);
   /** Whether the daily-budget dialog is open. */
   const [budgetOpen, setBudgetOpen] = useState(false);
+  const [avatarOpen, setAvatarOpen] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -266,10 +294,41 @@ export function AgentDetailView({
     };
   }, [client, company]);
 
+  /**
+   * The required fields the draft leaves blank, so the form can say why Save is
+   * disabled instead of just being disabled (issue #1776).
+   *
+   * Empty until the teammate loads — there is nothing to require a value of.
+   */
+  const missing = agent ? missingRequired(draft, (key) => isEditable(agent, key)) : [];
+
+  // Issue #1776: read the cognition path while the edit form is open, so the
+  // copilot can say "no model is configured" instead of offering a draft that
+  // can only come back refused. Its own effect rather than a field on the boot
+  // read: a slow `/inference` must not delay the teammate itself appearing.
+  useEffect(() => {
+    if (!editing) return;
+    let live = true;
+    (async () => {
+      try {
+        const status = await getInferenceStatus(client, company);
+        if (live) setCognition(status.cognition);
+      } catch {
+        // A host without the route tells us nothing either way. `null` is not
+        // `echo`, so the control stays enabled and a refusal (with its reason)
+        // is what the operator would see instead.
+        if (live) setCognition(null);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [editing, client, company]);
+
   /** A human label for whoever set a cap — never a raw user id. */
   function whoSet(userId: string): string {
     const person = people.find((p) => p.id === userId);
-    return person?.displayName?.trim() || person?.email || "an admin";
+    return person ? personName(person) : "an admin";
   }
 
   const boot = useCallback(async () => {
@@ -464,6 +523,35 @@ export function AgentDetailView({
     }
   }
 
+  /**
+   * Save a chosen face, or `undefined` to go back to the hashed default.
+   *
+   * Its own write rather than a field of the edit form: a face is picked by
+   * clicking it, and making that click wait for a Save button — in a form whose
+   * other fields are text — would be the only place in the console where
+   * choosing something visual is a two-step commit. Same identity guard as the
+   * budget and inbox writes, for the same reason.
+   */
+  async function saveAvatar(avatar: string | undefined) {
+    if (!agent) return;
+    // The picker is disabled for the duration (see `avatarSaving`), so at most
+    // one avatar PATCH can be pending at a time — an older response can never
+    // land after a newer choice was saved.
+    setAvatarSaving(true);
+    try {
+      const updated = await client.updateAgent(agentId, { avatar: avatar ?? null }, company);
+      if (displayedAgentIdRef.current !== agentId) return;
+      setAgent(updated);
+      toast.success(avatar ? "Icon updated." : "Back to the default icon.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Couldn't change this teammate's icon.",
+      );
+    } finally {
+      setAvatarSaving(false);
+    }
+  }
+
   async function save() {
     if (!agent) return;
     const edits = agentEdits(agent, draft);
@@ -490,6 +578,47 @@ export function AgentDetailView({
             ? error.message
             : "Couldn't save this teammate.",
       );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /**
+   * Write this teammate's own tool-grant list — the Tools card is a report
+   * AND an editor (the read-only report of a decision nobody could change was
+   * the dead end this card existed to end).
+   *
+   * Its own write rather than a field on the shared draft, because `tools` is
+   * not shaped like the others: the host gates it on admin where name, role and
+   * instructions are member-open, so folding it into `save()` would make every
+   * ordinary edit by a member 403 the moment a stale tools value rode along.
+   * Sent alone, a member never sends the key at all.
+   */
+  async function saveTools(globs: string[] | null) {
+    if (!agent) return;
+    setSaving(true);
+    try {
+      // Three-state (issue #1804): `null` resets to the standard company grant,
+      // `[]` is a deliberate deny-all, a non-empty list narrows. All three are
+      // meaningful on the wire, so the value is passed through untouched.
+      const updated = await client.updateAgent(agentId, { tools: globs }, company);
+      // A slow save must not clobber the active detail: only fold the response
+      // in when the agent on screen is still the one we saved (the same guard
+      // the ordinary save, reset, budget and inbox writes use).
+      if (displayedAgentIdRef.current !== agentId) return;
+      setAgent(updated);
+      toast.success("Tool grants updated.");
+    } catch (error) {
+      toast.error(
+        error instanceof ApiError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Couldn't save these tool grants.",
+      );
+      // Rethrow so the card keeps its editor open on a refusal — closing it
+      // would read as "saved" for a write the host rejected.
+      throw error;
     } finally {
       setSaving(false);
     }
@@ -608,6 +737,31 @@ export function AgentDetailView({
           </ol>
         </nav>
 
+        {/*
+          The page's accessible name in the four states `Identity` does not
+          mount for (codex review, #1785). `Identity`'s `h1` is this page's
+          only heading and it renders only once the teammate has loaded, so a
+          direct `#/team/<id>` visit that was still loading — or that landed on
+          a removed teammate, an older host, or a failed read — was a page a
+          screen reader could not announce at all.
+
+          `hidden`, because the breadcrumb above already says where you are and
+          a title bar over a skeleton would be chrome about nothing.
+
+          The name is gated on `load === "ready"` and not merely on `agent`
+          being set (coderabbit review). `boot()` moves `load` to `"loading"`
+          on an `agentId` change but keeps the previous `agent` until the new
+          request settles, so keying off `agent` alone announced the teammate
+          you just navigated *away from* as the name of the page you navigated
+          *to* — a wrong name, which is worse than a generic one. The crumb has
+          the same shape and can afford it: it is visible text next to the
+          controls, changing in place, rather than the one string a screen
+          reader announces on arrival.
+        */}
+        {load !== "ready" || !agent ? (
+          <PageHeader title="Teammate" hidden />
+        ) : null}
+
         {load === "loading" && <Skeleton className="h-64 rounded-xl" />}
 
         {load === "missing" && (
@@ -635,6 +789,16 @@ export function AgentDetailView({
           <>
             <Identity
               agent={agent}
+              // The host's own `editable` list decides, never this file: a host
+              // predating the field lists no `avatar`, and offering the picker
+              // there would be a click whose save is a 400. Same rule the edit
+              // form's fields follow.
+              onPickAvatar={
+                agent.editable.includes("avatar")
+                  ? () => setAvatarOpen(true)
+                  : undefined
+              }
+              avatarBusy={avatarSaving}
               action={
                 !editing ? (
                   <Button
@@ -710,6 +874,52 @@ export function AgentDetailView({
                       setDraft((d) => ({ ...d, [key]: value }))
                     }
                     readOnly={(key) => !isEditable(agent, key)}
+                    copilot={(key) =>
+                      key === "description" || key === "instructions" ? (
+                        <FieldCopilot
+                          field={key}
+                          // Addressed by id: this teammate exists, so the host
+                          // grounds the draft in its own record rather than in
+                          // anything this console sends.
+                          onTurn={(conversation) =>
+                            draftAgentField(client, company, agentId, key, conversation, {
+                              // The form's own values, not the host's. An
+                              // operator who took a draft and has not saved is
+                              // looking at something the record does not have,
+                              // and a copilot grounded in the record would
+                              // refine a version that is no longer on screen.
+                              description: draft.description,
+                              instructions: draft.instructions,
+                              // Identity too: both prompts are written FROM the
+                              // role, so a teammate repurposed on this form and
+                              // drafted for before Save would otherwise get a
+                              // mandate for the job it used to do.
+                              role: draft.role,
+                              name: draft.name,
+                            })
+                          }
+                          // Fills the form draft and nothing else. The Save
+                          // below is still what writes, which is what makes a
+                          // drafted persona no different from a typed one.
+                          onAccept={(text) => setDraft((d) => ({ ...d, [key]: text }))}
+                          // A blank role is refused here for the reason the
+                          // Add form refuses it: both briefs are written FROM
+                          // the role. The wire drops a blank one rather than
+                          // sending it, so the host would fall back to the
+                          // STORED role and draft for the job this teammate is
+                          // being moved off — the one thing the operator is
+                          // mid-way through changing.
+                          disabled={saving || cognition === "echo" || !draft.role.trim()}
+                          disabledNotice={
+                            cognition === "echo"
+                              ? "No model is configured, so the copilot can't draft yet."
+                              : !draft.role.trim()
+                                ? "Give this teammate a role first — the copilot drafts from it."
+                                : undefined
+                          }
+                        />
+                      ) : null
+                    }
                   />
                   {agent.instructionsOverridden && agent.blueprintInstructions?.trim() && (
                     <p
@@ -720,7 +930,22 @@ export function AgentDetailView({
                       restores: {agent.blueprintInstructions.trim()}
                     </p>
                   )}
-                  <div className="flex justify-end gap-2">
+                  <div className="flex items-center justify-end gap-2">
+                    {/* Why Save is dead, next to Save (issue #1776). A manifest
+                        teammate carries no name of its own, so this form opens
+                        with Name blank and the button already disabled — and
+                        until this line the only way to find that out was to
+                        guess. The fields themselves are marked too; this says
+                        it where the operator is looking when they wonder. */}
+                    {missing.length > 0 && (
+                      <p
+                        className="mr-auto text-2xs text-muted-foreground"
+                        data-testid="agent-save-blocked"
+                      >
+                        {missing.map((field) => field.label).join(" and ")}{" "}
+                        {missing.length > 1 ? "are" : "is"} required to save.
+                      </p>
+                    )}
                     <Button
                       variant="ghost"
                       onClick={() => {
@@ -772,7 +997,7 @@ export function AgentDetailView({
               )}
             </Section>
 
-            <Tools agent={agent} />
+            <Tools agent={agent} saving={saving} onSave={(globs) => saveTools(globs)} />
             <HarnessAndModel
               agent={agent}
               harnesses={harnesses}
@@ -845,6 +1070,17 @@ export function AgentDetailView({
           </>
         )}
       </div>
+      <AvatarDialog
+        client={client}
+        company={company}
+        agent={avatarOpen ? agent : null}
+        busy={avatarSaving}
+        onOpenChange={setAvatarOpen}
+        onPick={(avatar) => {
+          setAvatarOpen(false);
+          void saveAvatar(avatar);
+        }}
+      />
       <BudgetDialog
         agent={budgetOpen ? agent : null}
         onOpenChange={setBudgetOpen}
@@ -858,14 +1094,27 @@ export function AgentDetailView({
 }
 
 /** Name, role, id, desks, and the two facts that classify an agent. */
-function Identity({ agent, action }: { agent: AgentDetailDto; action?: ReactNode }) {
+function Identity({
+  agent,
+  action,
+  onPickAvatar,
+  avatarBusy,
+}: {
+  agent: AgentDetailDto;
+  action?: ReactNode;
+  /** Opens the icon picker. Absent leaves the tile inert — a read-only header. */
+  onPickAvatar?: () => void;
+  /** An icon save is in flight — the tile must not start another one. */
+  avatarBusy?: boolean;
+}) {
   const display = agent.name?.trim() || agent.role;
   const seed = agent.id || display;
   const tone = toneFor(seed);
-  // Same seed as `tone` — the id where there is one — so a rename doesn't
+  // What this teammate wears: the chosen face, else the mascot hashed from the
+  // same seed as `tone` — the id where there is one — so a rename doesn't
   // change this teammate's face on the one screen that should never be
   // showing letters (issue #1181, and issue #1185 for the seed itself).
-  const avatar = avatarFor(seed);
+  const avatar = avatarRef(agent.avatar, seed);
   // #1208, on the page a teammate *is*. `display` already falls back to the
   // role, and a manifest-declared agent has no `name` at all, so the line under
   // the title was the title again on every teammate in every shipped company.
@@ -875,13 +1124,38 @@ function Identity({ agent, action }: { agent: AgentDetailDto; action?: ReactNode
       <div className="flex items-start gap-4 min-w-0">
         {/* The header of the page a teammate *is* — the one screen that should
             never be the one showing letters (issue #1181). 56px. */}
-        <TeammateAvatar
-          name={display}
-          tone={tone}
-          avatar={avatar}
-          className="size-14 rounded-xl text-base"
-          data-testid="agent-avatar"
-        />
+        {/* The tile is the control. A face is a visual thing, so the way to
+            change it is to click the one on screen rather than to hunt for a
+            field named after it — and the hover ring is what says so, since an
+            avatar that looks identical to an inert one is a button nobody
+            finds. Falls back to a plain tile where there is no handler. */}
+        {onPickAvatar ? (
+          <button
+            type="button"
+            onClick={onPickAvatar}
+            disabled={avatarBusy}
+            aria-label="Change this teammate's icon"
+            title="Change icon"
+            className="rounded-xl ring-2 ring-transparent transition-colors hover:ring-primary focus-visible:ring-primary focus-visible:outline-none disabled:cursor-wait"
+            data-testid="agent-avatar-pick"
+          >
+            <TeammateAvatar
+              name={display}
+              tone={tone}
+              avatar={avatar}
+              className="size-14 rounded-xl text-base"
+              data-testid="agent-avatar"
+            />
+          </button>
+        ) : (
+          <TeammateAvatar
+            name={display}
+            tone={tone}
+            avatar={avatar}
+            className="size-14 rounded-xl text-base"
+            data-testid="agent-avatar"
+          />
+        )}
         <div className="min-w-0 flex-1 space-y-2">
           <div>
             <h1 className="truncate text-2xl font-semibold tracking-tight" data-testid="agent-name">
@@ -1012,33 +1286,182 @@ function OpenTasks({ tasks }: { tasks: Task[] | null }) {
 }
 
 /**
- * The tool grants, resolved.
+ * The tool grants, resolved — and, for an admin, editable.
  *
  * Three facts, because the difference between them is the whole reason this
  * section exists. What the agent holds. Whether it holds it because it asked or
  * because it asked for nothing and inherited the company's grant. And what it
  * asked for and did not get, which is the line an operator checking a tool
- * change is actually looking for and which no surface showed before.
+ * change is actually looking for and which no surface showed before — and
+ * which, as of this card becoming an editor, has a way to act on it.
+ *
+ * The edit surface is deliberately live: the preview of what will be stored is
+ * computed against the same ceilings the host applies when it re-derives
+ * `effective`, so a glob that would land struck-through is flagged while the
+ * operator types, not after the write.
  */
-function Tools({ agent }: { agent: AgentDetailDto }) {
+function Tools({
+  agent,
+  saving,
+  onSave,
+}: {
+  agent: AgentDetailDto;
+  saving: boolean;
+  onSave: (globs: string[] | null) => Promise<void>;
+}) {
   const summary = summarizeGrants(agent.tools);
+  const canEdit = isEditable(agent, "tools");
+  const [editing, setEditing] = useState(false);
+  // `requested` is three-state since #1804 (`null` = standard, `[]` = deny-all,
+  // list = narrow); the text field only ever renders the concrete globs, so a
+  // `null`/`[]` grant both start from an empty box.
+  const requestedGlobs = agent.tools.requested ?? [];
+  const [field, setField] = useState(requestedGlobs.join(", "));
+
+  // The teammate on screen can change under this card (a slow detail load, a
+  // sibling route swap), and a draft left over from the previous one would be
+  // saved onto the new teammate. Re-seed whenever the stored list changes.
+  useEffect(() => {
+    setField((agent.tools.requested ?? []).join(", "));
+    setEditing(false);
+  }, [agent.id, agent.tools.requested]);
+
+  const draft = parseToolGlobs(field);
+  const dirty = toolGlobsDiffer(requestedGlobs, draft);
+  // Live, before the save rather than after it: the intersection is the thing
+  // operators get wrong, and a glob the desk-and-company ceiling does not allow
+  // is stored happily and then confers nothing. Saying so while they type is the
+  // whole reason this card knows the ceilings. The desk level is the gate when
+  // a desk states one — `grantCeiling` is `deskAllow` when a ceiling is active,
+  // else the company allow-list, matching the host's `agent_scoped_grants`
+  // two-level application — because a desk that omits a company-allowed
+  // namespace drops it immediately after saving. `deskCeilingActive` (not
+  // `deskAllow`'s emptiness) is the sentinel: a ceiling whose narrowed list is
+  // empty still narrows everything away.
+  const deskCeilingActive = agent.tools.deskCeilingActive;
+  const willNotApply = draft.filter((glob) => !companyCovers(grantCeiling(agent.tools), glob));
+
   return (
     <Section
       title="Tools"
       subtitle={
         summary.standardGrant
-          ? "This teammate lists no tools of its own, so it holds everything the company allows."
-          : "What this teammate asked for, narrowed by what the company allows."
+          ? deskCeilingActive
+            ? "This teammate lists no tools of its own, so it holds what its desk allows, narrowed by the company."
+            : "This teammate lists no tools of its own, so it holds everything the company allows."
+          : summary.deniedAll
+            ? "This teammate has been given an explicit empty grant, so it holds no tools at all."
+            : "What this teammate asked for, narrowed by what its desk and the company allow."
+      }
+      action={
+        canEdit && !editing ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setEditing(true)}
+            data-testid="agent-tools-edit"
+          >
+            <Pencil className="size-4" /> Edit
+          </Button>
+        ) : undefined
       }
     >
+      {editing && (
+        <div className="grid gap-2" data-testid="agent-tools-editor">
+          <Label htmlFor="agent-tools-field">Tool grants</Label>
+          <Input
+            id="agent-tools-field"
+            value={field}
+            onChange={(event) => setField(event.target.value)}
+            placeholder="workspace.read, docs.*, files.*"
+            className="font-mono text-xs"
+            data-testid="agent-tools-field"
+          />
+          <p className="text-xs text-muted-foreground">
+            One glob per grant, separated by commas or spaces. Each is narrowed by the
+            company tool list below
+            {deskCeilingActive ? " and by this teammate's desk ceiling" : ""}, so this
+            can only ever take capability away — never add to it.
+          </p>
+          {draft.length === 0 && (
+            // Since #1804 the inversion runs the other way: an empty list is a
+            // deliberate deny-all, NOT the standard grant. An operator who
+            // wants the standard grant back must use "Reset to standard" below.
+            <p className="text-xs text-status-blocked-text" data-testid="agent-tools-empty-warning">
+              Saving an empty list is a deny-all — this teammate would hold no tools at all. To
+              give it the standard company grant instead, use “Reset to standard grant”.
+            </p>
+          )}
+          {willNotApply.length > 0 && (
+            <p className="text-xs text-status-blocked-text" data-testid="agent-tools-uncovered">
+              {deskCeilingActive
+                ? `The desk and company tool lists do not cover ${willNotApply.join(", ")}, so it will be stored and confer nothing.`
+                : `The company tool list does not cover ${willNotApply.join(", ")}, so it will be stored and confer nothing.`}
+            </p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setField(requestedGlobs.join(", "));
+                setEditing(false);
+              }}
+            >
+              Cancel
+            </Button>
+            {/* Reset to the standard grant (`null`) — a distinct action from
+                saving an empty list (`[]`, a deny-all) since #1804. Only shown
+                when the teammate is not already on the standard grant. */}
+            {!summary.standardGrant && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={saving}
+                onClick={() => {
+                  void onSave(null).then(
+                    () => setEditing(false),
+                    () => undefined,
+                  );
+                }}
+                data-testid="agent-tools-reset"
+              >
+                Reset to standard grant
+              </Button>
+            )}
+            <Button
+              size="sm"
+              disabled={saving || !dirty}
+              onClick={() => {
+                // The editor closes on success and stays open on a refusal;
+                // the toast is raised by the caller, so the rejection is
+                // swallowed here rather than left unhandled. An empty `draft`
+                // is a deliberate deny-all (`[]`), not a reset — that is the
+                // separate "Reset to standard grant" button above.
+                void onSave(draft).then(
+                  () => setEditing(false),
+                  () => undefined,
+                );
+              }}
+              data-testid="agent-tools-save"
+            >
+              Save
+            </Button>
+          </div>
+        </div>
+      )}
       {summary.effective.length === 0 ? (
         <p className="text-sm text-muted-foreground" data-testid="agent-tools-empty">
-          {/* Both ways of holding nothing land here, and they are not the same
-              fact. An agent that asked for nothing under a company that allows
-              nothing has been refused nothing. */}
+          {/* The ways of holding nothing land here, and they are not the same
+              fact. An agent on the standard grant under a company that allows
+              nothing has been refused nothing; a deny-all agent asked to hold
+              nothing; a narrowed agent asked for tools none of which are
+              covered. */}
           {summary.standardGrant
             ? "This teammate has no tools, because the company allows none."
-            : "This teammate has no tools. Nothing it asked for is covered by the company tool list."}
+            : summary.deniedAll
+              ? "This teammate has no tools: it was given an explicit empty (deny-all) grant."
+              : "This teammate has no tools. Nothing it asked for is covered by the company tool list."}
         </p>
       ) : (
         <div className="flex flex-wrap gap-2" data-testid="agent-tools">
@@ -1066,6 +1489,12 @@ function Tools({ agent }: { agent: AgentDetailDto }) {
       {!summary.standardGrant && (
         <p className="text-xs text-muted-foreground">
           Company tool list: {agent.tools.companyAllow.join(", ") || "nothing allowed"}
+          {deskCeilingActive && (
+            <>
+              {" · "}
+              Desk tool list: {agent.tools.deskAllow.join(", ") || "nothing allowed"}
+            </>
+          )}
         </p>
       )}
     </Section>
@@ -1469,6 +1898,58 @@ function Budget({
 }
 
 /**
+ * Pick a teammate's icon.
+ *
+ * Picking **is** the save — there is no Save button — because a face is chosen
+ * by clicking it and a confirm step over a visual choice only adds a way to
+ * lose it. The dialog closes on the click, and the write reports itself with a
+ * toast like every other one-click write on this page.
+ */
+function AvatarDialog({
+  client,
+  company,
+  agent,
+  busy,
+  onOpenChange,
+  onPick,
+}: {
+  client: OpenCompanyClient;
+  company: string | null;
+  agent: AgentDetailDto | null;
+  /** An avatar save is in flight — the picker is inert until it settles. */
+  busy: boolean;
+  onOpenChange: (open: boolean) => void;
+  onPick: (avatar: string | undefined) => void;
+}) {
+  const name = agent?.name?.trim() || agent?.role || "this teammate";
+  return (
+    <Dialog open={agent !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Icon</DialogTitle>
+          <DialogDescription>
+            The face {name} wears everywhere in this console — chat, the org chart, every list
+            they appear in.
+          </DialogDescription>
+        </DialogHeader>
+        {agent && (
+          <AvatarPicker
+            client={client}
+            company={company}
+            value={agent.avatar}
+            seed={agent.id || name}
+            name={name}
+            tone={toneFor(agent.id || name)}
+            disabled={busy}
+            onChange={onPick}
+          />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
  * Enter a daily cap for one teammate.
  *
  * Empty input is **not** submittable: "no cap" is the explicit "Remove cap"
@@ -1552,7 +2033,7 @@ function Section({
 }) {
   return (
     <Card>
-      <CardContent className="space-y-3 py-4">
+      <CardContent className="space-y-3">
         <div className="flex items-start justify-between gap-3">
           <div className="space-y-1">
             <h3 className="font-medium">{title}</h3>
@@ -1568,8 +2049,8 @@ function Section({
 
 function EmptyState({ title, body }: { title: string; body: string }) {
   return (
-    <Card>
-      <CardContent className="space-y-1 py-8 text-center">
+    <Card className="[--card-spacing:--spacing(8)]">
+      <CardContent className="space-y-1 text-center">
         <p className="font-medium">{title}</p>
         <p className="text-sm text-muted-foreground">{body}</p>
       </CardContent>

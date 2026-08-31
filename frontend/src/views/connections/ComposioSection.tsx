@@ -8,6 +8,7 @@ import { ApiError } from "@/api/types";
 import { grantStanding } from "@/lib/provider-grid";
 import { classifyLoadFailure } from "@/lib/section-load";
 import { SectionUnreachable } from "@/views/connections/SectionUnreachable";
+import { GrantNamespace } from "@/components/grant-namespace";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -214,11 +215,18 @@ export function ComposioSection({ client, company, canManage, onChanged }: Props
               already be set, off a field that was never read, is the same false
               confidence the badge above used to show. */}
           {grant === "not-granted" && (
-            <p className="rounded-md bg-muted/40 p-2 text-xs text-muted-foreground">
-              This company does not grant the <span className="font-mono">composio</span> tool
-              namespace, so teammates will not receive Composio tools even once connected. Add
-              <span className="font-mono"> composio</span> to the company&apos;s tool grants first.
-            </p>
+            <GrantNamespace
+              client={client}
+              company={company}
+              namespace="composio"
+              explanation="Teammates will not receive Composio tools even once connected."
+              canManage={canManage}
+              onGranted={async () => {
+                await refresh();
+                onChanged();
+              }}
+              testId="composio-not-granted"
+            />
           )}
 
           {/* Gated on `credentialed`, not `attested`: a company brokered through
@@ -235,7 +243,7 @@ export function ComposioSection({ client, company, canManage, onChanged }: Props
 
           {showTokenCard && (
             <Card>
-              <CardContent className="space-y-4 py-4">
+              <CardContent className="space-y-4">
                 {/* The explainer has to name what the token would displace,
                     and that differs by tier: an attested company falls back to
                     the pod's cluster identity, a company-key one falls back to

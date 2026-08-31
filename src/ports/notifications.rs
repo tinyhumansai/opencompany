@@ -29,8 +29,11 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::ports::types::CompanyId;
 
-/// What a notification is about. A closed set — the four subjects #577 names —
-/// so a backend can store it as a small tag rather than an open string.
+/// What a notification is about. A closed set, so a backend can store it as a
+/// small tag rather than an open string.
+///
+/// Adding a variant is safe and additive; **renaming** one is a data migration,
+/// because backends persist [`Self::as_str`] verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubjectKind {
@@ -38,6 +41,10 @@ pub enum SubjectKind {
     Run,
     Approval,
     Workflow,
+    /// One chat message — today, a mention. The subject id is the message's own
+    /// id, which is its journal sequence position stringified, so it resolves
+    /// through the same `chat/history` ids the console already links to.
+    Message,
 }
 
 impl SubjectKind {
@@ -49,6 +56,7 @@ impl SubjectKind {
             SubjectKind::Run => "run",
             SubjectKind::Approval => "approval",
             SubjectKind::Workflow => "workflow",
+            SubjectKind::Message => "message",
         }
     }
 
@@ -64,6 +72,7 @@ impl SubjectKind {
             "run" => Some(SubjectKind::Run),
             "approval" => Some(SubjectKind::Approval),
             "workflow" => Some(SubjectKind::Workflow),
+            "message" => Some(SubjectKind::Message),
             _ => None,
         }
     }
@@ -100,6 +109,55 @@ pub struct Notification {
     pub created_at: u64,
     /// One-line, operator-readable summary — the line a person reads.
     pub title: String,
+    /// Who this is for, as user ids — or `None` for the whole company.
+    ///
+    /// **`None` is what every row stored before this field existed means**, and
+    /// is why the field is additive rather than a migration: a company-wide
+    /// notification is exactly what the store did before it could target
+    /// anyone.
+    ///
+    /// One row with an audience, never N rows — read state is already per
+    /// `(company, user, notification)`, so a single targeted row gives every
+    /// recipient independent read state for free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
+    /// Where the subject lives, in the console's own channel-id space
+    /// (`engineering`, `dm:product_manager`).
+    ///
+    /// Carried so a badge can be placed on a channel **without** the console
+    /// having already loaded that channel's transcript — which is the whole
+    /// difficulty with a mention badge: the host holds the message and the
+    /// browser holds the transcript, and only the host knows the mention
+    /// happened at all.
+    ///
+    /// A sibling field rather than a third member of [`Subject`], which is a
+    /// closed `{kind, id}` shape every stored row already has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+/// Whether an audience admits `user` — `None` is the whole company.
+///
+/// The one place the audience rule is written down, so three backends cannot
+/// each interpret it slightly differently. [`Notification::visible_to`]
+/// delegates here, and the SQLite backend decodes its stored audience string
+/// and delegates here too, so a change to the rule cannot leave one backend
+/// behind.
+pub(crate) fn audience_admits(audience: Option<&[String]>, user: &str) -> bool {
+    match audience {
+        None => true,
+        Some(ids) => ids.iter().any(|id| id == user),
+    }
+}
+
+impl Notification {
+    /// Whether `user` should see this row.
+    ///
+    /// The one place the audience rule is written down, so three backends
+    /// cannot each interpret it slightly differently.
+    pub fn visible_to(&self, user: &str) -> bool {
+        audience_admits(self.audience.as_deref(), user)
+    }
 }
 
 /// A notification as one person sees it: the record plus whether *they* have
@@ -121,8 +179,12 @@ pub trait NotificationStore: Send + Sync {
     /// Records a notification for the whole company.
     async fn append(&self, company: &CompanyId, notification: &Notification) -> Result<()>;
 
-    /// Every notification in the company, each carrying **this** person's read
-    /// state.
+    /// Every notification **this person** should see, each carrying their own
+    /// read state.
+    ///
+    /// A row is visible when its [`Notification::audience`] is `None` (the
+    /// whole company) or contains `user`. Backends must filter; the conformance
+    /// suite asserts that one person's targeted rows never reach another.
     ///
     /// **Newest first** (by `created_at`, descending; ties broken by `id`
     /// descending for a stable order). Part of the contract rather than an
@@ -133,7 +195,8 @@ pub trait NotificationStore: Send + Sync {
     async fn list(&self, company: &CompanyId, user: &str) -> Result<Vec<NotificationView>>;
 
     /// Marks notifications read for this person — the given `ids`, or every
-    /// notification in the company when `ids` is `None`.
+    /// notification **visible to this person** when `ids` is `None`. A row
+    /// targeted at someone else is left alone.
     ///
     /// **A latch.** Once read it stays read; re-marking an already-read
     /// notification is a no-op and preserves the original `read_at`. Ids that

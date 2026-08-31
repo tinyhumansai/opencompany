@@ -741,7 +741,7 @@ export function McpServersSection({ client, company, canManage, chrome = "inline
         <Skeleton className="h-24 rounded-xl" />
       ) : (
         <Card>
-          <CardContent className="space-y-3 py-4">
+          <CardContent className="space-y-3">
             {servers.length === 0 ? (
               <p className="text-sm text-muted-foreground">No MCP servers yet.</p>
             ) : (

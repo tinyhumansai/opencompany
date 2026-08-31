@@ -31,7 +31,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::metering::roster_display_names;
 use crate::ports::types::CompanyRecord;
-use crate::runtime::builder::agent_effective_grants;
+use crate::runtime::builder::agent_scoped_grants;
 use crate::runtime::tools::grants_cover_server;
 use crate::server::error::ApiError;
 use crate::server::ops::{AdminScopedCompany, ScopedCompany, mcp_registry, scoped};
@@ -347,8 +347,10 @@ fn dto_from_decl(
 /// question about a different namespace ("who can read this?"), and a second
 /// roster walk beside this one is exactly how the two consoles would come to
 /// disagree with each other and with the harness. The roster is exactly what the harness builds in
-/// `build_roster`: the manifest agents (each with its own `tools` narrowed by
-/// the company `allow`), plus the promoted overlay teammates — each narrowed by
+/// `build_roster` — the **effective** roster, not the blueprint's: the manifest
+/// agents with every operator edit applied (each with its own `tools` narrowed
+/// by the company `allow` **and** by the desks it sits on — issue #1674), plus
+/// the promoted overlay teammates — each narrowed by
 /// **its own** `tools` line the same way (issue #661), which for the common
 /// empty line is still the full company `allow`, the standard grant
 /// `overlay_agent_to_manifest` gives it. An overlay id already claimed by a
@@ -362,19 +364,37 @@ fn dto_from_decl(
 /// id, matching `bucket_usage`.
 pub(super) fn roster_grants(record: &CompanyRecord) -> Vec<(RosterAgentDto, Vec<String>)> {
     let allow = &record.manifest.tools.allow;
-    let names = roster_display_names(&record.effective_agents(), &record.overlay_agents);
+    // The roster as it *effectively* stands, exactly as `build_roster` builds
+    // it: a teammate an operator edited keeps its edits (an override `tools`
+    // line replaces the manifest's), and a retired teammate is not on the
+    // roster at all. Reading the raw manifest half here made `reachableBy`
+    // track the blueprint while the harness and the Team tab's Tools card
+    // tracked the edit — so granting or revoking `mcp:*` on a manifest
+    // teammate never moved the Connections surface.
+    let effective = record.effective_agents();
+    let names = roster_display_names(&effective, &record.overlay_agents);
     let roster_agent = |id: &str| RosterAgentDto {
         id: id.to_string(),
         name: names.get(id).cloned().unwrap_or_else(|| id.to_string()),
     };
-    let mut grants: Vec<(RosterAgentDto, Vec<String>)> = record
-        .manifest
-        .agents
+    // Three-level narrowing, exactly as `build_roster` builds the roster (issue
+    // #1674): company `allow` → the desks this teammate sits on → the teammate's
+    // own `tools`. `agent_desk_tools` resolves through the record's *effective*
+    // desk membership, so a console-seated member is scoped by its desk as a
+    // manifest one is. Without this level a teammate on a desk whose ceiling
+    // omits `mcp:*` still read back here as reaching every server the company
+    // grants, while the harness gives it no such tools.
+    let desk_narrowed = |id: &str, tools: Option<&[String]>| {
+        let desk_tools = record.agent_desk_tools(id);
+        let desk_refs: Vec<&[String]> = desk_tools.iter().map(Vec::as_slice).collect();
+        agent_scoped_grants(allow, &desk_refs, tools)
+    };
+    let mut grants: Vec<(RosterAgentDto, Vec<String>)> = effective
         .iter()
         .map(|agent| {
             (
                 roster_agent(&agent.id),
-                agent_effective_grants(allow, &agent.tools),
+                desk_narrowed(&agent.id, agent.tools.as_deref()),
             )
         })
         .collect();
@@ -401,7 +421,7 @@ pub(super) fn roster_grants(record: &CompanyRecord) -> Vec<(RosterAgentDto, Vec<
         // grant.
         grants.push((
             roster_agent(&overlay.id),
-            agent_effective_grants(allow, &overlay.tools),
+            desk_narrowed(&overlay.id, overlay.tools.as_deref()),
         ));
     }
     grants
@@ -1013,7 +1033,7 @@ async fn discover_tools(
 mod tests {
     use super::*;
     use crate::company::CompanyManifest;
-    use crate::ports::types::{CompanyId, OverlayAgent};
+    use crate::ports::types::{CompanyId, OverlayAgent, OverlayDesk};
 
     /// A company allowing two MCP families, with one manifest agent that lists
     /// none (so it inherits both).
@@ -1046,20 +1066,27 @@ role = "Chief Executive"
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 
     fn teammate(id: &str, tools: Vec<&str>) -> OverlayAgent {
+        // An empty argument list means "the standard grant" (`None`), matching
+        // every caller's pre-#1804 intent; a non-empty list is a narrowed grant.
+        let tools: Vec<String> = tools.into_iter().map(str::to_string).collect();
         OverlayAgent {
             id: id.to_string(),
             name: id.to_string(),
             role: "Growth".to_string(),
             description: None,
-            tools: tools.into_iter().map(str::to_string).collect(),
+            tools: (!tools.is_empty()).then_some(tools),
             model: None,
             harness: None,
         }
@@ -1143,6 +1170,113 @@ role = "Chief Executive"
         assert_eq!(
             jamie.1,
             vec!["mcp:notion".to_string(), "mcp:linear".to_string()]
+        );
+    }
+
+    /// Issue #1674: a teammate seated on a desk whose `tools` ceiling omits
+    /// `mcp:*` must not read back as reaching every server the company grants.
+    /// `roster_grants` is what every MCP server row's `reachableBy` is computed
+    /// from, and the harness scopes the same agent by its desk (`build_roster`'s
+    /// three-level narrowing) — so a company that grants `mcp:*` while a desk
+    /// omits MCP would otherwise list that desk's teammates as reaching servers
+    /// they cannot call.
+    #[test]
+    fn a_desk_ceiling_that_omits_mcp_narrows_reachability() {
+        let mut scoped = record(vec![teammate("jamie", Vec::new())]);
+        scoped.overlay_desks.push(OverlayDesk {
+            id: "creative".to_string(),
+            name: "Creative".to_string(),
+            description: None,
+            members: vec!["jamie".to_string()],
+            responder: crate::ports::types::ResponderMode::default(),
+        });
+        scoped
+            .overlay_desk_tools
+            .insert("creative".to_string(), vec!["mcp:notion".to_string()]);
+        let grants = roster_grants(&scoped);
+        let jamie = grants
+            .iter()
+            .find(|(agent, _)| agent.id == "jamie")
+            .expect("the overlay teammate is on the roster");
+        assert_eq!(
+            jamie.1,
+            vec!["mcp:notion".to_string()],
+            "the desk ceiling narrows reachability below the company grant"
+        );
+
+        // The manifest agent on no desk still inherits the whole company grant,
+        // so the narrowing above is the desk's and not a company change.
+        let ceo = grants
+            .iter()
+            .find(|(agent, _)| agent.id == "ceo")
+            .expect("on roster");
+        assert_eq!(
+            ceo.1,
+            vec!["mcp:notion".to_string(), "mcp:linear".to_string()]
+        );
+    }
+
+    /// An operator's `tools` edit to a **manifest** teammate is the grant the
+    /// harness reads: `PATCH …/team/{id}` stores the edit as an override, and
+    /// `roster_grants` derives reachability from the effective roster just like
+    /// `build_roster` does — so granting or revoking `mcp:*` on the Tools card
+    /// moves the Connections surface rather than leaving it pinned to the
+    /// blueprint's `[[agent]].tools` line.
+    #[test]
+    fn a_manifest_teammates_tools_edit_reaches_the_roster() {
+        let mut scoped = record(vec![]);
+        scoped
+            .overlay_agent_edits
+            .push(crate::ports::types::AgentOverride {
+                agent_id: "ceo".to_string(),
+                // Double-option since #1804: `Some(Some(globs))` narrows.
+                tools: Some(Some(vec!["mcp:notion".to_string()])),
+                ..Default::default()
+            });
+        let grants = roster_grants(&scoped);
+        let ceo = grants
+            .iter()
+            .find(|(agent, _)| agent.id == "ceo")
+            .expect("on roster");
+        assert_eq!(
+            ceo.1,
+            vec!["mcp:notion".to_string()],
+            "an override `tools` line replaces the manifest's, narrowed by allow"
+        );
+
+        // Resetting the override to the standard grant (`Some(None)` since
+        // #1804 — NOT `Some(Some([]))`, which is a deny-all) restores the
+        // blueprint-wide reachability.
+        let mut inherited = record(vec![]);
+        inherited
+            .overlay_agent_edits
+            .push(crate::ports::types::AgentOverride {
+                agent_id: "ceo".to_string(),
+                tools: Some(None),
+                ..Default::default()
+            });
+        let grants = roster_grants(&inherited);
+        let ceo = grants
+            .iter()
+            .find(|(agent, _)| agent.id == "ceo")
+            .expect("on roster");
+        assert_eq!(
+            ceo.1,
+            vec!["mcp:notion".to_string(), "mcp:linear".to_string()]
+        );
+    }
+
+    /// A retired manifest teammate is not on the effective roster, so it cannot
+    /// be listed as reaching a server — the same roster `build_roster` builds,
+    /// where a removed teammate is not built at all.
+    #[test]
+    fn a_retired_manifest_teammate_is_not_a_reacher() {
+        let mut retired = record(vec![]);
+        retired.overlay_retired_agents.push("ceo".to_string());
+        let grants = roster_grants(&retired);
+        assert!(
+            !grants.iter().any(|(agent, _)| agent.id == "ceo"),
+            "a retired teammate is off the effective roster"
         );
     }
 }

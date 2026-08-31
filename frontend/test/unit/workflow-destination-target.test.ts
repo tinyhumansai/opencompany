@@ -17,9 +17,9 @@ const unavailable: WiredChannels = { status: "unavailable" };
 // free-text value can be entered when the host offered no list at all. These
 // pin the author-time refusal on that path.
 describe("destinationTargetProblem — unwired channel", () => {
-  // `operator` is deliberately NOT in this fixture: the host stopped serving it
-  // (#981) because delivery refuses it by name, so a wired set containing it is
-  // no longer a state the console can be in.
+  // `operator` is deliberately NOT in this fixture: this suite is about a
+  // target absent from the wired set, and operator's own presence is covered
+  // separately below.
   const wired = ready("engineering", "product_design");
 
   it("rejects a channel that is not in the wired set, naming what is", () => {
@@ -29,10 +29,21 @@ describe("destinationTargetProblem — unwired channel", () => {
     );
   });
 
-  it("rejects `operator`, which the host never offers and delivery refuses", () => {
+  it("rejects `operator` when the host's wired set doesn't include it", () => {
     expect(destinationTargetProblem("channel", "operator", wired)).toContain(
       "is not a workflow delivery channel",
     );
+  });
+
+  // #1757: `operator` used to be excluded from every host's wired set (#981) —
+  // an in-memory surface delivery refused by name. It is now a durable,
+  // journal-backed channel every company wires, so the function that gates a
+  // channel target on membership in `channels.ids` accepts it exactly like any
+  // other name the host lists — no special-casing either way.
+  it("accepts `operator` once the host's wired set includes it", () => {
+    expect(
+      destinationTargetProblem("channel", "operator", ready("operator", "engineering")),
+    ).toBeNull();
   });
 
   it("accepts a channel that is wired", () => {

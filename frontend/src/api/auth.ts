@@ -98,6 +98,11 @@ export interface Me {
   id: string;
   email: string;
   displayName?: string;
+  /**
+   * The face they chose (`lib/avatar.ts`), absent when they have not chosen —
+   * which the console draws as the mascot it hashes from their id.
+   */
+  avatar?: string;
   role: UserRole;
   company: string;
   /** Whether they have a password, never what it is. */
@@ -317,6 +322,15 @@ export interface Person {
   id: string;
   email: string;
   displayName?: string;
+  /**
+   * The face they chose, absent when they have not chosen.
+   *
+   * Readable by anyone who can read the roster, and writable **only by the
+   * person wearing it** — `updateMe`, not `updatePerson`. An admin may set
+   * somebody's `displayName` so a roster of raw addresses can be made legible;
+   * a person's own face is theirs to pick.
+   */
+  avatar?: string;
   role: UserRole;
   status: UserStatus;
   /** Whether they have a password — never what it is. */
@@ -414,6 +428,22 @@ export async function revokeInvite(
   inviteId: string,
 ): Promise<void> {
   await client.del(`${client.scopeFor(company)}/users/invites/${encodeURIComponent(inviteId)}`);
+}
+
+/**
+ * Changes your own name or face.
+ *
+ * Deliberately not `updatePerson`: that one is admin-only and takes a user id,
+ * which is right for administering somebody else and wrong for naming yourself.
+ * Both fields are three-state — omitted leaves it alone, `null` goes back to the
+ * default, a value sets it — so saving a name cannot wipe a face.
+ */
+export async function updateMe(
+  client: OpenCompanyClient,
+  company: string | null,
+  changes: { displayName?: string | null; avatar?: string | null },
+): Promise<Me> {
+  return client.patch<Me>(`${client.scopeFor(company)}/auth/me`, changes);
 }
 
 /** Changes a person's role, status, or display name. */

@@ -37,3 +37,10 @@ context = [
 # A missing path here is a manifest error rather than a skipped entry — a role
 # whose prompt was written around a briefing it never received fails silently.
 prompt_files = ["prompts/qa_engineer.md"]
+
+# The company belt minus `chargebee` (#788, #1854). Stated explicitly rather
+# than left empty because an omitted `tools` line inherits the WHOLE company
+# grant, billing included — omission is how capability arrives here, not how it
+# is withheld. This member's desk states no ceiling, so an operator naming them
+# the biller from the console can add `chargebee` here.
+tools = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*"]

@@ -213,7 +213,7 @@ export function DropZone({ client, company, onIngested, discarding }: Props) {
       )}
       data-testid="memory-dropzone"
     >
-      <CardContent className="space-y-3 py-5">
+      <CardContent className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             {busy ? (

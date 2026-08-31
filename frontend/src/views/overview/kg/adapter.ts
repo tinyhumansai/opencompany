@@ -60,6 +60,7 @@ import type { TeamMember } from "@/lib/team";
 import { humanizeStatus } from "@/lib/board-columns";
 import type { BrainGraphEdge, BrainGraphNode, MemoryGraph } from "./memory-core";
 import { distillMemoryGraph } from "./memory-core";
+import { personName } from "@/lib/person";
 import { isOpen } from "../pulse";
 import type { Agent, Department, Person, SopTask, Workflow, WorkflowStage } from "./schemas";
 
@@ -349,9 +350,10 @@ export function adapt(input: AdaptInput): Adapted {
     // Never a desk: the company staffs desks with agents and declares no desk
     // for a person. See the note where `assignHumanDepartment` used to be.
     departmentId: UNPLACED,
-    // Falling back to the local part of the address keeps a real name off the
-    // graph only when nobody has set one.
-    name: p.displayName?.trim() || p.email.split("@")[0],
+    // Falling back to a name derived from the address keeps a real name off
+    // the graph only when nobody has set one — the same derivation every other
+    // surface uses, so one person is not two names on two screens.
+    name: personName(p),
     role: p.role === "admin" ? "Admin" : "Member",
     // Humans get no derived tool shelf: an operator's tools are their browser,
     // and inventing an MCP loadout for a person would read as a claim.

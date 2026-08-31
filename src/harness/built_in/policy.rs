@@ -9,6 +9,15 @@
 //! `always_approve` effect kinds and the per-agent `budget_usd_daily` /
 //! `auto_approve_under_usd` thresholds.
 //!
+//! ## Current production mode: policy HITL disabled
+//!
+//! Roster construction applies [`ApprovalPolicy::with_policy_hitl_disabled`].
+//! In that mode this policy preserves the `readonly` hard denial and redeems
+//! grants for approvals already in flight, but returns `Allow` instead of
+//! manufacturing a new `RequireApproval`. Agents create new approvals only by
+//! calling [`request_approval`](crate::harness::approval_tool). The machinery
+//! below is retained for migration compatibility and focused policy tests.
+//!
 //! ## Where approvals actually park (issue #172)
 //!
 //! openhuman's [`ToolPolicy`] returns
@@ -121,6 +130,7 @@
 //! which un-declares it. Only this last arm reads the path; every arm above
 //! decides identically on both.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -463,6 +473,10 @@ tokio::task_local! {
     /// not a new dependency — `with_stop_hooks` is itself a task-local scope on
     /// this exact path.
     static CURRENT_SCOPE: ApprovalScope;
+    /// Whether this one actual agent turn has already executed
+    /// `request_approval`. Unlike `CURRENT_SCOPE`, this resets for every model
+    /// turn inside a shared cycle/workflow bucket.
+    static EXPLICIT_REQUEST_PENDING: Cell<bool>;
 }
 
 /// A turn's exclusive claim on one [`ApprovalScope`]'s bucket (issue #439).
@@ -531,11 +545,19 @@ impl ApprovalRequestQueue {
     /// separate: two different turns asking for the same tool are two requests,
     /// and collapsing them would hide one turn's ask behind another's.
     pub fn push(&self, request: ApprovalRequest) {
+        let explicit = request.tool == crate::harness::approval_tool::REQUEST_APPROVAL_TOOL;
+        if explicit {
+            // The turn boundary is established by making the request, even if
+            // its card is a duplicate of one already queued in this scope.
+            let _ = EXPLICIT_REQUEST_PENDING.try_with(|pending| pending.set(true));
+        }
         let scope = Self::current_scope();
         let mut guard = self.inner.lock().expect("approval request queue");
         let bucket = guard.entry(scope).or_default();
         if bucket.iter().any(|q| {
-            q.effect.kind == request.effect.kind && q.effect.payload == request.effect.payload
+            q.effect.kind == request.effect.kind
+                && q.effect.payload == request.effect.payload
+                && q.effect.agent == request.effect.agent
         }) {
             return;
         }
@@ -552,6 +574,24 @@ impl ApprovalRequestQueue {
         CURRENT_SCOPE
             .try_with(ApprovalScope::clone)
             .unwrap_or_default()
+    }
+
+    /// Whether the current turn has already made an explicit approval request.
+    /// Tool execution is serial whenever OpenHuman's tool middleware is wired;
+    /// this lets the policy refuse every later sibling call in a provider
+    /// response after `request_approval` has established the turn boundary.
+    fn explicit_request_pending(&self) -> bool {
+        EXPLICIT_REQUEST_PENDING
+            .try_with(Cell::get)
+            .unwrap_or(false)
+    }
+
+    /// Runs one real agent turn with a fresh explicit-approval boundary.
+    pub async fn turn_scoped<F, T>(&self, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        EXPLICIT_REQUEST_PENDING.scope(Cell::new(false), fut).await
     }
 
     /// Takes exclusive ownership of `scope`'s bucket for the life of the
@@ -686,6 +726,38 @@ impl ApprovalRequestQueue {
             .map_or(0, Vec::len)
     }
 
+    /// How many requests queued **since** `from` are blockers (issue #1861).
+    ///
+    /// Counted the same way [`stamp_run`](Self::stamp_run) stamps — over this
+    /// scope's bucket from the same boundary — so the two describe one set of
+    /// requests rather than two overlapping ones.
+    ///
+    /// `run_task` needs it to settle honestly. A turn that raised a question
+    /// has not succeeded, and it has not failed either; without this the
+    /// ending would come from the turn's own outcome and a turn that escalated
+    /// and then produced prose would land `in_review` with an unanswered
+    /// question attached to it.
+    ///
+    /// Keyed on the effect kind's [`BLOCKER_EFFECT_PREFIX`] rather than on a
+    /// flag: the kind is what the journal, the console and the approvals feed
+    /// all read, so a request that says `blocker.*` to them and something else
+    /// here could not happen.
+    ///
+    /// [`BLOCKER_EFFECT_PREFIX`]: crate::ports::blockers::BLOCKER_EFFECT_PREFIX
+    pub fn blockers_since(&self, from: usize) -> usize {
+        let scope = Self::current_scope();
+        let guard = self.inner.lock().expect("approval request queue");
+        let Some(bucket) = guard.get(&scope) else {
+            return 0;
+        };
+        let prefix = format!("{}.", crate::ports::blockers::BLOCKER_EFFECT_PREFIX);
+        bucket
+            .iter()
+            .skip(from)
+            .filter(|request| request.effect.kind.starts_with(&prefix))
+            .count()
+    }
+
     /// Stamps `run_id` onto every request queued at or after `from`, returning
     /// how many were stamped (issue #242).
     ///
@@ -718,6 +790,8 @@ impl ApprovalRequestQueue {
 /// openhuman [`ToolPolicy`] derived from a company's manifest `[policy]` and a
 /// single agent's per-agent budget.
 pub struct ApprovalPolicy {
+    /// Whether policy may manufacture HITL requests from ordinary tool calls.
+    policy_hitl_enabled: bool,
     mode: PolicyMode,
     always_approve: Vec<String>,
     auto_approve_under_usd: Option<f64>,
@@ -803,6 +877,18 @@ pub struct ApprovalPolicy {
     /// The shared workspace, when this harness has one. It is queried only for
     /// the four mutation tools' authorship-aware auto-tier exception.
     workspace: Option<WorkspaceReader>,
+    /// The company's CONNECTED Composio toolkits (issue #1759, slice S2), used to
+    /// deflect a raw web call aimed at one of their API hosts.
+    ///
+    /// **Empty at every non-harness construction site** — the default — which
+    /// keeps every one of them (and every test that sets nothing) letting web
+    /// calls through exactly as before. Only `build_roster` chains
+    /// [`with_connected_composio_toolkits`](Self::with_connected_composio_toolkits),
+    /// from `deps.composio` (the same allowlist S1's `composio_brief` names), and
+    /// only when the company has Composio wired. The set is the S1 brief's twin:
+    /// S1 tells the agent to route these providers through Composio, this refuses
+    /// the raw `http_request` / `curl` / `web_fetch` that ignores it.
+    connected_composio_toolkits: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -838,6 +924,7 @@ impl ApprovalPolicy {
     /// the same way it already chains [`with_requests`](Self::with_requests).
     pub fn new(policy: &Policy, budget_usd_daily: Option<f64>) -> Self {
         Self {
+            policy_hitl_enabled: true,
             mode: PolicyMode::parse(&policy.mode),
             always_approve: policy.always_approve.clone(),
             auto_approve_under_usd: policy.auto_approve_under_usd,
@@ -853,7 +940,17 @@ impl ApprovalPolicy {
             // exactly as before — see `with_mcp_reads`.
             mcp_reads: McpReadSet::default(),
             workspace: None,
+            // No connected toolkits by default, so the S2 web-deflection arm is
+            // inert — see `with_connected_composio_toolkits`.
+            connected_composio_toolkits: Vec::new(),
         }
+    }
+
+    /// Disables policy-generated approvals while preserving hard denials and
+    /// redemption of approvals that were already in flight during migration.
+    pub fn with_policy_hitl_disabled(mut self) -> Self {
+        self.policy_hitl_enabled = false;
+        self
     }
 
     /// Installs the shared queue every `RequireApproval` decision is recorded on,
@@ -907,6 +1004,21 @@ impl ApprovalPolicy {
         self
     }
 
+    /// Installs the company's connected Composio toolkits so the S2 guardrail can
+    /// deflect a raw web call aimed at one of their API hosts (issue #1759).
+    ///
+    /// Without this the set is empty and the web-deflection arm is inert — which
+    /// is exactly what every non-harness construction site and every test wants:
+    /// a build with no Composio configured has no connected provider to route
+    /// around, so `http_request` / `curl` / `web_fetch` gate exactly as before.
+    /// Chained by `build_roster` from `deps.composio` (the same allowlist S1's
+    /// [`composio_brief`](crate::harness::composio_catalog::composio_brief)
+    /// names), and only when a toolkit is actually connected.
+    pub fn with_connected_composio_toolkits(mut self, toolkits: Vec<String>) -> Self {
+        self.connected_composio_toolkits = toolkits;
+        self
+    }
+
     /// Binds this policy to the authored workflow whose nodes it is gating, so a
     /// standing permission the operator gave that workflow can be matched (issue
     /// #1098).
@@ -954,6 +1066,17 @@ impl ApprovalPolicy {
     /// The resolved tier.
     pub fn mode(&self) -> PolicyMode {
         self.mode
+    }
+
+    /// The mode handed to OpenHuman's built-in tool security. With policy HITL
+    /// disabled, non-readonly tiers use `Full` there too; otherwise an advisory
+    /// medium-risk check could recreate an approval prompt below this policy.
+    pub fn toolbelt_mode(&self) -> PolicyMode {
+        if !self.policy_hitl_enabled && self.mode != PolicyMode::Readonly {
+            PolicyMode::Full
+        } else {
+            self.mode
+        }
     }
 
     /// The per-agent daily budget, if any.
@@ -1410,6 +1533,25 @@ impl ToolPolicy for ApprovalPolicy {
     async fn check(&self, request: &ToolPolicyRequest) -> ToolPolicyDecision {
         let tool = request.tool_name.as_str();
 
+        // `request_approval` is a real turn boundary, not advice in a tool
+        // result. The hosted profile requests one call per assistant message;
+        // this is the fail-closed second layer for a provider that nevertheless
+        // returns several calls. Once the explicit request tool has queued its
+        // card, every later call in the serial tool fold is refused.
+        if self.requests.explicit_request_pending() {
+            return ToolPolicyDecision::deny(format!(
+                "'{tool}' was not run because this turn already asked the operator for approval; \
+                 stop and wait for the decision"
+            ));
+        }
+
+        // Asking the operator is never itself an effect to approve or deny.
+        // The first call queues a question; a second call in the same turn was
+        // refused by the boundary above.
+        if tool == crate::harness::approval_tool::REQUEST_APPROVAL_TOOL {
+            return ToolPolicyDecision::Allow;
+        }
+
         // 0. `never_do` hard-deny — RESERVED SLOT, deliberately empty.
         //
         // The manifest's `never_do` list is compiled by the delegation-rule
@@ -1426,6 +1568,40 @@ impl ToolPolicy for ApprovalPolicy {
         // that is supposed to survive that.
         //
         // Adding the arm below the grant check would silently invert that.
+
+        // 0.5. S2 web-deflection (issue #1759): a raw web call aimed at a
+        //      CONNECTED Composio provider's API host is refused, with the
+        //      Composio route named.
+        //
+        // Defense-in-depth behind S1's routing brief: even when the agent ignores
+        // the prompt, `http_request` / `curl` / `web_fetch` to `api.github.com`
+        // and its kin are blocked, because unauthenticated they only ever 401/403
+        // — the connection credential lives in Composio, not the web tools. The
+        // observed failure was exactly this: a raw `http_request` to
+        // `api.github.com` → 403.
+        //
+        // ABOVE the grant arms, and for the same reason the reserved `never_do`
+        // slot is: a grant is an operator approving one specific call, but this
+        // call cannot succeed by this route for anyone, so no grant should smuggle
+        // it past the block. A hard deny, never a rewrite — the guardrail points
+        // at the right door rather than silently walking the agent through it.
+        //
+        // Scoped strictly to hosts of toolkits this company actually connected
+        // (the field is empty unless `build_roster` wired a live Composio set),
+        // so a provider host whose toolkit is NOT connected — and every
+        // non-provider host — passes through untouched (requirement #2). The
+        // decision and the host table live in `composio_catalog`; the web-tool
+        // family lives in `toolbelt`; this arm only joins them.
+        if !self.connected_composio_toolkits.is_empty()
+            && crate::harness::toolbelt::is_web_request_tool(tool)
+            && let Some(url) = request.arguments.get("url").and_then(|v| v.as_str())
+            && let Some(reason) = crate::harness::composio_catalog::web_call_deflection(
+                &self.connected_composio_toolkits,
+                url,
+            )
+        {
+            return ToolPolicyDecision::deny(reason);
+        }
 
         // 1. `readonly` outranks a grant — the brake wins (issue #243).
         //
@@ -1503,6 +1679,26 @@ impl ToolPolicy for ApprovalPolicy {
         // `composio_execute` call whose action is a send, so a grant minted on
         // a repository read cannot admit an outgoing email (issue #441).
         if self.standing_grant_allows(tool, &request.arguments) {
+            return ToolPolicyDecision::Allow;
+        }
+
+        // Paid media tools are explicitly approval-producing tool calls: their
+        // own invocation stages the concrete generation request before the
+        // backend can bill it. This is tool behavior, not risk-classifier HITL.
+        // An exact one-shot grant was consumed above on the approved re-issue.
+        if matches!(tool, "media_generate_image" | "media_generate_video") {
+            return self.require_approval(
+                tool,
+                &request.arguments,
+                format!("'{tool}' explicitly stages a paid media generation for approval"),
+            );
+        }
+
+        // General approvals come only from `request_approval`; specialized
+        // approval-producing tools such as paid media stage themselves above.
+        // Keep the readonly brake and old-grant redemption above this point,
+        // but bypass every arm below that would turn classification into HITL.
+        if !self.policy_hitl_enabled {
             return ToolPolicyDecision::Allow;
         }
 
@@ -1737,6 +1933,147 @@ mod tests {
         ToolPolicyRequest::new(tool, args, ctx)
     }
 
+    #[tokio::test]
+    async fn an_explicit_request_refuses_later_calls_in_the_same_turn() {
+        let queue = ApprovalRequestQueue::default();
+        let policy = policy("full", &[], None)
+            .with_policy_hitl_disabled()
+            .with_requests(queue.clone());
+        let claim = queue.claim(ApprovalScope::Cycle);
+
+        let (second_request, later_call) = claim
+            .scoped(queue.turn_scoped(async {
+                queue.push(ApprovalRequest {
+                    tool: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+                    reason: "May I send this?".to_string(),
+                    effect: Effect {
+                        kind: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+                        group: EffectGroup::Other,
+                        amount_usd: None,
+                        established_thread: false,
+                        first_time_counterparty: false,
+                        payload: serde_json::json!({
+                            "title": "Send update",
+                            "question": "May I send it?"
+                        }),
+                        agent: Some("ceo".to_string()),
+                        run_id: None,
+                    },
+                });
+                let second_request = policy
+                    .check(&request(
+                        crate::harness::approval_tool::REQUEST_APPROVAL_TOOL,
+                        serde_json::json!({
+                            "title": "Ask twice",
+                            "question": "May I ask again?"
+                        }),
+                    ))
+                    .await;
+                let later_call = policy
+                    .check(&request("composio_execute", composio_send_args()))
+                    .await;
+                (second_request, later_call)
+            }))
+            .await;
+
+        assert!(
+            matches!(second_request, ToolPolicyDecision::Deny { .. }),
+            "a second explicit request must hit the same turn boundary"
+        );
+        let ToolPolicyDecision::Deny { reason } = later_call else {
+            panic!("later sibling call must be refused");
+        };
+        assert!(reason.contains("already asked the operator"));
+
+        let unrelated_turn = queue
+            .turn_scoped(policy.check(&request("composio_execute", composio_send_args())))
+            .await;
+        assert_eq!(
+            unrelated_turn,
+            ToolPolicyDecision::Allow,
+            "a later agent turn in the same cycle/run scope gets a fresh boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_explicit_request_still_establishes_a_fresh_turn_boundary() {
+        let queue = ApprovalRequestQueue::default();
+        let policy = policy("full", &[], None)
+            .with_policy_hitl_disabled()
+            .with_requests(queue.clone());
+        let claim = queue.claim(ApprovalScope::Cycle);
+        let approval_request = ApprovalRequest {
+            tool: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+            reason: "May I send this?".to_string(),
+            effect: Effect {
+                kind: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::json!({
+                    "title": "Send update",
+                    "question": "May I send it?"
+                }),
+                agent: Some("ceo".to_string()),
+                run_id: None,
+            },
+        };
+
+        claim
+            .scoped(async { queue.push(approval_request.clone()) })
+            .await;
+        let later_call = claim
+            .scoped(queue.turn_scoped(async {
+                queue.push(approval_request);
+                policy
+                    .check(&request("composio_execute", composio_send_args()))
+                    .await
+            }))
+            .await;
+
+        assert!(matches!(later_call, ToolPolicyDecision::Deny { .. }));
+        assert_eq!(
+            claim.scoped(async { queue.drain(8).requests.len() }).await,
+            1,
+            "the duplicate card is suppressed without suppressing the boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_explicit_requests_from_different_agents_are_not_deduplicated() {
+        let queue = ApprovalRequestQueue::default();
+        let claim = queue.claim(ApprovalScope::Cycle);
+        claim
+            .scoped(async {
+                for agent in ["finance", "legal"] {
+                    queue.push(ApprovalRequest {
+                        tool: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+                        reason: "Proceed?".to_string(),
+                        effect: Effect {
+                            kind: crate::harness::approval_tool::REQUEST_APPROVAL_TOOL.to_string(),
+                            group: EffectGroup::Other,
+                            amount_usd: None,
+                            established_thread: false,
+                            first_time_counterparty: false,
+                            payload: serde_json::json!({
+                                "title": "Proceed",
+                                "question": "Proceed?"
+                            }),
+                            agent: Some(agent.to_string()),
+                            run_id: None,
+                        },
+                    });
+                }
+            })
+            .await;
+
+        assert_eq!(
+            claim.scoped(async { queue.drain(8).requests.len() }).await,
+            2
+        );
+    }
+
     /// May this call be granted standing? The rule as the mint path asks it,
     /// so a test here and the enforcement in the default build cannot answer
     /// differently.
@@ -1744,6 +2081,52 @@ mod tests {
         crate::policy::consequence_of(tool, args)
             .standing
             .is_grantable()
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_hitl_allows_calls_that_supervised_would_park() {
+        let queue = ApprovalRequestQueue::default();
+        let p = policy("supervised", &["payment"], None)
+            .with_policy_hitl_disabled()
+            .with_requests(queue.clone());
+
+        assert_eq!(
+            p.check(&request(
+                "payment.send",
+                serde_json::json!({ "amount_usd": 500.0 })
+            ))
+            .await,
+            ToolPolicyDecision::Allow
+        );
+        assert!(
+            queue
+                .drain(MAX_APPROVAL_REQUESTS_PER_TURN)
+                .requests
+                .is_empty()
+        );
+        assert_eq!(p.toolbelt_mode(), PolicyMode::Full);
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_hitl_keeps_readonly_as_a_hard_denial() {
+        let p = policy("readonly", &[], None).with_policy_hitl_disabled();
+
+        assert!(matches!(
+            p.check(&request(
+                "payment.send",
+                serde_json::json!({ "amount_usd": 5.0 })
+            ))
+            .await,
+            ToolPolicyDecision::Deny { .. }
+        ));
+        assert_eq!(
+            p.check(&request(
+                crate::harness::approval_tool::REQUEST_APPROVAL_TOOL,
+                serde_json::json!({ "title": "Ask", "question": "Proceed?" })
+            ))
+            .await,
+            ToolPolicyDecision::Allow
+        );
     }
 
     /// Every tier is reachable from a manifest, parses to its own variant, and
@@ -2306,6 +2689,13 @@ mod tests {
                 "{tool} must park under supervised"
             );
         }
+        let explicit_staging = policy("full", &[], None).with_policy_hitl_disabled();
+        assert!(matches!(
+            explicit_staging
+                .check(&request("media_generate_image", serde_json::json!({})))
+                .await,
+            ToolPolicyDecision::RequireApproval { .. }
+        ));
         // The catalog GET is read-only — allowed even under supervised.
         assert_eq!(
             supervised
@@ -2658,6 +3048,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         };
         let own = WorkspaceOrigin::Agent {
             id: "ceo".to_string(),
@@ -2753,6 +3144,7 @@ mod tests {
                     mime: None,
                     size: None,
                     sha256: None,
+                    adopted: false,
                 },
                 Some("draft"),
             )
@@ -2807,6 +3199,7 @@ mod tests {
                 mime: None,
                 size: None,
                 sha256: None,
+                adopted: false,
             }
         };
         store
@@ -2907,6 +3300,7 @@ mod tests {
                 mime: None,
                 size: None,
                 sha256: None,
+                adopted: false,
             };
         store
             .create(&company, &node("agents", "agents", None, own.clone()), None)
@@ -4083,6 +4477,7 @@ mod tests {
             cost_usd: usd,
             kind: SampleKind::Inference,
             run_id: None,
+            model: None,
         }
     }
 
@@ -4775,6 +5170,70 @@ mod tests {
             ),
             EffectGroup::Send
         );
+    }
+
+    /// **Issue #1818, end to end at the gate.** The live evidence from the
+    /// issue: an agent's `composio_execute` to fetch GitHub issues was blocked
+    /// under `opencompany-approval` — *"leaves the company or spends money"* —
+    /// for what is a read.
+    ///
+    /// `GITHUB_ISSUES_LIST_FOR_REPO` is Composio's own spelling of the
+    /// operation the curated catalogue calls `GITHUB_LIST_REPOSITORY_ISSUES`.
+    /// The catalogue miss used to make it a `Send`, which parks under both
+    /// `supervised` and `auto` and — being `PerCall` — could not be unblocked
+    /// by granting standing either, so the desk stopped for good.
+    ///
+    /// Both unattended tiers are asserted, not just `auto`: the symptom in the
+    /// issue is a park, and a park is what `supervised` does too. `readonly` is
+    /// asserted from the other side — it is the one tier whose promise is that
+    /// the desk reaches into nobody's account, and a drifted slug is no reason
+    /// to break it.
+    #[tokio::test]
+    #[cfg(feature = "openhuman")]
+    async fn a_drifted_composio_read_no_longer_parks_as_spend() {
+        let drifted = || serde_json::json!({ "tool": "GITHUB_ISSUES_LIST_FOR_REPO" });
+        for mode in ["supervised", "auto"] {
+            let p = policy(mode, &[], None).with_agent("ops");
+            assert_eq!(
+                p.check(&request("composio_execute", drifted())).await,
+                ToolPolicyDecision::Allow,
+                "under `{mode}` a GitHub issue read must run, not park behind a card \
+                 that says it spends money"
+            );
+        }
+        // The card never says spend, whatever tier is asking.
+        assert_eq!(
+            classify_group("composio_execute", &drifted()),
+            EffectGroup::Other,
+        );
+        // …and the two boundaries the fix does not move. `readonly` still
+        // refuses: this reaches a third party's account with the company's
+        // credential, which is exactly what that tier promises not to do.
+        let ro = policy("readonly", &[], None).with_agent("ops");
+        assert!(matches!(
+            ro.check(&request("composio_execute", drifted())).await,
+            ToolPolicyDecision::Deny { .. }
+        ));
+        // And an inferred read is not mintable: a verb is evidence, and a
+        // standing grant outlives the call it was cut from.
+        assert!(!grantable("composio_execute", &drifted()));
+        // The control, in the same tiers: a send that merely misses the
+        // catalogue is still a send. `GITHUB_INVENT_A_NEW_VERB` names no verb
+        // this layer knows, so nothing about #1818 rescues it.
+        for mode in ["supervised", "auto"] {
+            let p = policy(mode, &[], None).with_agent("ops");
+            assert!(
+                matches!(
+                    p.check(&request(
+                        "composio_execute",
+                        serde_json::json!({ "tool": "GITHUB_INVENT_A_NEW_VERB" })
+                    ))
+                    .await,
+                    ToolPolicyDecision::RequireApproval { .. }
+                ),
+                "under `{mode}` an action nobody has classified must still park"
+            );
+        }
     }
 
     /// The grantability answer and the parking answer are read from one
@@ -5715,6 +6174,123 @@ mod tests {
             decision_name(&d),
             "park",
             "the operator declared the shape, not the command"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The S2 http_request deflection guardrail (issue #1759)
+    // -----------------------------------------------------------------------
+
+    /// A policy that would otherwise wave everything through (`full`), so any
+    /// deny in these tests is the S2 arm and nothing else.
+    fn full_with_connected(toolkits: &[&str]) -> ApprovalPolicy {
+        policy("full", &[], None)
+            .with_connected_composio_toolkits(toolkits.iter().map(|t| t.to_string()).collect())
+    }
+
+    /// The headline case: `http_request` to `api.github.com` when `github` is
+    /// connected is denied, and the refusal names the Composio path.
+    #[tokio::test]
+    async fn http_request_to_a_connected_provider_is_denied_with_the_composio_route() {
+        let p = full_with_connected(&["github"]);
+        let decision = p
+            .check(&request(
+                "http_request",
+                serde_json::json!({"url": "https://api.github.com/repos/o/r/issues"}),
+            ))
+            .await;
+        match decision {
+            ToolPolicyDecision::Deny { reason } => {
+                assert!(reason.contains("composio_execute"), "{reason}");
+                assert!(reason.contains("composio_list_tools"), "{reason}");
+                assert!(reason.contains("401") || reason.contains("403"), "{reason}");
+            }
+            other => panic!("expected a deny naming the Composio route, got {other:?}"),
+        }
+    }
+
+    /// Requirement #2: the same host passes through UNCHANGED when its toolkit is
+    /// NOT connected — the company may legitimately hit a public endpoint of a
+    /// provider it has not wired. Proven by asserting the decision is identical
+    /// to the one a policy with no connected toolkits gives: S2 did not touch it.
+    /// (Under `full` an un-deflected `http_request` is not `Allow` outright — the
+    /// per-call judge parks it — so "unchanged" is the precise claim, not
+    /// "allowed".)
+    #[tokio::test]
+    async fn http_request_to_the_same_host_passes_through_when_its_toolkit_is_not_connected() {
+        let url = "https://api.github.com/repos/o/r";
+        let baseline = full_with_connected(&[])
+            .check(&request("http_request", serde_json::json!({ "url": url })))
+            .await;
+        // The S2 arm must never itself be a deny — the baseline is the
+        // un-guarded decision this passthrough must reproduce.
+        assert!(
+            !matches!(baseline, ToolPolicyDecision::Deny { .. }),
+            "baseline (no connected toolkits) must not deny: {baseline:?}"
+        );
+
+        // Some other toolkit connected, but not github → identical to baseline.
+        let other_connected = full_with_connected(&["slack"])
+            .check(&request("http_request", serde_json::json!({ "url": url })))
+            .await;
+        assert_eq!(
+            other_connected, baseline,
+            "an unconnected provider host must pass through unchanged"
+        );
+    }
+
+    /// A non-provider host is never deflected, whatever is connected — it passes
+    /// through to the ordinary policy exactly as if S2 were not installed.
+    #[tokio::test]
+    async fn http_request_to_a_non_provider_host_passes_through() {
+        let url = "https://example.com/data.json";
+        let baseline = full_with_connected(&[])
+            .check(&request("http_request", serde_json::json!({ "url": url })))
+            .await;
+        let guarded = full_with_connected(&["github", "gmail"])
+            .check(&request("http_request", serde_json::json!({ "url": url })))
+            .await;
+        assert_eq!(
+            guarded, baseline,
+            "a non-provider host must pass through unchanged"
+        );
+    }
+
+    /// `curl` and `web_fetch` follow the same rule as `http_request` — the whole
+    /// `url`-taking web family is deflected, not just one tool.
+    #[tokio::test]
+    async fn curl_and_web_fetch_are_deflected_on_the_same_terms() {
+        let p = full_with_connected(&["github"]);
+        for tool in ["curl", "web_fetch"] {
+            let decision = p
+                .check(&request(
+                    tool,
+                    serde_json::json!({"url": "https://api.github.com/repos/o/r"}),
+                ))
+                .await;
+            assert!(
+                matches!(decision, ToolPolicyDecision::Deny { .. }),
+                "{tool} must be deflected to Composio, got {decision:?}"
+            );
+        }
+    }
+
+    /// The deflection outranks a single-use grant: a grant is an operator
+    /// approving one call, but a raw call to a connected provider cannot succeed
+    /// by this route for anyone, so the guardrail still refuses it.
+    #[tokio::test]
+    async fn the_deflection_outranks_a_grant() {
+        let p = full_with_connected(&["github"]);
+        let args = serde_json::json!({"url": "https://api.github.com/repos/o/r"});
+        // Even if a grant existed for this exact call, the arm above the grant
+        // check refuses it. `http_request` is not grantable, but the ordering is
+        // what this pins: the deny fires before any grant arm is consulted.
+        assert!(
+            matches!(
+                p.check(&request("http_request", args)).await,
+                ToolPolicyDecision::Deny { .. }
+            ),
+            "the S2 arm must sit above the grant checks"
         );
     }
 }

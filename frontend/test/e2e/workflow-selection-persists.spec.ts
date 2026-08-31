@@ -120,6 +120,8 @@ async function mockCompanySwitchApi(page: Page) {
     }
     if (path.endsWith("/team")) return json([]);
     if (path.endsWith("/users")) return json([]);
+    if (path.endsWith("/me"))
+      return json({ id: "op", email: "op@example.com", role: "member" });
     if (path.endsWith("/events"))
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     return json([]);
@@ -174,7 +176,12 @@ test("a company switch does not reuse the previous company's workflow route (#86
     timeout: 30_000,
   });
 
-  await page.getByRole("button", { name: "Switch company" }).click();
+  // Companies live in the host switcher's own menu now — the sidebar footer's
+  // "Switch company" row moved in there with the lifecycle line, leaving the
+  // footer to the profile alone. The trigger is named by its nameplate (the
+  // company and its state), so it is addressed by its test id rather than by a
+  // label it deliberately does not carry.
+  await page.getByTestId("host-switcher").click();
   await page.getByRole("menuitem", { name: "Other", exact: true }).click();
   // Issue #1110 sharpened what this test proves. It used to assert the switch
   // landed on the OTHER company's first workflow — `#/workflows/other-default`

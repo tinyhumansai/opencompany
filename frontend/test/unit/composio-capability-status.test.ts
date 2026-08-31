@@ -40,6 +40,13 @@ describe("composioStatus", () => {
     ).toEqual({ label: "Not granted", variant: "secondary" });
   });
 
+  it("reports an omitted grant as unknown, never as not granted", () => {
+    expect(composioStatus(granted({ composioGranted: undefined }))).toEqual({
+      label: "Couldn't check",
+      variant: "outline",
+    });
+  });
+
   /**
    * The #886 regression guard. An unanswered host is unknown, not broken —
    * and specifically not `destructive`, which is the colour that sent the

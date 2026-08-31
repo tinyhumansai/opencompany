@@ -95,7 +95,7 @@ const FILTERS: { key: string; label: string; statuses?: RunStatus[] }[] = [
   {
     key: "parked",
     label: "Waiting",
-    statuses: ["waiting_approval", "paused"],
+    statuses: ["waiting_approval", "paused", "blocked"],
   },
   { key: "failed", label: "Failed", statuses: ["failed", "cancelled"] },
 ];
@@ -122,9 +122,14 @@ function statusIcon(status: RunStatus) {
     case "failed":
       return <XCircle className="size-4" />;
     case "cancelled":
+    // A by-design decline (issue #1809) is terminal and neutral, so it takes the
+    // same quiet icon as a cancel — never the spinning `default`, which would
+    // paint a settled attempt as still running.
+    case "declined":
       return <Ban className="size-4" />;
     case "waiting_approval":
     case "paused":
+    case "blocked":
       return <Hourglass className="size-4" />;
     default:
       return <Loader2 className="size-4 animate-spin" />;
@@ -374,7 +379,7 @@ export function AgentRuns({
 
   return (
     <Card data-testid="agent-runs">
-      <CardContent className="space-y-3 py-4">
+      <CardContent className="space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="space-y-1">
             <h3 className="font-medium">Runs</h3>
@@ -745,7 +750,7 @@ function RunDetailPanel({
 
   return (
     <Card data-testid="agent-run-detail">
-      <CardContent className="space-y-4 py-4">
+      <CardContent className="space-y-4">
         <Button
           variant="ghost"
           size="sm"
@@ -852,7 +857,6 @@ function RunDetailPanel({
             detail && (
               <TimelineList
                 entries={detail.steps}
-                now={now}
                 empty={
                   <Note>
                     {live

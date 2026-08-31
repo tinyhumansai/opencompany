@@ -209,9 +209,27 @@ every visit for a task performed once.
 Expanded, the connection panel is the existing `BillingView` card for that
 provider, moved not rewritten. Its four-state reporting is the part worth
 keeping intact: *no key/site*, *no webhook*, *not granted*, *not in build* fail
-differently and two of them cannot be fixed from the form. The collapsed line
-shows the worst of the four, so "Connected" never hides "the manifest does not
+differently and none of them is fixed by the credential form. The collapsed line
+shows the worst of the four, so "Connected" never hides "this company does not
 grant `chargebee`, so no agent can use any of this".
+
+Two corrections to that reporting came out of issue #1796:
+
+- **The panel can now fix *not granted*.** The remedy used to end in "it cannot
+  be fixed from this page", which was true and was the bug: nothing in the
+  console could write `[tools].allow`, and on a hosted tenant the manifest is a
+  read-only boot snapshot. `Health.grantNamespace` names the namespace and the
+  panel renders a **Grant** control over `PUT …/tools/grants`
+  ([tools.md](tools.md)). It is offered for *not granted* only — on a host built
+  without the provider the grant would succeed and change nothing.
+- **Precedence needs the configured-check first.** *not granted* outranking
+  *not configured* is right, but only once there is a credential for the missing
+  grant to be blocking — which is what `health.ts` always said and what its
+  guards did not do. Testing `!granted` first put a company that had never
+  touched Chargebee into the *not granted* arm, which asserts "Connected" and
+  interpolates the site, rendering `Connected to null — but no teammate can use
+  it`. Two claims in one line, both false. PayPal had the same ordering and
+  printed a bare "Connected —" over a company with no client id at all.
 
 ### Invoicing (Chargebee)
 

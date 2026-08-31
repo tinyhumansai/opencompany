@@ -10,6 +10,8 @@
 // here is readable by an agent on its next turn. Every node carries who created
 // it and who last wrote it (issue #326) so the two are told apart on sight.
 
+import { rosterDisplayName, type RosterNames } from "@/lib/roster-names";
+
 import type { OpenCompanyClient } from "./client";
 
 /** Whether a node is a folder or a file. */
@@ -28,19 +30,35 @@ export type WorkspaceOrigin =
 export const OPERATOR_ORIGIN: WorkspaceOrigin = { kind: "operator" };
 
 /**
+ * The lookup an `originLabel` caller passes when it has no roster to hand.
+ *
+ * A shared empty map rather than a fresh one per call: `rosterDisplayName`
+ * only reads it, and this function is called once per rendered row.
+ */
+const NO_ROSTER_NAMES: RosterNames = new Map();
+
+/**
  * A short human label for an origin, or `null` for a plain operator note.
  *
  * Mirrors `ORIGIN_LABELS` in `api/memory.ts`, but returns `null` rather than
  * "Operator" for the operator case: in the Brain every row has an interesting
  * origin, whereas here the operator is the unremarkable default and badging it
  * would put a chip on nearly every note while saying nothing.
+ *
+ * `names` resolves the agent case through the one shared
+ * {@link rosterDisplayName} (issue #1723): the raw roster handle is engine
+ * plumbing — `seo_specialist` where the operator knows "SEO Specialist" — and
+ * this label sits beside names that are already resolved. Optional, and the
+ * resolver falls back to the id, so a caller that has no roster read to hand
+ * gets exactly the previous string rather than a blank badge.
  */
 export function originLabel(
   origin: WorkspaceOrigin | undefined,
+  names: RosterNames = NO_ROSTER_NAMES,
 ): string | null {
   switch (origin?.kind) {
     case "agent":
-      return `Teammate · ${origin.id}`;
+      return `Teammate · ${rosterDisplayName(origin.id, names)}`;
     case "seed":
       return "Seeded";
     default:
@@ -449,7 +467,7 @@ export interface MergedFolder {
 
 /** Why the repair left a node exactly where it found it. */
 export type ResidualCause =
-  "fileSharesTheName" | "fileInTheWay" | "treeMovedOn";
+  "fileSharesTheName" | "fileInTheWay" | "treeMovedOn" | "danglingParent";
 
 /** One node the repair deliberately did not touch (issue #759). */
 export interface Residual {
@@ -490,6 +508,8 @@ export function residualReason(cause: ResidualCause): string {
       return "Both copies hold a note with this name. Merging them would discard one, so both were kept — open them and keep what you want.";
     case "treeMovedOn":
       return "Something changed while the repair ran, so this was left alone. Run it again.";
+    case "danglingParent":
+      return "The folder this was filed under no longer exists, so it has no reachable path. Move it somewhere that does, or delete it if you don't need it.";
   }
 }
 
@@ -563,14 +583,20 @@ export async function uploadFile(
  * **The caller must revoke the returned URL** when it is done with it —
  * `URL.revokeObjectURL` — or the blob stays resident for the life of the
  * document.
+ *
+ * An optional `signal` cancels the transfer: a preview that scrolls out of
+ * view aborts its fetch instead of downloading the whole payload only to
+ * discard it (codex review finding).
  */
 export async function fetchBlobUrl(
   client: OpenCompanyClient,
   company: string | null,
   id: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const blob = await client.getBlob(
     `${client.scopeFor(company)}/workspace/blob/${encodeURIComponent(id)}`,
+    signal,
   );
   return URL.createObjectURL(blob);
 }

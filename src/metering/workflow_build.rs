@@ -64,11 +64,15 @@ use super::inference::inference_ledger_entry;
 /// `run_id` are parameters and both are carried: the builder pass runs on a
 /// dispatched card, so its spend belongs to that card's assignee and its attempt,
 /// exactly like any other dispatch turn.
+///
+/// `model` is the classified [`ModelSlug`](crate::metering::ModelSlug) the pass
+/// ran against, or `None` when the caller cannot name one (issue #1749).
 pub fn workflow_build_sample(
     usage: &TokenUsage,
     provider: &str,
     agent: &str,
     run_id: &str,
+    model: Option<crate::metering::ModelSlug>,
 ) -> Option<UsageSample> {
     if usage.is_zero() {
         return None;
@@ -83,6 +87,7 @@ pub fn workflow_build_sample(
         cost_usd: usage.cost_usd,
         kind: SampleKind::Inference,
         run_id: Some(run_id.to_string()),
+        model,
     })
 }
 
@@ -94,12 +99,14 @@ pub fn workflow_build_sample(
 /// other inference spend uses, under the same `inference.spend` kind and memo'd
 /// to the assignee — a builder pass's spend is inference spend as far as the
 /// money is concerned. Both writes are logged-and-swallowed: see the module docs.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_workflow_build_usage(
     usage: &TokenUsage,
     provider: &str,
     company: &CompanyId,
     agent: &str,
     run_id: &str,
+    model: Option<crate::metering::ModelSlug>,
     store: &dyn CompanyStore,
     meter: &dyn UsageMeter,
 ) {
@@ -126,7 +133,7 @@ pub async fn record_workflow_build_usage(
             "[usage] failed to append the builder-pass spend entry; the proposal itself was written"
         );
     }
-    if let Some(sample) = workflow_build_sample(usage, provider, agent, run_id)
+    if let Some(sample) = workflow_build_sample(usage, provider, agent, run_id, model)
         && let Err(err) = meter.record(company, &sample).await
     {
         tracing::warn!(
@@ -158,7 +165,7 @@ mod test {
     /// than the run-less, company-bucket planning pass.
     #[test]
     fn a_builder_sample_is_charged_to_the_assignee_with_a_run() {
-        let sample = workflow_build_sample(&usage_with(0.6), "managed", "maya", "run-7")
+        let sample = workflow_build_sample(&usage_with(0.6), "managed", "maya", "run-7", None)
             .expect("a real pass meters");
         assert_eq!(sample.agent, "maya");
         assert_eq!(sample.kind, SampleKind::Inference);
@@ -182,8 +189,8 @@ mod test {
     /// the ceiling fails a test instead.
     #[test]
     fn builder_spend_counts_toward_the_capability_ceiling() {
-        let sample =
-            workflow_build_sample(&usage_with(0.6), "managed", "maya", "run-7").expect("sample");
+        let sample = workflow_build_sample(&usage_with(0.6), "managed", "maya", "run-7", None)
+            .expect("sample");
         assert_eq!(
             crate::metering::tokens_in(std::slice::from_ref(&sample)),
             1_600
@@ -194,10 +201,11 @@ mod test {
     /// Usage view's provider axis does not grow a second spelling of one backend.
     #[test]
     fn the_provider_slug_is_normalised() {
-        let sample =
-            workflow_build_sample(&usage_with(0.1), "  MANAGED ", "maya", "run-7").expect("sample");
+        let sample = workflow_build_sample(&usage_with(0.1), "  MANAGED ", "maya", "run-7", None)
+            .expect("sample");
         assert_eq!(sample.provider, "managed");
-        let blank = workflow_build_sample(&usage_with(0.1), "", "maya", "run-7").expect("sample");
+        let blank =
+            workflow_build_sample(&usage_with(0.1), "", "maya", "run-7", None).expect("sample");
         assert_eq!(blank.provider, crate::metering::UNKNOWN_PROVIDER);
     }
 
@@ -207,7 +215,8 @@ mod test {
     #[test]
     fn a_zero_pass_writes_no_sample() {
         assert!(
-            workflow_build_sample(&TokenUsage::default(), "managed", "maya", "run-7").is_none()
+            workflow_build_sample(&TokenUsage::default(), "managed", "maya", "run-7", None)
+                .is_none()
         );
         assert!(
             workflow_build_sample(
@@ -217,7 +226,8 @@ mod test {
                 },
                 "managed",
                 "maya",
-                "run-7"
+                "run-7",
+                None
             )
             .is_some()
         );
@@ -229,7 +239,8 @@ mod test {
                 },
                 "managed",
                 "maya",
-                "run-7"
+                "run-7",
+                None
             )
             .is_some()
         );

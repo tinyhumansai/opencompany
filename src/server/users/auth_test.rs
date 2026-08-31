@@ -53,10 +53,14 @@ async fn state_with(home: &std::path::Path, companies: &[&str]) -> AppState {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -89,6 +93,7 @@ async fn seed_session(
                 id: "u1".into(),
                 email: "ada@example.com".into(),
                 display_name: None,
+                avatar: None,
                 role,
                 status,
                 password_hash: None,
@@ -276,6 +281,7 @@ async fn an_expired_session_does_not_resolve() {
                 id: "u1".into(),
                 email: "ada@example.com".into(),
                 display_name: None,
+                avatar: None,
                 role: UserRole::Member,
                 status: UserStatus::Active,
                 password_hash: None,

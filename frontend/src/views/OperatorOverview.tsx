@@ -5,13 +5,13 @@ import type { OpenCompanyClient } from "@/api/client";
 import { listRuns, RUN_STATUS_LABEL, type RunSummary } from "@/api/runs";
 import type { LocalScope } from "@/connections/types";
 import type { CompanyFeed } from "@/hooks/use-company";
-import { readOverviewVisit, writeOverviewVisit } from "@/lib/overview-visit";
+import { commitOverviewVisit, openOverviewVisit } from "@/lib/overview-visit";
 import { chatHref } from "@/lib/run-source";
+import { PageHeader } from "@/components/page-header";
 
 interface Props {
   client: OpenCompanyClient;
   company: string | null;
-  companyName: string;
   feed: Pick<CompanyFeed, "approvals" | "queue">;
   scope: LocalScope;
   /**
@@ -47,12 +47,48 @@ const FAILED_READ_LIMIT = 200;
 export function OperatorOverview({
   client,
   company,
-  companyName,
   feed,
   scope,
   attemptEventTick,
 }: Props) {
-  const [previousVisit] = useState(() => readOverviewVisit(scope));
+  /**
+  /**
+   * The boundary the panel below compares against, for the current `scope`.
+   *
+   * Two fixes meet here and both are load-bearing, so neither side of this
+   * merge could be taken whole.
+   *
+   * **From #1745, kept exactly:** the read happens during *render*, pinned in a
+   * ref keyed on `scope` — which its owner ([`ConnectionConsole`]) memoizes on
+   * `[connectionId, company]`, so reference identity is the right key. A
+   * `[scope]` read effect paired with a `[scope]` write effect looks idempotent
+   * and is not: StrictMode replays both in declaration order, so the replay's
+   * read observes what the first pass's write just recorded. Reading before any
+   * effect runs is what makes that replay harmless. A scope switch also gets
+   * the new scope's boundary in the same render rather than one frame late.
+   *
+   * **From #1700, and why the functions changed:** a ref lives as long as one
+   * component instance, and the shell mounts this view conditionally — every
+   * trip to Chat and back is a fresh instance with a fresh ref, re-reading a
+   * `localStorage` value the previous instance's write effect had already
+   * advanced. That is the remount half of #1700, and no per-instance pin can
+   * see it. [`openOverviewVisit`](overview-visit) pins the boundary in MODULE
+   * state instead, which lives exactly as long as one page load — the lifetime
+   * "since you last opened" is a claim about.
+   *
+   * `openOverviewVisit` records nothing, and `commitOverviewVisit` below is the
+   * only durable write. A render React starts and never commits — a descendant
+   * throws, the operator reloads out of the error boundary — is not a visit,
+   * and must not become the boundary the next page load hides failures behind.
+   * `commitOverviewVisit` is idempotent per page load per scope for the same
+   * reason the read is, so StrictMode replaying the effect writes once.
+   */
+  const visitRef = useRef<{ scope: LocalScope; previousVisit: number | null }>();
+  if (!visitRef.current || visitRef.current.scope !== scope) {
+    visitRef.current = { scope, previousVisit: openOverviewVisit(scope) };
+  }
+  const previousVisit = visitRef.current.previousVisit;
+
   const [stoppedRuns, setStoppedRuns] = useState<RunSummary[]>([]);
   const [failedRuns, setFailedRuns] = useState<RunSummary[]>([]);
   const [runLoad, setRunLoad] = useState<RunLoad>("loading");
@@ -161,8 +197,17 @@ export function OperatorOverview({
       });
   }, [attemptEventTick, fetchRuns]);
 
+  // Record that this browser opened this scope's overview. The only durable
+  // side effect in the read/write pair — the read lives at render time above —
+  // so StrictMode replaying it twice on mount is harmless twice over: the
+  // boundary was already captured before this effect's first pass ran, and
+  // `commitOverviewVisit` writes once per page load per scope anyway.
+  //
+  // In an effect rather than beside the read, because a render React starts and
+  // discards is not a visit (review of PR #1752). It was `writeOverviewVisit`
+  // straight from render on both sides of this merge, in different places.
   useEffect(() => {
-    writeOverviewVisit(scope, Date.now());
+    commitOverviewVisit(scope);
   }, [scope]);
 
   const stopped = useMemo(
@@ -191,17 +236,18 @@ export function OperatorOverview({
   const failedReadCapped = failedRuns.length >= FAILED_READ_LIMIT;
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6 overflow-auto p-5 sm:p-8" data-testid="operator-overview" data-tour="operator-overview">
-      <header className="flex flex-col gap-4 border-b pb-6 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-sm text-muted-foreground">{companyName}</p>
-          <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Start with the work that needs your judgment.</p>
-        </div>
-        <a href="#/chat" className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
-          <MessageSquare className="size-4" aria-hidden /> Start a conversation
-        </a>
-      </header>
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="operator-overview" data-tour="operator-overview">
+      <PageHeader
+        gutter="px-5 sm:px-8"
+        title="Overview"
+        width="5xl"
+        actions={
+          <a href="#/chat" className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+            <MessageSquare className="size-4" aria-hidden /> Start a conversation
+          </a>
+        }
+      />
+      <div className="mx-auto flex w-full min-h-0 max-w-5xl flex-1 flex-col gap-6 overflow-auto p-5 sm:p-8">
 
       <section aria-labelledby="overview-attention" className="rounded-xl border bg-card p-5 shadow-sm">
         <div className="flex items-start justify-between gap-4">
@@ -258,6 +304,7 @@ export function OperatorOverview({
       <p className="text-xs text-muted-foreground">
         Looking for the company&apos;s structure? <a className="underline-offset-2 hover:underline" href="#/company/graph">Open the knowledge graph</a>.
       </p>
+      </div>
     </div>
   );
 }

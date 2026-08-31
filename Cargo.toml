@@ -226,9 +226,20 @@ regex = { version = "1", optional = true }
 # default build links no network crates.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
 
-# Real HMAC-SHA256 webhook signing. Pure-Rust, no system libs, no network beyond
-# the shared `reqwest` client used by `HttpWebhookSink`.
-hmac = { version = "0.12", optional = true }
+# HMAC-SHA256. Two callers: webhook signing (`HttpWebhookSink`, behind
+# `webhooks`) and the analytics tenant identifier (`analytics::types::OpaqueId`,
+# un-gated).
+#
+# NOT optional, because the second caller is not. `OpaqueId::tenant` derives a
+# hosted tenant's analytics identity from its slug, and an *unkeyed* digest of a
+# slug is not an opaque identity at all: a tenant slug is usually the customer's
+# brand, so a few thousand guesses invert it and the third-party collector
+# learns exactly who it is looking at. Keying it is the fix, and a keyed digest
+# has to work in every build the identity code compiles in — which is all of
+# them, since the decision layer is deliberately un-gated so it can be tested
+# without the network feature. Pure-Rust, no system libs, and already in
+# `Cargo.lock`, so no lane's graph changes.
+hmac = "0.12"
 
 # Hashing (session/login-code digests) and OS randomness (minting them). Both
 # are unconditional: a build that cannot hash or generate a random token cannot
@@ -254,9 +265,9 @@ hmac = { version = "0.12", optional = true }
 # is not — shared-string tables and cell typing make hand-parsing it a
 # liability — so `calamine` reads that one.
 pdf-extract = { version = "0.12", optional = true }
-calamine = { version = "0.34", optional = true }
+calamine = { version = "0.36", optional = true }
 quick-xml = { version = "0.41", optional = true }
-zip = { version = "6", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "7", default-features = false, features = ["deflate"], optional = true }
 
 sha2 = "0.10"
 getrandom = "0.4"
@@ -366,7 +377,20 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 # and *run* by nothing. Moving it into the default set makes both `cargo test`
 # lanes execute them, which is why this needs no new CI lane. It costs one pure
 # dependency (`jsonwebtoken`), already in `Cargo.lock`.
-default = ["oauth", "platform-jwt", "documents"]
+#
+# `tinymemory` ships in the standard build because the memory-engine catalog is
+# a console surface in every build, and without this feature four of its eight
+# tiles ("Supermemory", "Mem0", "Cognee", "No memory") render disabled with
+# "this build was compiled without the `tinymemory` feature" — an instruction
+# to go and find a differently compiled binary, which for the desktop app and
+# for anyone running the shipped container is not an instruction they can
+# follow. It is the cheap half of the memory seam: the driver registry, the
+# contract API and the HTTP remote, all pure Rust already in `Cargo.lock`. The
+# in-pod engines stay opt-in (`tinycortex`, `tinymemory-embedded`) because
+# those do cost a bundled SQLite build, and the desktop — which offers no
+# in-pod memory surface — keeps them off; it enables `tinymemory` itself in
+# `src-tauri/Cargo.toml`, so the hosted catalog tiles are live there too.
+default = ["oauth", "platform-jwt", "documents", "tinymemory"]
 # Text extraction for files dropped on the Brain page (PDF, Word, Excel,
 # PowerPoint). Without it those formats still upload and are still refused
 # honestly — the route reports "no text could be extracted" rather than
@@ -459,7 +483,7 @@ runner = ["acp"]
 # Real HTTP POST webhook delivery + HMAC-SHA256 signing. The `WebhookSink` trait,
 # the offline `RecordingWebhookSink`, and the deterministic default signer
 # compile without this; only `HttpWebhookSink`/`HmacSha256Signer` are gated here.
-webhooks = ["dep:reqwest", "dep:hmac"]
+webhooks = ["dep:reqwest"]
 # Real signed per-tenant JWT verification. The `PlatformVerifier` trait and the
 # offline `StaticPlatformVerifier` compile without this; only the JWT verifier is
 # gated behind it.
@@ -510,6 +534,22 @@ smtp = ["dep:lettre"]
 # offline `RecordingMailReceiver` compile without this; only `AsyncImapReceiver`
 # and the RFC822 parser are gated here.
 imap = ["dep:async-imap", "dep:mail-parser", "dep:tokio-rustls", "dep:webpki-roots"]
+# Product analytics: the real Mixpanel HTTP transport (issue #1739). The
+# `Tracker` port, the `NullTracker` / `RecordingTracker` mocks, the whole
+# enable/disable decision, the payload vocabulary and the JSON body builder all
+# compile and test WITHOUT this; only `HttpMixpanelTracker` is gated here.
+#
+# That split is the acceptance criterion of #1739 expressed as a dependency
+# graph rather than as a rule. This crate is GPL-3.0 and self-hostable, so a
+# default build must be incapable of reporting — not merely configured not to.
+# With the feature off there is no type in the tree that owns an HTTP client for
+# analytics, which is also what keeps `tests/offline_e2e.rs` honest: that lane
+# runs inside a network namespace with no routes, and
+# `docs/spec/runtime/offline.md` forbids widening it.
+#
+# `reqwest` is the only dependency, and it is already in the DEFAULT set via
+# `oauth`, so enabling this adds nothing to any lane's graph or to Cargo.lock.
+analytics = ["dep:reqwest"]
 # OAuth connection lifecycle (authorize-url + server-side token exchange). The
 # read-only connections catalog compiles without this; only the token-exchanging
 # write routes are gated here (they need the shared `reqwest` client).

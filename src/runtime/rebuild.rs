@@ -68,6 +68,7 @@ use crate::app::AppState;
 use crate::company::CompanyManifest;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
+use crate::ports::store::company_write_lock;
 use crate::ports::types::CompanyId;
 use crate::runtime::handover::RuntimeHandover;
 
@@ -154,22 +155,64 @@ pub async fn rebuild_company(state: &AppState, id: &CompanyId) -> Result<Arc<Com
         )
     })?;
 
-    // The materialized manifest, read before the quiesce so a store failure
-    // never leaves a company parked.
-    let manifest = outgoing
-        .store()
-        .load(id)
-        .await?
-        .map(|record| record.manifest)
-        .ok_or_else(|| {
-            OpenCompanyError::CompanyNotFound(format!(
-                "{id} is registered but has no persisted record to rebuild from"
-            ))
-        })?;
-
     // Stop accepting cycles and let the one in flight finish. Everything after
     // this point must either swap or resume — never leave the company quiesced.
     outgoing.quiesce().await;
+
+    // Serialize the rebuilder's load-through-save of the company record against
+    // every other `company_write_lock` holder (PR #1875 review finding).
+    // `RuntimeBuilder::build` reads the persisted record near the top of
+    // `build` and does not write the successor record (`store.save_importing`)
+    // until near the bottom, with no lock of its own held across that span. A
+    // console write racing in between — a name-confirm PATCH, a desk reorder,
+    // anything else that serializes on this same lock — can land its `save`
+    // inside that window and then have the rebuild's own full-record save
+    // silently revert it, because the rebuild read its copy of the record
+    // before the concurrent write landed.
+    //
+    // Taken *after* `quiesce()`, not before it: quiescing waits on `serial`,
+    // and an in-flight cycle can itself take this same lock partway through
+    // (the orchestrator's `add_agent` tool does), so acquiring this lock ahead
+    // of the drain would deadlock — this task waiting on the cycle to finish,
+    // the cycle waiting on a lock this task already holds. By the time
+    // `quiesce()` returns no cycle is running or can start, so taking the lock
+    // here cannot race against that path.
+    let write_lock = company_write_lock(id);
+    let lock = write_lock.lock().await;
+
+    // The materialized manifest, read *under* the lock above rather than before
+    // `quiesce()` (PR #1875 review finding, second pass). `quiesce()` only waits
+    // on `serial`, not on `company_write_lock` — a manifest writer such as `PUT
+    // …/logo` can load-modify-save the record in the gap between an earlier
+    // snapshot and this lock, and every field that snapshot fed into
+    // `RebuildRequest` is seed-authoritative in `RuntimeBuilder::build` (every
+    // field but `[workflows].enabled`), so the rebuild's own save would silently
+    // restore the pre-write value. Reading here closes that: nothing that takes
+    // `company_write_lock` can land between this read and the lock this task is
+    // already holding.
+    //
+    // A load failure here must resume `outgoing` before returning, unlike a
+    // load failure would have needed to before `quiesce()` — this task already
+    // quiesced it.
+    let manifest = match outgoing.store().load(id).await {
+        Ok(Some(record)) => record.manifest,
+        Ok(None) => {
+            drop(lock);
+            if !state.registry().is_shutting_down() {
+                outgoing.resume();
+            }
+            return Err(OpenCompanyError::CompanyNotFound(format!(
+                "{id} is registered but has no persisted record to rebuild from"
+            )));
+        }
+        Err(err) => {
+            drop(lock);
+            if !state.registry().is_shutting_down() {
+                outgoing.resume();
+            }
+            return Err(err);
+        }
+    };
 
     let request = RebuildRequest {
         id: id.clone(),
@@ -180,6 +223,7 @@ pub async fn rebuild_company(state: &AppState, id: &CompanyId) -> Result<Arc<Com
     let built = match rebuilder.rebuild(state, request).await {
         Ok(runtime) => runtime,
         Err(err) => {
+            drop(lock);
             // The stale brain is a worse company; a permanently quiesced one is
             // not a company at all — unless the host is already draining. In that
             // case the shutdown drain has gated this company against new cycles,
@@ -191,8 +235,14 @@ pub async fn rebuild_company(state: &AppState, id: &CompanyId) -> Result<Arc<Com
             return Err(err);
         }
     };
+    drop(lock);
 
     let successor = Arc::new(built);
+    // Issue #1739: this is the one thing that *changes* a host's cognition
+    // after boot. A first inference config rebuilds the runtime from `echo` to
+    // `harness`, and an envelope stamped at boot would keep saying `echo` for
+    // the life of the process.
+    state.analytics().observe_cognition(successor.cognition());
     state.registry().insert(id.clone(), successor.clone());
     tracing::info!(
         company = %id,
@@ -315,6 +365,7 @@ mod test {
         // drain) takes them the same way, so an accessor here would be a public
         // surface that exists only for this assertion.
         assert!(Arc::ptr_eq(&before.serial, &after.serial));
+        assert!(Arc::ptr_eq(&before.per_agent, &after.per_agent));
         assert!(Arc::ptr_eq(&before.task_writes, &after.task_writes));
     }
 
@@ -421,6 +472,159 @@ mod test {
         assert!(matches!(err, OpenCompanyError::Config(_)), "{err}");
         // Crucially, the check happens before the quiesce.
         assert!(!state.registry().get(&id).expect("registered").is_quiesced());
+    }
+
+    /// `rebuild_company` must serialize the rebuilder's load-through-save of
+    /// the company record against `company_write_lock` (PR #1875 review
+    /// finding): `RuntimeBuilder::build` reads the persisted record near the
+    /// top and does not save its successor until near the bottom, and
+    /// without this lock a console write racing in between — a name-confirm
+    /// PATCH, a desk reorder — could land its save inside that window only
+    /// to have the rebuild's own full-record save silently revert it. Proven
+    /// the same way `set_lifecycle_serializes_against_the_company_write_lock`
+    /// (`company/runtime.rs`) proves it for that method: hold the lock
+    /// externally, drive the real call, and demand it cannot finish while
+    /// the lock is held.
+    #[tokio::test]
+    async fn rebuild_company_serializes_against_the_company_write_lock() {
+        let home_dir = tmp_home();
+        let home = home_dir.path();
+        let id = CompanyId::new("acme");
+        let state = state_with(home, &id)
+            .await
+            .with_rebuilder(Arc::new(Working {
+                home: home.to_path_buf(),
+            }));
+
+        let lock = crate::ports::store::company_write_lock(&id);
+        let guard = lock.lock().await;
+
+        let state_for_task = state.clone();
+        let id_for_task = id.clone();
+        let mut task =
+            tokio::spawn(async move { rebuild_company(&state_for_task, &id_for_task).await });
+
+        // The rebuild must be blocked behind the held lock — give it every
+        // chance to (wrongly) race ahead before declaring it stuck.
+        let raced_ahead = tokio::time::timeout(std::time::Duration::from_millis(200), &mut task)
+            .await
+            .is_ok();
+        assert!(
+            !raced_ahead,
+            "rebuild_company completed while company_write_lock was held \
+             elsewhere — it is not serializing its load-through-save of the \
+             company record against a concurrent writer (e.g. a racing \
+             name-confirm PATCH), which can silently revert that writer's \
+             save"
+        );
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("rebuild_company never resumed after the lock was released")
+            .expect("task panicked")
+            .expect("rebuild_company failed");
+    }
+
+    /// PR #1875 review finding (second pass): a manifest snapshot taken
+    /// *before* `quiesce()` — rather than under the `company_write_lock` this
+    /// function already holds by the time it calls the rebuilder — leaves a
+    /// window `quiesce()`'s own wait can outlast: `quiesce()` blocks on
+    /// `serial`, not on `company_write_lock`, so a writer like `PUT …/logo`
+    /// (load-modify-save under `company_write_lock`) can complete entirely
+    /// while `quiesce()` is still draining an in-flight cycle — long before
+    /// this function reaches its own lock. `RuntimeBuilder::build` treats
+    /// every manifest field but `[workflows].enabled` as seed-authoritative,
+    /// i.e. taken from the snapshot handed to it rather than re-read from the
+    /// store, so a stale snapshot's full-record save silently reverts that
+    /// write. This reproduces the race directly: hold `serial` to stand in
+    /// for the in-flight cycle, let the write land while `rebuild_company` is
+    /// parked in `quiesce()`, then release it and demand the write survived.
+    #[tokio::test]
+    async fn a_rebuild_does_not_revert_a_manifest_write_that_lands_during_quiesce() {
+        let home_dir = tmp_home();
+        let home = home_dir.path();
+        let id = CompanyId::new("acme");
+        let seed: CompanyManifest =
+            toml::from_str("[company]\nname = \"Acme\"\nlogo_url = \"old-logo\"\n")
+                .expect("valid manifest");
+        let outgoing = Arc::new(
+            RuntimeBuilder::new(home.to_path_buf(), seed)
+                .with_id(id.clone())
+                .build()
+                .await
+                .expect("build"),
+        );
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id.clone(), outgoing.clone());
+        state.set_boot_inputs(id.clone(), BootInputs::default());
+        let state = state.with_rebuilder(Arc::new(Working {
+            home: home.to_path_buf(),
+        }));
+
+        // Stand in for a cycle already in flight: `quiesce()` cannot return
+        // until this is released.
+        let in_flight = outgoing.serial.clone().lock_owned().await;
+
+        let state_for_task = state.clone();
+        let id_for_task = id.clone();
+        let task =
+            tokio::spawn(async move { rebuild_company(&state_for_task, &id_for_task).await });
+
+        // Give the spawned task every chance to reach the blocked
+        // `quiesce()` await before the write below lands. A fixed yield
+        // count only hopes the spawned task got scheduled in time; this
+        // instead polls `is_quiesced()`, which `quiesce()` sets *before*
+        // ever awaiting `serial` (`CompanyRuntime::quiesce`'s own doc), so
+        // seeing it flip proves `rebuild_company` actually reached that
+        // point rather than merely having had the chance to (CodeRabbit,
+        // PR #1875 review). Bounded so a real regression here fails fast
+        // instead of hanging the suite.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !outgoing.is_quiesced() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rebuild_company never reached quiesce() before the timeout");
+
+        // The concurrent write: lock, load-modify-save, unlock — exactly the
+        // shape `PUT …/logo` takes (`src/server/ops/company_logo.rs`).
+        {
+            let write_lock = company_write_lock(&id);
+            let _guard = write_lock.lock().await;
+            let mut record = outgoing
+                .store()
+                .load(&id)
+                .await
+                .expect("load")
+                .expect("record exists");
+            record.manifest.company.logo_url = Some("new-logo".to_string());
+            outgoing.store().save(&record).await.expect("save");
+        }
+
+        // Let the "in-flight cycle" finish, unblocking `quiesce()`.
+        drop(in_flight);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("rebuild_company never finished")
+            .expect("task panicked")
+            .expect("rebuild_company failed");
+
+        let persisted = outgoing
+            .store()
+            .load(&id)
+            .await
+            .expect("load")
+            .expect("record exists");
+        assert_eq!(
+            persisted.manifest.company.logo_url.as_deref(),
+            Some("new-logo"),
+            "the rebuild's own save must not revert a manifest write that \
+             landed under company_write_lock while quiesce() was still \
+             draining the in-flight cycle"
+        );
     }
 
     #[tokio::test]

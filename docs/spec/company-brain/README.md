@@ -36,8 +36,9 @@ vocabulary (glossary: Cycle, Pass, Dispatch):
 
 1. **Drain** pending events (batched — a burst of webhooks becomes one
    cycle).
-2. **Load** working memory: recent compressed traces, the context index,
-   roster and charter.
+2. **Load** the company record and charter. Cycle-level working memory is not
+   implemented: traces are retained for inspection, but no brain consumes them
+   until a real compression and recall design exists.
 3. **Think**: `Brain::run_cycle`. The orchestrator tier reviews everything
    and loops refine → delegate → dispatch. Mid-cycle callbacks come back to
    the host: tool calls (grant-checked against the manifest), context ops,

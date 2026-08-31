@@ -131,10 +131,55 @@ fi
 # shellcheck disable=SC2086
 git -C vendor/openhuman submodule update --init --depth 1 ${VENDORED_CRATES}
 
-# `tinycortex` declares its own `tinyagents` path dependency, so its manifest
-# must resolve too. Conditional because the pin decides whether tinycortex is
-# vendored at all, and a resync that drops it must not fail this script.
-if [ -f vendor/openhuman/vendor/tinycortex/.gitmodules ]; then
-  git -C vendor/openhuman/vendor/tinycortex submodule update --init --depth 1 \
-    vendor/tinyagents
-fi
+# SECOND LEVEL: each of the crates just checked out may itself declare
+# `vendor/`-prefixed submodules that its own manifest needs (a path dependency
+# one hop further down the tree). `tinycortex` declaring its own `tinyagents`
+# path dependency was the first case of this; this used to be a single
+# hardcoded `tinycortex` → `vendor/tinyagents` block.
+#
+# That hardcoding is exactly the failure this file's header describes:
+# `tinyagents` later grew its own nested path dependency, `tinytools`
+# (extracted from what used to live inline in `tinyagents`), vendored at
+# `vendor/openhuman/vendor/tinyagents/vendor/tinytools`. The hardcoded block
+# only ever looked at `tinycortex`, so `tinyagents`'s own manifest resolution
+# broke with `failed to read .../tinytools/crates/tinytools/Cargo.toml — No
+# such file or directory` — the crate was never cloned, because nothing here
+# knew to. Generalizing to read each crate's own `.gitmodules`, the same way
+# the top-level list above is read rather than written by hand, is what keeps
+# the next one of these from happening the same way.
+#
+# Depth is deliberately capped at two levels (this loop does not recurse into
+# what it just checked out). Nothing vendored today needs a third level, and
+# recursing here would reopen the exact `--recursive` risk the top-level
+# derivation is scoped to avoid: an unbounded walk into diamond-shared trees
+# quietly initializing something a build does not need. When a third level is
+# needed, extend this deliberately with the same reasoning, not by looping.
+for crate in ${VENDORED_CRATES}; do
+  crate_path="vendor/openhuman/${crate}"
+
+  # Conditional per crate because the pin decides which of these crates are
+  # vendored at all and which of those declare further nested submodules; a
+  # resync dropping one must not fail this script.
+  if [ ! -f "${crate_path}/.gitmodules" ]; then
+    continue
+  fi
+
+  NESTED_CRATES=$(
+    git -C "${crate_path}" config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+      awk '{ print $2 }' |
+      grep '^vendor/' ||
+      true
+  )
+
+  # Unlike the top-level list, an empty result here is expected and fine — most
+  # vendored crates declare no further nested submodules (or only a `wiki/`,
+  # excluded by the same `vendor/` prefix filter as above). Only the top-level
+  # read treats empty as an error, because there the alternative is silently
+  # falling through to a plain `--recursive`.
+  if [ -z "${NESTED_CRATES}" ]; then
+    continue
+  fi
+
+  # shellcheck disable=SC2086
+  git -C "${crate_path}" submodule update --init --depth 1 ${NESTED_CRATES}
+done

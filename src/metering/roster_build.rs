@@ -59,7 +59,14 @@ use super::inference::{UNATTRIBUTED_AGENT, inference_ledger_entry};
 /// `agent` is not a parameter. Attribution to [`UNATTRIBUTED_AGENT`] is the rule
 /// this module exists to hold — see the module docs — so no caller can bill
 /// setup to a teammate, least of all one the pass itself invented.
-pub fn roster_build_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample> {
+///
+/// `model` is the classified [`ModelSlug`](crate::metering::ModelSlug) the pass
+/// ran against, or `None` when the caller cannot name one (issue #1749).
+pub fn roster_build_sample(
+    usage: &TokenUsage,
+    provider: &str,
+    model: Option<crate::metering::ModelSlug>,
+) -> Option<UsageSample> {
     if usage.is_zero() {
         return None;
     }
@@ -73,6 +80,7 @@ pub fn roster_build_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSa
         cost_usd: usage.cost_usd,
         kind: SampleKind::SetupCall,
         run_id: None,
+        model,
     })
 }
 
@@ -90,6 +98,7 @@ pub fn roster_build_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSa
 pub async fn record_roster_build_usage(
     usage: &TokenUsage,
     provider: &str,
+    model: Option<crate::metering::ModelSlug>,
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: &dyn UsageMeter,
@@ -115,7 +124,7 @@ pub async fn record_roster_build_usage(
             "[usage] failed to append the setup spend entry; the roster itself was proposed"
         );
     }
-    if let Some(sample) = roster_build_sample(usage, provider)
+    if let Some(sample) = roster_build_sample(usage, provider, model)
         && let Err(err) = meter.record(company, &sample).await
     {
         tracing::warn!(
@@ -146,7 +155,8 @@ mod test {
     /// action.
     #[test]
     fn a_setup_sample_is_charged_to_the_company_with_no_run() {
-        let sample = roster_build_sample(&usage_with(0.2), "managed").expect("a real pass meters");
+        let sample =
+            roster_build_sample(&usage_with(0.2), "managed", None).expect("a real pass meters");
         assert_eq!(sample.agent, UNATTRIBUTED_AGENT);
         assert_eq!(sample.agent, "company");
         assert_eq!(sample.kind, SampleKind::SetupCall);
@@ -165,9 +175,9 @@ mod test {
     /// question this feature is being measured on.
     #[test]
     fn a_setup_sample_is_not_a_planning_sample() {
-        let setup = roster_build_sample(&usage_with(0.2), "managed").expect("sample");
-        let planning =
-            super::super::planning::planning_sample(&usage_with(0.2), "managed").expect("sample");
+        let setup = roster_build_sample(&usage_with(0.2), "managed", None).expect("sample");
+        let planning = super::super::planning::planning_sample(&usage_with(0.2), "managed", None)
+            .expect("sample");
         assert_ne!(setup.kind, planning.kind);
         // But both belong to the company rather than to a teammate.
         assert_eq!(setup.agent, planning.agent);
@@ -178,7 +188,7 @@ mod test {
     /// something on setup when it never made the request.
     #[test]
     fn a_pass_that_never_called_writes_no_sample() {
-        assert!(roster_build_sample(&TokenUsage::default(), "managed").is_none());
+        assert!(roster_build_sample(&TokenUsage::default(), "managed", None).is_none());
     }
 
     /// Cost alone and tokens alone are each enough to be worth recording — a
@@ -192,7 +202,8 @@ mod test {
                     cost_usd: 0.01,
                     ..TokenUsage::default()
                 },
-                "managed"
+                "managed",
+                None
             )
             .is_some()
         );
@@ -202,7 +213,8 @@ mod test {
                     input: 10,
                     ..TokenUsage::default()
                 },
-                "managed"
+                "managed",
+                None
             )
             .is_some()
         );
@@ -212,9 +224,9 @@ mod test {
     /// does not grow a second spelling of one backend.
     #[test]
     fn the_provider_slug_is_normalised() {
-        let sample = roster_build_sample(&usage_with(0.1), "  MANAGED ").expect("sample");
+        let sample = roster_build_sample(&usage_with(0.1), "  MANAGED ", None).expect("sample");
         assert_eq!(sample.provider, "managed");
-        let blank = roster_build_sample(&usage_with(0.1), "").expect("sample");
+        let blank = roster_build_sample(&usage_with(0.1), "", None).expect("sample");
         assert_eq!(blank.provider, crate::metering::UNKNOWN_PROVIDER);
     }
 
@@ -222,7 +234,7 @@ mod test {
     /// would leave a tenant able to run setup on an exhausted plan.
     #[test]
     fn setup_tokens_count_toward_the_tier_ceiling() {
-        let sample = roster_build_sample(&usage_with(0.2), "managed").expect("sample");
+        let sample = roster_build_sample(&usage_with(0.2), "managed", None).expect("sample");
         assert_eq!(
             crate::metering::capability::tokens_in(std::slice::from_ref(&sample)),
             950

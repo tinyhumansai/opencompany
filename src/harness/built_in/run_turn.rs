@@ -14,11 +14,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Result;
+use crate::company::Policy;
 use crate::company::steer::SteerControl;
 use crate::harness::run_trace::RunTraceSink;
 use crate::harness::{HarnessDeps, HarnessPool, TurnOutcome};
 use crate::ports::types::{CompanyId, CompanyRecord};
-use crate::runtime::delegation::RunTurn;
+use crate::runtime::delegation::{ChatTarget, RunTurn};
 
 /// The built-in harness's [`RunTurn`]: re-attaches [`HarnessDeps`] onto each
 /// pool turn.
@@ -47,10 +48,10 @@ impl RunTurn for HarnessRunTurn {
         company: &CompanyId,
         agent_id: &str,
         message: &str,
-        chat_id: Option<&str>,
+        chat: ChatTarget<'_>,
     ) -> Result<TurnOutcome> {
         self.pool
-            .run(company, agent_id, message, &self.deps, chat_id)
+            .run(company, agent_id, message, &self.deps, chat)
             .await
     }
 
@@ -60,12 +61,12 @@ impl RunTurn for HarnessRunTurn {
         agent_id: &str,
         message: &str,
         control: &SteerControl,
-        chat_id: Option<&str>,
+        chat: ChatTarget<'_>,
         run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.pool
             .run_steered(
-                company, agent_id, message, &self.deps, control, chat_id, run_sink,
+                company, agent_id, message, &self.deps, control, chat, run_sink,
             )
             .await
     }
@@ -88,13 +89,50 @@ impl RunTurn for HarnessRunTurn {
         company: &CompanyId,
         agent_id: &str,
         message: &str,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.pool
-            .run_background(company, agent_id, message, &self.deps)
+            .run_background(company, agent_id, message, &self.deps, run_sink)
+            .await
+    }
+
+    async fn run_background_workflow(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        run_sink: Option<Arc<RunTraceSink>>,
+        workflow_run_id: &str,
+        node_id: &str,
+    ) -> Result<TurnOutcome> {
+        self.pool
+            .run_background_workflow(
+                company,
+                agent_id,
+                message,
+                &self.deps,
+                run_sink,
+                workflow_run_id,
+                node_id,
+            )
             .await
     }
 
     async fn ensure(&self, company: &CompanyRecord) -> Result<()> {
         self.pool.ensure(company, &self.deps).await
+    }
+
+    async fn ensure_with_policy(&self, company: &CompanyRecord, policy: &Policy) -> Result<()> {
+        self.pool
+            .ensure_with_policy(company, &self.deps, policy)
+            .await
+    }
+
+    async fn end_cycle(&self, company: &CompanyId) {
+        self.pool.end_cycle(company).await
+    }
+
+    fn release_policy_pin_sync(&self, company: &CompanyId) {
+        self.pool.release_policy_pin_sync(company);
     }
 }

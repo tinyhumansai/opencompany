@@ -1,13 +1,13 @@
 import { lazy, Suspense } from "react";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { RouteLoading } from "@/components/route-loading";
 import type { CompanyFeed } from "@/hooks/use-company";
 import { cn } from "@/lib/utils";
 import { InferenceView } from "@/views/InferenceView";
 import { HostingView } from "@/views/HostingView";
 import { SearchView } from "@/views/SearchView";
 import { McpServersView } from "@/views/McpServersView";
-import { MemoryView } from "@/views/MemoryView";
 import { OAuthView } from "@/views/OAuthView";
 import { PeopleView } from "@/views/PeopleView";
 import { SkillsView } from "@/views/SkillsView";
@@ -33,6 +33,8 @@ interface Props {
   /** The hash's second segment, e.g. `people` in `#/settings/people`. */
   sub: string | null;
   onFlag: () => void;
+  /** Start the reset (archive + start clean) flow for the active company (#1807). */
+  onResetCompany?: (id: string, name: string) => void;
 }
 
 /**
@@ -44,7 +46,7 @@ interface Props {
  * Each is its own route (`#/settings/people`), so a sub-page is linkable and
  * survives a refresh exactly as a top-level view does.
  */
-export function SettingsSection({ client, company, feed, sub, onFlag }: Props) {
+export function SettingsSection({ client, company, feed, sub, onFlag, onResetCompany }: Props) {
   const page = resolveSettingsPage(sub);
   const activePage = SETTINGS_PAGES.find((item) => item.id === page)!;
 
@@ -101,7 +103,18 @@ export function SettingsSection({ client, company, feed, sub, onFlag }: Props) {
           width its widest card (SMTP) needs, clipping it on both sides
           (issue #1383). */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="border-b lg:hidden">
+        {/* On the macOS desktop, `ContentSurface` overlays every page's top
+            28px with an absolutely-positioned, pointer-events-enabled drag
+            band (`WindowDragBar`, z-20) so the window stays movable without a
+            native title bar — content-surface.tsx explains the trade-off it
+            accepted: that band wins the click over whatever a page draws
+            underneath it. This row is the one page top that actually sits in
+            that band below `lg`, so without a higher stacking order its links
+            are unreachable at 880–1023px window widths on macOS. `relative
+            z-30` gives it its own stacking context above the drag band without
+            touching `WindowDragBar` itself, whose absolute-overlay contract
+            other pages (the graph, the workflow editor) still rely on. */}
+        <div className="relative z-30 border-b lg:hidden">
           <div className="flex gap-1 overflow-x-auto p-2">
             {SETTINGS_PAGES.map((item) => (
               <a
@@ -122,7 +135,13 @@ export function SettingsSection({ client, company, feed, sub, onFlag }: Props) {
         </div>
 
         {page === "general" && (
-          <SettingsView client={client} company={company} feed={feed} onFlag={onFlag} />
+          <SettingsView
+            client={client}
+            company={company}
+            feed={feed}
+            onFlag={onFlag}
+            onResetCompany={onResetCompany}
+          />
         )}
         {page === "people" && <PeopleView client={client} company={company} />}
         {page === "oauth" && <OAuthView client={client} company={company} />}
@@ -143,15 +162,8 @@ export function SettingsSection({ client, company, feed, sub, onFlag }: Props) {
           <SearchView key={company ?? "self"} client={client} company={company} />
         )}
         {page === "skills" && <SkillsView client={client} company={company} />}
-        {page === "brain" && <MemoryView client={client} company={company} />}
         {page === "usage" && (
-          <Suspense
-            fallback={
-              <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-                Loading usage…
-              </div>
-            }
-          >
+          <Suspense fallback={<RouteLoading title="Usage" label="Loading usage…" />}>
             <UsageView client={client} company={company} />
           </Suspense>
         )}

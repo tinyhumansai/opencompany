@@ -21,6 +21,29 @@ import { WorkspaceView } from "@/views/WorkspaceView";
  * *different* note open and dirty, revealing a file residual must not touch
  * the network, and the dirty note's draft must still read as unsaved
  * afterward — not "saving" or "saved" out from under the operator.
+ *
+ * # Why this file owns the clock (issue #1783)
+ *
+ * A dirty draft is the precondition here, and a dirty draft arms the editor's
+ * 800ms autosave debounce (`AUTOSAVE_DELAY_MS` in `WorkspaceView`). That
+ * autosave is correct and wanted — issue #1372 exists to make sure typing
+ * reaches the host — but it writes through the very same `client.put` these
+ * tests watch, so on real timers the file was a race: every `expect(...).not
+ * .toHaveBeenCalled()` below was really asserting "the reveal did not write
+ * *and* this test finished in under 800ms of wall clock".
+ *
+ * It did not always finish in time. Measured on `upstream/main` at 27b42eda0
+ * with no source changes, the first test reached its assertion 729ms after the
+ * keystroke in one full-suite run (green, 91% of the budget) and overran it in
+ * the next (red, one `put` to `/workspace/file/note-1` carrying the draft) —
+ * the autosave firing, not the reveal. Run alone the file finished in ~400ms
+ * and always passed, which is why it read as a `main`-only failure.
+ *
+ * So the timers are faked and only advanced deliberately. Nothing about the
+ * invariant is relaxed: the regression this file guards is `open()`'s
+ * `await flush()`, a direct call on the click path that no clock can hide.
+ * Freezing the clock removes the *other* writer, so a `put` here can only mean
+ * the click made it.
  */
 
 const ENG = "eng";
@@ -72,7 +95,15 @@ let client: ReturnType<typeof host>;
 let container: HTMLDivElement;
 let root: Root;
 
+/** `AUTOSAVE_DELAY_MS` in `WorkspaceView`. Only ever advanced past on purpose. */
+const AUTOSAVE_DELAY_MS = 800;
+
 beforeEach(() => {
+  // Only the two functions the debounce uses. Faking `Date`, `setInterval` or
+  // `queueMicrotask` as well would buy nothing here and would put React's
+  // scheduler and the mocked host's promises on a clock this file has no
+  // reason to drive.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Element.prototype.scrollIntoView = vi.fn();
   localStorage.clear();
@@ -84,6 +115,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  vi.useRealTimers();
 });
 
 function button(label: string): HTMLButtonElement {
@@ -107,8 +139,9 @@ function residualRows(): HTMLElement[] {
 /**
  * Open `Notes.md`, switch it to Edit, and type a paragraph the host has never
  * seen — the exact "staged draft" precondition the finding names — then open
- * the repair dialog on top of it without letting the autosave debounce (800ms,
- * real timers here) ever fire.
+ * the repair dialog on top of it. The keystroke arms the autosave debounce and
+ * deliberately leaves it armed: the clock is frozen (see the file header), so
+ * it stays pending until a test advances past it on purpose.
  */
 async function openRepairWithADirtyNoteBehindIt() {
   client = host();
@@ -165,6 +198,19 @@ describe("a residual reveal never flushes a dirty draft (PR #1498 review)", () =
     expect(client.put).not.toHaveBeenCalled();
     expect(client.patch).not.toHaveBeenCalled();
     expect(client.del).not.toHaveBeenCalled();
+
+    // …and the silence above has to be the click's doing, not an empty buffer's.
+    // Release the frozen autosave: the draft is still staged, so it writes now.
+    // If a future change ever stopped staging it — or stopped arming the
+    // debounce — the three assertions above would pass for the wrong reason and
+    // this file would guard nothing. That is the failure mode #1783 was really
+    // about, so it gets an assertion rather than a comment.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    });
+    expect(client.put).toHaveBeenCalledWith("/api/v1/company/acme/workspace/file/note-1", {
+      content: "a paragraph the host has never seen",
+    });
   });
 
   it("leaves the open note's draft reading as unsaved, not saving or saved", async () => {

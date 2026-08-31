@@ -80,26 +80,39 @@ impl Drop for EmbeddedHost {
 /// A host that seeds is a host that is *already set up* — `AppSpec` reports
 /// `setup_complete` as `stamp || !registry.is_empty()` — so seeding does not
 /// merely add a company, it suppresses the first-run wizard the console would
-/// otherwise open (`views/setup/SetupWizard.tsx`).
+/// otherwise open (`views/setup/SetupWizard.tsx`), permanently and with no way
+/// back to it.
+///
+/// That last clause is why the packaged application now gives the same answer
+/// for **every** instance it starts, including the one at the data root, which
+/// used to seed: see `local::start_at`. What is left here is a knob for callers
+/// that want a populated host without walking a wizard — the test suites, which
+/// need a company to address, and any embedder in the same position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstRun {
     /// Register a starter company from the default preset when the root is
-    /// empty, so the application is enterable with no terminal and no
-    /// decisions ([issue #632](https://github.com/tinyhumansai/opencompany/issues/632)).
+    /// empty, so the host is usable with no decisions at all
+    /// ([issue #632](https://github.com/tinyhumansai/opencompany/issues/632)).
     ///
-    /// What the instance rooted at the data dir does, which is every install
-    /// that predates a roster.
+    /// No longer what a launched application does — #632's requirement is now
+    /// met by the wizard being reachable rather than by the answer being
+    /// assumed. Reached through [`start`], which the test suites use.
     SeedStarterCompany,
     /// Register only what the root already holds, leaving an empty root empty.
     ///
-    /// What an instance an operator *asked for* does. They are standing in
-    /// front of the application having just named a company, so the decisions
-    /// the wizard asks for are ones they are already making — and a seeded
-    /// starter company would answer them silently and hide the wizard for good.
+    /// What every instance the desktop starts does. An empty root then reports
+    /// setup outstanding and the console opens the wizard against it; a root
+    /// with companies in it — every install that has been used — adopts them
+    /// and goes straight to the console, exactly as before.
     RunSetupWizard,
 }
 
 /// Boots a host over `data_dir`, seeding a starter company on an empty root.
+///
+/// The seeding entry point, kept for callers that want a host with a company in
+/// it without completing setup first. The application itself starts its hosts
+/// through [`start_with`] with [`FirstRun::RunSetupWizard`] — see
+/// `local::start_at` for why.
 ///
 /// `data_dir` is passed explicitly rather than resolved from the environment.
 /// A desktop app knows its platform data directory and should say so — and the
@@ -301,8 +314,13 @@ mod test {
     /// through the sole-company alias the console addresses before it knows any
     /// id, and the principal has to resolve with nothing presented. Asserting a
     /// company was registered would prove neither.
+    ///
+    /// Seeded explicitly through [`start`], because a launched install no longer
+    /// seeds — it opens the wizard instead (`local::start_at`). What is under
+    /// test here is the host once it *has* a company, which is where a launched
+    /// install arrives the moment setup completes.
     #[tokio::test]
-    async fn a_fresh_install_opens_with_no_sign_in() {
+    async fn a_host_with_a_company_opens_with_no_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let host = start(dir.path().to_path_buf()).await.expect("host starts");
         let base = host.base_url();
@@ -311,7 +329,7 @@ mod test {
         assert_eq!(
             host.companies().len(),
             1,
-            "a fresh root gets exactly one starter company"
+            "the seeding entry point registers exactly one starter company"
         );
 
         // Where the console starts, and where it used to stop with a 401.

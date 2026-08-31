@@ -120,7 +120,19 @@ export function resolveConfig(): ConsoleConfig {
   const baseUrl = (merged.baseUrl ?? "").replace(/\/$/, "");
   return {
     baseUrl,
-    company: merged.company ?? null,
+    // `|| null`, not `?? null` — an empty `?company=` (how
+    // `retargetCompanyUrlParam` clears an explicit-company connection's
+    // abandon-path override, since removing the param outright would let a
+    // lower-priority `window.OPENCOMPANY_CONFIG`/`VITE_OC_COMPANY` company
+    // show back through) must resolve to the same `null` a persisted
+    // profile's cleared `defaultCompany` does. `profileStore.findProfile`
+    // matches on strict `(baseUrl, defaultCompany)` equality, so an
+    // unnormalized `""` here does not match that profile's `null` — the
+    // bootstrap `addConnection` call in `App.tsx` mints a fresh, orphaned
+    // duplicate connection instead of reusing it (issue #1828 comment
+    // 3865190492). An empty company id was never meaningful on its own
+    // terms either way — `""` and `null` both mean "no explicit company".
+    company: merged.company || null,
     operatorToken: merged.operatorToken ?? null,
     // Never configured at this level: a session belongs to one connection, and
     // this resolves at most one connection's *address*. See `ConsoleConfig`.

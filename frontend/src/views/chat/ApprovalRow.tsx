@@ -49,12 +49,22 @@ import {
   ApprovalPayload,
   ApprovalScopeControl,
   DeclineScopeControl,
+  approvalConsequence,
   approvalIcon,
+  batchConsequences,
+  deadlineToneClass,
   type ApprovalThreadLink,
 } from "@/components/approval-card";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { approvedLine } from "@/lib/approval-wording";
-import { approvalAction, money, payloadLeadLabel, payloadLeadTruncated } from "@/lib/language";
+import {
+  approvalAction,
+  approvalDeadline,
+  money,
+  payloadAge,
+  payloadLeadLabel,
+  payloadLeadTruncated,
+} from "@/lib/language";
 import { cn } from "@/lib/utils";
 
 /** One count written with the noun it qualifies. */
@@ -108,6 +118,20 @@ function partialLabel(settled: number, total: number): string {
 }
 
 /**
+ * The tint for a batch, only when every pending item has the same known
+ * consequence. An unclassified item makes the aggregate meaning ambiguous, so
+ * the icon remains neutral even if the other items share one consequence.
+ */
+function uniformConsequence(approvals: ApprovalSummary[]) {
+  const consequences = batchConsequences(approvals);
+  return consequences.length === 1 && approvals.every(
+    (approval) => approvalConsequence(approval.group)?.label === consequences[0].label,
+  )
+    ? consequences[0]
+    : null;
+}
+
+/**
  * What the card says when a decision did not land (#842 review).
  *
  * The failure consolidation makes worse, said out loud. Deciding three cards
@@ -148,12 +172,32 @@ function itemLabel(a: ApprovalSummary): string {
   return payloadLeadLabel(a) ?? approvalAction(a);
 }
 
+/**
+ * Which surface is asking, and therefore how the same decision is laid out.
+ *
+ * * `full` — the Approvals page and the run drawer: payload, grant scope, room
+ *   to study the request.
+ * * `compact` — a quiet horizontal interruption inside a chat transcript
+ *   (#1330).
+ * * `card` — a **board card** (#1891). Stacked, because a `w-65` column leaves
+ *   roughly 220px of card content and `compact`'s single flex row does not fit
+ *   in it; the buttons go full-width underneath rather than beside the label.
+ *
+ * A variant changes the arrangement and nothing else. Every rule about what a
+ * decision *means* — the all-or-nothing batch, the per-id resolve, the
+ * truncated-lead gate below — is shared by all three, which is the whole reason
+ * the board card renders this component instead of its own row.
+ */
+export type ApprovalRowVariant = "full" | "compact" | "card";
+
 export function ApprovalRow({
   approvals,
   now,
   askerNames,
+  chatChannelByThread,
   thread,
-  compact = false,
+  variant = "full",
+  detailsHref = "#/approvals",
   deciding,
   decided,
   failed,
@@ -163,10 +207,21 @@ export function ApprovalRow({
   approvals: ApprovalSummary[];
   now: number;
   askerNames: Map<string, string>;
+  chatChannelByThread?: Readonly<Record<string, string>>;
   /** The channel this inline row is already rendered inside. */
   thread?: ApprovalThreadLink | null;
-  /** Render as a quiet interruption inside a chat transcript (#1330). */
-  compact?: boolean;
+  /** How this surface lays the decision out — see {@link ApprovalRowVariant}. */
+  variant?: ApprovalRowVariant;
+  /**
+   * Where a condensed row sends an operator who needs the full payload (#1891).
+   *
+   * Defaults to the whole queue, which is what chat means. A board card passes
+   * `#/approvals/<taskId>` so the two places it can send somebody — "View
+   * details", and the Approve that {@link needsFullReview} replaces — land on
+   * that card's own rows rather than in a flat list the operator then has to
+   * search for the request they were just looking at.
+   */
+  detailsHref?: string;
   /** The verdict an item is waiting on, keyed by approval id; empty when idle. */
   deciding: ReadonlyMap<string, Verdict>;
   /** Verdicts already witnessed — from this console or from the page. */
@@ -190,6 +245,19 @@ export function ApprovalRow({
   const [scope, setScope] = useState<GrantScope>({ kind: "once" });
   const [declineScope, setDeclineScope] = useState<GrantScope>({ kind: "once" });
 
+  const compact = variant === "compact";
+  /**
+   * Whether this surface shows a *summary* of the request rather than the
+   * request.
+   *
+   * The distinction the truncated-lead gate below turns on, and it has to be
+   * the condensed set rather than `compact` alone: a board card is the most
+   * compressed surface there is, so a rule that let it one-click Approve a
+   * request it could only paraphrase would open on the card exactly the hole
+   * #1330 closed in chat.
+   */
+  const condensed = variant !== "full";
+
   const lead = approvals[0];
   const pending = useMemo(() => approvals.filter((a) => !decided[a.id]), [approvals, decided]);
   const settledCount = approvals.length - pending.length;
@@ -200,7 +268,7 @@ export function ApprovalRow({
   /** Whether any item in this card is waiting on `verdict` right now. */
   const awaiting = (verdict: Verdict) => [...deciding.values()].includes(verdict);
   /**
-   * Whether the compact row is asked to one-click Approve something its label
+   * Whether a condensed row is asked to one-click Approve something its label
    * does not fully say.
    *
    * A body cut to fit the lead is a preview, not the payload — two POSTs to the
@@ -211,7 +279,7 @@ export function ApprovalRow({
    * that is what the button would decide; an item already settled elsewhere is
    * not part of the one-click authorisation.
    */
-  const needsFullReview = compact && pending.some((a) => payloadLeadTruncated(a));
+  const needsFullReview = condensed && pending.some((a) => payloadLeadTruncated(a));
 
   /**
    * The decision, applied to every item the card is still asking about.
@@ -235,12 +303,21 @@ export function ApprovalRow({
     }
   };
 
+  // The board card's buttons are the card's own furniture, so they take the
+  // Resume button's height and split the width between them rather than
+  // borrowing chat's ghost treatment — which exists to keep the composer's
+  // emphasis and means nothing on a Kanban column.
+  const actionClass =
+    variant === "compact" ? COMPACT_ACTION_CLASS : variant === "card" ? "h-7 flex-1" : undefined;
+  const declineVariant = compact ? "ghost" : "outline";
+  const approveVariant = compact ? "ghost" : "default";
+
   const actions = done ? undefined : (
     <>
       <Button
-        variant={compact ? "ghost" : "outline"}
+        variant={declineVariant}
         size="sm"
-        className={compact ? COMPACT_ACTION_CLASS : undefined}
+        className={actionClass}
         disabled={busy}
         onClick={() => decideAll("deny")}
       >
@@ -252,25 +329,29 @@ export function ApprovalRow({
         Decline
       </Button>
       {needsFullReview ? (
-        // The row's label is a preview, not the payload: a body cut to fit the
-        // compact lead is not something the operator may authorize on. Decline
+        // The row's label is a preview, not the payload: a body cut to fit a
+        // condensed lead is not something the operator may authorize on. Decline
         // is always safe and stays inline; Approve is replaced by a path to the
         // detailed view, where the complete host-bounded payload is on the card
         // (#1330 review).
         <a
-          href="#/approvals"
+          href={detailsHref}
           className={cn(
-            buttonVariants({ variant: compact ? "ghost" : "default", size: "sm" }),
-            compact ? COMPACT_ACTION_CLASS : undefined,
+            buttonVariants({ variant: approveVariant, size: "sm" }),
+            actionClass,
           )}
         >
-          Review in Approvals
+          {/* The board card has no room for the page's name, and does not need
+              it: `detailsHref` is that card's own rows there. What the operator
+              has to be told is why Approve is not on offer — that the label
+              they can see is not the whole request. */}
+          {variant === "card" ? "Read it first" : "Review in Approvals"}
         </a>
       ) : (
         <Button
-          variant={compact ? "ghost" : "default"}
+          variant={approveVariant}
           size="sm"
-          className={compact ? COMPACT_ACTION_CLASS : undefined}
+          className={actionClass}
           disabled={busy}
           onClick={() => decideAll("approve")}
         >
@@ -295,31 +376,51 @@ export function ApprovalRow({
     );
   }
 
+  // What the row says about itself while a decision is in flight, failed, or
+  // partly landed. Hoisted because both condensed variants say it, and the
+  // three arms are ordered: a failure outranks a partial count because it is
+  // the one thing here the operator has to act on.
+  const status = busy
+    ? awaiting("approve")
+      ? "Waiting for the teammate…"
+      : "Recording…"
+    : failedCount > 0
+      ? failureLabel(failedCount, approvals.length)
+      : settledCount > 0
+        ? partialLabel(settledCount, approvals.length)
+        : undefined;
+
+  // The row speaks for what its buttons still decide, not for the whole
+  // original batch: an item settled on the Approvals page or in another tab is
+  // no longer something this Approve/Decline will touch, and a summary that
+  // still named it would leave the operator guessing which action the
+  // remaining buttons authorize (#842 review). True of both condensed
+  // variants, which is why each is handed `pending`.
   if (compact) {
     return (
       <CompactApprovalRow
-        // The row speaks for what its buttons still decide, not for the whole
-        // original batch: an item settled on the Approvals page or in another
-        // tab is no longer something this Approve/Decline will touch, and a
-        // summary that still named it would leave the operator guessing which
-        // action the remaining buttons authorize (#842 review).
         approvals={pending}
         now={now}
         askerNames={askerNames}
         thread={thread}
+        detailsHref={detailsHref}
         actions={actions}
         busy={busy}
-        status={
-          busy
-            ? awaiting("approve")
-              ? "Waiting for the teammate…"
-              : "Recording…"
-            : failedCount > 0
-              ? failureLabel(failedCount, approvals.length)
-              : settledCount > 0
-                ? partialLabel(settledCount, approvals.length)
-                : undefined
-        }
+        status={status}
+      />
+    );
+  }
+
+  if (variant === "card") {
+    return (
+      <BoardApprovalRow
+        approvals={pending}
+        now={now}
+        askerNames={askerNames}
+        detailsHref={detailsHref}
+        actions={actions}
+        busy={busy}
+        status={status}
       />
     );
   }
@@ -337,6 +438,7 @@ export function ApprovalRow({
           {approvals.length > 1 ? (
             <BatchHeadline
               approvals={approvals}
+              pending={pending}
               askerNames={askerNames}
               actions={actions}
             />
@@ -392,22 +494,14 @@ export function ApprovalRow({
             approval={lead}
             now={now}
             askerNames={askerNames}
+            chatChannelByThread={chatChannelByThread}
             thread={thread}
-            status={
-              busy
-                  ? awaiting("approve")
-                    ? "Waiting for the teammate…"
-                    : "Recording…"
-                  : // A failure outranks the partial count, because it is the
-                    // one thing here the operator has to act on. It also has to
-                    // reach a single-item card, which renders no item list to
-                    // carry the per-row form.
-                    failedCount > 0
-                    ? failureLabel(failedCount, approvals.length)
-                    : settledCount > 0
-                      ? partialLabel(settledCount, approvals.length)
-                      : undefined
-            }
+            // The same three-arm status the condensed variants show, and the
+            // ordering matters here too: a failure outranks the partial count,
+            // because it is the one thing the operator has to act on. It has to
+            // reach a single-item card, which renders no item list to carry the
+            // per-row form.
+            status={status}
           />
         </div>
       </div>
@@ -421,6 +515,7 @@ function CompactApprovalRow({
   now,
   askerNames,
   thread,
+  detailsHref,
   actions,
   busy,
   status,
@@ -435,6 +530,8 @@ function CompactApprovalRow({
   askerNames: Map<string, string>;
   /** The channel this inline row is already rendered inside (#1419). */
   thread?: ApprovalThreadLink | null;
+  /** Where "View details" goes — see `ApprovalRow`'s own prop. */
+  detailsHref: string;
   actions: React.ReactNode;
   busy: boolean;
   status?: React.ReactNode;
@@ -444,6 +541,8 @@ function CompactApprovalRow({
   // A mixed batch has no one glyph that is true of it, so it wears the neutral
   // one rather than the first item's, just as `BatchHeadline` does.
   const Icon = sameKind ? approvalIcon(lead.kind) : ShieldCheck;
+  const consequences = batchConsequences(approvals);
+  const uniform = uniformConsequence(approvals);
 
   return (
     <div className="px-4 py-1.5">
@@ -454,11 +553,27 @@ function CompactApprovalRow({
         data-approval-inline="compact"
         className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-muted/50"
       >
-        <div className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+        <div
+          className={cn(
+            "flex size-7 shrink-0 items-center justify-center rounded-md",
+            uniform?.iconClass ?? "bg-muted text-muted-foreground",
+          )}
+        >
           <Icon className="size-3.5" aria-hidden />
         </div>
         <div className="min-w-0 flex-1">
-          <CompactLabel approvals={approvals} />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <CompactLabel approvals={approvals} />
+            {consequences.map((c) => (
+              <span
+                key={c.label}
+                data-approval-consequence={c.label}
+                className="rounded-full bg-muted px-2 py-0.5 text-2xs font-medium text-foreground"
+              >
+                {c.label}
+              </span>
+            ))}
+          </div>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <ApprovalMeta
               approval={lead}
@@ -469,7 +584,7 @@ function CompactApprovalRow({
             />
             {!busy && (
               <a
-                href="#/approvals"
+                href={detailsHref}
                 className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
               >
                 View details
@@ -480,6 +595,158 @@ function CompactApprovalRow({
         <div className="flex shrink-0 items-center gap-1">{actions}</div>
       </section>
     </div>
+  );
+}
+
+/**
+ * The decidable blocker on a board card (#1891).
+ *
+ * ## Why it is stacked rather than `compact`
+ *
+ * A board column is `w-65`, so a card has roughly 220px of content width.
+ * {@link CompactApprovalRow} puts the glyph, the label, the chips, the meta
+ * line and both buttons on one horizontal axis, which needs a transcript's
+ * width and collapses into a stack of orphaned fragments at this one. So the
+ * axis is turned: label, then chips and meta, then the buttons across the
+ * bottom — the same content, arranged for the space it has.
+ *
+ * ## What it deliberately does not render
+ *
+ * {@link ApprovalMeta}'s origin pills. "Open the card" would link to the card
+ * the row is drawn on, which is the same redundancy `OutputLinkRow` skips a row
+ * to avoid, and the rest do not fit. The three facts that survive are the ones
+ * that decide whether to act *now*: who asked, how old the payload is, and how
+ * long before the deadline decides for you. All three come from the shared
+ * helpers rather than being re-derived, so the board cannot end up saying
+ * something the Approvals page does not.
+ *
+ * ## The label is not clamped
+ *
+ * Tempting on a card this size, and wrong for the reason {@link compactLabel}
+ * exists: the line names *every* call one Approve would authorise, so cutting
+ * it at three lines would let a harmless first call conceal a consequential
+ * later one — "+2 more" with extra steps. A blocked card is allowed to be the
+ * tall card in the column; that is what being blocked looks like.
+ */
+function BoardApprovalRow({
+  approvals,
+  now,
+  askerNames,
+  detailsHref,
+  actions,
+  busy,
+  status,
+}: {
+  /** The still-undecided items the buttons will decide — `pending`, never the
+   *  original batch. Same contract as {@link CompactApprovalRow}. */
+  approvals: ApprovalSummary[];
+  now: number;
+  askerNames: Map<string, string>;
+  /** This card's own rows on the Approvals page. */
+  detailsHref: string;
+  actions: React.ReactNode;
+  busy: boolean;
+  status?: React.ReactNode;
+}) {
+  const lead = approvals[0];
+  const sameKind = approvals.every((a) => a.kind === lead.kind);
+  // Neutral for a mixed batch, exactly as `CompactApprovalRow` and
+  // `BatchHeadline` do — an envelope over a batch that also spends money would
+  // be the icon quietly making a claim.
+  const Icon = sameKind ? approvalIcon(lead.kind) : ShieldCheck;
+  const consequences = batchConsequences(approvals);
+  const uniform = uniformConsequence(approvals);
+  const asker = lead.agent ? (askerNames.get(lead.agent) ?? lead.agent) : null;
+  const age = payloadAge(lead, now);
+  const deadline = approvalDeadline(lead.expires_at_millis ?? 0, now);
+
+  return (
+    <section
+      aria-label={
+        approvals.length > 1 ? "Approval request for several actions" : "Approval request"
+      }
+      data-approval-id={lead.id}
+      data-approval-count={approvals.length}
+      data-approval-inline="card"
+      className="mt-2 rounded-md border border-status-blocked/30 bg-status-blocked-soft px-2 py-1.5"
+    >
+      <div className="flex items-start gap-1.5">
+        <div
+          className={cn(
+            "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-sm",
+            uniform?.iconClass ?? "text-status-blocked-text",
+          )}
+        >
+          <Icon className="size-3" aria-hidden />
+        </div>
+        <BoardLabel approvals={approvals} />
+      </div>
+      {consequences.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {consequences.map((c) => (
+            <span
+              key={c.label}
+              data-approval-consequence={c.label}
+              className="rounded-full bg-muted px-1.5 py-0.5 text-3xs font-medium text-foreground"
+            >
+              {c.label}
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-2xs text-muted-foreground">
+        {asker && (
+          <>
+            <span className="truncate">{asker}</span>
+            <span aria-hidden>·</span>
+          </>
+        )}
+        <span className={age.emphasise ? "font-medium text-foreground" : undefined}>
+          {age.text}
+        </span>
+        {/* Only when the host reports one — never computed here. An operator
+            who acted on an invented deadline would be refused, which is the
+            rule `ApprovalMeta` states at length and this row obeys rather than
+            restates. This is also the whole of what the board was missing: it
+            counted *up* from the park and never once said the decision would be
+            taken for you. */}
+        {typeof lead.expires_at_millis === "number" && (
+          <>
+            <span aria-hidden>·</span>
+            <span className={deadlineToneClass(deadline.tone)}>{deadline.text}</span>
+          </>
+        )}
+        {status && (
+          <>
+            <span aria-hidden>·</span>
+            <span className="text-foreground">{status}</span>
+          </>
+        )}
+      </div>
+      <div className="mt-1.5 flex items-center gap-1">{actions}</div>
+      {!busy && (
+        <a
+          href={detailsHref}
+          // Stops at the row: the card's own click handler opens the task
+          // detail, and this goes somewhere else.
+          onClick={(e) => e.stopPropagation()}
+          className="mt-1 block text-2xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
+        >
+          View details
+        </a>
+      )}
+    </section>
+  );
+}
+
+/** The board row's label — same split as {@link CompactLabel}, sized for a card. */
+function BoardLabel({ approvals }: { approvals: ApprovalSummary[] }) {
+  const { text, amounts } = compactLabel(approvals);
+  return (
+    <p className="min-w-0 flex-1 text-2xs font-medium leading-snug text-status-blocked-text">
+      <span>{text}</span>
+      {amounts !== "" && <span className="whitespace-nowrap">{amounts}</span>}
+    </p>
   );
 }
 
@@ -619,10 +886,13 @@ function SettledApprovalReceipt({
  */
 function BatchHeadline({
   approvals,
+  pending,
   askerNames,
   actions,
 }: {
   approvals: ApprovalSummary[];
+  /** The subset one Approve would actually act on. */
+  pending: ApprovalSummary[];
   askerNames: Map<string, string>;
   actions?: React.ReactNode;
 }) {
@@ -635,14 +905,54 @@ function BatchHeadline({
   const asker = lead.agent ? (askerNames.get(lead.agent) ?? lead.agent) : null;
   const title = sameKind ? approvalAction(lead) : `${approvals.length} actions need your sign-off`;
 
+  // Consolidating the asking must not consolidate away the warning (#1426).
+  // Batching is the common case for exactly the calls that carry one — a
+  // research turn parks several fetches, an outreach turn several sends — so a
+  // batch that showed no consequence would hide it precisely where it is most
+  // often earned, while the Approvals page went on showing it for the same
+  // parks.
+  //
+  // The tint follows the same rule as the glyph above: a batch that agrees
+  // with itself wears its one consequence, and a mixed batch stays neutral
+  // rather than letting the first item's colour speak for a card that also
+  // spends money. Either way every distinct label is listed, so nothing is
+  // lost to the mixed case — and `BatchItem` repeats each line's own label, so
+  // a mixed batch still says *which* call is the one that spends.
+  //
+  // Derived from `pending`, not from every item the card was raised with, for
+  // the same reason `decideAll` iterates `pending`: the badge describes what
+  // the next Approve authorises. An item settled on the Approvals page while
+  // this card sat open is no longer part of that, so a batch whose only spend
+  // has already been approved elsewhere must stop claiming the remaining
+  // internal call spends money — that warning would be attached to a decision
+  // nobody is about to make.
+  const consequences = batchConsequences(pending);
+  const uniform = uniformConsequence(pending);
+
   return (
     <div className="flex flex-wrap items-start gap-4">
-      <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
+      <div
+        className={cn(
+          "flex size-10 shrink-0 items-center justify-center rounded-lg",
+          uniform?.iconClass ?? "bg-muted text-foreground",
+        )}
+      >
         <Icon className="size-5" />
       </div>
       {/* Same container-capped 12rem floor as `ApprovalHeadline`. */}
       <div className="min-w-[min(12rem,100%)] flex-1">
-        <p className="font-medium">{title}</p>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <p className="font-medium">{title}</p>
+          {consequences.map((c) => (
+            <span
+              key={c.label}
+              data-approval-consequence={c.label}
+              className="rounded-full bg-muted px-2 py-0.5 text-2xs font-medium text-foreground"
+            >
+              {c.label}
+            </span>
+          ))}
+        </div>
         <p className="text-xs text-muted-foreground">
           {asker ? `${asker} needs` : "This turn needs"} {approvals.length} sign-offs before it
           can carry on
@@ -684,6 +994,11 @@ function BatchItem({
   failure: string | null;
 }) {
   const label = itemLabel(a);
+  // Repeated per line, not only in the headline: a mixed batch's headline says
+  // the card both spends money and leaves the company, and this is what says
+  // which of the three calls does which. A settled line drops it — the warning
+  // is there to inform a decision that has already been made.
+  const consequence = approvalConsequence(a.group);
 
   // A failed decision outranks the pending look, and says which item and why.
   // Silence here is the failure mode worth designing against: the operator
@@ -704,11 +1019,36 @@ function BatchItem({
       <li
         data-approval-item={a.id}
         data-approval-failed="true"
-        className="flex items-center gap-2 text-sm text-status-blocked-text"
+        className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-status-blocked-text"
       >
         <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
         <span className="min-w-0 flex-1 truncate font-mono text-xs">{label}</span>
-        <span className="shrink-0 text-xs">Not recorded — {failure}</span>
+        {/*
+         * Carried into this branch too. A failed item is still pending and the
+         * card's buttons are still live, so the retry is a decision the
+         * operator has yet to make — and in a mixed batch the headline says the
+         * card both sends and spends without saying which row is which. Two
+         * argument-classified calls sharing a kind (`composio_execute`) are
+         * indistinguishable by their label alone, so dropping it here is
+         * exactly where the attribution is needed most.
+         */}
+        {consequence && (
+          <span
+            data-approval-consequence={consequence.label}
+            className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-2xs font-medium text-foreground"
+          >
+            {consequence.label}
+          </span>
+        )}
+        {/*
+         * The row wraps so the badge and this line can flow beneath the label on
+         * a narrow chat pane instead of both holding fixed widths and pushing
+         * the label to nothing. The badge keeps `shrink-0` — a pill must not
+         * squash — but a non-wrapping row left it and this text side by side,
+         * and two non-shrinking pieces beside a truncating label overflow the
+         * card rather than wrap.
+         */}
+        <span className="min-w-0 text-xs">Not recorded — {failure}</span>
       </li>
     );
   }
@@ -720,7 +1060,10 @@ function BatchItem({
     // reaches any of the others.
     <li
       data-approval-item={a.id}
-      className="flex items-center gap-2 text-sm text-muted-foreground"
+      // Wrapping like the failed row above: the consequence badge is
+      // non-shrinking, and a non-wrapping row would let it crowd the label to
+      // nothing on a narrow chat pane instead of flowing to the next line.
+      className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground"
     >
       {verdict === "approve" ? (
         <Check className="size-3.5 shrink-0" />
@@ -739,6 +1082,14 @@ function BatchItem({
       >
         {label}
       </span>
+      {!verdict && consequence && (
+        <span
+          data-approval-consequence={consequence.label}
+          className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-2xs font-medium text-foreground"
+        >
+          {consequence.label}
+        </span>
+      )}
       {deciding ? (
         <Loader2 className="size-3.5 shrink-0 animate-spin" />
       ) : (

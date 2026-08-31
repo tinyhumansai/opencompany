@@ -76,9 +76,8 @@ See
 ## Human in the loop
 
 Humans **set the question and accept the findings**; the lab runs everything
-else. `[policy].mode = "auto"` lets it read and compute unattended — its outward
-actions are searches and fetches — while anything that spends money or leaves
-the company still parks for approval.
+else. Policy-generated HITL is disabled. When the lab genuinely needs a
+decision before an action, it asks explicitly with `request_approval`.
 
 Acceptance stays human on purpose. A result the lab can defend is not the same
 as a result the operator wants, and the runtime keeps those two questions

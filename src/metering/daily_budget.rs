@@ -136,6 +136,7 @@ mod tests {
             cost_usd: cost,
             kind,
             run_id: None,
+            model: None,
         }
     }
 

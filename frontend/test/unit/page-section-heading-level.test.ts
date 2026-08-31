@@ -66,9 +66,18 @@ const PAGES = [
   },
 ] as const;
 
-/** The heading tags a file opens, in source order. */
+/**
+ * The heading tags a file opens, in source order.
+ *
+ * `<PageHeader` counts as an `h1`: since issue #1763 a page's title comes from
+ * that component rather than from a heading tag the view writes itself, so a
+ * scan that only looked for `<h1` would report every page as having none — and
+ * would then read "this page's sections are orphaned" as "this page is fine".
+ */
 function headingLevels(source: string): number[] {
-  return [...source.matchAll(/<h([1-6])[\s>]/g)].map(([, level]) => Number(level));
+  return [...source.matchAll(/<(?:h([1-6])|(PageHeader))[\s>/]/g)].map(
+    ([, level, pageHeader]) => (pageHeader ? 1 : Number(level)),
+  );
 }
 
 const read = (name: string) => readFileSync(`${VIEWS}/${name}.tsx`, "utf8");

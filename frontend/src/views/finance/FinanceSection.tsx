@@ -2,6 +2,7 @@ import { lazy, Suspense } from "react";
 import { CreditCard, LayoutDashboard, Wallet, type LucideIcon } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { RouteLoading } from "@/components/route-loading";
 import { cn } from "@/lib/utils";
 import { InvoicingView } from "@/views/finance/InvoicingView";
 import { WalletView } from "@/views/finance/WalletView";
@@ -143,13 +144,7 @@ export function FinanceSection({ client, company, sub, onNavigate }: Props) {
         </div>
 
         {page === "overview" && (
-          <Suspense
-            fallback={
-              <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-                Loading finances…
-              </div>
-            }
-          >
+          <Suspense fallback={<RouteLoading title="Finances" label="Loading finances…" />}>
             <FinancesView client={client} company={company} />
           </Suspense>
         )}

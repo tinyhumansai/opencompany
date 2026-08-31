@@ -29,15 +29,13 @@ human_role = "State the problem and accept the answer"
 # `full`, and this is the one manifest decision in the bundle that is not
 # stylistic.
 #
-# The lab's whole method is running programs. Under `auto`, a shell command the
-# vendored classifier grades as anything but a *read* parks for a human — and
-# `python3 solve.py` is not a read, so the tier that sounds unattended stops
-# this company on its first useful move (`src/policy/consequence.rs`, and the
-# `auto`/`supervised` arm in `harness/built_in/policy.rs`). The high-risk
-# judgement arm still parks `rm -rf` and its relatives under `full`, and no
-# agent here holds a tool that spends money or leaves the company: no `search`,
-# no `web`, no `composio`, no `media`. So the blast radius `full` opens is the
-# agent's own sandbox, which is exactly where the work happens.
+# The lab's whole method is running programs. Policy-generated HITL is disabled,
+# so the routed agent agreement explicitly requires `request_approval` before
+# `shell` or `run_workflow` and forbids emitting the program in the same turn.
+# No agent here holds a tool that spends money or leaves the company: no
+# `search`, no `web`, no `composio`, no `media`. The `full` tier opens only the
+# agent's own sandbox, which is exactly where the work happens; the explicit
+# request remains the human boundary.
 mode = "full"
 
 [users]

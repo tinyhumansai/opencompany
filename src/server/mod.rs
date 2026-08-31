@@ -10,6 +10,7 @@ pub mod a2a;
 pub mod acp;
 pub(crate) mod approval_visibility;
 pub mod chat_history;
+pub mod cognition;
 pub mod cors;
 mod error;
 pub mod feedback;
@@ -17,6 +18,7 @@ pub mod feedback_board;
 pub mod graphql;
 pub mod hooks_chargebee;
 pub mod hub_identity;
+pub(crate) mod inference_models;
 // Console MCP OAuth callback (issue #90): the unauthenticated browser-redirect
 // landing route. Gated on `mcp` (it needs the OAuth token-exchange path).
 #[cfg(feature = "mcp")]

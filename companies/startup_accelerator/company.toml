@@ -24,7 +24,7 @@ enabled = ["cohort_pipeline", "progress_checkin"]
 # from its own manifest instead of inferred from an absent block.
 #
 # `auto` runs the agent's own sandbox writes and outward reads unattended and
-# still parks everything that leaves the company or spends money. `always_approve`
+# policy HITL is disabled; agents use `request_approval` when they want sign-off. `always_approve`
 # is omitted, so it keeps its default.
 [policy]
 mode = "auto"

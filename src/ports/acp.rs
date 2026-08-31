@@ -68,6 +68,27 @@ pub struct AcpTurn {
     pub stop_reason: String,
 }
 
+/// Watches a turn's updates **as they arrive**, before the turn returns.
+///
+/// The whole of an ACP turn used to be observable only after
+/// `session/prompt` resolved: the transport buffered every `session/update`
+/// and handed back one [`AcpTurn`] at the end. That is fine for the durable
+/// timeline, which is folded from the same buffer either way, and useless for
+/// the operator watching a five-minute turn — an ACP-run teammate sat silent
+/// until it was finished, while a `built_in`-run one showed each tool call as
+/// it started.
+///
+/// So the port carries an optional observer rather than a second "streaming"
+/// method: the buffer is still what the fold reads (the live view and the
+/// final timeline can never disagree, because one is not derived from the
+/// other), and an implementation with nothing to stream — the runner lane,
+/// whose own wire hands back a whole turn — simply ignores it.
+///
+/// Called from whatever task the transport reads its wire on, so it must not
+/// block: [`crate::harness::acp::run_turn`]'s implementation publishes onto a
+/// broadcast bus and returns.
+pub type AcpObserver = std::sync::Arc<dyn Fn(&AcpUpdate) + Send + Sync>;
+
 /// An ACP agent this host can run a turn on.
 ///
 /// Implemented by the desktop (a subprocess over stdio) and, later, by the
@@ -78,11 +99,16 @@ pub trait AcpAgent: Send + Sync {
     ///
     /// `session_key` is stable for a (company, agent) pair so the agent can
     /// keep a conversation rather than starting fresh each turn.
+    ///
+    /// `observer`, when set, is called with each update as it arrives — see
+    /// [`AcpObserver`]. Every update passed to it is also in the returned
+    /// [`AcpTurn`]; observing is a tee, never a hand-off.
     async fn prompt(
         &self,
         company: &CompanyId,
         session_key: &str,
         message: &str,
+        observer: Option<&AcpObserver>,
     ) -> Result<AcpTurn>;
 
     /// Asks the agent to stop the turn in flight.

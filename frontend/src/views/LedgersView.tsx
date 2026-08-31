@@ -44,7 +44,10 @@
 // plan, discussion and attempts this screen does not try to reproduce.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useHashFlag } from "@/hooks/use-hash-flag";
+import { useLedgerViewMode, type LedgerViewMode } from "@/hooks/use-ledger-view-mode";
+import { withHostParam } from "@/hooks/use-host-route";
 import { DeclareListWizard } from "@/views/company/DeclareListWizard";
 import {
   AlertTriangle,
@@ -65,9 +68,11 @@ import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { listTasks, patchTask, type Task } from "@/api/tasks";
-import type { ApprovalSummary } from "@/api/types";
+import type { ApprovalSummary, GrantScope, Verdict } from "@/api/types";
 import { CreateTaskDialog } from "@/views/CreateTaskDialog";
 import { LedgerBoard } from "@/views/LedgerBoard";
+import { useAskerNames } from "@/components/approval-card";
+import type { DecidedApproval } from "@/views/chat/model";
 import { TaskItem } from "@/views/TaskCard";
 import {
   BOARD_LEDGER,
@@ -75,7 +80,7 @@ import {
   columnsOf,
   labelFor,
 } from "@/lib/board-columns";
-import { taskApprovalBlock } from "@/lib/task-approvals";
+import { taskApprovalRows } from "@/lib/task-approvals";
 import {
   byline,
   composableFields,
@@ -98,6 +103,7 @@ import {
 } from "@/api/ledgers";
 import { inlineCode } from "@/lib/inline-code";
 import { Markdown } from "@/components/markdown";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -165,7 +171,7 @@ interface Props {
    * does it. Absent when this view is rendered with nowhere to link to, in which
    * case a card opens the ordinary amend form.
    */
-  onOpenCard?: (id: string) => void;
+  onOpenCard?: (id: string, mode: LedgerViewMode) => void;
   /**
    * A counter the shell bumps on every task event off the company SSE stream
    * (issue #464) — a card opened, moved, settled, dispatched or steered.
@@ -192,8 +198,28 @@ interface Props {
   approvals?: readonly ApprovalSummary[];
   /** The feed's clock, for "blocked for 4m". Falls back to the browser's. */
   now?: number;
-  /** Opens the Approvals page filtered to one card (issue #883). */
-  onReviewApprovals?: (taskId: string) => void;
+  /**
+   * The console-wide decision state a blocked card decides through (#1891).
+   *
+   * The same four the shell already hands `WorkflowsView` for the run drawer,
+   * owned there for the same reason: an operator who decides on the board,
+   * steps over to Approvals and comes back must not find a card that forgot
+   * what they did. `decided` is fed by the `approval_resolved` frame as well as
+   * by this console's own resolves, which is what makes a decision taken on the
+   * page settle on the board with no reload.
+   *
+   * All optional, and absent means a read-only board: `onDecideApproval` is
+   * what a card checks before offering buttons at all.
+   */
+  decidingApprovals?: ReadonlyMap<string, Verdict>;
+  decidedApprovals?: Readonly<Record<string, DecidedApproval>>;
+  failedApprovals?: Record<string, string>;
+  /** Whether a detached approval continuation is still running for a card. */
+  onDecideApproval?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+  ) => void;
   /**
    * Re-reads the shared list (`useLedgerNav.refresh`) — called after the
    * switcher's in-place wizard declares a new one, so it shows up in the
@@ -240,6 +266,11 @@ export const RESERVED_SEGMENTS: readonly string[] = [
  * and this screen re-renders on every keystroke in its search box.
  */
 const EMPTY_APPROVALS: readonly ApprovalSummary[] = [];
+/** Stable defaults, so a board rendered without the decide bundle does not
+ *  churn every card's props on each poll (#1891). */
+const EMPTY_DECIDING: ReadonlyMap<string, Verdict> = new Map();
+const EMPTY_DECIDED: Readonly<Record<string, DecidedApproval>> = {};
+const EMPTY_FAILED: Record<string, string> = {};
 
 /** The task ledger is operated as a board; declared ledgers are read as rows. */
 export function defaultLedgerMode(
@@ -272,7 +303,10 @@ export function LedgersView({
   taskEventTick,
   approvals = EMPTY_APPROVALS,
   now,
-  onReviewApprovals,
+  decidingApprovals = EMPTY_DECIDING,
+  decidedApprovals = EMPTY_DECIDED,
+  failedApprovals = EMPTY_FAILED,
+  onDecideApproval,
   onListsChanged,
 }: Props) {
   // The declare wizard, opened in place over whatever list is already on
@@ -284,13 +318,16 @@ export function LedgersView({
   const [reading, setReading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  // Issue #1696: the read effect keys on `refreshRead`, whose identity turns
+  // over on every `query` change. Feeding the raw box to it fired one network
+  // read per keystroke; feeding this settled copy fires one per typing pause.
+  // The <Input> stays bound to raw `query` so typing still echoes instantly.
+  const debouncedQuery = useDebouncedValue(query, 300);
   const [statusFilter, setStatusFilter] = useState(EVERY_STATUS);
   const [composing, setComposing] = useState<Composing | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<LedgerEntry | null>(null);
   const [rendered, setRendered] = useState<string | null>(null);
-  /** Columns for dispatched tasks; rows for every agent-written ledger. */
-  const [mode, setMode] = useState<"board" | "list">("list");
   /**
    * The board's own create dialog, for the native `tasks` ledger only.
    *
@@ -319,6 +356,17 @@ export function LedgersView({
     [ledgers, sub],
   );
 
+  /**
+   * Columns or rows.
+   *
+   * The task ledger is operated as a board; declared ledgers read as rows
+   * (`defaultLedgerMode`). The choice is navigation state (`?view=list`) so a
+   * browser Back returns to the rendering the operator left — and the
+   * per-ledger default above applies only when the address names no view, which
+   * is what the fallback argument to `useLedgerViewMode` means here.
+   */
+  const [mode, setMode] = useLedgerViewMode(defaultLedgerMode(ledger));
+
   // A bare `#/ledgers` (no slug — the nav row's own address, a hand-typed
   // one, or a bookmark) lands on Tasks, not "whichever list happened to load
   // first" — Tasks is the hero content this screen defaults to (issue
@@ -332,13 +380,6 @@ export function LedgersView({
 
   /** The task board, as opposed to a ledger a company declared. */
   const isBoard = ledger?.source === "native" && ledger.slug === BOARD_LEDGER;
-
-  // A view choice belongs to the ledger it describes. Returning to Tasks
-  // restores its dispatch board; opening Goals or Decisions makes the closing
-  // reason readable without first finding and changing this toggle.
-  useEffect(() => {
-    setMode(defaultLedgerMode(ledger));
-  }, [ledger?.slug, ledger?.source]);
 
   const taskById = useMemo(
     () => new Map(tasks.map((task) => [task.id, task])),
@@ -362,6 +403,16 @@ export function LedgersView({
 
   /** The clock the "blocked since" labels measure against (issue #883). */
   const clock = now ?? Date.now();
+
+  /**
+   * Who asked for each parked approval, for the blocked cards (#1891).
+   *
+   * At the view rather than per card: `useAskerNames` keys on the *set* of
+   * asker ids, so one call over the company's queue is a single roster read
+   * however many columns hold blocked cards — and a card that mounts mid-poll
+   * finds the names already resolved instead of starting its own fetch.
+   */
+  const askerNames = useAskerNames(client, company, [...approvals]);
 
   /**
    * Why this ledger is showing nothing, when a filter is the reason (#1217).
@@ -393,7 +444,7 @@ export function LedgersView({
       if (!quiet) setReading(true);
       try {
         const next = await readLedger(client, company, sub, {
-          q: query.trim() || undefined,
+          q: debouncedQuery.trim() || undefined,
           status: statusFilter === EVERY_STATUS ? undefined : statusFilter,
           limit: 100,
         });
@@ -405,7 +456,7 @@ export function LedgersView({
         if (!quiet) setReading(false);
       }
     },
-    [client, company, sub, query, statusFilter],
+    [client, company, sub, debouncedQuery, statusFilter],
   );
 
   useEffect(() => {
@@ -460,7 +511,7 @@ export function LedgersView({
   // follow it any more — issue #1284 removed the in-page picker that used to
   // own that), so this keys on `sub` directly.
   useEffect(() => {
-    setStatusFilter("all");
+    setStatusFilter(EVERY_STATUS);
     setRendered(null);
   }, [sub]);
 
@@ -628,10 +679,29 @@ export function LedgersView({
     }
   };
 
+  /*
+    The page's name before its switcher can exist (codex review, #1785). Both
+    guards below used to return above the header, so a fresh `#/ledgers/<slug>`
+    and a console with no company selected each rendered with no `h1` at all.
+
+    A plain title rather than the real header: the loaded one *is* the list
+    switcher, and a switcher with no list to switch between is a control that
+    lies. `ledger?.title` is used when it is already known — the second guard
+    fires while the rows load, by which point the list itself has resolved —
+    and "Lists" when it is not, which is the honest name for a page that does
+    not yet know which one it is showing.
+  */
+  // Same gutter as the loaded header below, so the title does not shift 8px
+  // sideways the moment the board arrives.
+  const loadingHeader = <PageHeader gutter="px-6" title={ledger?.title ?? "Lists"} />;
+
   if (!company) {
     return (
-      <div className="p-6 text-sm text-muted-foreground">
-        Pick a company to see its lists.
+      <div className="flex h-full min-h-0 flex-col">
+        {loadingHeader}
+        <div className="p-6 text-sm text-muted-foreground">
+          Pick a company to see its lists.
+        </div>
       </div>
     );
   }
@@ -642,29 +712,37 @@ export function LedgersView({
   // did rather than a flash of "not found" before the list catches up.
   if ((ledgersLoading && !ledger) || (reading && !read)) {
     return (
-      <div className="space-y-3 p-6">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-40 w-full" />
+      <div className="flex h-full min-h-0 flex-col">
+        {loadingHeader}
+        <div className="space-y-3 p-6">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton className="h-40 w-full" />
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 p-6">
-      <header className="flex flex-wrap items-start gap-3">
-        <div className="min-w-[16rem] flex-1 space-y-1">
-          {/* The page's own title is the switcher (issue #1284): no new
-              element added, one click to any other list, and the menu
-              includes where you already are rather than only offering
-              somewhere else to go. Still a real `<h1>` — the interactive
-              affordance is the `<button>` inside it, not the heading itself,
-              so a screen reader still announces "heading level 1: Goals"
-              rather than losing the page's landmark structure to a button. */}
-          {/* A flex row, because the trigger inside is a flex button: as
-              ordinary inline content the count badge wrapped to a line of its
-              own and cost back the space this header just saved. */}
-          <h1 className="flex flex-wrap items-center gap-2 text-xl font-semibold">
-            <DropdownMenu>
+    <div className="flex h-full min-h-0 flex-col">
+      {/*
+        Issue #1763: the page header, with the list switcher as the title.
+
+        The title is still a real level-one heading — the interactive affordance is the
+        `<button>` inside it, not the heading (issue #1284) — and the count
+        rides beside it, which is the shape `PageHeader` gives every page.
+
+        "About this list" goes to `children` rather than `description`: it is
+        a `<details>`, and the description renders into a `<p>`.
+      */}
+      <PageHeader
+        // The body below is `p-6`, so the header's default `px-4` put the title
+        // and actions 8px outside the board content they belong to. Before this
+        // page had a `PageHeader` at all its heading lived inside that same
+        // wrapper and lined up; `ManageListsView` passes the same gutter for the
+        // same reason.
+        gutter="px-6"
+        title={
+          <DropdownMenu>
               <DropdownMenuTrigger
                 render={
                   <button
@@ -729,58 +807,23 @@ export function LedgersView({
                   Manage lists
                 </DropdownMenuItem>
               </DropdownMenuContent>
-            </DropdownMenu>
-            {/* How much is live here, beside the name — the one fact about a
-                list that changes, and the one the switcher already shows for
-                every *other* list while saying nothing about the open one. */}
-            {ledger && (
-              <span
-                title={`${ledger.open} open`}
-                className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium tabular-nums text-muted-foreground"
-              >
-                {ledger.open}
-              </span>
-            )}
-          </h1>
-          {!ledger && (
-            <p className="text-sm text-muted-foreground">
-              This list does not exist, or was retired. Pick another from the
-              title menu.
-            </p>
-          )}
-          {ledger && (
-            // The purpose lives in here now (issue #1349). It is a fixed
-            // sentence about the engine — "this ledger is written through the
-            // board, not with `record_entry`" — written for whoever declares a
-            // list, not for the operator working one, and it was holding two
-            // permanent lines above the board on the console's most-visited
-            // screen. Read once, then never again; a disclosure is what that
-            // shape of text is for.
-            <details className="text-xs text-muted-foreground">
-              <summary className="w-fit cursor-pointer select-none rounded px-1 py-0.5 hover:bg-accent/50 hover:text-foreground">
-                About this list
-              </summary>
-              <div className="mt-1 max-w-prose space-y-1 px-1">
-                <p>{inlineCode(ledger.purpose)}</p>
-                <p>
-                  Renders into <code>{ledger.derived}</code>
-                </p>
-                {!isWritable(ledger) && (
-                  <p className="flex items-start gap-1.5">
-                    <Lock className="mt-0.5 size-3 shrink-0" />
-                    <span>
-                      Rows here are opened elsewhere:{" "}
-                      {inlineCode(ledger.writtenBy)}. You can still move one
-                      between columns — that goes through the board, which is
-                      what makes it start work.
-                    </span>
-                  </p>
-                )}
-              </div>
-            </details>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
+          </DropdownMenu>
+        }
+        /* How much is live here, beside the name — the one fact about a list
+           that changes, and the one the switcher already shows for every
+           *other* list while saying nothing about the open one. */
+        trailing={
+          ledger && (
+            <span
+              title={`${ledger.open} open`}
+              className="rounded-full bg-muted px-2 py-0.5 text-xs font-medium tabular-nums text-muted-foreground"
+            >
+              {ledger.open}
+            </span>
+          )
+        }
+        actions={
+          <>
           <Button
             variant="outline"
             size="sm"
@@ -826,9 +869,48 @@ export function LedgersView({
                 </Button>
               )
             ))}
-        </div>
-      </header>
-
+          </>
+        }
+      >
+          {!ledger && (
+            <p className="text-sm text-muted-foreground">
+              This list does not exist, or was retired. Pick another from the
+              title menu.
+            </p>
+          )}
+          {ledger && (
+            // The purpose lives in here now (issue #1349). It is a fixed
+            // sentence about the engine — "this ledger is written through the
+            // board, not with `record_entry`" — written for whoever declares a
+            // list, not for the operator working one, and it was holding two
+            // permanent lines above the board on the console's most-visited
+            // screen. Read once, then never again; a disclosure is what that
+            // shape of text is for.
+            <details className="text-xs text-muted-foreground">
+              <summary className="w-fit cursor-pointer select-none rounded px-1 py-0.5 hover:bg-accent/50 hover:text-foreground">
+                About this list
+              </summary>
+              <div className="mt-1 max-w-prose space-y-1 px-1">
+                <p>{inlineCode(ledger.purpose)}</p>
+                <p>
+                  Renders into <code>{ledger.derived}</code>
+                </p>
+                {!isWritable(ledger) && (
+                  <p className="flex items-start gap-1.5">
+                    <Lock className="mt-0.5 size-3 shrink-0" />
+                    <span>
+                      Rows here are opened elsewhere:{" "}
+                      {inlineCode(ledger.writtenBy)}. You can still move one
+                      between columns — that goes through the board, which is
+                      what makes it start work.
+                    </span>
+                  </p>
+                )}
+              </div>
+            </details>
+          )}
+      </PageHeader>
+      <div className="flex min-h-0 flex-1 flex-col gap-4 p-6">
       {error && (
         <Alert variant="destructive">
           <AlertTriangle className="size-4" />
@@ -956,7 +1038,7 @@ export function LedgersView({
                   }
                   onOpen={(entry) =>
                     ledger.source === "native" && onOpenCard
-                      ? onOpenCard(entry.id)
+                      ? onOpenCard(entry.id, mode)
                       : setComposing({
                           id: entry.id,
                           fields: { ...entry.fields },
@@ -971,11 +1053,17 @@ export function LedgersView({
                   }
                   approvals={approvals}
                   now={clock}
+                  // #1891: a blocked card decides in place, through the shell's
+                  // one resolve. The same four the run drawer already receives.
+                  askerNames={askerNames}
+                  deciding={decidingApprovals}
+                  decided={decidedApprovals}
+                  failed={failedApprovals}
+                  onDecide={onDecideApproval}
                   // Resume has its own write since #1512: a paused card is
                   // already in the `working` phase, so routing it through
                   // `move` would be a no-op the operator could not see fail.
                   onResume={(entry) => void resume(entry)}
-                  onReview={onReviewApprovals}
                 />
               ) : (
                 <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
@@ -986,7 +1074,14 @@ export function LedgersView({
                       ledger={ledger}
                       onOpen={
                         ledger.source === "native" && onOpenCard
-                          ? () => onOpenCard(entry.id)
+                          ? () => onOpenCard(entry.id, mode)
+                          : undefined
+                      }
+                      detailHref={
+                        ledger.source === "native"
+                          ? withHostParam(`tasks/${encodeURIComponent(entry.id)}`, {
+                              view: "list",
+                            })
                           : undefined
                       }
                       onAmend={() =>
@@ -1050,6 +1145,7 @@ export function LedgersView({
             </>
           )}
         </section>
+      </div>
       </div>
 
       {composing && ledger && (
@@ -1165,8 +1261,12 @@ function BoardMode({
   taskFor,
   approvals,
   now,
+  askerNames,
+  deciding,
+  decided,
+  failed,
+  onDecide,
   onResume,
-  onReview,
 }: {
   ledger: LedgerSummary;
   entries: LedgerEntry[];
@@ -1188,10 +1288,23 @@ function BoardMode({
   approvals?: readonly ApprovalSummary[];
   /** The clock those "blocked for 4m" labels measure against. */
   now?: number;
+  /**
+   * Roster ids → names, resolved once for the whole board (#1891).
+   *
+   * Lifted to the view rather than run per card: `useAskerNames` keys on the
+   * set of asker ids, so one call over the company's queue is one roster read
+   * for every blocked column — and a card that mounts mid-poll finds the names
+   * already in hand instead of starting its own fetch.
+   */
+  askerNames: Map<string, string>;
+  /** The console-wide decision state a blocked card decides through (#1891). */
+  deciding: ReadonlyMap<string, Verdict>;
+  decided: Readonly<Record<string, DecidedApproval>>;
+  failed: Record<string, string>;
+  /** The shell's one resolve — absent when this board is read-only. */
+  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
   /** Re-dispatch a paused card. */
   onResume?: (entry: LedgerEntry) => void;
-  /** Open the approvals queue narrowed to one card (issue #883). */
-  onReview?: (taskId: string) => void;
 }) {
   return (
     <LedgerBoard
@@ -1207,11 +1320,14 @@ function BoardMode({
             <TaskItem
               task={task}
               dragging={dragging}
-              block={taskApprovalBlock(approvals ?? [], task.id)}
+              rows={taskApprovalRows(approvals ?? [], decided, task.id)}
               now={now ?? Date.now()}
+              askerNames={askerNames}
+              deciding={deciding}
+              failed={failed}
+              onDecide={onDecide}
               onOpen={() => onOpen(entry)}
               onResume={() => onResume?.(entry)}
-              onReview={onReview ? () => onReview(task.id) : undefined}
             />
           );
         }
@@ -1272,14 +1388,17 @@ function EntryCard({
   entry,
   ledger,
   onOpen,
+  detailHref,
   onAmend,
   onClose,
   onDelete,
 }: {
   entry: LedgerEntry;
   ledger: LedgerSummary;
-  /** Leaves for the row's own screen, when it has one. Only the board does. */
+  /** Opens the row's own screen, when it has one. Only native Tasks do. */
   onOpen?: () => void;
+  /** Native task-detail address, including the List return context. */
+  detailHref?: string;
   onAmend: () => void;
   onClose: () => void;
   onDelete: () => void;
@@ -1287,21 +1406,28 @@ function EntryCard({
   const writable = isWritable(ledger);
   const columns = columnsOf(ledger);
   return (
-    <Card className={cn(entry.closed && "opacity-75")}>
+    <Card
+      className={cn(
+        onOpen && "cursor-pointer transition-colors hover:bg-accent/50",
+        entry.closed && "opacity-75",
+      )}
+      onClick={(event) => {
+        if (!(event.target as HTMLElement).closest("a, button")) onOpen?.();
+      }}
+    >
       <CardContent
-        className="space-y-2 p-4"
+        className="space-y-2"
         data-testid={`ledger-entry-${entry.id}`}
       >
         <div className="flex flex-wrap items-start gap-2">
           {onOpen ? (
-            <button
-              type="button"
+            <a
+              href={detailHref}
               className="min-w-0 flex-1 text-left font-medium hover:underline"
-              onClick={onOpen}
               data-testid="ledger-entry-title"
             >
               {entry.title}
-            </button>
+            </a>
           ) : (
             <span
               className="min-w-0 flex-1 font-medium"

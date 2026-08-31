@@ -22,7 +22,7 @@ function agent(over: Partial<AgentDetailDto> = {}): AgentDetailDto {
     source: "overlay",
     editable: ["name", "role", "description"],
     isOrchestrator: false,
-    tools: { requested: [], companyAllow: ["workspace.*"], effective: ["workspace.*"] },
+    tools: { requested: null, companyAllow: ["workspace.*"], deskAllow: [], deskCeilingActive: false, effective: ["workspace.*"] },
     desks: [],
     inboxEnabled: false,
     ...over,
@@ -88,9 +88,10 @@ describe("what the panel says a teammate is", () => {
     expect(after.tone).toBe(before.tone);
   });
 
-  it("keeps an empty tool request legible as the standard grant", () => {
+  it("keeps an absent tool request (null) legible as the standard grant", () => {
     const profile = agentProfile(agent());
     expect(profile.tools.standardGrant).toBe(true);
+    expect(profile.tools.deniedAll).toBe(false);
     expect(profile.tools.effective).toEqual(["workspace.*"]);
   });
 
@@ -100,6 +101,8 @@ describe("what the panel says a teammate is", () => {
         tools: {
           requested: ["workspace.*", "finance.*"],
           companyAllow: ["workspace.*"],
+          deskAllow: [],
+          deskCeilingActive: false,
           effective: ["workspace.*"],
         },
       }),

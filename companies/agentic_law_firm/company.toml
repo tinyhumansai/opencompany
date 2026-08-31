@@ -14,15 +14,19 @@ human_role = "Approving filings"
 # only read one the agent already has.
 #
 # Every entry below is load-bearing. `allow` REPLACES the default
-# (`["*", "media", "composio"]`); it never extends it. `*` covers
-# files/docs/shell/code/web/subagent but deliberately excludes the opt-in
-# namespaces, so `media`, `composio` and `search` are each listed literally.
+# (`globals/globals.toml`'s `default_allow`); it never extends it. `*` covers
+# files/docs/shell/code/web/subagent but deliberately excludes the rest, so
+# `workspace.*` and `workspace.write` (the latter is explicit because the host
+# recognizes only the exact write grant), `media`, `composio`,
+# `search` and `mcp:*` are each listed literally. This line is the default belt
+# restated verbatim; keeping it written out is what makes a narrowing here a
+# visible edit rather than an inherited surprise.
 # Reducing this line to `["search"]` would silently strip the whole belt from
 # every agent in the company.
 #
 # Search spend is bounded by `[tools].search_daily_calls` (200/day by default);
 # setting it to `0` pauses search without editing this list.
-allow = ["*", "media", "composio", "search"]
+allow = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*"]
 
 # The matter-review desk aligns research, drafting, and compliance before legal approval.
 [[group_chat]]
@@ -41,7 +45,7 @@ enabled = ["matter_pipeline", "intake_screen"]
 # from its own manifest instead of inferred from an absent block.
 #
 # `auto` runs the agent's own sandbox writes and outward reads unattended and
-# still parks everything that leaves the company or spends money. `always_approve`
+# policy HITL is disabled; agents use `request_approval` when they want sign-off. `always_approve`
 # is omitted, so it keeps its default.
 [policy]
 mode = "auto"

@@ -146,10 +146,10 @@ pub const DEFAULT_PROVIDER: &str = "openrouter";
 /// The slugs mirror the platform's own OpenRouter bindings, so proxied and
 /// direct resolve to the same models by default.
 pub const DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
-    ("chat-v1", "deepseek/deepseek-v4-flash"),
-    ("reasoning-v1", "deepseek/deepseek-v4-pro"),
-    ("agentic-v1", "deepseek/deepseek-v4-pro"),
-    ("vision-v1", "qwen/qwen3.7-plus"),
+    ("chat-v1", "anthropic/claude-sonnet-5"),
+    ("reasoning-v1", "openai/gpt-5.6-sol-pro"),
+    ("agentic-v1", "anthropic/claude-opus-5"),
+    ("vision-v1", "qwen/qwen3.8-max"),
 ];
 
 /// The concrete model id to put on the wire for `tier`.
@@ -1498,6 +1498,30 @@ mod tests {
         }
     }
 
+    /// `every_tier_resolves_to_a_concrete_model_id_on_the_direct_path` above
+    /// only proves each tier resolves to *some* concrete slug — it would still
+    /// pass if `chat-v1` and `agentic-v1` were swapped. These expected ids are
+    /// hardcoded rather than read back from [`DEFAULT_TIER_MODELS`]: asserting
+    /// a table against itself would pass no matter what the table said, so an
+    /// incorrect tier assignment needs a second, independent source of truth
+    /// to fail against.
+    #[test]
+    fn every_tier_resolves_to_its_documented_default_model() {
+        let none = BTreeMap::new();
+        for (tier, expected) in [
+            ("chat-v1", "anthropic/claude-sonnet-5"),
+            ("reasoning-v1", "openai/gpt-5.6-sol-pro"),
+            ("agentic-v1", "anthropic/claude-opus-5"),
+            ("vision-v1", "qwen/qwen3.8-max"),
+        ] {
+            assert_eq!(
+                model_for_tier(tier, &none, false),
+                expected,
+                "`{tier}` must resolve to the documented default `{expected}`"
+            );
+        }
+    }
+
     #[test]
     fn a_harness_override_beats_the_default_and_a_concrete_slug_passes_through() {
         let overrides =
@@ -1513,7 +1537,7 @@ mod tests {
         // An unmapped tier still takes the shipped default on the direct path.
         assert_eq!(
             model_for_tier("reasoning-v1", &overrides, false),
-            "deepseek/deepseek-v4-pro"
+            "openai/gpt-5.6-sol-pro"
         );
         // A caller naming a concrete slug is not treated as an unknown tier.
         assert_eq!(

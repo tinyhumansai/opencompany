@@ -282,6 +282,15 @@ impl WorkspaceStore for DerivedGuardWorkspace {
         self.inner.delete(company, id).await
     }
 
+    /// Forwards to `self.inner.delete_if_empty`, deliberately unguarded like
+    /// `delete` above, and deliberately NOT the default trait method — that
+    /// default would resolve `tree()`/`delete()` back through this decorator
+    /// as two separate calls and lose whatever tighter guarantee the wrapped
+    /// store provides. See the port doc.
+    async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        self.inner.delete_if_empty(company, id).await
+    }
+
     async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
         self.inner.is_empty(company).await
     }

@@ -178,7 +178,7 @@ export function AccountChoiceSection({ client, company, canManage, generation = 
       </p>
 
       <Card>
-        <CardContent className="space-y-4 py-4">
+        <CardContent className="space-y-4">
           {multi.map((row) => (
             <div key={row.toolkit} className="space-y-2" data-testid={`accounts-${row.toolkit}`}>
               <div className="flex items-center gap-2">

@@ -16,6 +16,7 @@ export const STYLEGUIDE_COMPONENTS = [
   "dropdown-menu",
   "input",
   "label",
+  "popover",
   "scroll-area",
   "select",
   "separator",

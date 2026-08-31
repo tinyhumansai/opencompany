@@ -18,11 +18,9 @@ The builder seams are wired to OpenCompany's own ports:
   OpenAI-compatible client for the hosted TinyHumans brain (`chat()` sends the
   full history and parses token/cost usage back out), with a `MockProvider`
   for offline tests.
-- **Approval policy** → `harness::policy::ApprovalPolicy` maps `[policy].mode`
-  onto openhuman's `ToolPolicy`; the security-tier words
-  (readonly/supervised/full) line up 1:1. See
-  [approval parking](#approval-parking) for how a gated call reaches the
-  operator.
+- **Tool policy** → `harness::policy::ApprovalPolicy` still enforces hard
+  denials such as `readonly`, but policy-generated HITL is disabled. Approvals
+  are raised deliberately through the intrinsic `request_approval` tool.
 - **Tools / skills** → injected from the company's manifest grants.
 
 See [`docs/modules/runtime/README.md`](../runtime/README.md) for `HarnessPool`
@@ -55,33 +53,22 @@ runtime override > manifest `[inference]` > managed env default — on every tur
 so a provider switch or key rotation reaches agents on the next turn with no
 rebuild at all.
 
-## Approval parking
+## Explicit approval requests
 
-openhuman resolves a `ToolPolicyDecision::RequireApproval` **inline**: it blocks
-the tool call and feeds the model a refusal, then lets the turn continue. That
-refusal used to be the only trace a gated call left — nothing was written to
-OpenCompany's `ApprovalGate` or its journal, so the operator's Approvals page
-stayed empty however many tools an agent parked (issue #172).
+Every roster agent receives `request_approval` as an intrinsic tool. It takes a
+short `title`, a precise yes/no `question`, and optional `context`. Calling it
+pushes one `request_approval` effect onto the shared `ApprovalRequestQueue`;
+`HarnessBrain` drains and journals that request through the existing approval
+inbox. The tool tells the agent to stop the turn and wait.
 
-The two halves are now joined:
+Resolving the card starts a continuation turn for the requesting agent. Approve
+and deny are both delivered as decisions; approval does **not** re-run the
+`request_approval` tool. The agent continues (or stops) based on the answer.
 
-1. `ApprovalPolicy::check` projects every `RequireApproval` onto an `Effect`
-   (`effect_for` — the tool name becomes the effect `kind`, the arguments become
-   the payload) and pushes it onto the shared `ApprovalRequestQueue` carried on
-   `HarnessDeps`. Duplicates (a model re-trying the same blocked call) collapse.
-2. `HarnessBrain::run_cycle` clears that queue before its turns and drains it
-   after, parking each request through `CycleHost::park_effect` — capped at
-   `MAX_APPROVAL_REQUESTS_PER_TURN`.
-
-`park_effect` is deliberately **not** `emit_effect`: the verdict was already
-reached inside the turn, and re-evaluating it against the coarser `ApprovalGate`
-taxonomy would `Allow` (and so "execute" as a no-op) anything in the `Other`
-group — which is most gated tool calls — making the request vanish again.
-
-**Not yet wired: resume-after-approval.** Because openhuman resolves the decision
-inline, approving a parked tool call records the verdict and clears the queue but
-does not re-dispatch the tool; the operator re-asks. Suspending and resuming a
-call inside openhuman's session loop is separate work.
+Ordinary tools no longer enter HITL because of `[policy].mode`,
+`always_approve`, budget thresholds, or per-call judgement. Existing parked
+tool-call approvals and their grants remain redeemable during migration. The
+`readonly` brake stays a hard denial, not a prompt the operator can override.
 
 ## Inference config (environment)
 
@@ -93,6 +80,7 @@ default model, most specific first:
 | key | `OPENCOMPANY_INFERENCE_KEY` | `TINYHUMANS_API_KEY` — **no key ⇒ echo brain** |
 | url | `OPENCOMPANY_INFERENCE_URL` | `https://api.tinyhumans.ai/openai/v1` |
 | model | `OPENCOMPANY_INFERENCE_MODEL` | `chat-v1` |
+| window | `OPENCOMPANY_CONTEXT_WINDOW` | `240000` — context window advertised on the managed profile; `off`/`0` disables compression and trimming. Lower it for a smaller model — see [history protection](../runtime/providers.md#history-protection) |
 
 The two key names keep a per-tenant override distinct from the platform-wide
 credential the hosting manager injects.

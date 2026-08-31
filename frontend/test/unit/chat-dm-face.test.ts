@@ -37,7 +37,9 @@ function member(over: Partial<TeamMember> & Pick<TeamMember, "id" | "name">): Te
 }
 
 function dmFor(m: TeamMember): Channel {
-  const dms = buildChannels([m], []).find((s) => s.id === "dms");
+  const dms = buildChannels([m], [], {
+    [`dm:${m.id}`]: [{ id: "message", from: "you", text: "Hello", at: 1 }],
+  }).find((s) => s.id === "dms");
   expect(dms?.channels).toHaveLength(1);
   return dms!.channels[0];
 }

@@ -59,6 +59,15 @@ test("at xl the run result is a right rail, and the canvas keeps a usable width"
   await dismissTour(page);
   await openWorkflow(page, "Committed flow");
 
+  // Issue #1683 opens the History rail on select. "Only one rail open" is the
+  // scenario this case is about, so close it — the two-rail case is the third
+  // test in this file.
+  const historyToggle = page.getByTestId("workflow-history-toggle");
+  if (await historyToggle.isVisible().catch(() => false)) {
+    await historyToggle.click();
+    await expect(page.getByTestId("workflow-run-history")).toBeHidden();
+  }
+
   const flow = canvas(page);
   await expect(flow).toBeVisible();
 
@@ -121,9 +130,10 @@ test("both rails open at once: history left, run result right, canvas squeezed b
   const flow = canvas(page);
   await expect(flow).toBeVisible();
 
+  // Issue #1683: index select already opens the History rail, so the toggle
+  // needs waiting on (host-support check) but not clicking.
   const historyToggle = page.getByTestId("workflow-history-toggle");
   await historyToggle.waitFor({ state: "visible", timeout: 30_000 });
-  await historyToggle.click();
   const history = page.getByTestId("workflow-run-history");
   await expect(history).toBeVisible();
 

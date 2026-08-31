@@ -69,10 +69,14 @@ async fn state_at(dir: &std::path::Path) -> AppState {
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -163,6 +167,51 @@ fn catalog_matches_driver_registry() {
     assert_eq!(
         offered,
         crate::store::memory::driver::SUPPORTED_REMOTE_DRIVERS.to_vec()
+    );
+}
+
+/// The hosted engines are available in a **default** build, not only in one
+/// somebody remembered to pass `--features tinymemory` to.
+///
+/// This is a regression pin with a support case behind it: the memory-engine
+/// catalog is a console surface in every build, and without `tinymemory` four
+/// of its tiles ("Supermemory", "Mem0", "Cognee", "No memory") render disabled
+/// with "this build was compiled without the `tinymemory` feature" — an
+/// instruction to go and find a differently compiled binary. For the desktop
+/// app and for anyone running the shipped container that is not an instruction
+/// they can follow, so the feature ships in the default set (see `Cargo.toml`)
+/// and this asserts it from a lane that passes no features at all.
+///
+/// Deliberately NOT quantified over the whole catalog: the in-pod engines
+/// (`embedded`, `namespace`) do cost a bundled SQLite build and stay opt-in.
+/// The desktop keeps those off too — it offers no in-pod memory surface — and
+/// enables the hosted drivers itself via `tinymemory` in `src-tauri/Cargo.toml`.
+#[test]
+fn the_hosted_memory_engines_ship_in_the_default_build() {
+    let hosted = ["supermemory", "mem0", "cognee", "null"];
+    let entries: Vec<_> = catalog()
+        .into_iter()
+        .filter(|option| hosted.contains(&option.id))
+        .collect();
+    // Assert that the catalog still offers every required ID, so a regression
+    // that drops one of them fails here rather than passing silently because
+    // the entry never reached the disabled list.
+    let offered: Vec<_> = entries.iter().map(|option| option.id).collect();
+    assert_eq!(offered, hosted);
+    let disabled: Vec<String> = entries
+        .into_iter()
+        .filter(|option| !option.available)
+        .map(|option| {
+            format!(
+                "{}: {}",
+                option.id,
+                option.unavailable_reason.unwrap_or_default()
+            )
+        })
+        .collect();
+    assert!(
+        disabled.is_empty(),
+        "a default build must offer the hosted memory engines: {disabled:?}"
     );
 }
 
@@ -280,6 +329,12 @@ async fn the_default_host_reports_the_built_in_store_as_editable() {
             .any(|o| o["id"] == "supermemory"),
         "the catalog is offered whether or not this build can bind it"
     );
+}
+
+#[test]
+fn an_env_owned_engine_is_detected_from_an_injected_source() {
+    let env = crate::app::config::MapEnv::new([("OPENCOMPANY_MEMORY", "store")]);
+    assert!(crate::store::StorageSettings::memory_is_env_owned_by(&env));
 }
 
 /// A health answer is useful only if it is current. The engine route is

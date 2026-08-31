@@ -75,6 +75,11 @@ pub(crate) const COMPOSIO_READ_SLUG: &str = "GITHUB_LIST_PULL_REQUESTS";
 /// The cautious fallback deserves its own coverage, so this exists to be
 /// requested deliberately and named as such at the call site — never as the
 /// accidental result of a typo'd key.
+///
+/// Its verb matters since issue #1818: `DO` is in neither the read list nor
+/// the mutating one, so the fallback finds no evidence of a read and this stays
+/// a send. A fixture spelled `..._LIST_...` would now classify as an inferred
+/// read and would quietly stop covering what it is named for.
 pub(crate) const COMPOSIO_UNCLASSIFIED_SLUG: &str = "NOTAREALTOOLKIT_DO_SOMETHING";
 
 /// A `composio_execute` argument object naming `slug`, keyed the way the tool

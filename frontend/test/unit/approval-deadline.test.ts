@@ -61,6 +61,106 @@ afterEach(() => {
 });
 
 describe("the deadline on an approval card", () => {
+  it("links a reported desk thread back to its conversation", async () => {
+    await act(async () => {
+      root.render(
+        createElement(ApprovalMeta, {
+          approval: approval({ thread: "engineering" }),
+          now: T0,
+          askerNames: new Map(),
+          chatChannelByThread: { engineering: "engineering" },
+        }),
+      );
+    });
+
+    const link = container.querySelector<HTMLAnchorElement>('a[href="#/chat/engineering"]');
+    expect(link?.textContent).toContain("Open the conversation");
+  });
+
+  it("uses the resolved DM channel rather than the host thread id", async () => {
+    await act(async () => {
+      root.render(
+        createElement(ApprovalMeta, {
+          approval: approval({ thread: "agent-grace" }),
+          now: T0,
+          askerNames: new Map(),
+          chatChannelByThread: { "agent-grace": "dm:agent-grace" },
+        }),
+      );
+    });
+
+    const link = container.querySelector<HTMLAnchorElement>('a[href="#/chat/dm%3Aagent-grace"]');
+    expect(link?.textContent).toContain("Open the conversation");
+  });
+
+  it("links a native workflow gate to its exact run", async () => {
+    await render(
+      approval({
+        kind: "workflow.approve",
+        workflow_run_id: "run/1",
+        workflow_id: "invoice sync",
+      }),
+      T0,
+    );
+
+    const link = container.querySelector<HTMLAnchorElement>(
+      'a[href="#/workflows/invoice%20sync?run=run%2F1"]',
+    );
+    expect(link?.textContent).toContain("Open the run");
+  });
+
+  /**
+   * Issue #1418: the run link must survive role redaction.
+   *
+   * A member reader's summary arrives with `payload` stripped (#618), but the
+   * workflow id is a top-level field that rides through with `workflow_run_id`
+   * — so the member holding up the stalled run still gets the address instead
+   * of "Origin unavailable".
+   */
+  it("keeps the run link when role redaction stripped the payload", async () => {
+    await render(
+      approval({
+        kind: "workflow.approve",
+        workflow_run_id: "run/1",
+        workflow_id: "invoice sync",
+        contents_hidden: true,
+        payload: undefined,
+      }),
+      T0,
+    );
+
+    const link = container.querySelector<HTMLAnchorElement>(
+      'a[href="#/workflows/invoice%20sync?run=run%2F1"]',
+    );
+    expect(link?.textContent).toContain("Open the run");
+    expect(container.textContent).not.toContain("Origin unavailable");
+  });
+
+  it("says when the host did not report an addressable origin", async () => {
+    await render(approval({ agent: null }), T0);
+    expect(container.textContent).toContain("Origin unavailable");
+  });
+
+  it("counts a resolved thread link as an origin while chat hydration is empty", async () => {
+    // The shell hydrates `chatChannelByThread` separately from the card's own
+    // `useApprovalThreadLinks`, so a card can resolve its "Asked in" link
+    // before the shell does — or while the shell's read has failed. The origin
+    // is visibly available either way, so the footer must not say otherwise.
+    await act(async () => {
+      root.render(
+        createElement(ApprovalMeta, {
+          approval: approval({ thread: "engineering" }),
+          now: T0,
+          askerNames: new Map(),
+          thread: { channelId: "engineering", label: "#engineering" },
+        }),
+      );
+    });
+
+    expect(container.textContent).toContain("Asked in #engineering");
+    expect(container.textContent).not.toContain("Origin unavailable");
+  });
+
   it("renders beside how long the request has already waited", async () => {
     await render(approval({ expires_at_millis: T0 + 24 * HOUR }), T0 + 2 * HOUR);
     const text = container.textContent ?? "";
@@ -116,7 +216,7 @@ describe("the deadline on an approval card", () => {
     expect(text).toContain("2h ago");
     expect(text).not.toContain("eclines itself");
     expect(text).not.toContain("deadline");
-    expect(text).not.toContain("in ");
+    expect(text).not.toContain("Declines itself in");
   });
 
   it("leaves the rest of the card untouched either way", async () => {

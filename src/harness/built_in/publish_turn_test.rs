@@ -301,6 +301,7 @@ fn brain_with(
 ) -> (HarnessBrain, Arc<FsOps>) {
     let ops = Arc::new(FsOps::new(dir));
     let deps = HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: Arc::new(HostedProvider::new(HostedProviderConfig {
@@ -354,6 +355,8 @@ fn brain_with(
         workspace: None,
         search: None,
         tenant_search: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
     let record = CompanyRecord {
         overlay_retired_agents: Vec::new(),
@@ -369,10 +372,14 @@ fn brain_with(
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     };
     (
         // Issue #339: the run store is wired here so a dispatch carrying a
@@ -418,6 +425,7 @@ fn card(id: &str) -> TaskRecord {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     }
 }
 
@@ -440,6 +448,7 @@ fn dispatch_run(task_id: &str, run_id: Option<&str>) -> CycleRequest {
             run_id: run_id.map(str::to_string),
         }],
         event_seqs: Vec::new(),
+        policy: None,
     }
 }
 
@@ -1188,8 +1197,10 @@ fn chat(text: &str) -> CycleRequest {
             chat: None,
             parent: None,
             deliverable: None,
+            attachments: Vec::new(),
         }],
         event_seqs: Vec::new(),
+        policy: None,
     }
 }
 

@@ -5,6 +5,18 @@
 # features (e.g. "medulla tinyplace sqlite"); empty = the small default build.
 FROM rust:1-slim-bookworm AS builder
 ARG FEATURES=""
+# The revision this image is built from, read by `build.rs` (see
+# `src/build_stamp.rs`). It has to be passed in here: `.dockerignore` excludes
+# `.git`, so the build script has no repository to ask, and `GITHUB_SHA` does
+# not cross into a build context either. Left unset, the binary stamps the
+# honest string `unknown` — which is what a hosted tenant would otherwise
+# report forever, since `version` has read 0.1.0 for thousands of commits.
+#
+#   docker build --build-arg OPENCOMPANY_BUILD_COMMIT="$(git rev-parse --short=12 HEAD)" .
+#
+# A changing value invalidates the layer below, but not the compile: the cargo
+# `target` cache mount survives it, so only the final crate is rebuilt.
+ARG OPENCOMPANY_BUILD_COMMIT=""
 WORKDIR /build
 
 # `--features openhuman` transitively needs system libraries at build time that

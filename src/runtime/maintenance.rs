@@ -51,21 +51,60 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::CompanyRuntime;
-use crate::ports::types::{ApprovalId, CompanyId};
+use crate::ports::types::{ApprovalId, CompanyId, EvictionPolicy};
 use crate::runtime::CompanyRegistry;
 use crate::runtime::scheduler::{Clock, MINUTE_MS, PRUNE_CUTOFF_MINUTES, millis_to_next_minute};
+
+/// Number of completed-cycle traces retained for one company.
+///
+/// Trace summaries are not yet a recall mechanism (#1175), but they remain
+/// useful in the export bundle and through the inspection route. Keeping this
+/// small, fixed window bounds every backend until a real compression and recall
+/// design supplies a policy with stronger product semantics.
+pub(crate) const TRACE_RETENTION_LIMIT: usize = 32;
+
+/// Retires the registry entry, and both ownership records, of a company whose
+/// archive left it registered.
+///
+/// The maintenance loop owns no `AppState`, so the cleanup archive performs
+/// inline is injected as this trait. The production implementation lives beside
+/// `archive` in `server::provision` and runs the same three removals.
+#[async_trait::async_trait]
+pub trait CompanyEvictor: Send + Sync {
+    /// Removes `company` from the registry and drops its ownership rows —
+    /// but only if the runtime still registered under `company` is the exact
+    /// instance `expected` names. `expected` is the runtime this call site
+    /// itself just read `status()` as `"archived"` from; passing it lets the
+    /// implementation refuse to remove a replacement that has since taken
+    /// the id over (a rebuild swap, the production case) instead of evicting
+    /// whatever it finds by id alone (codex review on #1943, PR comment
+    /// 3894439351).
+    async fn evict(&self, company: &CompanyId, expected: &Arc<CompanyRuntime>);
+}
 
 /// Retires expired approvals, expired grants and stale fire claims for every
 /// company in the registry, once a minute.
 pub struct MaintenanceTicker {
     registry: CompanyRegistry,
     clock: Arc<dyn Clock>,
+    evictor: Option<Arc<dyn CompanyEvictor>>,
 }
 
 impl MaintenanceTicker {
     /// Builds a ticker over every company in `registry`, driven by `clock`.
     pub fn new(registry: CompanyRegistry, clock: Arc<dyn Clock>) -> Self {
-        Self { registry, clock }
+        Self {
+            registry,
+            clock,
+            evictor: None,
+        }
+    }
+
+    /// Wires the eviction hook that retires a company left registered after its
+    /// archive persisted `lifecycle: "archived"` but skipped registry cleanup.
+    pub fn with_evictor(mut self, evictor: Arc<dyn CompanyEvictor>) -> Self {
+        self.evictor = Some(evictor);
+        self
     }
 
     /// Runs one maintenance pass over every registered company. Returns how
@@ -105,6 +144,22 @@ impl MaintenanceTicker {
             // exactly as it is for a continuation released by an operator
             // clicking Decline on a paused company today.
             retired += sweep_company(&company, &runtime, minute).await.len();
+
+            // Retire a company whose archive persisted `lifecycle: "archived"`
+            // but left it registered (the stranded-cleanup path).
+            if let Some(evictor) = &self.evictor {
+                let status = runtime.status().await;
+                if let Err(err) = &status {
+                    tracing::warn!(%company, %err, "[maintenance] archive-eviction status read failed");
+                }
+                if should_evict_archived(&status) {
+                    tracing::info!(
+                        %company,
+                        "[maintenance] evicting a company left registered after archive"
+                    );
+                    evictor.evict(&company, &runtime).await;
+                }
+            }
         }
         retired
     }
@@ -136,6 +191,15 @@ impl MaintenanceTicker {
             }
         })
     }
+}
+
+/// Whether a re-read `status()` marks a still-registered company for eviction.
+///
+/// `archived` alone qualifies — `running`/`paused`/`suspended` are left
+/// registered — and a read failure (`Err`) defers rather than evicting, so an
+/// unproven failure never removes a company, mirroring `archive`'s own default.
+fn should_evict_archived(status: &crate::Result<crate::runtime::types::CompanyStatus>) -> bool {
+    matches!(status, Ok(status) if status.lifecycle == "archived")
 }
 
 /// One company's maintenance pass: retire overdue approvals, expire unredeemed
@@ -205,6 +269,18 @@ pub(crate) async fn sweep_company(
     {
         tracing::warn!(%company, %err, "[maintenance] pruning fire claims failed");
     }
+    if let Err(err) = runtime
+        .memory
+        .evict(
+            company,
+            EvictionPolicy::KeepRecent {
+                n: TRACE_RETENTION_LIMIT,
+            },
+        )
+        .await
+    {
+        tracing::warn!(%company, %err, "[maintenance] trace retention sweep failed");
+    }
     retired
 }
 
@@ -212,12 +288,13 @@ pub(crate) async fn sweep_company(
 mod test {
     use std::sync::Arc;
 
-    use super::MaintenanceTicker;
+    use super::{MaintenanceTicker, TRACE_RETENTION_LIMIT};
     use crate::company::CompanyManifest;
     use crate::policy::ManifestApprovalGate;
     use crate::ports::now_millis;
     use crate::ports::types::{
-        Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, Effect, EffectGroup, Verdict,
+        Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, CompressedTrace, Effect,
+        EffectGroup, Verdict,
     };
     use crate::runtime::scheduler::FakeClock;
     use crate::runtime::{CompanyRegistry, RuntimeBuilder};
@@ -554,6 +631,168 @@ mod test {
         assert_eq!(ticker.tick().await, 0);
     }
 
+    /// Trace summaries are not recalled yet, but the maintenance loop must
+    /// bound their durable window for companies with and without schedules.
+    #[tokio::test]
+    async fn maintenance_retains_only_the_newest_cycle_traces() {
+        let home_dir = tmp_home();
+        let (runtime, ticker) =
+            given_an_unscheduled_company_with_an_overdue_gate(home_dir.path()).await;
+
+        for i in 0..=TRACE_RETENTION_LIMIT {
+            runtime
+                .memory
+                .save_trace(
+                    runtime.id(),
+                    CompressedTrace {
+                        cycle_id: format!("cycle-{i}"),
+                        summary: format!("summary-{i}"),
+                        at_millis: i as u64,
+                    },
+                )
+                .await
+                .expect("trace saves");
+        }
+
+        ticker.tick().await;
+
+        let traces = runtime
+            .memory
+            .recent_traces(runtime.id(), TRACE_RETENTION_LIMIT + 1)
+            .await
+            .expect("traces read");
+        assert_eq!(traces.len(), TRACE_RETENTION_LIMIT);
+        assert_eq!(traces.first().unwrap().cycle_id, "cycle-1");
+        assert_eq!(
+            traces.last().unwrap().cycle_id,
+            format!("cycle-{TRACE_RETENTION_LIMIT}")
+        );
+    }
+
+    /// Records every company the ticker asks it to evict.
+    struct RecordingEvictor {
+        evicted: std::sync::Mutex<Vec<CompanyId>>,
+    }
+
+    impl RecordingEvictor {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                evicted: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn evicted(&self) -> Vec<CompanyId> {
+            self.evicted.lock().expect("evictor mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::CompanyEvictor for RecordingEvictor {
+        async fn evict(&self, company: &CompanyId, _expected: &Arc<CompanyRuntime>) {
+            self.evicted
+                .lock()
+                .expect("evictor mutex")
+                .push(company.clone());
+        }
+    }
+
+    fn operator() -> Actor {
+        Actor {
+            kind: ActorKind::Operator,
+            id: "operator".into(),
+        }
+    }
+
+    /// A registered company with no overdue gate — the eviction tests care only
+    /// about its lifecycle, not its approval queue.
+    async fn registered_company(home: &std::path::Path) -> (Arc<CompanyRuntime>, CompanyRegistry) {
+        let runtime = Arc::new(
+            RuntimeBuilder::new(home.to_path_buf(), unscheduled_manifest())
+                .build()
+                .await
+                .expect("runtime builds"),
+        );
+        let registry = CompanyRegistry::new();
+        registry.insert(runtime.id().clone(), Arc::clone(&runtime));
+        (runtime, registry)
+    }
+
+    fn ticker_with(registry: CompanyRegistry, evictor: Arc<RecordingEvictor>) -> MaintenanceTicker {
+        MaintenanceTicker::new(
+            registry,
+            Arc::new(FakeClock::new(now_millis() + 60 * MINUTE)),
+        )
+        .with_evictor(evictor)
+    }
+
+    /// A: a company that persisted `lifecycle: "archived"` but was left
+    /// registered is evicted, and the evictor's removals fire for its id.
+    #[tokio::test]
+    async fn an_archived_but_still_registered_company_is_evicted() {
+        let home_dir = tmp_home();
+        let (runtime, registry) = registered_company(home_dir.path()).await;
+        runtime
+            .set_lifecycle("archived", operator())
+            .await
+            .expect("archive");
+
+        let evictor = RecordingEvictor::new();
+        let ticker = ticker_with(registry, evictor.clone());
+        ticker.tick().await;
+
+        assert_eq!(
+            evictor.evicted(),
+            vec![runtime.id().clone()],
+            "an archived-but-registered company must be evicted"
+        );
+    }
+
+    /// B: `running`, `paused` and `suspended` companies are left registered —
+    /// the predicate is `archived` alone.
+    #[tokio::test]
+    async fn a_non_archived_company_is_left_registered() {
+        for lifecycle in ["running", "paused", "suspended"] {
+            let home_dir = tmp_home();
+            let (runtime, registry) = registered_company(home_dir.path()).await;
+            runtime
+                .set_lifecycle(lifecycle, operator())
+                .await
+                .expect("set lifecycle");
+
+            let evictor = RecordingEvictor::new();
+            let ticker = ticker_with(registry, evictor.clone());
+            ticker.tick().await;
+
+            assert!(
+                evictor.evicted().is_empty(),
+                "a {lifecycle} company must not be evicted"
+            );
+        }
+    }
+
+    /// C: a `status()` read failure defers — the predicate never evicts on an
+    /// `Err`, only on a proven `archived`.
+    #[test]
+    fn a_status_read_failure_defers_eviction() {
+        use super::should_evict_archived;
+
+        let status = |lifecycle: &str| crate::runtime::types::CompanyStatus {
+            id: CompanyId::new("acme"),
+            name: "Acme".into(),
+            logo_url: None,
+            lifecycle: lifecycle.into(),
+            pending_approvals: 0,
+            template_provenance: None,
+            emergency_paused: false,
+        };
+
+        assert!(should_evict_archived(&Ok(status("archived"))));
+        assert!(!should_evict_archived(&Ok(status("running"))));
+        assert!(!should_evict_archived(&Err(
+            crate::error::OpenCompanyError::CompanyNotFound("acme".into())
+        )));
+    }
+
     /// Recursively lists files under `root`. Test-only; the journal's on-disk
     /// layout is a store detail and this keeps the assertion about the record
     /// rather than about the path.
@@ -571,5 +810,215 @@ mod test {
             }
         }
         out
+    }
+
+    // ── Issue #1861: an unanswered blocker returns its card ─────────────────
+
+    fn paused_card(id: &str) -> crate::ports::TaskRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": "Ship the changelog",
+            "column": "paused",
+            "priority": "medium",
+            "assignee": "maya",
+            "updatedAtMillis": 7,
+        }))
+        .expect("card")
+    }
+
+    /// Gated with the tests below: parking a blocker needs
+    /// `CompanyRuntime::park_blocker`, which only the (openhuman-only)
+    /// planning pass calls in production. The `Rust (openhuman, tinymemory)`
+    /// lane runs these.
+    #[cfg(feature = "openhuman")]
+    fn blocker_payload(task_id: &str) -> crate::ports::blockers::BlockerPayload {
+        crate::ports::blockers::BlockerPayload {
+            kind: crate::ports::blockers::BlockerKind::Infrastructure,
+            source: crate::ports::blockers::BlockerSource::Provider,
+            step: Some(crate::ports::blockers::BlockerStep::Task {
+                task_id: task_id.to_string(),
+            }),
+            reason: "the model `gpt-nonexistent` was rejected".to_string(),
+            needed: "a model id this provider serves".to_string(),
+        }
+    }
+
+    async fn card_after(runtime: &Arc<CompanyRuntime>, id: &str) -> crate::ports::TaskRecord {
+        runtime
+            .tasks()
+            .list(runtime.id())
+            .await
+            .expect("board reads")
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("the card survives")
+    }
+
+    /// The same close, reached the other way: an operator's verdict lands
+    /// *after* the deadline, so the resolve itself discovers the expiry and
+    /// `retire_if_expired` — not the sweeper — owns the rest of it.
+    ///
+    /// # The bug this reproduces (CodeRabbit review on #1905)
+    ///
+    /// That path retired the approval and filed the badge but never returned
+    /// the card, so a task-linked blocker found this way sat in `paused`
+    /// forever: the approval it was waiting on had just been retired, and no
+    /// later sweep will ever see that id again. The badge made it worse by
+    /// saying the card *was* back in To-do — it was keyed on the blocker
+    /// naming a card, not on a move that happened.
+    ///
+    /// Both paths now run the same `finish_expiry` tail, so this asserts the
+    /// identical outcome its sweeper twin above does.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_verdict_that_arrives_late_returns_the_card_too() {
+        let home_dir = tmp_home();
+        let (runtime, _ticker) =
+            given_an_unscheduled_company_with_an_overdue_gate(home_dir.path()).await;
+        runtime
+            .tasks()
+            .upsert(runtime.id(), &paused_card("t-1"))
+            .await
+            .expect("seed");
+        let approval_id = runtime
+            .park_blocker(&blocker_payload("t-1"), "t-1")
+            .await
+            .expect("parks");
+
+        // The gate's TTL is 0, so this verdict is already too late: the resolve
+        // reports `Expired` rather than settling the operator's answer.
+        runtime
+            .resolve_approval(
+                &approval_id,
+                crate::ports::types::Verdict::Approve,
+                crate::ports::types::Actor {
+                    kind: crate::ports::types::ActorKind::User,
+                    id: "ceo".into(),
+                },
+            )
+            .await
+            .expect("a late resolve still reports cleanly");
+
+        let after = card_after(&runtime, "t-1").await;
+        assert_eq!(
+            after.column,
+            crate::ports::tasks::COLUMN_TODO,
+            "a card whose blocker expired must come back whichever path noticed the deadline"
+        );
+        let note = after.note.expect("the question rides back on the note");
+        assert!(note.contains("gpt-nonexistent"), "{note}");
+
+        let feed = runtime
+            .notifications()
+            .list(runtime.id(), "ceo")
+            .await
+            .expect("read notifications");
+        let badge = feed
+            .iter()
+            .find(|n| n.notification.kind == "approval_expired")
+            .expect("the expiry is badged here too");
+        assert!(
+            badge.notification.title.contains("back in To-do"),
+            "and the badge may say so, because the move actually landed: {:?}",
+            badge.notification.title
+        );
+    }
+
+    /// The close of the epic's own loop: nothing waits forever, and nothing is
+    /// dropped without a record. The question that went unanswered rides back
+    /// to To-do on the card, because the TTL expiring does not make the work
+    /// possible — it only stops pretending somebody is about to answer.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn an_unanswered_blocker_returns_its_card_carrying_the_question() {
+        let home_dir = tmp_home();
+        let (runtime, ticker) =
+            given_an_unscheduled_company_with_an_overdue_gate(home_dir.path()).await;
+        runtime
+            .tasks()
+            .upsert(runtime.id(), &paused_card("t-1"))
+            .await
+            .expect("seed");
+        runtime
+            .park_blocker(&blocker_payload("t-1"), "t-1")
+            .await
+            .expect("parks");
+        assert_eq!(runtime.pending_approvals().len(), 1);
+
+        assert_eq!(ticker.tick().await, 1, "the tick must retire it");
+
+        let after = card_after(&runtime, "t-1").await;
+        assert_eq!(
+            after.column,
+            crate::ports::tasks::COLUMN_TODO,
+            "a card nobody answered must not sit in `paused` waiting on a decision that has \
+             already been made against it"
+        );
+        let note = after.note.expect("the question rides back on the note");
+        assert!(note.contains("gpt-nonexistent"), "{note}");
+        assert!(
+            note.contains("a model id this provider serves"),
+            "what would answer it has to come back too: {note}"
+        );
+        // Issue #1865's chip: an operator scanning To-do must be able to tell
+        // this from a card nobody has started, without opening it.
+        let bounced = after
+            .bounced
+            .expect("the board distinguishes it from fresh work");
+        assert!(bounced.contains("gpt-nonexistent"), "{bounced}");
+    }
+
+    /// An ordinary approval expiring touches no card. It is a decision that was
+    /// defaulted, not a question that went unanswered, and the board has
+    /// nothing to say about it.
+    #[tokio::test]
+    async fn an_expiring_approval_that_is_not_a_blocker_leaves_the_board_alone() {
+        let home_dir = tmp_home();
+        let (runtime, ticker) =
+            given_an_unscheduled_company_with_an_overdue_gate(home_dir.path()).await;
+        runtime
+            .tasks()
+            .upsert(runtime.id(), &paused_card("t-2"))
+            .await
+            .expect("seed");
+        park(&runtime).await.expect("parks");
+
+        assert_eq!(ticker.tick().await, 1);
+
+        let after = card_after(&runtime, "t-2").await;
+        assert_eq!(after.column, "paused", "nothing on the board changed");
+        assert!(after.bounced.is_none());
+    }
+
+    /// A card an operator has since moved is theirs. The expiry records the
+    /// default-deny and leaves the board exactly where they put it — the same
+    /// guard `advance_settled_card` applies one column over.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn an_expiry_does_not_drag_back_a_card_an_operator_has_moved() {
+        let home_dir = tmp_home();
+        let (runtime, ticker) =
+            given_an_unscheduled_company_with_an_overdue_gate(home_dir.path()).await;
+        let mut moved = paused_card("t-3");
+        moved.column = crate::ports::tasks::COLUMN_IN_PROGRESS.to_string();
+        runtime
+            .tasks()
+            .upsert(runtime.id(), &moved)
+            .await
+            .expect("seed");
+        runtime
+            .park_blocker(&blocker_payload("t-3"), "t-3")
+            .await
+            .expect("parks");
+
+        assert_eq!(ticker.tick().await, 1);
+
+        let after = card_after(&runtime, "t-3").await;
+        assert_eq!(
+            after.column,
+            crate::ports::tasks::COLUMN_IN_PROGRESS,
+            "an operator who picked the card back up owns where it sits"
+        );
+        assert!(after.bounced.is_none());
     }
 }

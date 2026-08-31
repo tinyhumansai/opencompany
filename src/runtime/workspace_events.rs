@@ -322,6 +322,19 @@ impl WorkspaceStore for WorkspaceAnnouncer {
         }
         Ok(removed)
     }
+
+    /// Forwards to `self.inner.delete_if_empty`, not the default trait method.
+    /// The default re-derives the check from `self.tree()` + `self.delete()`,
+    /// which would call back through this announcer as two separate steps and
+    /// never reach whatever tighter guarantee the wrapped store actually
+    /// implements — see the port doc. Same removed-only announce as `delete`.
+    async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let removed = self.inner.delete_if_empty(company, id).await?;
+        if removed {
+            self.announce(company, id, CHANGE_REMOVED).await;
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +428,7 @@ mod test {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 

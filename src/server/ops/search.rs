@@ -283,10 +283,15 @@ mod tests {
         use crate::ports::types::CompanyRecord;
 
         let id = CompanyId::new("acme");
+        // Both arms state `[tools]` explicitly. Leaving the ungranted arm
+        // empty used to mean "no grant", but the global default belt carries
+        // `search` now, so an absent section is a company that *does* grant it
+        // — and the ungranted test would have been asserting the opposite of
+        // what it set up.
         let allow = if grant_search {
             "\n[tools]\nallow = [\"search\"]\n"
         } else {
-            ""
+            "\n[tools]\nallow = [\"*\"]\n"
         };
         let manifest: crate::company::CompanyManifest = ::toml::from_str(&format!(
             "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n{allow}"
@@ -303,6 +308,7 @@ mod tests {
                 overlay_agents: Vec::new(),
                 overlay_desk_members: Vec::new(),
                 overlay_desk_order: Vec::new(),
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
@@ -311,6 +317,9 @@ mod tests {
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .expect("save");

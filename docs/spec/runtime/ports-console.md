@@ -64,6 +64,21 @@ pass — …", the dispatch error text, `[operator] cancelled while in flight`),
 which the board renders on the card. So a task that cannot proceed goes **back
 to Pending with the reason on the card**, never into a stuck state of its own.
 
+**The note stopped being the only carrier (issue #1865).** The reason text
+above is still appended to `note` — nothing about that changed — but a settle
+that lands a card back on `todo` because its run **failed or was cancelled**
+now also stamps `TaskRecord::bounced: Option<String>` with the same reason,
+via the one rule (`bounced_reason` in `src/runtime/advance.rs`) both card-write
+sites share. That gives the board a structured signal to render a dedicated
+chip instead of parsing prose out of the note, and — unlike the note, which is
+append-only — `bounced` is cleared the instant the card leaves `todo` any other
+way: a re-dispatch, a manual drag, or any other write that takes it off `todo`
+(`task_leaves_todo` in `src/company/runtime.rs`). A card re-entering `todo`
+later earns a fresh reading, never a stale chip left over from the last bounce.
+`None` is the default for every card that has never bounced and every board
+written before this field existed — additive on the wire like the rest of
+`TaskCard`, so no stored board needs migrating.
+
 Nothing about that is silent for stored data: `backlog` is no longer a board
 column, so a card persisted under it would fail `is_board_column` and vanish
 from the board — the exact silent disappearance #205 exists to prevent.
@@ -425,6 +440,29 @@ write is a money bug. **Retention:** backends evict samples older than
 **90 days** (`RETENTION_DAYS`, the console's maximum `D90` window) on write,
 anchored to the newest observed sample for deterministic eviction. Samples are
 non-secret accounting rows; money still resolves from the ledger and `[budget]`.
+
+**Model attribution (issue #1749).** `UsageSample::model` is an
+`Option<ModelSlug>`, not a `String`. `provider` says *who served* the tokens
+(`subscription`, `byok`, `ollama`); only `model` says *what ran*, which is what
+"is this company's spend going to Sonnet or to Haiku?" asks. It is a closed
+vocabulary — `<vendor>` or `<vendor>-<line>`, plus this repo's four workload
+tiers, plus `other` — because a BYOK or `openai_compatible` tenant names its
+models itself and that string is operator-authored free text: as a payload it
+is a content leak, and as a stored column it is unbounded-cardinality data kept
+for 90 days. The raw name is classified inside the harness, at the same place it
+is put on the wire (`HarnessModel::telemetry_model`), and never leaves it; the
+vocabulary and the rule for extending it are documented in
+`src/metering/model.rs`; `ModelSlug::as_str` returns a `&'static str`, so a
+telemetry payload can carry it directly without a second classifier. `ModelSlug`'s `Deserialize` re-classifies, so a stored
+row cannot smuggle raw text back into the process either. A provider publishes
+that value only **after its own call has succeeded**: one provider is shared by
+every agent on a company and the cache is read after a turn finishes, so a turn
+that was rejected — and therefore metered nothing — must not name the model for
+a concurrent turn that did run. `None` means no model
+to name — an `OauthCall`/`SearchCall`, a path that cannot identify one, or a
+sample written before the field existed; the field is `#[serde(default,
+skip_serializing_if)]`, so pre-existing rows on all three backends load
+unchanged and need no migration.
 
 ### SkillStateStore
 

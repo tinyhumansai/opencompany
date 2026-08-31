@@ -48,7 +48,9 @@ function member(over: Partial<TeamMember> & Pick<TeamMember, "id" | "name">): Te
 }
 
 function dmFor(m: TeamMember): Channel {
-  const dms = buildChannels([m], []).find((s) => s.id === "dms");
+  const dms = buildChannels([m], [], {
+    [`dm:${m.id}`]: [{ id: "message", from: "you", text: "Hello", at: 1 }],
+  }).find((s) => s.id === "dms");
   expect(dms?.channels).toHaveLength(1);
   return dms!.channels[0];
 }
@@ -58,8 +60,11 @@ function channelFor(over: { channel: string; blurb: string }): Channel {
     { id: "d1", channel: over.channel, name: "Engineering", blurb: over.blurb },
   ]);
   const channels = sections.find((s) => s.id === "channels")!.channels;
-  expect(channels).toHaveLength(1);
-  return channels[0];
+  // The built-in `#general` channel is always first (issue #1743); this helper
+  // is about the desk channel after it.
+  expect(channels).toHaveLength(2);
+  expect(channels[0].id).toBe("main");
+  return channels[1];
 }
 
 /** The roster shape the sample company actually produces: a role, no name. */

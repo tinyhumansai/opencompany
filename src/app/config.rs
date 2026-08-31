@@ -221,8 +221,17 @@ impl ConfigProvenance {
 /// A read-only source of environment values. The `std::env`-backed
 /// [`ProcessEnv`] is used at runtime; tests use a [`MapEnv`].
 pub trait EnvSource {
+    /// Returns the raw OS value for `key`, including empty and non-Unicode
+    /// values. Configuration readers that must distinguish a malformed value
+    /// from an unset one should use this rather than [`Self::get`].
+    fn get_os(&self, key: &str) -> Option<std::ffi::OsString>;
+
     /// Returns the value for `key`, or `None` when unset or empty.
-    fn get(&self, key: &str) -> Option<String>;
+    fn get(&self, key: &str) -> Option<String> {
+        self.get_os(key)
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty())
+    }
 }
 
 /// Reads from the real process environment.
@@ -230,11 +239,8 @@ pub trait EnvSource {
 pub struct ProcessEnv;
 
 impl EnvSource for ProcessEnv {
-    fn get(&self, key: &str) -> Option<String> {
-        match std::env::var(key) {
-            Ok(value) if !value.is_empty() => Some(value),
-            _ => None,
-        }
+    fn get_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key)
     }
 }
 
@@ -260,8 +266,8 @@ impl MapEnv {
 }
 
 impl EnvSource for MapEnv {
-    fn get(&self, key: &str) -> Option<String> {
-        self.0.get(key).filter(|value| !value.is_empty()).cloned()
+    fn get_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        self.0.get(key).cloned().map(std::ffi::OsString::from)
     }
 }
 
@@ -1014,10 +1020,15 @@ fn default_data_dir_str(env: &dyn EnvSource) -> String {
 /// workspace root. For callers like `serve` and `doctor` that resolve the data
 /// root before (or without) the full [`resolve`] precedence pass.
 pub fn data_dir_from_env() -> PathBuf {
+    data_dir_from_source(&ProcessEnv)
+}
+
+/// Resolves the instance data directory from an injected environment source.
+pub fn data_dir_from_source(env: &dyn EnvSource) -> PathBuf {
     data_dir_from(
-        std::env::var_os("OPENCOMPANY_DATA_DIR"),
-        std::env::var_os("HOME"),
-        std::env::var_os("USERPROFILE"),
+        env.get_os("OPENCOMPANY_DATA_DIR"),
+        env.get_os("HOME"),
+        env.get_os("USERPROFILE"),
     )
 }
 

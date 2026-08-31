@@ -11,7 +11,7 @@ use crate::company::CompanyManifest;
 use crate::company::steer::{InflightEntry, InflightKind};
 use crate::ports::facts::{FactKind, FactRecord};
 use crate::ports::tasks::TaskRecord;
-use crate::ports::types::{CompanyId, CompanyRecord, ContextChunk};
+use crate::ports::types::{CompanyId, CompanyRecord, CompressedTrace, ContextChunk};
 use crate::runtime::RuntimeBuilder;
 use crate::runtime::journal::{ApprovalConversation, TaskLink};
 use crate::server::router;
@@ -110,10 +110,14 @@ async fn state_with(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -765,6 +769,7 @@ async fn steer_task_validates_statuses_and_journals_acceptance() {
                 workflow_proposal: None,
                 origin_run_id: None,
                 origin_workflow_id: None,
+                bounced: None,
             },
         )
         .await
@@ -870,6 +875,41 @@ async fn memory_create_and_delete_journals_event() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn memory_traces_are_inspectable_newest_last() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+
+    for (cycle_id, summary, at_millis) in [
+        ("cycle-1", "first completed cycle", 1_000),
+        ("cycle-2", "second completed cycle", 2_000),
+    ] {
+        runtime
+            .memory
+            .save_trace(
+                runtime.id(),
+                CompressedTrace {
+                    cycle_id: cycle_id.into(),
+                    summary: summary.into(),
+                    at_millis,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, traces) = send(&state, "GET", "/api/v1/company/memory/traces", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let traces = traces.as_array().unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[0]["cycleId"], "cycle-1");
+    assert_eq!(traces[0]["summary"], "first completed cycle");
+    assert_eq!(traces[0]["atMillis"], 1_000);
+    assert_eq!(traces[1]["cycleId"], "cycle-2");
 }
 
 #[tokio::test]
@@ -3283,10 +3323,14 @@ async fn state_with_manifest_and_defaults(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -3328,10 +3372,14 @@ async fn state_with_manifest_and_overlays(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -3543,14 +3591,14 @@ async fn mcp_manifest_server_cannot_be_deleted_but_can_be_overridden() {
 
 /// Issue #568: each listed server carries the agents whose *effective* grants
 /// reach it — over the full runtime roster, manifest agents plus overlay
-/// teammates. With a company `allow = ["*"]`, an agent that declares no `tools`
-/// (and every overlay teammate, which has no tools row) inherits the wildcard and
-/// reaches everything; an agent that narrows itself to `mcp:notion` reaches only
-/// that server.
+/// teammates. With a company `allow = ["*", "mcp:*"]`, an agent that declares
+/// no `tools` (and every overlay teammate, which has no tools row) inherits the
+/// wildcard and explicit MCP grant and reaches every server; an agent that
+/// narrows itself to `mcp:notion` reaches only that server.
 #[tokio::test]
 async fn mcp_reachability_lists_reaching_agents_including_overlay() {
     let manifest: CompanyManifest = toml::from_str(
-        "[company]\nname = \"Acme\"\n[tools]\nallow = [\"*\"]\n\
+        "[company]\nname = \"Acme\"\n[tools]\nallow = [\"*\", \"mcp:*\"]\n\
          [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\ntools = [\"mcp:notion\"]\n\
          [[agent]]\nid = \"eng\"\nrole = \"Engineer\"\n[policy]\nmode = \"full\"\n\
          [[mcp_server]]\nname = \"notion\"\nendpoint = \"https://notion.example/mcp\"\n\
@@ -3566,7 +3614,7 @@ async fn mcp_reachability_lists_reaching_agents_including_overlay() {
         name: "Helper".to_string(),
         role: "Assistant".to_string(),
         description: None,
-        tools: Vec::new(),
+        tools: None,
         model: None,
         harness: None,
     };
@@ -3672,7 +3720,7 @@ async fn mcp_reachability_flags_a_server_no_agent_can_reach() {
 #[tokio::test]
 async fn mcp_reachability_is_empty_for_a_disabled_server() {
     let manifest: CompanyManifest = toml::from_str(
-        "[company]\nname = \"Acme\"\n[tools]\nallow = [\"*\"]\n\
+        "[company]\nname = \"Acme\"\n[tools]\nallow = [\"*\", \"mcp:*\"]\n\
          [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\ntools = [\"mcp:docs\"]\n[policy]\nmode = \"full\"\n\
          [[mcp_server]]\nname = \"docs\"\nendpoint = \"https://docs.example/mcp\"\n",
     )
@@ -3890,10 +3938,14 @@ async fn state_with_source_dir(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -4416,6 +4468,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     };
     for t in [
         card("t-parent", "Parent", None),
@@ -4612,6 +4665,7 @@ fn discussion_card(id: &str, title: &str) -> TaskRecord {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     }
 }
 
@@ -4666,7 +4720,7 @@ async fn a_withdrawn_discussion_message_stops_being_served() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(withdrawn["redacted"], true);
     assert_eq!(
-        withdrawn["redactedBy"], "harness-admin",
+        withdrawn["redactedBy"], "Harness Admin",
         "a withdrawal nobody's name is on is a message that can vanish quietly"
     );
     assert_eq!(
@@ -4681,9 +4735,9 @@ async fn a_withdrawn_discussion_message_stops_being_served() {
     assert_eq!(thread.len(), 2, "the row is withdrawn, not deleted: {body}");
     assert_eq!(thread[0]["seq"], seq);
     assert_eq!(thread[0]["redacted"], true);
-    assert_eq!(thread[0]["redactedBy"], "harness-admin");
+    assert_eq!(thread[0]["redactedBy"], "Harness Admin");
     assert_eq!(
-        thread[0]["author"], "harness-admin",
+        thread[0]["author"], "Harness Admin",
         "the poster is still named"
     );
     assert_eq!(
@@ -4912,7 +4966,7 @@ async fn task_discussion_posts_persist_and_are_scoped_to_their_card() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(posted["text"], "blocked on the API key");
-    assert_eq!(posted["author"], "harness-admin");
+    assert_eq!(posted["author"], "Harness Admin");
 
     for (task, text) in [
         ("t-1", "unblocked, the key was rotated"),
@@ -5280,6 +5334,7 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
                 workflow_proposal: None,
                 origin_run_id: None,
                 origin_workflow_id: None,
+                bounced: None,
             },
         )
         .await
@@ -5402,6 +5457,7 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
                 workflow_proposal: None,
                 origin_run_id: None,
                 origin_workflow_id: None,
+                bounced: None,
             },
         )
         .await
@@ -5508,6 +5564,7 @@ async fn dispatched_task(
                 workflow_proposal: None,
                 origin_run_id: None,
                 origin_workflow_id: None,
+                bounced: None,
             },
         )
         .await
@@ -5967,6 +6024,7 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
                 workflow_proposal: None,
                 origin_run_id: None,
                 origin_workflow_id: None,
+                bounced: None,
             },
         )
         .await
@@ -6290,6 +6348,155 @@ async fn the_attempt_id_outranks_the_card_link_when_both_are_present() {
     assert_eq!(
         approvals[0]["id"], "appr-attempt-2",
         "the attempt id decides ownership, not the card link",
+    );
+}
+
+/// The **queue** answers ownership the same way the card does (#1891).
+///
+/// [`the_attempt_id_outranks_the_card_link_when_both_are_present`] pins the task
+/// detail read. `GET …/approvals` projected the raw park stamp instead, so the
+/// two surfaces disagreed about the same approval: the card refused to show
+/// `appr-elsewhere` and the queue handed it out labelled `t-1`. Every console
+/// join on that link — the board's blocked row, the Approvals page's per-card
+/// filter — inherited the disagreement.
+///
+/// Read-only that was a wrong label. Once the board card grew Approve and
+/// Decline it became an operator resolving another card's request, so the two
+/// reads are pinned against each other here rather than left to agree by
+/// convention.
+#[tokio::test]
+async fn the_queue_resolves_ownership_the_same_way_the_card_does() {
+    use crate::ports::runs::NewRun;
+    use crate::ports::types::ApprovalId;
+
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+    let company = CompanyId::new("acme");
+    let (runtime, dispatched_at) = dispatched_task(&state, &company).await;
+
+    for (id, task) in [("run-b", "t-1"), ("run-c", "t-other")] {
+        runtime
+            .runs()
+            .create_run(&company, NewRun::for_task(id, task, "ceo"))
+            .await
+            .unwrap();
+    }
+
+    let under_run = |run: &str| {
+        let mut effect = parked_effect();
+        effect.run_id = Some(run.to_string());
+        effect
+    };
+
+    // Stamped with this card, parked under another card's attempt. The card
+    // read refuses it; the queue must not label it `t-1` either.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-elsewhere"),
+            &under_run("run-c"),
+            dispatched_at + 5,
+            TaskLink::Task { id: "t-1".into() },
+            ApprovalConversation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    // Stamped Unlinked *and* carrying a run id — which `workflow_run_of` reads
+    // as a workflow park, because the two id spaces are indistinguishable by
+    // value. The card read claims it (it checks membership in this card's own
+    // attempt ids, which the queue has no way to do); the queue leaves it
+    // alone rather than risk relabelling a workflow approval onto a card.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-attempt-2"),
+            &under_run("run-b"),
+            dispatched_at + 6,
+            TaskLink::Unlinked,
+            ApprovalConversation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    // No attempt at all: the stamp is the whole answer, unchanged.
+    runtime
+        .journal
+        .record_parked(
+            &ApprovalId::new("appr-stamped"),
+            &parked_effect(),
+            dispatched_at + 7,
+            TaskLink::Task { id: "t-1".into() },
+            ApprovalConversation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = send(&state, "GET", "/api/v1/company/approvals", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let queue = body.as_array().unwrap();
+    let owner_of = |id: &str| {
+        queue
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from the queue: {queue:?}"))["task"]
+            .clone()
+    };
+
+    assert_eq!(
+        owner_of("appr-elsewhere"),
+        json!({ "link": "task", "id": "t-other" }),
+        "the attempt outranks the stamp on the queue, exactly as on the card",
+    );
+    assert_eq!(
+        owner_of("appr-attempt-2"),
+        json!({ "link": "unlinked" }),
+        "an Unlinked park carrying a run id is a workflow park by `workflow_run_of`'s \
+         rule, and the queue must not claim it for a card on the strength of an id \
+         whose space it cannot identify",
+    );
+    assert_eq!(
+        owner_of("appr-stamped"),
+        json!({ "link": "task", "id": "t-1" }),
+        "a park with no attempt keeps the link it was stamped with",
+    );
+
+    // The pinning half, and it is a **subset** rather than an equality, which is
+    // the honest shape of the guarantee.
+    //
+    // The queue may never claim an approval the card does not — that direction
+    // is the defect, and it is what puts a decision the operator should not
+    // have in front of them. It may fall short: `approval_owner` asks whether a
+    // run is among *this card's* attempts, which the queue cannot ask without
+    // per-card state, so where the id space is ambiguous the queue abstains.
+    // The cost of abstaining is a blocked row the board does not draw; the cost
+    // of the other direction is deciding somebody else's request.
+    let (_, card) = send(&state, "GET", "/api/v1/company/tasks/t-1", None).await;
+    let on_card: std::collections::HashSet<&str> = card["approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let from_queue: std::collections::HashSet<&str> = queue
+        .iter()
+        .filter(|row| row["task"] == json!({ "link": "task", "id": "t-1" }))
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        from_queue.is_subset(&on_card),
+        "the queue must never put an approval on a card the card itself disowns: \
+         queue={from_queue:?} card={on_card:?}",
+    );
+    assert!(
+        from_queue.contains("appr-stamped"),
+        "and must still carry the unambiguous ones: {from_queue:?}",
+    );
+    assert!(
+        !from_queue.contains("appr-elsewhere"),
+        "least of all the one parked under another card's attempt: {from_queue:?}",
     );
 }
 
@@ -7217,6 +7424,7 @@ async fn a_published_note_refuses_the_save_when_its_version_cannot_be_recorded()
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         },
         Some("the agent's draft"),
     )
@@ -7254,6 +7462,14 @@ async fn a_published_note_refuses_the_save_when_its_version_cannot_be_recorded()
 /// proposal graph, straight through the task store (the builder pass that would
 /// normally mint it is behind the `openhuman` feature). Returns the card id.
 async fn seed_proposal_card(state: &AppState, ops: Value) -> String {
+    seed_proposal_card_assigned(state, ops, "ceo").await
+}
+
+/// [`seed_proposal_card`], with the assignee set to whatever the caller
+/// passes rather than the hardcoded `"ceo"` — for proving the owning-desk
+/// default against a card assigned directly to a desk (issue #1882 review),
+/// where `assignee` is the desk's own canonical id rather than a teammate's.
+async fn seed_proposal_card_assigned(state: &AppState, ops: Value, assignee: &str) -> String {
     let runtime = state
         .registry()
         .get(&CompanyId::new("acme"))
@@ -7265,7 +7481,7 @@ async fn seed_proposal_card(state: &AppState, ops: Value) -> String {
         note: None,
         column: "in_review".to_string(),
         priority: "medium".to_string(),
-        assignee: "ceo".to_string(),
+        assignee: assignee.to_string(),
         updated_at_millis: 1,
         origin_chat_id: None,
         parent_task_id: None,
@@ -7281,6 +7497,7 @@ async fn seed_proposal_card(state: &AppState, ops: Value) -> String {
         }),
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     };
     runtime
         .tasks()
@@ -7350,6 +7567,176 @@ async fn applying_a_proposal_creates_the_workflow_and_finishes_the_card() {
         .find(|w| w["id"] == "weekly-digest")
         .expect("the created workflow is listed");
     assert_eq!(created["enabled"], true, "a manual trigger is not disarmed");
+}
+
+/// Issue #1862 prerequisite: a proposal that names no `ownerDesk` defaults to
+/// the proposing card's assignee's desk. `seed_proposal_card` assigns the
+/// card to `ceo`, and `desk_manifest` seats `ceo` on the `engineering` desk —
+/// so the created workflow must come out owned by `engineering` even though
+/// `digest_ops` never mentions it.
+///
+/// This reads the default back off the persisted overlay TOML directly,
+/// rather than the `GET …/workflows/{id}` response (which now also projects
+/// `ownerDesk`, see `WorkflowGraph::owner_desk`) — pinning the actual stored
+/// effect of the defaulting logic, independent of the read projection.
+#[tokio::test]
+async fn applying_a_proposal_defaults_the_owner_desk_from_the_assignees_desk() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_manifest(&home, desk_manifest()).await;
+    let id = seed_proposal_card(&state, digest_ops(None)).await;
+
+    let (status, card) = send(
+        &state,
+        "POST",
+        &format!("/api/v1/company/tasks/{id}/workflow-proposal/apply"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.clone());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    let overlay = record
+        .overlay_workflows
+        .iter()
+        .find(|w| w.id == "weekly-digest")
+        .expect("the created workflow is saved as an overlay");
+    let file = crate::company::parse_workflow(&overlay.toml).expect("saved TOML parses");
+    assert_eq!(
+        file.owner_desk.as_deref(),
+        Some("engineering"),
+        "the assignee's desk fills the omitted owner_desk"
+    );
+}
+
+/// **Regression, issue #1882 review — blank must default the same as absent.**
+/// A stored proposal that names `ownerDesk` as a blank/whitespace string (a
+/// builder pass that emits the key but leaves it empty, rather than omitting
+/// it) must still fall through to the assignee-desk default. Before the fix,
+/// `Some("   ")` passed the `is_none()` gate in `apply_workflow_proposal`, so
+/// the default never ran and the blank string was persisted as the "owner"
+/// instead.
+#[tokio::test]
+async fn applying_a_proposal_with_a_blank_owner_desk_still_defaults_it() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_manifest(&home, desk_manifest()).await;
+    let mut ops = digest_ops(None);
+    ops["ownerDesk"] = json!("   ");
+    let id = seed_proposal_card(&state, ops).await;
+
+    let (status, card) = send(
+        &state,
+        "POST",
+        &format!("/api/v1/company/tasks/{id}/workflow-proposal/apply"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.clone());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    let overlay = record
+        .overlay_workflows
+        .iter()
+        .find(|w| w.id == "weekly-digest")
+        .expect("the created workflow is saved as an overlay");
+    let file = crate::company::parse_workflow(&overlay.toml).expect("saved TOML parses");
+    assert_eq!(
+        file.owner_desk.as_deref(),
+        Some("engineering"),
+        "a blank ownerDesk must default the same as an omitted one: {file:?}"
+    );
+}
+
+/// **Regression, issue #1882 review — a desk-assigned card must default to
+/// its own desk.** `runtime::assignee::AssigneeResolution::canonical` stores
+/// a desk assignment as the desk's own canonical id, not a teammate id — so
+/// `record.assignee` can BE `"engineering"` directly. Before the fix, the
+/// defaulting fallback only checked desk MEMBERSHIP (`desk_of_member`), which
+/// a desk id is never a member of, so a card already naming its owning desk
+/// still produced an ownerless workflow.
+#[tokio::test]
+async fn applying_a_proposal_for_a_desk_assigned_card_defaults_to_that_desk() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_manifest(&home, desk_manifest()).await;
+    let id = seed_proposal_card_assigned(&state, digest_ops(None), "engineering").await;
+
+    let (status, card) = send(
+        &state,
+        "POST",
+        &format!("/api/v1/company/tasks/{id}/workflow-proposal/apply"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.clone());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    let overlay = record
+        .overlay_workflows
+        .iter()
+        .find(|w| w.id == "weekly-digest")
+        .expect("the created workflow is saved as an overlay");
+    let file = crate::company::parse_workflow(&overlay.toml).expect("saved TOML parses");
+    assert_eq!(
+        file.owner_desk.as_deref(),
+        Some("engineering"),
+        "a card assigned straight to a desk must default owner_desk to that desk: {file:?}"
+    );
+}
+
+/// **Regression, issue #1882 review — a multi-desk teammate must not default
+/// an arbitrary owner.** `desk_of_member` returns the first desk in
+/// `desk_ids` declaration order, which is fine for the informational message
+/// it was written for (`unknown_desk_message`) but wrong for a value that
+/// gets persisted: a proposal naming no `ownerDesk`, assigned to a teammate
+/// who sits on two desks, has no basis for picking either one. Before the
+/// fix, `apply_workflow_proposal`'s fallback used `desk_of_member` directly
+/// and silently persisted `"engineering"` — the desk declared first in the
+/// manifest — even though `ceo` sits on `legal` too. The fix must leave
+/// `owner_desk` `None` rather than guess.
+#[tokio::test]
+async fn applying_a_proposal_for_a_multi_desk_assignee_leaves_owner_desk_unset() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let manifest: CompanyManifest = toml::from_str(
+        "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+         [[group_chat]]\nid = \"engineering\"\nname = \"Engineering\"\nmembers = [\"ceo\"]\n\
+         [[group_chat]]\nid = \"legal\"\nname = \"Legal\"\nmembers = [\"ceo\"]\n\
+         [policy]\nmode = \"full\"\n",
+    )
+    .unwrap();
+    let state = state_with_manifest(&home, manifest).await;
+    let id = seed_proposal_card(&state, digest_ops(None)).await;
+
+    let (status, card) = send(
+        &state,
+        "POST",
+        &format!("/api/v1/company/tasks/{id}/workflow-proposal/apply"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+
+    use crate::ports::CompanyStore;
+    let store = FsCompanyStore::new(home.clone());
+    let record = store.load(&CompanyId::new("acme")).await.unwrap().unwrap();
+    let overlay = record
+        .overlay_workflows
+        .iter()
+        .find(|w| w.id == "weekly-digest")
+        .expect("the created workflow is saved as an overlay");
+    let file = crate::company::parse_workflow(&overlay.toml).expect("saved TOML parses");
+    assert_eq!(
+        file.owner_desk, None,
+        "a teammate on two desks gives no basis for picking either one: {file:?}"
+    );
 }
 
 /// #276: applying a proposal whose trigger carries a schedule creates the
@@ -8939,6 +9326,7 @@ async fn the_export_document_is_built_from_the_redacted_detail() {
             runtime: runtime.clone(),
             actor: None,
             may_read_contents: false,
+            is_admin: false,
         },
         &id,
     )
@@ -8961,6 +9349,7 @@ async fn the_export_document_is_built_from_the_redacted_detail() {
             runtime: runtime.clone(),
             actor: None,
             may_read_contents: true,
+            is_admin: true,
         },
         &id,
     )
@@ -9021,6 +9410,7 @@ async fn the_run_history_carries_a_runs_board_rows() {
             workflow_id: "digest".into(),
             run_id: "run-1".into(),
             scheduled: true,
+            started_by: None,
         },
         CompanyEvent::WorkflowRunFinished {
             workflow_id: "digest".into(),
@@ -9145,4 +9535,431 @@ async fn setup_is_reachable_under_both_scope_forms() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["template"], "software", "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Chat attachments (issue #1682)
+// ---------------------------------------------------------------------------
+
+/// Uploads one file to the chat-attachment route, hand-rolling the multipart
+/// body so the test drives the real `Multipart` extractor rather than a stub —
+/// the same shape as `upload_file`, pointed at `/chat/upload`.
+async fn chat_upload(
+    state: &AppState,
+    filename: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> (StatusCode, Value) {
+    const BOUNDARY: &str = "----opencompany1682boundary";
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(
+        format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    if let Some(ct) = content_type {
+        body.extend_from_slice(format!("Content-Type: {ct}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/company/chat/upload")
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status();
+    let out = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value = if out.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&out).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// The upload half of #1682: a file posts to `/chat/upload`, comes back as a
+/// compact `AttachmentRef` with the store's own metadata, and lands in the
+/// workspace tree as a binary node the existing blob route can serve. This is
+/// the reference the send path then carries by id.
+#[tokio::test]
+async fn chat_upload_stores_binary_and_returns_ref() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    // Not valid UTF-8, so nothing on this path can be quietly routing it
+    // through a `String` and turning the attachment into a prose note.
+    let png: Vec<u8> = vec![
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00,
+    ];
+    let (status, reference) = chat_upload(&state, "hero.png", Some("image/png"), &png).await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    assert_eq!(reference["name"], "hero.png");
+    assert_eq!(reference["mime"], "image/png");
+    assert_eq!(reference["size"], png.len() as u64);
+    let node_id = reference["nodeId"].as_str().expect("a node id").to_string();
+
+    // It is a real binary node in the tree, so it shares the workspace quota
+    // and the hardened blob serve rather than a parallel store.
+    let (status, tree) = send(&state, "GET", "/api/v1/company/workspace", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = tree
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == node_id.as_str())
+        .expect("the uploaded node is in the tree");
+    assert_eq!(listed["mime"], "image/png");
+    assert_eq!(listed["size"], png.len() as u64);
+
+    // And it streams back byte-exactly through the existing blob route — the
+    // download path #1682 reuses untouched.
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/company/workspace/blob/{node_id}"))
+        .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let got = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(got.to_vec(), png, "the bytes must survive the round trip");
+}
+
+/// A browser may send a full path as the filename; the route stores under the
+/// last segment only, named by the workspace rule — the same sanitizer the
+/// workspace upload applies, so no client string reaches a filesystem path.
+#[tokio::test]
+async fn chat_upload_sanitizes_pathy_filename() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let bytes: Vec<u8> = vec![0x00, 0x01, 0x02, 0xff];
+    let (status, reference) = chat_upload(
+        &state,
+        "../../etc/Secret Report.bin",
+        Some("application/octet-stream"),
+        &bytes,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    let name = reference["name"].as_str().unwrap();
+    assert!(
+        !name.contains('/') && !name.contains('\\'),
+        "the stored name kept a path separator: {name}"
+    );
+    assert_eq!(
+        name, "secret-report.bin",
+        "stored under the sanitized last segment"
+    );
+}
+
+/// Codex review finding on #1682: chat uploads all land at the workspace
+/// root, so a second message attaching a file under an earlier one's exact
+/// name — the common case of picking `image.png` twice — used to 409 rather
+/// than attach, since the only way to free the name was deleting the first
+/// upload and breaking its download. The route now retries once under a
+/// disambiguated name instead of failing the attach.
+#[tokio::test]
+async fn chat_upload_disambiguates_a_repeated_filename() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let first: Vec<u8> = vec![0x01, 0x02, 0x03];
+    let (status, first_ref) = chat_upload(&state, "image.png", Some("image/png"), &first).await;
+    assert_eq!(status, StatusCode::OK, "{first_ref}");
+    assert_eq!(first_ref["name"], "image.png");
+
+    // A later message attaches a *different* file under the same filename.
+    let second: Vec<u8> = vec![0x09, 0x08, 0x07, 0x06];
+    let (status, second_ref) = chat_upload(&state, "image.png", Some("image/png"), &second).await;
+    assert_eq!(status, StatusCode::OK, "{second_ref}");
+    let second_name = second_ref["name"].as_str().expect("a stored name");
+    assert_ne!(
+        second_name, "image.png",
+        "the second upload must not silently fail or overwrite the first"
+    );
+    assert!(
+        second_name.starts_with("image-") && second_name.ends_with(".png"),
+        "expected a disambiguated image-*.png name, got {second_name}"
+    );
+
+    // Both node ids are distinct, live in the tree, and stream back their own
+    // (not each other's) bytes — no data was lost or aliased on the collision.
+    let first_id = first_ref["nodeId"].as_str().unwrap();
+    let second_id = second_ref["nodeId"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    for (node_id, want) in [(first_id, &first), (second_id, &second)] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/company/workspace/blob/{node_id}"))
+            .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let got = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&got.to_vec(), want);
+    }
+}
+
+/// The headline of #1682 end-to-end: an operator attaches a file, the message
+/// carries it, and a reload projects the attachment back with the **store's**
+/// name / mime / size — never a client claim, because `/chat` was handed only
+/// the node id. This is the reload proof the whole two-step design exists for.
+#[tokio::test]
+async fn chat_message_with_attachment_journals_and_hydrates() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x01];
+    let (status, reference) = chat_upload(&state, "diagram.png", Some("image/png"), &png).await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    let node_id = reference["nodeId"].as_str().unwrap().to_string();
+
+    // The send carries the id only — no name, mime or size the host could be
+    // tricked into trusting.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({ "message": "here is the diagram", "attachments": [node_id] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The reload: the operator's own message comes back with the attachment,
+    // and every field is the store's.
+    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let mine = history
+        .as_array()
+        .expect("history is a list")
+        .iter()
+        .find(|m| m["text"] == "here is the diagram")
+        .expect("the operator message survived the reload");
+    let attachments = mine["attachments"]
+        .as_array()
+        .expect("the message carries its attachment on reload");
+    assert_eq!(attachments.len(), 1, "exactly one attachment: {mine}");
+    let attachment = &attachments[0];
+    assert_eq!(attachment["nodeId"], node_id.as_str());
+    assert_eq!(attachment["name"], "diagram.png", "name is the store's");
+    assert_eq!(attachment["mime"], "image/png", "mime is the store's");
+    assert_eq!(attachment["size"], png.len() as u64, "size is the store's");
+}
+
+/// Codex review finding on #1682, round 2: a bare node id told a hosted or
+/// sidecar brain a file existed but gave it nothing to act on — no device
+/// tool bridges a `context_*` call into the workspace's binary store. The
+/// send route now extracts a readable attachment's text and journals it
+/// alongside the reference, so `wire_event` (`brain::medulla::effects`) has
+/// real content to put on the wire.
+///
+/// Reads the raw journal rather than `/chat/history` on purpose:
+/// `extracted_text` is an internal server-to-brain channel, not operator-
+/// facing data, so `ChatAttachmentDto` deliberately drops it — the console
+/// never sees it and must not.
+#[tokio::test]
+async fn chat_attachment_text_is_extracted_and_journaled_for_the_brain() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let text = b"Q3 revenue grew 12% year over year.".to_vec();
+    let (status, reference) = chat_upload(&state, "report.txt", Some("text/plain"), &text).await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    let node_id = reference["nodeId"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({ "message": "summarize the attached report", "attachments": [node_id] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let journaled = runtime
+        .events()
+        .read_from(runtime.id(), crate::ports::types::EventSeq::new(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|s| match s.event {
+            crate::ports::types::CompanyEvent::OperatorMessage { attachments, .. }
+                if !attachments.is_empty() =>
+            {
+                Some(attachments)
+            }
+            _ => None,
+        })
+        .expect("the message with an attachment is in the journal");
+
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(
+        journaled[0].extracted_text.as_deref(),
+        Some("Q3 revenue grew 12% year over year."),
+        "a plain-text attachment's content must reach the durable event, \
+         not just its node id"
+    );
+}
+
+/// A binary attachment nothing here parses (an image) journals with no
+/// extracted text — the reference alone rides the wire, and honestly: no
+/// content is fabricated for a format extraction cannot read.
+#[tokio::test]
+async fn chat_attachment_with_no_readable_text_journals_none() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x01];
+    let (status, reference) = chat_upload(&state, "photo.png", Some("image/png"), &png).await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    let node_id = reference["nodeId"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({ "message": "what's in this photo?", "attachments": [node_id] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let journaled = runtime
+        .events()
+        .read_from(runtime.id(), crate::ports::types::EventSeq::new(0), 10_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|s| match s.event {
+            crate::ports::types::CompanyEvent::OperatorMessage { attachments, .. }
+                if !attachments.is_empty() =>
+            {
+                Some(attachments)
+            }
+            _ => None,
+        })
+        .expect("the message with an attachment is in the journal");
+
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(journaled[0].extracted_text, None);
+}
+
+/// The IDOR / phantom guard: a `node_id` that resolves to no binary node in
+/// this company's workspace refuses the send with a `400`, on the same terms a
+/// malformed thread `parent` does — so a stale or hostile client cannot attach
+/// another company's file, or a file that does not exist.
+#[tokio::test]
+async fn chat_message_rejects_foreign_node() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({ "message": "trust me", "attachments": ["01JZZZNOTAREALNODE00000000"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // And nothing was journaled: the refusal is before the append, so the
+    // transcript does not hold a message pointing at a file this company lacks.
+    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        history
+            .as_array()
+            .expect("history is a list")
+            .iter()
+            .all(|m| m["text"] != "trust me"),
+        "a refused attachment message still reached the transcript: {history}"
+    );
+}
+/// Codex review finding: an unbounded attachment list turns one `/chat` POST
+/// into an attacker-controlled multiplier on `resolve_attachments`' tree scan
+/// and extraction work. Refused with a `400` before any of that work runs.
+#[tokio::test]
+async fn chat_message_rejects_too_many_attachments() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let ids: Vec<String> = (0..21).map(|n| format!("node-{n}")).collect();
+    let (status, body) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({ "message": "too many", "attachments": ids })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        history
+            .as_array()
+            .expect("history is a list")
+            .iter()
+            .all(|m| m["text"] != "too many"),
+        "a refused attachment message still reached the transcript: {history}"
+    );
+}
+
+/// Codex review finding: the same node id repeated in `attachments` used to
+/// resolve — and extract — once per repetition. A message attaching the same
+/// file three times over carries it exactly once.
+#[tokio::test]
+async fn chat_message_deduplicates_a_repeated_attachment_id() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with_company(&home).await;
+
+    let text = b"Q3 revenue grew 12%.".to_vec();
+    let (status, reference) = chat_upload(&state, "report.txt", Some("text/plain"), &text).await;
+    assert_eq!(status, StatusCode::OK, "{reference}");
+    let node_id = reference["nodeId"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/api/v1/company/chat",
+        Some(json!({
+            "message": "attached three times",
+            "attachments": [node_id.clone(), node_id.clone(), node_id],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let mine = history
+        .as_array()
+        .expect("history is a list")
+        .iter()
+        .find(|m| m["text"] == "attached three times")
+        .expect("the message survived");
+    assert_eq!(
+        mine["attachments"].as_array().map(Vec::len),
+        Some(1),
+        "a repeated id must resolve to one attachment, not three: {mine}"
+    );
 }

@@ -123,13 +123,35 @@ pub fn kebab_path(path: &str) -> String {
         .join("/")
 }
 
+/// The extension of a name: what follows its last dot, when that dot is not the
+/// first character and at least one ASCII alphanumeric follows it. `None` for
+/// a name with no extension — `.hidden` has none (leading dot) and `dir.` has
+/// none (nothing after the dot).
+fn trailing_extension(raw: &str) -> Option<&str> {
+    let dot = raw.rfind('.')?;
+    let extension = &raw[dot + 1..];
+    if dot == 0 || extension.is_empty() || !extension.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(extension)
+}
+
 /// The shared implementation. `None` means "nothing survived", which is the
 /// distinction [`is_kebab_name`] and [`kebab_name_or`] both need and a `String`
 /// return would flatten into the fallback.
 fn normalize(raw: &str) -> Option<String> {
+    // The trailing extension is reserved before the loop runs. A long-named
+    // upload must keep the suffix that identifies its format: the stored name
+    // keys both `resolve_mime` and `ingest::extract` dispatch, so a name that
+    // sheds its `.docx` at the cap is refused as unreadable at recall time.
+    let extension = trailing_extension(raw).map(str::to_ascii_lowercase);
+
     let mut out = String::with_capacity(raw.len().min(MAX_NAME_BYTES));
     // Suppresses a dash run, and any dash that would lead the name.
     let mut pending_dash = false;
+    // True when the budget stopped the loop before the end of `raw` — the only
+    // case where the reserved extension has to be grafted back on.
+    let mut truncated = false;
 
     for ch in raw.chars() {
         if ch.is_ascii_alphanumeric() {
@@ -138,6 +160,7 @@ fn normalize(raw: &str) -> Option<String> {
             // would need — so the result never exceeds the cap, and never ends
             // on a separator the next character was going to justify.
             if out.len() + dash + 1 > MAX_NAME_BYTES {
+                truncated = true;
                 break;
             }
             if dash == 1 {
@@ -147,6 +170,7 @@ fn normalize(raw: &str) -> Option<String> {
             out.extend(ch.to_lowercase());
         } else if ch == '.' {
             if out.len() + 1 > MAX_NAME_BYTES {
+                truncated = true;
                 break;
             }
             // A dot only counts once something precedes it, so a leading dot is
@@ -169,6 +193,28 @@ fn normalize(raw: &str) -> Option<String> {
     // A trailing dash or dot is separation with nothing after it.
     while out.ends_with('-') || out.ends_with('.') {
         out.pop();
+    }
+
+    // The cap stopped the loop with the extension unread — possibly mid-way
+    // into it. Trim the basename to the budget for `basename.ext` (popping any
+    // partial extension, and any separator left at the cut) and graft the
+    // reserved suffix back on whole, so the stored name still names its format.
+    // A suffix that could eat the whole budget is not an extension; the plain
+    // truncated basename is kept instead.
+    if truncated && let Some(ext) = extension {
+        let suffix = format!(".{ext}");
+        if suffix.len() <= MAX_NAME_BYTES / 2 {
+            let room = MAX_NAME_BYTES.saturating_sub(suffix.len());
+            while out.len() > room {
+                out.pop();
+            }
+            while out.ends_with('-') || out.ends_with('.') {
+                out.pop();
+            }
+            if !out.is_empty() {
+                out.push_str(&suffix);
+            }
+        }
     }
 
     if out.is_empty() { None } else { Some(out) }
@@ -249,6 +295,31 @@ mod test {
         assert!(name.len() <= MAX_NAME_BYTES, "{} bytes", name.len());
         assert!(!name.ends_with('-'));
         assert!(is_kebab_name(&name));
+    }
+
+    /// A name long enough to hit the cap keeps the extension that identifies
+    /// its format: the stored name keys both mime inference and
+    /// `ingest::extract` dispatch, so a `.docx` shed at the cap would make the
+    /// upload unreadable at recall time (codex review finding on #1682).
+    #[test]
+    fn a_long_name_keeps_the_extension_that_identifies_its_format() {
+        let raw = format!(
+            "Quarterly Financial Review & Board Deck {} .docx",
+            "FINAL ".repeat(20)
+        );
+        let name = kebab_name(&raw);
+        assert!(name.len() <= MAX_NAME_BYTES, "{} bytes", name.len());
+        assert!(name.ends_with(".docx"), "{name}");
+        assert!(is_kebab_name(&name), "{name}");
+    }
+
+    /// The extension reserve only engages on truncation — a name that fits is
+    /// byte-for-byte the same as before the reserve existed.
+    #[test]
+    fn the_extension_reserve_does_not_rewrite_names_that_fit() {
+        assert_eq!(kebab_name("README.md"), "readme.md");
+        assert_eq!(kebab_name("Page.compiled.mjs"), "page.compiled.mjs");
+        assert_eq!(kebab_name("Close checklist.md"), "close-checklist.md");
     }
 
     #[test]

@@ -151,3 +151,159 @@ test("changing provider asks before replacing a typed endpoint or model", async 
   await expect(page.locator("#inference-base-url")).toHaveValue("https://models.example.test/v1");
   await expect(page.locator("#inference-model-chat-v1")).toHaveValue("operator-draft");
 });
+
+test("OpenRouter models are selected from the registry and persist through reload", async ({
+  page,
+}) => {
+  await page.route("**/inference/models", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify([
+        { id: "provider/catalog-chat", name: "Catalog Chat", contextLength: 128_000 },
+        { id: "provider/catalog-reasoning", name: "Catalog Reasoning" },
+      ]),
+    });
+  });
+  await openConnections(page);
+  await expect(page.locator("#inference-provider")).toBeVisible({ timeout: 30_000 });
+
+  await pickProvider(page, "OpenRouter");
+  // A key is required before the catalog picker offers itself (issue #1838
+  // follow-up): with none typed and no key already stored server-side, a
+  // save would ride the platform's subscription proxy, which rejects the
+  // raw `<author>/<model>` id the catalog select writes — so the free-text
+  // inputs stay up instead until a key makes that pick safe to store. This
+  // spec runs against the shared E2E company, whose key state a prior spec
+  // in this file (or an earlier run of this one) can have left cleared, so
+  // typing one here is what makes the picker's availability deterministic
+  // rather than an accident of what state a previous test left behind.
+  await page.locator("#inference-key").fill(`pw-e2e-${Date.now()}`);
+  const chat = page.getByTestId("inference-model-select-chat-v1");
+  await expect(chat).toBeEnabled();
+  await chat.click();
+  await page.getByRole("option", { name: /Catalog Chat/ }).click();
+  await page.getByTestId("inference-save").click();
+  await expect(
+    page.getByText(/Inference updated\.|Inference saved — restart the company/),
+  ).toBeVisible({ timeout: 30_000 });
+
+  const saved = await page.request.get("/api/v1/company/inference");
+  expect(saved.ok()).toBeTruthy();
+  expect((await saved.json()).models["chat-v1"]).toBe("provider/catalog-chat");
+
+  await page.reload();
+  await expect(page.getByTestId("inference-model-select-chat-v1")).toContainText("Catalog Chat", {
+    timeout: 30_000,
+  });
+
+  await pickProvider(page, "Custom (OpenAI-compatible)");
+  await expect(page.locator("input#inference-model-chat-v1")).toBeVisible();
+
+  // Leave the shared E2E company on its committed default for later specs.
+  await page.getByRole("button", { name: "Reset to default" }).click();
+  await expect(
+    page.getByText("Reverted to the committed manifest (or managed) configuration."),
+  ).toBeVisible({ timeout: 30_000 });
+});
+
+test("a saved OpenRouter tier override can be cleared back to the tier default (issue #1838 follow-up)", async ({
+  page,
+}) => {
+  // Once a keyed company has picked a concrete model for a tier, the select
+  // used to offer no way back — every option only replaced the override, and
+  // Reset throws away the whole provider configuration and key rather than
+  // one tier's mapping. This proves the explicit "Use the tier default" item
+  // actually clears the stored override, end to end against a real host.
+  await page.route("**/inference/models", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify([
+        { id: "provider/catalog-chat", name: "Catalog Chat", contextLength: 128_000 },
+      ]),
+    });
+  });
+  await openConnections(page);
+  await expect(page.locator("#inference-provider")).toBeVisible({ timeout: 30_000 });
+
+  await pickProvider(page, "OpenRouter");
+  await page.locator("#inference-key").fill(`pw-e2e-${Date.now()}`);
+  const chat = page.getByTestId("inference-model-select-chat-v1");
+  await expect(chat).toBeEnabled();
+  await chat.click();
+  await page.getByRole("option", { name: /Catalog Chat/ }).click();
+  await page.getByTestId("inference-save").click();
+  await expect(
+    page.getByText(/Inference updated\.|Inference saved — restart the company/),
+  ).toBeVisible({ timeout: 30_000 });
+
+  const saved = await page.request.get("/api/v1/company/inference");
+  expect(saved.ok()).toBeTruthy();
+  expect((await saved.json()).models["chat-v1"]).toBe("provider/catalog-chat");
+
+  // Reload so the picker is seeded straight from the stored override, then
+  // clear it through the select rather than typing anything.
+  await page.reload();
+  const chatAfterReload = page.getByTestId("inference-model-select-chat-v1");
+  await expect(chatAfterReload).toContainText("Catalog Chat", { timeout: 30_000 });
+  await chatAfterReload.click();
+  await page.getByRole("option", { name: "Use the tier default" }).click();
+  await page.getByTestId("inference-save").click();
+  await expect(
+    page.getByText(/Inference updated\.|Inference saved — restart the company/),
+  ).toBeVisible({ timeout: 30_000 });
+
+  const cleared = await page.request.get("/api/v1/company/inference");
+  expect(cleared.ok()).toBeTruthy();
+  expect((await cleared.json()).models["chat-v1"]).toBeUndefined();
+
+  // Leave the shared E2E company on its committed default for later specs.
+  await page.getByRole("button", { name: "Reset to default" }).click();
+  await expect(
+    page.getByText("Reverted to the committed manifest (or managed) configuration."),
+  ).toBeVisible({ timeout: 30_000 });
+});
+
+test("typing an OpenRouter passthrough id one keystroke at a time is not stripped mid-word (issue #1838 follow-up, sixth instance)", async ({
+  page,
+}) => {
+  // Unit coverage for this same regression (inference-model-picker.test.ts)
+  // dispatches synthetic input events; this spec is the proof against a real
+  // browser's actual keystroke-by-keystroke typing, which is what a prior
+  // regression on this same effect (the baseline/models divergence, #1838)
+  // slipped past unit tests and only an E2E run caught.
+  await openConnections(page);
+  await expect(page.locator("#inference-key")).toBeVisible({ timeout: 30_000 });
+
+  // A keyless switch to OpenRouter lands on the proxied, free-text path
+  // (issue #1838 follow-up): the provider's own raw-id presets get stripped
+  // immediately since there is no key to save them under, leaving the tier
+  // fields editable and empty.
+  //
+  // Make that keyless precondition explicit rather than inherited from
+  // whatever a prior spec (or an aborted earlier run) left stored on the
+  // shared E2E company: the free-text `<input>` and the catalog `Select`
+  // trigger share the same `id={inference-model-${tier}}` (only one renders
+  // at a time), so `#inference-model-chat-v1` alone would just as happily
+  // match a leftover-key company's Select trigger — and `toHaveValue("")`
+  // against that gives a confusing "not an input" failure instead of naming
+  // the real problem. `input#…` only matches the free-text control, the same
+  // guard the OpenRouter-catalog spec above already uses.
+  await pickProvider(page, "OpenRouter");
+  const chatInput = page.locator("input#inference-model-chat-v1");
+  await expect(chatInput).toBeVisible();
+  await expect(chatInput).toHaveValue("");
+
+  // Type the proxy's own passthrough id character by character. Every prefix
+  // shorter than the full three-segment id counts as a raw catalog id by
+  // segment count, so this is exactly the sequence a per-render strip used to
+  // clear mid-word.
+  const target = "openrouter/anthropic/claude-sonnet-5";
+  await chatInput.pressSequentially(target, { delay: 20 });
+  await expect(chatInput).toHaveValue(target);
+
+  // Leave the shared E2E company on its committed default for later specs.
+  await page.getByRole("button", { name: "Reset to default" }).click();
+  await expect(
+    page.getByText("Reverted to the committed manifest (or managed) configuration."),
+  ).toBeVisible({ timeout: 30_000 });
+});

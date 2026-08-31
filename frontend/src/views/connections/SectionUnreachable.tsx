@@ -14,7 +14,7 @@ import { Card, CardContent } from "@/components/ui/card";
 export function SectionUnreachable({ label }: { label: string }) {
   return (
     <Card>
-      <CardContent className="py-4">
+      <CardContent>
         <p className="text-xs text-muted-foreground">
           {label} — the host could not answer, so this is unknown rather than absent. Reload to try
           again.

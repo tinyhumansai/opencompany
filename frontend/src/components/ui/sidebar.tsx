@@ -378,7 +378,17 @@ function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sidebar-header"
       data-sidebar="header"
-      className={cn("flex flex-col gap-2 p-2", className)}
+      // OpenHuman's shell gutter (`px-3`, `pt-3 pb-2`), with `gap-1` between
+      // the blocks inside it — see `app/src/components/layout/shell` in the
+      // vendored checkout. The rail keeps `px-2`: it is 3rem wide, so a 12px
+      // gutter would leave 24px of content box and clip every 32px control in
+      // this column. OpenHuman never hits that case because its sidebar hides
+      // outright rather than collapsing to icons.
+      className={cn(
+        "flex flex-col gap-1 px-3 pt-3 pb-2",
+        "group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:items-center",
+        className,
+      )}
       {...props}
     />
   )
@@ -389,7 +399,14 @@ function SidebarFooter({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sidebar-footer"
       data-sidebar="footer"
-      className={cn("flex flex-col gap-2 p-2", className)}
+      // `pt-1 pb-2` against the header's `pt-3 pb-2`: the top of the column
+      // carries the window's own breathing room, the bottom does not need it.
+      // Same gutter and rail override as the header above.
+      className={cn(
+        "flex flex-col gap-1 px-3 pt-1 pb-2",
+        "group-data-[collapsible=icon]:px-2",
+        className,
+      )}
       {...props}
     />
   )
@@ -414,8 +431,19 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sidebar-content"
       data-sidebar="content"
+      // The collapsed rail used to clip rather than scroll here
+      // (`overflow-hidden`), which was harmless while the rail's own chrome
+      // was short enough that the nav list always fit above the fold. Issue
+      // #1931 review: it no longer always is — the macOS traffic-light inset
+      // (`WindowControlsInset`) and the four-utility bar (`SidebarUtilityBar`)
+      // both stack vertically above the nav in collapsed mode, and at the
+      // desktop's supported minimum window height that stack plus a full nav
+      // list can exceed the rail's height, clipping the last row(s) out of
+      // reach with no way to get to them. `overflow-y-auto` keeps them
+      // reachable by scroll; `no-scrollbar` (already applied above) keeps the
+      // rail visually identical when everything already fits.
       className={cn(
-        "no-scrollbar flex min-h-0 flex-1 flex-col gap-0 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        "no-scrollbar flex min-h-0 flex-1 flex-col gap-1 overflow-auto group-data-[collapsible=icon]:overflow-y-auto",
         className
       )}
       {...props}
@@ -428,7 +456,14 @@ function SidebarGroup({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="sidebar-group"
       data-sidebar="group"
-      className={cn("relative flex w-full min-w-0 flex-col p-2", className)}
+      // `px-3 py-1` — the group's gutter matches the header's, so a nav row's
+      // icon and the switcher's glyph stand on the same vertical line, and the
+      // group contributes only rhythm vertically. The rail narrows to `px-2`
+      // for the reason `SidebarHeader` gives.
+      className={cn(
+        "relative flex w-full min-w-0 flex-col px-3 py-1 group-data-[collapsible=icon]:px-2",
+        className,
+      )}
       {...props}
     />
   )
@@ -501,7 +536,7 @@ function SidebarMenu({ className, ...props }: React.ComponentProps<"ul">) {
     <ul
       data-slot="sidebar-menu"
       data-sidebar="menu"
-      className={cn("flex w-full min-w-0 flex-col gap-0", className)}
+      className={cn("flex w-full min-w-0 flex-col gap-0.5", className)}
       {...props}
     />
   )

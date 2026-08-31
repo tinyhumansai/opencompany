@@ -54,6 +54,36 @@ opencompany doctor --json
 
 Print a JSON runtime specification. Accepts `--openhuman_root <PATH>`.
 
+## `issue-password`
+
+Issue a sign-in password for an address a company already admits, from the host —
+the recovery path when a deployment cannot mail a sign-in link
+([issue #1718](https://github.com/tinyhumansai/opencompany/issues/1718)).
+
+```sh
+opencompany issue-password --company <id> --email ada@example.com
+```
+
+The password is read from **stdin** unless passed with `--password`, so it never
+appears in argv, shell history, or `ps`. Only the trailing newline is stripped;
+a password may legitimately end in a space.
+
+| Flag | Purpose |
+| --- | --- |
+| `--company <ID>` | The company id as `serve` registers it. In shared-database mode a bare id is namespaced to the current `OPENCOMPANY_TENANT_ID`; the namespaced `<tenant>--<id>` form is also accepted, and an id carrying a different tenant's prefix is refused. |
+| `--email <ADDRESS>` | The address to issue for. It must already be a standing admin — a manifest `[users].admins` entry or the injected `OPENCOMPANY_ADMIN_EMAIL` — because the command makes a grant usable; it does not create one. |
+| `--password <VALUE>` | The password. Omit to read it from stdin. |
+| `--no-change-required` | Do not require a replacement on first sign-in. The default requires one, matching an admin-issued temporary password. |
+| `--home <DIR>` | Data root, resolved the same way `serve` resolves it. |
+
+It requires the effective email auth mode (`OPENCOMPANY_AUTH_MODE` →
+`config.toml` → the manifest's `[users] mode`); a `wallet` or `none` company is
+refused. Committing revokes the user's existing sessions and pending login codes
+first, then flags the password for replacement — the same semantics as the admin
+temporary-password route ([users spec](../../docs/spec/runtime/users.md)). On
+the filesystem store it holds the same data-root lock as `serve`, so it fails
+cleanly if a server is running on that root.
+
 ## `export` / `import`
 
 Move a company's full state (through the storage ports) between homes.

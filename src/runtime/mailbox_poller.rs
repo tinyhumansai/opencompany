@@ -148,6 +148,7 @@ mod tests {
     use crate::company::CompanyManifest;
     use crate::ports::inbox::InboxMeta;
     use crate::ports::types::CompanyId;
+    use crate::ports::types::SecretValue;
     use crate::runtime::RuntimeBuilder;
     use crate::server::ops::mailer::{FetchedEmail, InboundEmail, RecordingMailReceiver};
     use crate::store::FsInboxStore;
@@ -209,7 +210,7 @@ mod tests {
             host: "h".into(),
             port: 993,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
         };
         let poller = MailboxPoller::new(
             runtime.clone(),
@@ -336,7 +337,7 @@ mod tests {
             host: "h".into(),
             port: 993,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
         };
         let poller = MailboxPoller::new(
             runtime.clone(),
@@ -396,7 +397,7 @@ mod tests {
             host: "h".into(),
             port: 993,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
         };
         let poller = MailboxPoller::new(
             runtime.clone(),

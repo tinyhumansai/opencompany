@@ -595,6 +595,7 @@ mod test {
                         text: format!("scheduled: {prompt}"),
                         steps: Vec::new(),
                         reply_to: None,
+                        mentions: Vec::new(),
                     });
                 }
             }

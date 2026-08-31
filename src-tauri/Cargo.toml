@@ -47,20 +47,82 @@ path = "src/main.rs"
 # a desktop agent gets is exactly the minimal belt: built-in tools, MCP servers
 # and skills.
 #
-# Deliberately NOT here, and each for a reason rather than an oversight:
+# ## What is NOT in this list is not the same as what the app ships without
 #
-# * `tinycortex` / `tinymemory*` — the in-pod memory engines. They carry
+# `composio` and `acp` are **not** in the feature list below and they ARE in the
+# shipped application: `DESKTOP_RELEASE_FEATURES` in
+# `.github/workflows/release-desktop-macos.yml` passes
+# `opencompany/acp,opencompany/composio` on the `tauri build` command line, and
+# `ci.yml`'s `Desktop` lane compiles and tests that same string. Both are
+# `= ["openhuman"]` in the root manifest — pure `cfg` switches that pull no
+# `dep:` entry, and `mcp` above already enables `openhuman` — so turning them
+# on adds no package and leaves this crate's `Cargo.lock` byte-identical, and
+# that is what lets a release still build `--locked`. It is why they are passed
+# rather than written here; the argument is spelled out on that env block.
+#
+# What each buys is on that env block too, and the short version for `acp` is
+# worth keeping here because the comment this replaces got it backwards:
+# `src/acp/` in THIS crate is an ACP *client* and compiles either way, so the
+# feature looks inert from inside the manifest. What it actually gates is
+# `RuntimeBuilder::with_acp_agents` in the host — without it `acp_agents` is
+# forced to `None` and every `transport = "local"` harness resolves
+# `unavailable`, on the one host that has an `AcpAgentFactory` to hand over
+# (issue #1245). It is not a separate decision from having a harness; on the
+# desktop it is what makes the local harness lane exist.
+#
+# Reading this manifest as the whole story is issue #1738: it reported the
+# desktop's eight Connections tiles reading "not available here" over a card
+# inviting the operator to paste a Composio token, cited the exclusion comment
+# that used to sit here as the reason, and concluded the shipped app's
+# integration surface was dark. The DMG's surface is not dark. What was dark was
+# every desktop built WITHOUT that command line — which, until this issue, was
+# every developer's, because `scripts/desktop-dev.sh` ran `tauri dev` bare. The
+# dev shell and the shipped app were two different products and nothing said so.
+# #1823 closed that half, and closed it better than a copy would have: the
+# script *parses* `DESKTOP_RELEASE_FEATURES` out of the release workflow, so the
+# launcher cannot drift from what ships. `scripts/ci/assert-desktop-features.sh`
+# guards the copies that remain — the two `ci.yml` steps, `tauri:build` and the
+# command `docs/spec/runtime/desktop.md` documents — and asserts the launcher
+# still derives rather than duplicates.
+#
+# Deliberately NOT compiled at all, in the default set or the release one, and
+# each for a reason rather than an oversight:
+#
+# * `tinycortex` / `tinymemory-embedded` — the in-pod memory engines. They carry
 #   tinycortex, `tinyagents/sqlite` and a second bundled SQLite build into the
 #   bundle for a surface the desktop does not offer; the runtime keeps its
 #   fs-backed memory stores.
-# * `media`, `composio`, `search` and the rest of the managed backends — they
-#   need a platform credential the desktop has no way to hold, and each fails
-#   closed anyway.
-# * `acp` — the local coding-harness lane. `src/acp/` here is an ACP *client*
-#   and compiles without it; turning it on would additionally wire
-#   `RuntimeBuilder::with_acp_agents`, which is a separate decision from having
-#   a harness at all.
-opencompany = { path = "..", default-features = false, features = ["sqlite", "platform-jwt", "oauth", "mcp"] }
+# * `media` — the image/video generation tools. Unlike `composio` it is
+#   `["openhuman", "openhuman_core/media"]`, so it does pull an upstream domain
+#   this build otherwise never compiles, and its credential really is managed:
+#   the tools are wired only when a company grants the namespace AND a
+#   *platform* credential is configured. There is no BYO tier, so no desktop
+#   operator has anything to supply, and `…/capabilities` answers
+#   `media_in_build: false`, which is the honest report of that.
+#
+# There is no `search` to exclude. The comment this replaces named one among
+# "the rest of the managed backends", but no such cargo feature exists —
+# `…/capabilities` derives `search_in_build` from `cfg!(feature =
+# "openhuman")`, which `mcp` already turns on. Search has been in this build
+# the whole time the comment claimed it was kept out.
+#
+# The claim that the excluded set "needs a platform credential the desktop has
+# no way to hold" was also wrong about `composio` specifically, which is worth
+# recording so it is not re-derived. `company::composio::resolve_credential` is
+# always compiled and answers over *three* tiers, the platform identity being
+# the LAST: the BYO `composio/token` override wins, else the company's own
+# TinyHumans key, else this instance's platform identity. Tier one is precisely
+# what a desktop operator can hold, and the Connections card already asks them
+# for it.
+#
+# `tinymemory` IS here, in the features below. It is the cheap half of the
+# memory seam — the hosted/remote driver registry (Supermemory, Mem0, Cognee,
+# "No memory"), pure Rust and already in the lockfile — and the memory-engine
+# catalog is a console surface the desktop serves too. Without it four of its
+# tiles render disabled with "this build was compiled without the `tinymemory`
+# feature", an instruction no desktop user can follow. Only the in-pod engines
+# above are excluded.
+opencompany = { path = "..", default-features = false, features = ["sqlite", "platform-jwt", "oauth", "mcp", "tinymemory"] }
 
 tauri = { version = "2", features = [] }
 # The OS credential store, so a device session token never has to live in the

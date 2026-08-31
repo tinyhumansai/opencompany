@@ -115,10 +115,20 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// The context chunk recording one completed turn's outcome, labelled under
 /// [`OUTCOME_LABEL_PREFIX`] and carrying both the task and the answer so a later
 /// `search` matches on either side.
+///
+/// Both sides pass through [`redact_secrets`](super::memory::redact_secrets):
+/// this write path stores the operator message verbatim (the motivating
+/// `/secret/` and bearer-token leak), and it bypasses
+/// [`Memory::store`](crate::harness::built_in::memory::OcMemory), so the
+/// redaction has to live here, at the chunk's single construction point.
 pub fn outcome_chunk(agent_id: &str, message: &str, reply: &str) -> ContextChunk {
     ContextChunk {
         label: format!("{OUTCOME_LABEL_PREFIX}/{agent_id}"),
-        body: format!("Task: {message}\nOutcome: {reply}"),
+        body: format!(
+            "Task: {}\nOutcome: {}",
+            super::memory::redact_secrets(message),
+            super::memory::redact_secrets(reply)
+        ),
     }
 }
 
@@ -255,6 +265,22 @@ mod test {
         assert_eq!(chunk.label, "task-outcome/ceo");
         assert!(chunk.body.contains("plan the launch"));
         assert!(chunk.body.contains("here is the plan"));
+    }
+
+    #[test]
+    fn outcome_chunk_redacts_secrets_on_both_sides() {
+        // This write path bypasses `Memory::store`, so the operator message
+        // and the reply must be redacted here — an operator message carrying
+        // a one-time-secret URL or bearer token must not persist verbatim.
+        let chunk = outcome_chunk(
+            "ceo",
+            "open https://ots.example/secret/AbCdEf123456",
+            "opened it with Bearer sk-verylongsecrettoken",
+        );
+        assert!(chunk.body.contains("/secret/[REDACTED]"));
+        assert!(chunk.body.contains("Bearer [REDACTED]"));
+        assert!(!chunk.body.contains("AbCdEf123456"));
+        assert!(!chunk.body.contains("sk-verylongsecrettoken"));
     }
 
     #[test]

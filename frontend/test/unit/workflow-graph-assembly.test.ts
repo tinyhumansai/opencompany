@@ -54,6 +54,26 @@ describe("assembleGraph", () => {
     expect(out.graph.version).toBeNull();
   });
 
+  // Regression, issue #1882 review (found after the backend fix): this dialog
+  // has no control that edits `ownerDesk`, so the only way a Save doesn't
+  // clear one is if the draft carries it through untouched. The bug this pins
+  // was silent because a test that builds `GraphDraft` by hand (as the one
+  // above does) can't reproduce it — it has to prove the field survives THIS
+  // assembly step, the same one `runWrite` and the pre-flight both call.
+  it("carries ownerDesk through unedited, since no control here sets it", () => {
+    const out = assembleGraph(draft({ ownerDesk: "engineering" }));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.graph.ownerDesk).toBe("engineering");
+  });
+
+  it("assembles no ownerDesk for a draft that never had one (a fresh create)", () => {
+    const out = assembleGraph(draft());
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.graph.ownerDesk).toBeUndefined();
+  });
+
   // The host rejects a schedule on any non-trigger node and a destination on
   // any non-output node, so the assembly must not send either off-kind — a draft
   // row can still be carrying one after `changeKind`.

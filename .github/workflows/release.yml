@@ -14,6 +14,22 @@ on:
         description: Tag to publish, for example v0.1.0
         required: true
         type: string
+      notes_from:
+        description:
+          Start of the release-notes range, EXCLUDED. `latest-release` resolves
+          the previous GitHub Release, and falls back to the repository's root
+          commit when there is none — pass an explicit tag or SHA to bound a
+          first release.
+        required: false
+        default: latest-release
+        type: string
+      notes_ai:
+        description:
+          Polish the generated notes with OpenAI. Requires OPENAI_API_KEY; the
+          run falls back to the deterministic renderer rather than failing.
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -23,8 +39,16 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     steps:
+      # `fetch-depth: 0`. The release-notes generator walks
+      # `<previous release>..<tag>` and reads EVERY author before the range to
+      # tell a first-time contributor from a returning one. Under the default
+      # shallow checkout that history is not present, `git log A..B` prints
+      # nothing for an unknown A, and the notes come out empty and green — the
+      # one failure mode worth paying a full clone to remove.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
           submodules: true
 
@@ -66,8 +90,132 @@ jobs:
           cargo build --locked --all-targets
           cargo test --locked
 
-      - name: Create release
+      # ---- Release notes ------------------------------------------------------
+      # `generate_release_notes: true` used to do this, and what it produced was
+      # a flat "* <title> by @who in <url>" list in merge order. The generator
+      # below groups the same PRs into themed highlights and, unlike anything
+      # GitHub derives, names FIRST-TIME contributors — it reads history before
+      # the range, which the built-in list never does.
+      #
+      # Node is needed only for the generator; nothing else in this job uses it.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          # `package-manager-cache`, NOT `cache`. The `cache` input takes a
+          # package-manager NAME (npm/yarn/pnpm), and the action's own check is
+          # `if (cache)` — the string "false" is truthy, so `cache: false` does
+          # not disable anything; it asks for a package manager called "false"
+          # and the step dies with "Caching for 'false' is not supported",
+          # taking the release job with it. `package-manager-cache` is the input
+          # that actually means off.
+          #
+          # Off because the generator has no dependencies and this job never
+          # runs `npm install`, so there is nothing to cache — while the job
+          # does hold `contents: write` and publishes what users download, which
+          # makes a restored cache a supply-chain surface for no benefit at all.
+          package-manager-cache: false
+
+      # `continue-on-error` plus the fallback below, not `||` inside one step:
+      # a failed OpenAI call must still leave a `release-notes.md` behind, and
+      # the two-step form makes WHICH renderer ran visible in the job log rather
+      # than hiding a degraded release behind a green step.
+      #
+      # The step cap must sit ABOVE the generator's own 300s OpenAI abort, so
+      # that a hung API is caught by the SCRIPT — which names the timeout and
+      # exits non-zero — rather than by the step, which kills the process and
+      # reports only "timed out". At `timeout-minutes: 5` the two were both 300s
+      # and the step budget additionally covered `gh release view`, `git log`,
+      # and one `gh pr view` per PR, so the step always won and the script's
+      # error path was unreachable. 10 minutes leaves room for those lookups.
+      - name: Generate release notes (AI)
+        id: ai-notes
+        if: inputs.notes_ai
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAG: ${{ inputs.tag }}
+          NOTES_FROM: ${{ inputs.notes_from }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::warning::OPENAI_API_KEY is empty — falling back to deterministic notes."
+            exit 1
+          fi
+          node scripts/release/generate-release-notes.mjs \
+            --from "$NOTES_FROM" \
+            --to "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --output release-notes.md
+
+      # Runs when AI notes were disabled, skipped, or failed. This one is NOT
+      # `continue-on-error`: if the deterministic renderer cannot produce notes
+      # either, something is wrong with the range itself and the release should
+      # not be cut with an empty body.
+      - name: Generate release notes (deterministic)
+        if: ${{ !inputs.notes_ai || steps.ai-notes.outcome != 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          NOTES_FROM: ${{ inputs.notes_from }}
+        run: |
+          set -euo pipefail
+          node scripts/release/generate-release-notes.mjs \
+            --from "$NOTES_FROM" \
+            --to "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --no-ai \
+            --output release-notes.md
+
+      # So the notes are readable without opening the Release, and so a bad
+      # range is diagnosable from the run that produced it.
+      - name: Print notes to job summary
+        run: cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      # CREATED AS A DRAFT, and published only once the DMGs are attached.
+      #
+      # This repository has IMMUTABLE RELEASES enabled: at the moment a release
+      # is published, it and its asset list are frozen. `POST .../assets` on one
+      # is rejected, and so is any update that would move `target_commitish`.
+      # So the obvious ordering — publish here, have `release-desktop-macos.yml`
+      # attach the DMGs when they finish an hour later — cannot work at all.
+      # It failed exactly that way on v0.0.1-rc.1: both architectures signed,
+      # notarized and stapled, and both then failed to attach to a release that
+      # had been frozen 40 minutes earlier.
+      #
+      # A DRAFT is mutable. `release-desktop-macos.yml` uploads into this draft
+      # and its `publish` job flips `--draft=false` at the end, so the release
+      # becomes immutable at the moment it becomes public — already carrying
+      # both DMGs. That is the behaviour immutable releases are asking for: a
+      # published release is a complete one.
+      #
+      # A draft holds no git tag of its own, which is why `tag` must already
+      # exist as a real tag before this workflow is dispatched.
+      - name: Create draft release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.tag }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          draft: true
+          # Anything with a pre-release suffix — `v0.1.0-rc.1`, `-beta.2` — is
+          # marked as one, so it does not become the "Latest release" the
+          # repository's front page points at and `--from latest-release` picks
+          # up next time. A plain `vX.Y.Z` has no hyphen and is a full release.
+          prerelease: ${{ contains(inputs.tag, '-') }}
+
+      # Say what has to happen next, in the run that created the draft. A draft
+      # release is invisible on the repository's front page, so a half-finished
+      # release otherwise looks like nothing happened at all.
+      - name: Explain the next step
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "### Draft release created"
+            echo ""
+            echo "\`$TAG\` is a DRAFT and is not public yet."
+            echo ""
+            echo "Dispatch **Release Desktop (macOS DMG)** with \`tag=$TAG\`, \`sign=true\`, \`create_release=true\`."
+            echo "It attaches both signed DMGs to this draft and publishes it."
+          } >> "$GITHUB_STEP_SUMMARY"

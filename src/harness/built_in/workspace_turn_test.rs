@@ -189,6 +189,7 @@ fn folder(id: &str, name: &str) -> WorkspaceNode {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     }
 }
 
@@ -204,6 +205,7 @@ fn note(id: &str, name: &str, parent: &str) -> WorkspaceNode {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     }
 }
 
@@ -265,6 +267,7 @@ async fn harness(
         .unwrap();
 
     let deps = HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: Arc::new(HostedProvider::new(HostedProviderConfig {
@@ -321,6 +324,8 @@ async fn harness(
         // backend is the fail-closed default outside the runtime builder.
         search: None,
         tenant_search: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
 
     let record = CompanyRecord {
@@ -337,10 +342,14 @@ async fn harness(
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     };
 
     let pool = HarnessPool::new();
@@ -416,7 +425,7 @@ async fn a_real_turn_lists_reads_and_revises_a_workspace_note() {
             "ceo",
             "Add a Friday shipping rule to our standards.",
             &deps,
-            None,
+            crate::runtime::delegation::ChatTarget::default(),
         )
         .await
         .expect("turn runs");
@@ -494,9 +503,15 @@ async fn a_real_turn_is_refused_when_it_writes_with_a_stale_revision() {
 
     let (before, _) = store.read(&record.id, "n-eng").await.unwrap().unwrap();
 
-    pool.run(&record.id, "ceo", "Rewrite the standards.", &deps, None)
-        .await
-        .expect("turn runs");
+    pool.run(
+        &record.id,
+        "ceo",
+        "Rewrite the standards.",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("turn runs");
 
     let joined = tool_results(&script).join("\n---\n");
     // Before anything else: the write must have been built from a revision the
@@ -557,7 +572,7 @@ async fn a_wildcard_grant_turn_can_read_but_is_never_offered_the_write_tool() {
             "ceo",
             "What is our review standard?",
             &deps,
-            None,
+            crate::runtime::delegation::ChatTarget::default(),
         )
         .await
         .expect("turn runs");
@@ -607,9 +622,15 @@ async fn an_edit_between_turns_changes_what_the_next_turn_reads() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, deps, record, store) = harness(base_url, "\"*\"", dir.path()).await;
 
-    pool.run(&record.id, "ceo", "What is our standard?", &deps, None)
-        .await
-        .expect("first turn");
+    pool.run(
+        &record.id,
+        "ceo",
+        "What is our standard?",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("first turn");
 
     // The operator edits the note in the console — the same store handle.
     store
@@ -622,9 +643,15 @@ async fn an_edit_between_turns_changes_what_the_next_turn_reads() {
         .await
         .unwrap();
 
-    pool.run(&record.id, "ceo", "And now?", &deps, None)
-        .await
-        .expect("second turn");
+    pool.run(
+        &record.id,
+        "ceo",
+        "And now?",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("second turn");
 
     let results = tool_results(&script);
     let before = results
@@ -701,7 +728,7 @@ async fn an_oversized_note_reaches_the_model_whole_and_read_only() {
         "ceo",
         "What does the big standard say?",
         &deps,
-        None,
+        crate::runtime::delegation::ChatTarget::default(),
     )
     .await
     .expect("turn runs");
@@ -772,10 +799,14 @@ async fn supervised(deps: &HarnessDeps, grants: &str) -> (HarnessPool, CompanyRe
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     };
     record.manifest.tools.allow = manifest(grants).tools.allow;
     let pool = HarnessPool::new();
@@ -783,9 +814,8 @@ async fn supervised(deps: &HarnessDeps, grants: &str) -> (HarnessPool, CompanyRe
     (pool, record)
 }
 
-/// End-to-end, through a model: a read of the company workspace runs without
-/// asking, and a write of it parks — **and the parked card does not offer a
-/// standing scope**.
+/// End-to-end, through a model: workspace reads and writes both run without
+/// policy-generated HITL.
 ///
 /// The last clause is issue #444's headline, and nothing shorter than this can
 /// show it. The two halves of the gate live in different modules and disagreed
@@ -795,7 +825,7 @@ async fn supervised(deps: &HarnessDeps, grants: &str) -> (HarnessPool, CompanyRe
 /// carries no consequence word — and offered it for a week. This drives one real
 /// turn and asks both halves about the same call.
 #[tokio::test]
-async fn a_supervised_turn_reads_the_workspace_freely_and_parks_a_write_with_no_scope_offered() {
+async fn a_supervised_turn_reads_and_writes_the_workspace_without_policy_hitl() {
     let dir = tempfile::tempdir().unwrap();
     let (base, script) = spawn_script(vec![
         Turn::Call {
@@ -810,52 +840,43 @@ async fn a_supervised_turn_reads_the_workspace_freely_and_parks_a_write_with_no_
         Turn::Say("done"),
     ])
     .await;
-    let (_pool, deps, _record, _store) = harness(base, "\"workspace\"", dir.path()).await;
+    let (_pool, deps, _record, store) = harness(base, "\"workspace\"", dir.path()).await;
     let (pool, record) = supervised(&deps, "\"workspace\"").await;
 
-    pool.run(&record.id, "ceo", "tidy the standards", &deps, None)
-        .await
-        .expect("the turn runs");
+    pool.run(
+        &record.id,
+        "ceo",
+        "tidy the standards",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("the turn runs");
     // Issue #439: no boundary index — this turn ran outside any claim, so its
     // requests are in the `Unscoped` bucket and `drain` reads exactly them.
     let parked = deps
         .approval_requests
         .drain(crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN);
 
-    assert_eq!(
-        parked.requests.len(),
-        1,
-        "the read must not park and the write must: {:?}",
-        parked
-            .requests
-            .iter()
-            .map(|r| r.tool.clone())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(parked.requests[0].tool, "workspace_write");
-    // Not vacuous: the read that did not park was really made, and really
-    // returned — so "one parked request" is one write, not one read the belt
-    // silently withheld.
+    assert!(parked.requests.is_empty(), "{parked:?}");
     assert!(
         tool_results(&script).len() >= 2,
-        "both the read and the (blocked) write must have fed a result back"
+        "both the read and write must have run and fed a result back"
     );
-    assert!(
-        !parked.requests[0].effect.may_be_granted_standing(),
-        "a card for overwriting operator-owned guidance must not offer a standing scope"
-    );
+    let (_, content) = store
+        .read(&record.id, "n-eng")
+        .await
+        .expect("workspace read succeeds")
+        .expect("standards note remains");
+    assert_eq!(content, "# Engineering\nRewritten.");
 }
 
 /// The other side of the same boundary, so the feature is not proved dead:
-/// a write confined to the agent's **own** workspace parks the same way and
-/// *does* offer the scope.
-///
-/// Without this the test above would be satisfied by a gate that simply never
-/// offers a standing grant to anybody.
+/// The same policy-HITL-off boundary applies to the agent's own sandbox.
 #[tokio::test]
-async fn a_parked_write_to_the_agents_own_workspace_does_offer_a_standing_scope() {
+async fn a_write_to_the_agents_own_workspace_runs_without_policy_hitl() {
     let dir = tempfile::tempdir().unwrap();
-    let (base, _script) = spawn_script(vec![
+    let (base, script) = spawn_script(vec![
         Turn::Call {
             tool: "file_write",
             args: json!({ "path": "notes.md", "content": "draft" }),
@@ -867,22 +888,32 @@ async fn a_parked_write_to_the_agents_own_workspace_does_offer_a_standing_scope(
         harness(base, "\"files\", \"workspace\"", dir.path()).await;
     let (pool, record) = supervised(&deps, "\"files\", \"workspace\"").await;
 
-    pool.run(&record.id, "ceo", "jot a note", &deps, None)
-        .await
-        .expect("the turn runs");
+    pool.run(
+        &record.id,
+        "ceo",
+        "jot a note",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("the turn runs");
     // Issue #439: no boundary index — this turn ran outside any claim, so its
     // requests are in the `Unscoped` bucket and `drain` reads exactly them.
     let parked = deps
         .approval_requests
         .drain(crate::harness::policy::MAX_APPROVAL_REQUESTS_PER_TURN);
 
-    assert_eq!(parked.requests.len(), 1, "the sandboxed write parks");
-    assert_eq!(parked.requests[0].tool, "file_write");
+    assert!(parked.requests.is_empty(), "{parked:?}");
     assert!(
-        parked.requests[0].effect.may_be_granted_standing(),
-        "a write confined to the agent's own sandbox is exactly what a standing \
-         grant is for; refusing it would leave the feature with nothing to apply to"
+        tool_results(&script)
+            .iter()
+            .all(|result| !result.contains("error")),
+        "the file write must succeed: {:?}",
+        tool_results(&script)
     );
+    let note =
+        crate::harness::build::agent_workspace(dir.path(), &record.id, "ceo").join("notes.md");
+    assert_eq!(std::fs::read_to_string(note).unwrap(), "draft");
 }
 
 /// Issue #443, through the turn loop: the reads that used to park.
@@ -911,9 +942,15 @@ async fn a_supervised_turn_reads_its_own_workspace_without_asking() {
     let (_pool, deps, _record, _store) = harness(base, "\"files\"", dir.path()).await;
     let (pool, record) = supervised(&deps, "\"files\"").await;
 
-    pool.run(&record.id, "ceo", "what do we have?", &deps, None)
-        .await
-        .expect("the turn runs");
+    pool.run(
+        &record.id,
+        "ceo",
+        "what do we have?",
+        &deps,
+        crate::runtime::delegation::ChatTarget::default(),
+    )
+    .await
+    .expect("the turn runs");
     // Issue #439: no boundary index — this turn ran outside any claim, so its
     // requests are in the `Unscoped` bucket and `drain` reads exactly them.
     let parked = deps

@@ -153,7 +153,24 @@ const SCAN_SKIP_DIRS: [&str; 7] = [
 /// The entry stays anyway, for two reasons that outlive the move: a workspace
 /// provisioned before it still holds the legacy file, and `audit.log` is a
 /// plausible name for something else to write. Neither is ever a deliverable.
-const SCAN_SKIP_FILES: [&str; 1] = ["audit.log"];
+///
+/// `STYLE.md`, `SOUL.md`, `IDENTITY.md` and `ROLE.md` are the vendored
+/// OpenHuman prompt builder's own workspace seed files (openhuman#5701):
+/// `sync_workspace_file` writes the compiled-in default for each of them into
+/// the agent's workspace on **every prompt build** whose section runs, purely
+/// so the file exists on disk to edit — the agent never asked for it and never
+/// touched it. `STYLE.md` in particular is synced unconditionally by
+/// `global_style_block` regardless of `omit_identity`, specifically so an
+/// identity-omitted agent (the orchestrator among them) still gets style rules
+/// — so a card dispatched to a brand-new workspace sees `STYLE.md` appear
+/// between the pre-turn snapshot and the post-turn scan on its very first
+/// turn, with nothing the agent did producing it. Before this entry, that read
+/// as an unpublished deliverable and fired the "did you mean to publish this?"
+/// nudge as a second, uncounted model call on a turn that delegated or
+/// produced nothing — exactly the `audit.log` false positive above, for a file
+/// the harness itself just started writing. Their `.builtin-hash` sidecars
+/// need no entry of their own; `is_hidden` already skips any dot-prefixed name.
+const SCAN_SKIP_FILES: [&str; 5] = ["audit.log", "STYLE.md", "SOUL.md", "IDENTITY.md", "ROLE.md"];
 
 /// Whether a directory entry is hidden, and therefore skipped.
 ///

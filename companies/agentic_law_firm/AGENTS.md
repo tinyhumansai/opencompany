@@ -132,7 +132,6 @@ read by everyone and changed by the operator or the unconfined orchestrator.
 ## What stops and waits for a person
 
 Every filing, every signature, every piece of advice that reaches a client, and
-anything that binds the firm. `[policy].mode = "auto"` runs the roster's own
-sandbox writes and outward reads unattended and parks everything that leaves the
-firm or spends money — which is exactly the boundary a licensed human's review
-sits on.
+anything that binds the firm. `[policy].mode = "auto"` does not request sign-off by itself. Before any action covered by the human boundary above, including one that
+leaves the company or spends money, call `request_approval` with the exact
+decision and wait for the operator's answer.

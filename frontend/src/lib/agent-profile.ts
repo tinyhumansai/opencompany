@@ -8,8 +8,9 @@
 // asked for one more click away.
 
 import type { AgentDetailDto } from "@/api/types";
+import { avatarRef } from "@/lib/avatar";
 import { summarizeGrants, tierLabel, type ToolGrantSummary } from "@/lib/agent";
-import { avatarFor, roleSubtitle, toneFor } from "@/lib/team";
+import { roleSubtitle, toneFor } from "@/lib/team";
 
 /** How many characters of the persona the panel shows before it truncates. */
 const ABOUT_LIMIT = 320;
@@ -50,7 +51,10 @@ export function agentProfile(detail: AgentDetailDto): AgentProfile {
     subtitle: roleSubtitle(display, detail.role),
     seed,
     tone: toneFor(seed),
-    avatar: avatarFor(seed),
+    // The face this teammate chose, else the hashed default — the same rule
+    // the roster row uses, so clicking a customised face in chat opens the
+    // panel already wearing it rather than swapping it for the default.
+    avatar: avatarRef(detail.avatar, seed),
     tier: tierLabel(detail),
     origin: detail.source === "manifest" ? "Company blueprint" : "Added here",
     about: clipped || null,

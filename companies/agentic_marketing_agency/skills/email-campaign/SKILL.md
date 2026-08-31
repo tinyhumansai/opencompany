@@ -18,7 +18,9 @@ Plan, write, and send an email program, then report on what it drove.
 2. **Map** the sequence: trigger, messages, timing, exit.
 3. **Write** subject + body in the [[Brand voice]]; one CTA per email.
 4. **Set up** the send in the connected inbox provider.
-5. **Send** — sending is a parked effect; the operator approves the first send.
+5. **Ask, then send** — call `request_approval` with the audience, subject, and
+   exact send decision. Stop and wait; do not emit the inbox send in the same
+   turn. Send only after the operator approves.
 6. **Report** — opens, clicks, and conversions against the goal.
 
 ## Output

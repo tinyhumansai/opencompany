@@ -25,7 +25,7 @@ human_role = "Set the question and accept the findings"
 # `search`, the librarian below has no way to discover a source and the
 # fetch/read split collapses into "read what the operator pasted".
 #
-# `allow` REPLACES the default (`["*", "media", "composio"]`); it never extends
+# `allow` REPLACES the default (`globals/globals.toml`'s `default_allow`); it never extends
 # it. `*` covers files/docs/shell/code/web/subagent but deliberately excludes
 # the opt-in namespaces, so `search` is listed literally. `shell` and `code`
 # arrive with `*` and are load-bearing here: the analyst computes rather than
@@ -72,8 +72,7 @@ search_daily_calls = 200
 enabled = ["research_loop"]
 
 [policy]
-# `auto` runs the lab's own sandbox writes and outward reads unattended, and
-# still parks anything that leaves the company or spends money. Research is
-# read-heavy and its outward actions are searches and fetches, so unattended is
-# the right default here; the report still reaches a person before it counts.
+# `auto` runs the lab's own sandbox writes and outward reads unattended. Policy
+# HITL is disabled; agents call `request_approval` when they deliberately want
+# operator sign-off.
 mode = "auto"

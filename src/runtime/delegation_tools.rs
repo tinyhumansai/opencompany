@@ -160,12 +160,151 @@ the desk knows it was handed the work when asked directly."
 ///
 /// Lifted here from the harness-only delegation runtime so the hosted path can
 /// resolve a desk lead without the `openhuman` feature.
+///
+/// An [`Auto`](crate::ports::types::ResponderMode::Auto) channel (issue #1835)
+/// answers `None` **by definition, not by accident**: no lead exists there, so
+/// every lead-derived surface — the org chart's crown, the members-pane badge,
+/// a `delegate_to_desk` hand-off — stays honest without knowing the mode. The
+/// deterministic "who answers here" question is [`desk_default_responder`],
+/// which ignores the mode on purpose.
 pub fn desk_lead(record: &CompanyRecord, desk: &str) -> Option<String> {
+    let desk_id = record.resolve_desk_id(desk)?;
+    if !record.desk_responder_mode(&desk_id).is_lead() {
+        return None;
+    }
+    record
+        .effective_desk_members(&desk_id)
+        .into_iter()
+        .find(|m| record.is_roster_agent(m))
+}
+
+/// The desk's first effective roster member, **whatever its responder mode**
+/// (issue #1835).
+///
+/// For a [`Lead`](crate::ports::types::ResponderMode::Lead) desk this is the
+/// lead, byte-for-byte what [`desk_lead`] answers. For an `Auto` channel it is
+/// the deterministic fallback: the answer wherever per-message selection
+/// cannot run — the default build (the selector compiles only under the
+/// harness feature), the cycle's small-talk fast path, or a selection failure.
+/// One function, so "the fallback" cannot drift from "the pre-selector
+/// behaviour".
+pub fn desk_default_responder(record: &CompanyRecord, desk: &str) -> Option<String> {
     let desk_id = record.resolve_desk_id(desk)?;
     record
         .effective_desk_members(&desk_id)
         .into_iter()
         .find(|m| record.is_roster_agent(m))
+}
+
+/// Which roster teammate answers a message addressed to `chat` — or `None`
+/// when the key names neither a desk nor a teammate.
+///
+/// The four arms, in order, are the ones the harness brain's `responder_for`
+/// has always tried: a desk key resolves to its
+/// [`desk_lead`], a bare roster agent id answers as itself, and the console's
+/// `dm:<teammate-id>` thread key is unwrapped and tried both ways (issue #982,
+/// step 3) — last, so it can only claim a key that resolves to nothing today.
+///
+/// **Returns `None` rather than falling back to the orchestrator**, because the
+/// two callers want different things from a miss: the harness brain logs a
+/// warning and answers as the orchestrator it resolved when it was built, while
+/// the cycle's small-talk fast path (issue #1725) resolves the orchestrator off
+/// the record in hand. Folding the fallback in here would make one of those
+/// wrong.
+///
+/// Lifted out of the harness brain so the fast path — which is brain-agnostic
+/// and runs before any brain — attributes its reply to the same teammate the
+/// turn it replaced would have been answered by.
+///
+/// # The built-in `#general` channel answers to nobody here (issue #1743)
+///
+/// A General spelling that no desk claimed is the **company's own line**, and
+/// `None` is the right answer for it: both callers then resolve their own
+/// orchestrator, which is what has always answered an unaddressed message.
+///
+/// Without the guard the roster arm below claims it. `mint_agent_id` reserves
+/// `main` and `General`, but a manifest can still declare a teammate with one,
+/// and that teammate would then answer every unaddressed message — while
+/// `GET chat/history?desk=main` returned the *folded General conversation*
+/// rather than its transcript (`is_general_chat` has folded `""`, `main`,
+/// `General` and `general` into one since issue #65). The responder and the
+/// transcript named different conversations. The fold is a fact about the
+/// address, not about who was addressed.
+///
+/// Only the **bare** key. The teammate keeps its DM under `dm:<id>`, which the
+/// arm below still unwraps and resolves, and a desk that claims the key is
+/// matched first and still wins.
+///
+/// **A desk can claim the line by display name**, which the raw key misses: a
+/// blueprint declaring `id = "ops", name = "General"` answers to `General` but
+/// not to `main`, so asking for the raw key alone would hand a `main` turn to
+/// the orchestrator while an `ops` turn went to that desk's lead — two voices
+/// in one channel. The General arm therefore re-asks under
+/// [`DEFAULT_DESK`](crate::server::ops::language::DEFAULT_DESK), which is the
+/// same fold `HarnessBrain::everyone_desk` applies before expanding
+/// `@everyone`, so who answers and who a broadcast names cannot disagree. With
+/// no claimant it misses and the caller's orchestrator answers, as before.
+/// The blueprint desk that claims the company-wide line, by **either** spelling.
+///
+/// A manifest can declare a desk on any of the folded General spellings, and
+/// which half it uses is arbitrary: `id = "ops", name = "General"` claims the
+/// line by name, `id = "main", name = "Front office"` claims it by id. Asking
+/// for a fixed [`DEFAULT_DESK`](crate::server::ops::language::DEFAULT_DESK)
+/// recognised only the first, so for the second a turn addressed `main` reached
+/// its lead while the folded sibling `General` fell through to the orchestrator
+/// — one channel with two responders, decided by which alias the caller
+/// happened to use.
+///
+/// Only the manifest is searched. An overlay desk on a General key is refused
+/// by `resolve_desk_id` and unaddressable, so letting one claim the line here
+/// would hand `#general` to a desk nothing else routes to.
+pub(crate) fn general_claimant(record: &CompanyRecord) -> Option<String> {
+    let general = |s: &str| crate::server::chat_history::is_general_chat(Some(s));
+    record
+        .manifest
+        .group_chats
+        .iter()
+        .find(|c| general(&c.id) || general(&c.name))
+        .map(|c| c.id.clone())
+}
+
+pub fn chat_responder(record: &CompanyRecord, chat: &str) -> Option<String> {
+    // The desk arm asks [`desk_default_responder`], not [`desk_lead`]: for a
+    // lead desk the two are identical, and for an `Auto` channel (issue #1835)
+    // — where `desk_lead` is `None` by definition — this stays the
+    // deterministic answer. The per-message selection that may override it is
+    // the harness brain's own rung, deliberately not folded in here: this seam
+    // is sync, record-only, and shared with the small-talk fast path, which
+    // must not pay an inference call to attribute a greeting.
+    let direct = |key: &str| {
+        desk_default_responder(record, key).or_else(|| record.resolve_roster_agent_id(key))
+    };
+    if let Some(responder) = desk_default_responder(record, chat) {
+        return Some(responder);
+    }
+    // The General fold sits **between** the desk arm and the roster arm, and
+    // has to stay there: a teammate whose id is a General spelling must not
+    // inherit the company's line, and a blueprint desk that claims the line
+    // must answer every folded spelling of it (issue #1743). Resolved through
+    // `desk_default_responder` too, so an `auto` General desk answers the same
+    // way it would under its own id.
+    if crate::server::chat_history::is_general_chat(Some(chat)) {
+        return general_claimant(record).and_then(|desk| desk_default_responder(record, &desk));
+    }
+    if let Some(agent) = record.resolve_roster_agent_id(chat) {
+        return Some(agent);
+    }
+    // A `dm:` key names a **teammate**, so the roster is asked first when the
+    // prefix was used. Unwrapping straight into the desk-first `direct`
+    // resolver let a desk capture it: a blueprint may declare both a teammate
+    // and a desk with id `main` — manifest validation does not forbid the
+    // collision — and the prefixed address exists precisely to reach that
+    // teammate, so handing it to the desk's lead answers the wrong party in
+    // the one case the prefix was added for (issue #1743). The desk arm stays
+    // as the fallback, so `dm:<desk>` still resolves a desk that no teammate
+    // shares an id with, exactly as before.
+    crate::runtime::assignee::dm_key(chat)
+        .and_then(|key| record.resolve_roster_agent_id(key).or_else(|| direct(key)))
 }
 
 /// How many desk ids a rejection message names before eliding the rest, so the
@@ -179,6 +318,14 @@ const LISTED_DESKS: usize = 12;
 /// is the set a delegation target is grounded against. Reads the same two
 /// sources [`CompanyRecord::resolve_desk_id`] searches, so "what ids exist" and
 /// "does this id resolve" cannot disagree.
+///
+/// That invariant is why the overlay walk skips a desk whose **id** is a
+/// General spelling (issue #1743): `resolve_desk_id` declines to match an
+/// overlay desk against one, so listing it here would ground the model on a
+/// target every `delegate_to_desk` call is then refused for. Only overlay
+/// desks, and only by id — a `[[group_chat]]` the blueprint declares still
+/// resolves under any spelling, and an overlay desk merely *named* `General`
+/// still resolves under its own id, so both stay listed.
 pub fn desk_ids(record: &CompanyRecord) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for chat in &record.manifest.group_chats {
@@ -187,7 +334,8 @@ pub fn desk_ids(record: &CompanyRecord) -> Vec<String> {
         }
     }
     for desk in &record.overlay_desks {
-        if !ids.contains(&desk.id) {
+        if !ids.contains(&desk.id) && !crate::server::chat_history::is_general_chat(Some(&desk.id))
+        {
             ids.push(desk.id.clone());
         }
     }
@@ -216,6 +364,12 @@ pub fn reject_desk_target(record: &CompanyRecord, key: &str) -> Option<String> {
     let Some(desk_id) = record.resolve_desk_id(key) else {
         return Some(unknown_desk_message(record, key));
     };
+    // An `Auto` channel (issue #1835) is refused with its own reason, before
+    // the leadless-desk arm below can claim it: that arm's wording — "has no
+    // member on the roster" — would be a lie about a channel full of members.
+    if let Some(reason) = reject_auto_channel_target(record, &desk_id) {
+        return Some(reason);
+    }
     if desk_lead(record, &desk_id).is_some() {
         return None;
     }
@@ -233,6 +387,52 @@ Desks that can take work: {list}."
         None => format!(
             "The \"{desk_id}\" desk has no member on the roster, so nothing can be handed to it, \
 and no other desk has a lead either. Answer directly instead of delegating."
+        ),
+    })
+}
+
+/// Why an [`Auto`](crate::ports::types::ResponderMode::Auto) channel cannot
+/// take a `delegate_to_desk` hand-off (issue #1835) — or `None` when
+/// `desk_id` is an ordinary lead desk.
+///
+/// A hand-off to a desk is a hand-off to **its lead**, and an auto channel has
+/// none by design: its answerer is chosen per message. So the refusal says
+/// that, rather than reusing the leadless-desk wording ("has no member on the
+/// roster"), which would be a lie about a channel full of members.
+///
+/// **Public because both delegation paths must refuse identically.** The
+/// harness tool reaches it through [`reject_desk_target`]; the hosted
+/// device-side handler (`runtime::cycle`) calls it directly, because that path
+/// deliberately does *not* refuse an ordinary leadless desk — there a hand-off
+/// is a durable card on the board, visible whether or not anyone leads the
+/// desk yet. An auto channel is the one case it must still refuse, and codex
+/// caught the two paths disagreeing: the hosted one accepted the channel and
+/// wrote a card noting "no lead member on the roster yet", which is both false
+/// and permanently so.
+///
+/// Takes a **resolved** desk id, as `desk_responder_mode` does.
+pub fn reject_auto_channel_target(record: &CompanyRecord, desk_id: &str) -> Option<String> {
+    if record.desk_responder_mode(desk_id).is_lead() {
+        return None;
+    }
+    // `desk_lead` is `None` for an auto channel by definition, so this list
+    // excludes them without a second mode check.
+    let with_leads = desk_list(
+        desk_ids(record)
+            .into_iter()
+            .filter(|id| desk_lead(record, id).is_some())
+            .collect(),
+    );
+    Some(match with_leads {
+        Some(list) => format!(
+            "The \"{desk_id}\" channel has no lead — who answers there is picked per \
+message, not by rank — so `delegate_to_desk` has no one to hand this to. Desks that can \
+take work: {list}."
+        ),
+        None => format!(
+            "The \"{desk_id}\" channel has no lead — who answers there is picked per \
+message, not by rank — so `delegate_to_desk` has no one to hand this to, and no other \
+desk has a lead either. Answer directly instead of delegating."
         ),
     })
 }
@@ -673,8 +873,34 @@ hand work to either. Do the work yourself, or say what you cannot do."
 
 /// The first desk `member` is on, so an invented teammate-as-desk target can be
 /// redirected at the desk that teammate actually sits on.
-fn desk_of_member(record: &CompanyRecord, member: &str) -> Option<String> {
+///
+/// Naming one example desk is enough for this function's informational-message
+/// callers (`unknown_desk_message`) — the caller only needs *a* desk to point
+/// at. It is the wrong call for a value that gets **persisted**: see
+/// [`sole_desk_of_member`] for that case (issue #1882 review).
+pub(crate) fn desk_of_member(record: &CompanyRecord, member: &str) -> Option<String> {
     desks_of_member(record, member).into_iter().next()
+}
+
+/// The desk `member` sits on, but only when unambiguous — `member` belongs to
+/// exactly one desk. `None` both when `member` is on no desk and when it is on
+/// two or more.
+///
+/// `pub(crate)`: the issue #1862 prerequisite's default-owner lever —
+/// `apply_workflow_proposal` (`server/ops/tasks.rs`) fills a proposal's
+/// omitted `owner_desk` from the assignee's desk. Unlike [`desk_of_member`]'s
+/// informational-message use, that default gets written to disk, so picking
+/// the first desk in manifest declaration order for a teammate who sits on
+/// several would silently misrepresent ownership (issue #1882 review) —
+/// leaving `owner_desk` unset is the same permissive "best-effort" stance the
+/// caller already takes toward an assignee with no desk at all.
+pub(crate) fn sole_desk_of_member(record: &CompanyRecord, member: &str) -> Option<String> {
+    let mut desks = desks_of_member(record, member).into_iter();
+    let first = desks.next()?;
+    if desks.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Renders a desk-id list for a message, capped at [`LISTED_DESKS`] with the
@@ -834,12 +1060,292 @@ members = ["counsel"]
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            activation_completed_at: None,
+            created_at_millis: None,
+            name_confirmed: false,
+            overlay_tool_grants: Default::default(),
         }
+    }
+
+    /// Issue #1725: the four arms the harness brain used to hold inline. The
+    /// cycle's small-talk fast path answers in the same voice a turn would
+    /// have, and this is the resolution both now share.
+    #[test]
+    fn chat_responder_resolves_a_desk_a_teammate_and_a_dm_key() {
+        let record = record();
+        // A desk key -> its lead member.
+        assert_eq!(
+            chat_responder(&record, "engineering").as_deref(),
+            Some("ceo")
+        );
+        // A desk *name*, case-insensitively, resolves the same way.
+        assert_eq!(
+            chat_responder(&record, "Content desk").as_deref(),
+            Some("writer")
+        );
+        // A bare roster teammate id -> that teammate.
+        assert_eq!(chat_responder(&record, "writer").as_deref(), Some("writer"));
+        // The console's DM thread key, unwrapped (issue #982, step 3).
+        assert_eq!(
+            chat_responder(&record, "dm:writer").as_deref(),
+            Some("writer")
+        );
+        assert_eq!(
+            chat_responder(&record, "dm:engineering").as_deref(),
+            Some("ceo")
+        );
+        // A desk whose members are all off the roster resolves to nobody, and
+        // so does a key that names nothing — the caller decides the fallback.
+        assert_eq!(chat_responder(&record, "legal"), None);
+        assert_eq!(chat_responder(&record, "nope"), None);
+        assert_eq!(chat_responder(&record, "dm:"), None);
+    }
+
+    /// The built-in `#general` channel resolves to **nobody**, so both callers
+    /// answer as their own orchestrator (issue #1743).
+    ///
+    /// The teammate is the point: `mint_agent_id` reserves `main` and
+    /// `General`, but a manifest can declare one, and without the guard the
+    /// roster arm hands it every unaddressed message — while
+    /// `GET chat/history?desk=main` returns the folded General conversation
+    /// rather than that teammate's transcript. The bare key is the line; the
+    /// teammate keeps its DM.
+    #[test]
+    fn chat_responder_leaves_the_general_line_to_the_caller() {
+        let mut record = record();
+        for spelling in ["", "main", "Main", "MAIN", "general", "General"] {
+            assert_eq!(
+                chat_responder(&record, spelling),
+                None,
+                "the company's line resolves to nobody, addressed as {spelling:?}"
+            );
+        }
+
+        record
+            .overlay_agents
+            .push(crate::ports::types::OverlayAgent {
+                id: "main".to_string(),
+                name: "Mainard".to_string(),
+                role: "Analyst".to_string(),
+                description: None,
+                tools: None,
+                model: None,
+                harness: None,
+            });
+        assert!(record.is_roster_agent("main"), "the roster arm would match");
+        assert_eq!(
+            chat_responder(&record, "main"),
+            None,
+            "a teammate called `main` does not inherit the company's line"
+        );
+        assert_eq!(
+            chat_responder(&record, "dm:main").as_deref(),
+            Some("main"),
+            "and keeps its own DM, which is how the console addresses one"
+        );
+
+        // An overlay desk squatting the key does not take it either — the
+        // resolver declines it (see `resolve_desk_id`).
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "main".to_string(),
+            name: "Front office".to_string(),
+            description: None,
+            responder: Default::default(),
+            members: vec!["writer".to_string()],
+        });
+        assert_eq!(chat_responder(&record, "main"), None);
+
+        // A desk the *blueprint* declares still wins, as it always has.
+        let declared: crate::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"writer\"\nrole = \"Writer\"\n\n[[group_chat]]\nid = \"main\"\nname = \"Front office\"\nmembers = [\"writer\"]\n",
+        )
+        .expect("valid manifest");
+        record.manifest.group_chats.extend(declared.group_chats);
+        assert_eq!(chat_responder(&record, "main").as_deref(), Some("writer"));
+    }
+
+    /// A `dm:` key names a teammate, even when a desk shares that id.
+    ///
+    /// A blueprint may declare both — manifest validation does not forbid the
+    /// collision — and unwrapping the prefix into the desk-first resolver let
+    /// the desk's lead answer a DM addressed to the teammate. The prefixed
+    /// address exists precisely to reach that teammate, so it would have been
+    /// wrong in the one case it was added for.
+    #[test]
+    fn a_prefixed_dm_reaches_the_teammate_even_when_a_desk_shares_the_id() {
+        let mut record = record();
+        let declared: crate::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"writer\"\nrole = \"Writer\"\n\n[[group_chat]]\nid = \"main\"\nname = \"Front office\"\nmembers = [\"writer\"]\n",
+        )
+        .expect("valid manifest");
+        record.manifest.group_chats.extend(declared.group_chats);
+        record
+            .overlay_agents
+            .push(crate::ports::types::OverlayAgent {
+                id: "main".to_string(),
+                name: "Mainard".to_string(),
+                role: "Analyst".to_string(),
+                description: None,
+                tools: None,
+                model: None,
+                harness: None,
+            });
+        assert_eq!(
+            chat_responder(&record, "dm:main").as_deref(),
+            Some("main"),
+            "the prefix names the teammate, not the desk that shares its id"
+        );
+        // The bare key still belongs to the desk, which is what claims the line.
+        assert_eq!(
+            chat_responder(&record, "main").as_deref(),
+            Some("writer"),
+            "the desk still answers its own id"
+        );
+    }
+
+    /// ...and so does one that claims it by **id**, which is the other half.
+    ///
+    /// A manifest may declare the General desk either way, and which half it
+    /// uses is arbitrary. Re-asking under a fixed `DEFAULT_DESK` ("General")
+    /// recognised only the display-name claimant, so for `id = "main", name =
+    /// "Front office"` a turn addressed `main` reached its lead while the
+    /// folded sibling `General` fell through to the orchestrator — one channel,
+    /// two responders, decided by whichever accepted alias the caller used.
+    #[test]
+    fn chat_responder_folds_the_general_aliases_to_an_id_claimant() {
+        let mut record = record();
+        let declared: crate::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"writer\"\nrole = \"Writer\"\n\n[[group_chat]]\nid = \"main\"\nname = \"Front office\"\nmembers = [\"writer\"]\n",
+        )
+        .expect("valid manifest");
+        record.manifest.group_chats.extend(declared.group_chats);
+
+        let direct = chat_responder(&record, "main");
+        assert!(direct.is_some(), "the desk answers under its own id");
+        // Every folded spelling reaches the same lead — one channel, one voice.
+        for alias in ["", "General", "general", "MAIN"] {
+            assert_eq!(
+                chat_responder(&record, alias),
+                direct,
+                "the folded alias {alias:?} must reach the same responder as `main`"
+            );
+        }
+    }
+
+    /// A desk that claims the line by **display name** answers every spelling
+    /// folded into it, not just the one it is spelled with (issue #1743).
+    ///
+    /// `id = "ops", name = "General"` answers to `General` but not to `main`,
+    /// so asking for the raw key alone handed a `main` turn to the caller's
+    /// orchestrator while an `ops` turn went to that desk's lead — two voices
+    /// in the one channel the console renders for both. The General arm re-asks
+    /// under `DEFAULT_DESK`, which is the same fold `everyone_desk` applies, so
+    /// who answers and who `@everyone` names cannot disagree.
+    #[test]
+    fn chat_responder_folds_the_general_aliases_to_a_display_name_claimant() {
+        let plain = record();
+        let mut record = record();
+        let declared: crate::CompanyManifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"writer\"\nrole = \"Writer\"\n\n[[group_chat]]\nid = \"ops\"\nname = \"General\"\nmembers = [\"writer\"]\n",
+        )
+        .expect("valid manifest");
+        record.manifest.group_chats.extend(declared.group_chats);
+
+        for spelling in ["", "main", "Main", "general", "General", "ops"] {
+            assert_eq!(
+                chat_responder(&record, spelling).as_deref(),
+                Some("writer"),
+                "one voice in the channel, addressed as {spelling:?}"
+            );
+        }
+        // The other desks are untouched, and a company with no claimant still
+        // leaves the line to the caller.
+        assert_eq!(
+            chat_responder(&record, "engineering").as_deref(),
+            Some("ceo")
+        );
+        assert_eq!(chat_responder(&plain, "main"), None);
     }
 
     #[test]
     fn desk_ids_lists_manifest_desks_in_declaration_order() {
         assert_eq!(desk_ids(&record()), ["engineering", "content", "legal"]);
+    }
+
+    /// What this function lists and what [`CompanyRecord::resolve_desk_id`]
+    /// resolves must be the same set (issue #1743).
+    ///
+    /// `create_desk` accepted the General spellings until that issue, so an
+    /// upgraded record can hold an overlay desk called `main` or `general` —
+    /// and `resolve_desk_id` now declines to match an overlay desk against one,
+    /// because such a desk would otherwise answer for the built-in `#general`
+    /// channel. Grounding the model on an id every `delegate_to_desk` call is
+    /// then refused for is a loop the model cannot get out of: the refusal
+    /// names the desk set, the desk set names the target, the target is
+    /// refused.
+    #[test]
+    fn desk_ids_omits_an_overlay_desk_no_key_can_resolve() {
+        let mut record = record();
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "main".to_string(),
+            name: "Front office".to_string(),
+            description: None,
+            responder: Default::default(),
+            members: vec!["ceo".to_string()],
+        });
+        // Named `General`, but addressable under its own id — it stays.
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "ops".to_string(),
+            name: "General".to_string(),
+            description: None,
+            responder: Default::default(),
+            members: vec!["writer".to_string()],
+        });
+
+        assert_eq!(
+            desk_ids(&record),
+            ["engineering", "content", "legal", "ops"],
+            "the desk no key resolves is not offered as a target"
+        );
+        // The property, stated directly: every id listed resolves.
+        for id in desk_ids(&record) {
+            assert!(
+                record.resolve_desk_id(&id).is_some(),
+                "desk_ids offered {id:?}, which resolve_desk_id refuses"
+            );
+        }
+        assert!(
+            record.resolve_desk_id("main").is_none(),
+            "and the omitted one is omitted because it does not resolve"
+        );
+    }
+
+    /// A `[[group_chat]]` the **blueprint** declares under a General spelling
+    /// is grandfathered and stays listed — the rule above is about overlay
+    /// desks only, and narrowing it further would take a delegation target away
+    /// from a company whose manifest has always had one.
+    #[test]
+    fn desk_ids_keeps_a_blueprint_desk_declared_under_a_general_spelling() {
+        let mut record = record();
+        let declared: crate::CompanyManifest = toml::from_str(
+            r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+
+[[group_chat]]
+id = "main"
+name = "Front office"
+members = ["ceo"]
+"#,
+        )
+        .expect("valid manifest");
+        record.manifest.group_chats.extend(declared.group_chats);
+        assert!(desk_ids(&record).contains(&"main".to_string()));
+        assert_eq!(record.resolve_desk_id("main"), Some("main".to_string()));
     }
 
     #[test]
@@ -1284,5 +1790,77 @@ members = ["analyst"]
         .expect("valid");
         assert_eq!(parsed.desk, "engineering");
         assert_eq!(parsed.instruction, "build the thing");
+    }
+
+    /// Issue #1835: an `auto` channel answers the three routing questions
+    /// three different ways, and each is load-bearing. `desk_lead` is `None`
+    /// — no lead exists, so no crown, no badge, no `delegate_to_desk` target.
+    /// `desk_default_responder` is the first roster member — the deterministic
+    /// fallback wherever per-message selection cannot run. `chat_responder`
+    /// answers that fallback, so the small-talk fast path and the default
+    /// build route exactly as a lead desk would have.
+    #[test]
+    fn an_auto_channel_has_no_lead_but_a_deterministic_responder() {
+        let mut record = record();
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "launch".to_string(),
+            name: "Launch week".to_string(),
+            description: None,
+            members: vec!["ceo".to_string(), "writer".to_string()],
+            responder: crate::ports::types::ResponderMode::Auto,
+        });
+        assert_eq!(
+            desk_lead(&record, "launch"),
+            None,
+            "auto channels have no lead"
+        );
+        assert_eq!(
+            desk_default_responder(&record, "launch").as_deref(),
+            Some("ceo"),
+            "the deterministic fallback is the first roster member"
+        );
+        assert_eq!(
+            chat_responder(&record, "launch").as_deref(),
+            Some("ceo"),
+            "the shared seam answers the fallback, not None"
+        );
+        // An overlay desk that never states a mode is lead-routed — the
+        // pre-#1835 behaviour, byte-for-byte.
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "growth".to_string(),
+            name: "Growth".to_string(),
+            description: None,
+            members: vec!["writer".to_string()],
+            responder: crate::ports::types::ResponderMode::default(),
+        });
+        assert_eq!(desk_lead(&record, "growth").as_deref(), Some("writer"));
+    }
+
+    /// Issue #1835: a hand-off to an `auto` channel is refused with the real
+    /// reason — no lead exists by design — never with the leadless-desk arm's
+    /// "no member on the roster", which would be a lie about a staffed
+    /// channel. The valid-target list must also exclude the channel itself.
+    #[test]
+    fn delegating_to_an_auto_channel_is_refused_naming_the_selection() {
+        let mut record = record();
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "launch".to_string(),
+            name: "Launch week".to_string(),
+            description: None,
+            members: vec!["ceo".to_string(), "writer".to_string()],
+            responder: crate::ports::types::ResponderMode::Auto,
+        });
+        let message = reject_desk_target(&record, "launch").expect("refused");
+        assert!(message.contains("picked per message"), "{message}");
+        assert!(
+            !message.contains("no member on the roster"),
+            "a staffed channel must not be reported empty: {message}"
+        );
+        // Desks that can take work are still offered — and never the channel.
+        assert!(message.contains("engineering"), "{message}");
+        assert!(
+            !message.contains("Desks that can take work: launch"),
+            "{message}"
+        );
     }
 }

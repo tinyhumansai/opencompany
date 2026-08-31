@@ -24,7 +24,21 @@ Each node's `WorkflowNodeStarted` and `WorkflowNodeFinished` ride the **same**
 unbounded observer channel, so the collector drains them in order and a node's
 start is always journaled ahead of its finish.
 
-### Why the journal rather than a dedicated store
+## Run-start sender
+
+`WorkflowRunStarted` also carries `startedBy`, identifying the source of the
+run: `"operator"`, `"schedule"`, or `{ "agent": "<teammate-id>" }`. The field
+is serialized in the same mixed shape as the runtime event and is available on
+the operator SSE projection so consumers can attribute a run without guessing
+from `scheduled` alone.
+
+`startedBy` is optional on the wire, not a guaranteed member: a journal line
+written before this field existed carries none, and replaying it must not fail
+to parse, so the key is omitted rather than sent as `null`. `None` is also the
+honest reading for any future entry point that genuinely has no identity to
+give. A consumer — SSE or otherwise — must treat a missing `startedBy` as
+"unattributed," not assume `scheduled` alone can stand in for it.
+
 
 A chat turn emits dozens of steps per message; a workflow run emits **one event
 per non-trigger node** — roughly eight for a six-node graph. At that volume the
@@ -195,3 +209,26 @@ row against the finish's `blocked_nodes` list so the history's chips agree with
 its terminal reading. The durable node row is deliberately left as the engine
 wrote it — rewriting it would make the live progress frames disagree with the
 engine that produced them.
+
+## `agent_run_id` on the node events
+
+`WorkflowNodeFinished` carries `agent_run_id`: the attempt the node's agent ran
+as, when it opened one.
+
+This does not weaken the events' "structural ids, never payloads" stance — a run
+id is a structural id, no more revealing than the `node_id` beside it, and it is
+reachable by the same operator through `GET {scope}/runs`. What it buys is the
+join without a second round trip: a console watching the canvas can open a node's
+step trace directly instead of searching for which attempt was its.
+
+Absent for a non-agent node, for a host that records no attempts, and on every
+line written before the field existed (`serde(default)` + `skip_serializing_if`,
+for the reason `diagnostics` beside it has them — the journal is replayed at
+boot, so a field without a default turns pre-existing lines into silent history
+loss).
+
+The id travels from the node to the journal through `RunAttempts`, a shared
+side-channel in the `RunNotices`/`RunBoard`/`RunBlocks` family. It cannot ride
+the node's output: `run_agent`'s return value *becomes* the node's output, so a
+non-output fact placed there lands in the next node's `=items` binding — the
+mistake `RunBlocks` exists to document.

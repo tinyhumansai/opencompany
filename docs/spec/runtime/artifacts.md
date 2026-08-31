@@ -91,13 +91,41 @@ rather than a row behind one card's Artifacts tab. `company::artifact_mirror`
 files it at:
 
 ```text
-artifacts/<agent-id>/<task-id>/<source…>
+artifacts/<agent-id>/<task-title>.<task-id>/<source…>
 ```
 
 `artifacts/` is an eagerly-scaffolded system root carrying a `readme.md`; the
 member folder beneath it is minted the first time that agent publishes
 (`workspace_scaffold::ensure_artifact_folder`), so the list under it is a record
 of who has delivered rather than a copy of the roster.
+
+### The task folder is named for the work and keyed by the id (issue #1687)
+
+The folder used to be named by the card id alone — a good key and a useless
+label, since `artifacts/cmo/` was a column of `01hq8zm4x…` that could only be
+told apart by opening each one. It now carries the card's title first, because
+the console's tree truncates from the right, and the card id last, because that
+is the only half that is unique and immutable: two cards titled "Weekly update"
+must not share a folder, and an operator holding a card id needs something in
+the tree to match it against. The title half is budgeted against the 96-byte
+name cap so the id half is never truncated, and a title that normalizes to
+nothing (an emoji, punctuation) leaves the folder named by the id alone rather
+than collapsing every such card onto `untitled`.
+
+**The join is a dot, and the lookup is on the id half, not on the name.** A
+title is editable, so an exact-name lookup would stop finding the folder the
+moment somebody retitled the card and the next publish would mint a rival
+beside it, splitting one task's deliverables across two folders. The lookup
+therefore reads the text after the name's last dot and compares it to the card
+id. The dot is what makes that an equality test: a seed card's id is
+`[a-z0-9-]` (`task_file::normalize_task_id`), so `login` and `fix-login` are
+both legal ids and a dash join would leave one card's folder ending in the
+other's id — while neither id grammar can produce a dot. The same lookup
+**adopts** a folder minted before this change, whose name is the bare id.
+
+**Nothing is renamed**, here as everywhere else in this runtime: an existing
+folder keeps the name it was minted under, and only a task publishing for the
+first time gets a titled one.
 
 It used to be `agents/<agent-id>/<task-id>/…`, which filed a deliverable in the
 same folder as its author's scratch notes — the two populations were

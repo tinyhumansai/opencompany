@@ -893,6 +893,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spec_names_the_build_commit_beside_the_version() {
+        // `version` has read `0.1.0` for thousands of commits, so it alone
+        // cannot tell an operator which build a host is running. The commit is
+        // the same *kind* of fact — identical for every instance compiled from
+        // one artifact, and saying nothing about this host — which is why it
+        // sits on the unauthenticated handshake where `version` already does.
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(AppConfig::default()).with_home(dir.path().to_path_buf());
+        let body = spec_body(state).await;
+
+        let commit = body["build_commit"].as_str().expect("a build commit");
+        assert_eq!(commit, crate::BUILD_COMMIT);
+        assert!(!commit.is_empty(), "an absent stamp must read `unknown`");
+        assert!(
+            commit
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "{commit:?} is not a sanitized stamp"
+        );
+        assert_eq!(body["version"], crate::VERSION);
+    }
+
+    #[tokio::test]
     async fn two_instances_are_distinguishable() {
         // The multi-connection requirement in one assertion: a client holding
         // two servers must be able to tell them apart even when both are

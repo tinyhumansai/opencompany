@@ -50,6 +50,21 @@ export interface HostsValue {
   localInstances: LocalInstance[];
   /** Creates a host on this machine over a data root of its own, and starts it. */
   onAddLocal?: (label: string) => Promise<void>;
+  /**
+   * Renames the local host whose console is on screen, if it is one.
+   *
+   * Exists so finishing setup can put the *company's* name on the host that
+   * now holds it. A second company on this machine means a second data root,
+   * which the operator meets as "add a host" and has to name before they have
+   * been asked a single question about the company — so the name they type is
+   * a placeholder for a thing they were not thinking about, and the roster ends
+   * up listing hosts nobody can tell apart. Naming it after the company turns
+   * that into a detail they never have to hold.
+   *
+   * A no-op on a remote host and in the browser: neither is this machine's to
+   * rename. Absent entirely on a shell with no local roster.
+   */
+  onNameLocalHost?: (label: string) => Promise<void>;
   onStartLocal?: (id: string) => Promise<void>;
   onStopLocal?: (id: string) => Promise<void>;
   /** Permanently deletes a non-default local host and its data. */
@@ -125,6 +140,20 @@ export function useHosts(): HostsContextValue {
   const value = useContext(HostsContext);
   if (!value) throw new Error("useHosts must be used within a HostsProvider.");
   return value;
+}
+
+/**
+ * The hosts, for anything that works with or without them.
+ *
+ * The sibling of {@link useHosts}, and the difference is whether the caller is
+ * *about* the roster. A switcher outside the provider is a wiring mistake and
+ * should say so; a view that merely takes an extra step when it happens to be
+ * inside a console — the setup wizard naming its host after the company — is
+ * not, and it renders on its own in tests and wherever a console has not been
+ * assembled yet.
+ */
+export function useOptionalHosts(): HostsContextValue | null {
+  return useContext(HostsContext);
 }
 
 /** How many hosts the number row can reach. `⌘1`–`⌘9`, in list order. */

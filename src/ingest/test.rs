@@ -192,3 +192,116 @@ fn a_pdf_without_the_feature_names_the_feature() {
     };
     assert!(reason.contains("documents"), "{reason}");
 }
+
+/// An archive whose entries declare more uncompressed bytes than the cap is
+/// refused before any entry data is read — the zip-bomb guard. The fixture is
+/// one entry of zero bytes just over the cap: zeroes compress to almost
+/// nothing, so the archive is a few hundred bytes on disk while its declared
+/// expansion exceeds the limit, exactly the shape of a crafted bomb.
+#[cfg(feature = "documents")]
+#[test]
+fn an_overexpanding_document_is_refused_not_allocated() {
+    use crate::ingest::documents::MAX_DECOMPRESSED_BYTES;
+
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("word/document.xml", options).unwrap();
+        std::io::Write::write_all(&mut writer, &vec![0u8; MAX_DECOMPRESSED_BYTES as usize + 1])
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let Extracted::Unsupported(reason) = extract("bomb.docx", None, &buffer.into_inner()) else {
+        panic!("an overexpanding document must be refused");
+    };
+    assert!(reason.contains("expands"), "{reason}");
+}
+
+/// Builds a minimal XLSX archive from a worksheet's `sheetData` fragment.
+///
+/// The package parts are the smallest set calamine's Xlsx reader accepts: the
+/// content-type map, the root and workbook relationships, and the workbook
+/// itself. No shared strings or styles, which the reader tolerates.
+#[cfg(feature = "documents")]
+fn xlsx_with_sheet(sheet_data: &str) -> Vec<u8> {
+    let content_types = r#"<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#;
+    let root_rels = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+    let workbook = r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+    let workbook_rels = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+    let worksheet = format!(
+        r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>{sheet_data}</sheetData>
+</worksheet>"#
+    );
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buffer);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (path, contents) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", root_rels),
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", workbook_rels),
+            ("xl/worksheets/sheet1.xml", &worksheet),
+        ] {
+            writer.start_file(path, options).unwrap();
+            std::io::Write::write_all(&mut writer, contents.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
+/// A tiny spreadsheet still extracts its rows — the dense-range guard must not
+/// refuse ordinary files, and the concrete (non-auto) Xlsx open must not
+/// either.
+#[cfg(feature = "documents")]
+#[test]
+fn a_small_spreadsheet_yields_its_rows_in_order() {
+    let bytes = xlsx_with_sheet(
+        r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>alpha</v></c></row>
+           <row r="2"><c r="A2"><v>2</v></c><c r="B2"><v>beta</v></c></row>"#,
+    );
+    let Extracted::Text(text) = extract("ledger.xlsx", None, &bytes) else {
+        panic!("a small spreadsheet must extract");
+    };
+    assert!(text.contains("alpha"), "{text}");
+    assert!(text.contains("beta"), "{text}");
+}
+
+/// The dense-range guard: a spreadsheet whose cells span the whole grid — one
+/// at `A1` and one at `XFD1048576` — passes the decompression cap (it is a few
+/// hundred bytes) yet would force calamine's `worksheet_range` to materialize
+/// a ~17-billion-cell dense grid. It must be refused before that allocation,
+/// not after (codex review finding).
+#[cfg(feature = "documents")]
+#[test]
+fn a_spreadsheet_with_far_cells_is_refused_not_allocated() {
+    let bytes = xlsx_with_sheet(
+        r#"<row r="1"><c r="A1"><v>1</v></c></row>
+           <row r="1048576"><c r="XFD1048576"><v>2</v></c></row>"#,
+    );
+    let Extracted::Unsupported(reason) = extract("spread.xlsx", None, &bytes) else {
+        panic!("a spreadsheet with far-apart cells must be refused");
+    };
+    assert!(reason.contains("used range"), "{reason}");
+}

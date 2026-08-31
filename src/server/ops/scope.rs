@@ -86,6 +86,19 @@ pub(crate) struct ScopedCompany {
     /// second one. Two role checks that can disagree about what an operator may
     /// see is a worse outcome than the leak either was written to close.
     pub(crate) may_read_contents: bool,
+    /// Whether this principal may see an `admin_only` row — an owner-fallback
+    /// report journaled under
+    /// [`OWNER_FALLBACK_REPORT_AUTHOR`](crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+    /// (issue #1781 review, Codex P1).
+    ///
+    /// `GqlAuth::Platform` (no person behind the credential) gets `true` here,
+    /// matching [`Viewer::Operator`](crate::server::chat_history::Viewer::Operator)'s
+    /// existing, already unrestricted access to the rest of a company's
+    /// history — an admin-only row is not a narrower case than that. Mirrors
+    /// the same resolution the GraphQL `Chat.history` resolver makes
+    /// (`company.rs`), so the SSE feed and a reload can never disagree about
+    /// which viewer sees one.
+    pub(crate) is_admin: bool,
 }
 
 impl ScopedCompany {
@@ -143,6 +156,14 @@ impl FromRequestParts<AppState> for ScopedCompany {
         // the input to it.
         let may_read_contents =
             crate::server::approval_visibility::may_read_approval_contents(&auth);
+        // Same "resolved while the principal still exists" reasoning as
+        // `may_read_contents` above, for the admin-only-row gate (issue #1781
+        // review, Codex P1). Unlike `may_read_contents`, the machine principal
+        // is unrestricted here — see the field's doc.
+        let is_admin = match &auth {
+            GqlAuth::User(user) => user.may_administer(),
+            GqlAuth::Platform(_) => true,
+        };
         // Keep the person, drop the credential: only a human principal names an
         // actor, and only the user id travels — never the email or the role.
         let actor = match auth {
@@ -156,6 +177,7 @@ impl FromRequestParts<AppState> for ScopedCompany {
             runtime,
             actor,
             may_read_contents,
+            is_admin,
         })
     }
 }
@@ -232,6 +254,11 @@ impl FromRequestParts<AppState> for AdminScopedCompany {
             // read contents by construction (an admin, or the platform bearer
             // which this extractor admits and #618 refuses contents to anyway).
             may_read_contents: _,
+            // Not carried on, for the same reason: every principal that
+            // reaches this extractor already IS an admin by construction (see
+            // above), so this extractor's own callers have no narrower
+            // question to ask than `ScopedCompany` already answered.
+            is_admin: _,
         } = ScopedCompany::from_request_parts(parts, state).await?;
         match actor {
             // A human. `ScopedCompany` keeps the person but drops the role, so

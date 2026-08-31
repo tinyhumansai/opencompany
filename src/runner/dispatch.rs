@@ -163,11 +163,20 @@ impl<L: RunnerLink> RunnerDispatch<L> {
 
 #[async_trait]
 impl<L: RunnerLink> AcpAgent for RunnerDispatch<L> {
+    /// `observer` is ignored, and can only be ignored here: [`RunnerLink`]
+    /// hands back a whole [`AcpTurn`] when the remote turn is over, so there
+    /// is no per-update stream on this side to tee. Making it observable is a
+    /// change to the runner *wire* — the socket would have to forward each
+    /// `session/update` as it arrives instead of the turn's transcript at the
+    /// end — not something this fold can synthesise. Until then an ACP turn on
+    /// a runner shows its steps when it finishes, exactly as it did before,
+    /// while a local one shows them live.
     async fn prompt(
         &self,
         _company: &CompanyId,
         session_key: &str,
         message: &str,
+        _observer: Option<&crate::ports::acp::AcpObserver>,
     ) -> Result<AcpTurn> {
         // Chosen per turn rather than pinned at session start: a runner can go
         // away between turns, and re-choosing is how the next turn lands on
@@ -274,7 +283,7 @@ mod test {
         let (dispatch, recorder) = dispatch(registry);
 
         let turn = dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "do it")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "do it", None)
             .await
             .unwrap();
 
@@ -292,7 +301,7 @@ mod test {
 
         for _ in 0..3 {
             dispatch
-                .prompt(&CompanyId::new("acme"), "acme::ceo", "again")
+                .prompt(&CompanyId::new("acme"), "acme::ceo", "again", None)
                 .await
                 .unwrap();
         }
@@ -310,11 +319,11 @@ mod test {
         let (dispatch, recorder) = dispatch(registry);
 
         dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "x")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "x", None)
             .await
             .unwrap();
         dispatch
-            .prompt(&CompanyId::new("globex"), "globex::cto", "y")
+            .prompt(&CompanyId::new("globex"), "globex::cto", "y", None)
             .await
             .unwrap();
 
@@ -331,7 +340,7 @@ mod test {
         let (dispatch, _) = dispatch(registry);
 
         let error = dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "x")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "x", None)
             .await
             .unwrap_err();
         assert!(
@@ -349,7 +358,7 @@ mod test {
         let (dispatch, _) = dispatch(registry);
 
         let error = dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "x")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "x", None)
             .await
             .unwrap_err();
         assert!(
@@ -368,7 +377,7 @@ mod test {
             .with_clock(|| crate::runner::registry::PRESENCE_TTL_MILLIS * 10);
 
         let error = dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "x")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "x", None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stopped reporting"), "{error}");
@@ -383,13 +392,13 @@ mod test {
         let (dispatch, recorder) = dispatch(Arc::clone(&registry));
 
         dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "first")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "first", None)
             .await
             .unwrap();
         // Ada's laptop closes; Bob's takes the scope.
         registry.admit(runner("bob", "acme::ceo", true, 0));
         dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "second")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "second", None)
             .await
             .unwrap();
 
@@ -422,7 +431,7 @@ mod test {
         let (dispatch, recorder) = dispatch(registry);
 
         dispatch
-            .prompt(&CompanyId::new("acme"), "acme::ceo", "x")
+            .prompt(&CompanyId::new("acme"), "acme::ceo", "x", None)
             .await
             .unwrap();
         dispatch

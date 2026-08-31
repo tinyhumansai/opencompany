@@ -47,13 +47,13 @@ This company holds no web or search tools, on purpose. The answer to a stated
 problem is something the lab computes; a number that arrived any other way is
 not evidence that anything here works.
 
-## A refused tool is a pause, not a prompt to improvise
+## An approval request is a pause, not a prompt to improvise
 
-Running a program stops for the operator — `shell` and `run_workflow` are on
-the always-ask list on every policy tier, by construction. When one parks, the
-right move is to say what is waiting and stop; the wrong one is to produce the
-number some other way. The first run of this lab did the wrong one: refused its
-sandbox, it did the arithmetic in its head, reported the right answer, and the
-end-to-end test went green over a lab that had computed nothing. An answer with
-no program behind it is a recollection, and this lab does not ship
-recollections.
+Policy does not stop a program automatically. Before any `shell` or
+`run_workflow` action, the agent calls `request_approval` with the exact program
+and reason, then stops until the operator decides. The program call must not
+appear in the same turn. The wrong response to waiting is to produce the number
+some other way. The first run of this lab did that: refused its sandbox, it did
+the arithmetic in its head, reported the right answer, and the end-to-end test
+went green over a lab that had computed nothing. An answer with no program
+behind it is a recollection, and this lab does not ship recollections.

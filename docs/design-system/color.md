@@ -353,5 +353,27 @@ so it is named: `--brand-discord`, `--brand-discord-hover`,
 `--brand-discord-on-dark`. The token name is what stops a future cleanup
 "fixing" it into the palette.
 
+`--brand-chargebee` (`#ff3300`) joins it for the same reason — the provider
+mark on Finance → Invoicing. One token where Discord needs three: as a mark
+rather than a label it only has to clear 3:1, which it does on both grounds
+(5.36:1 dark, 3.67:1 light), so neither theme needs its own step.
+
+PayPal's monogram on Finance → Wallet needs five, because the mark is two
+overlapping P's and their crossing is its own colour: `--brand-paypal-back`,
+`--brand-paypal-front`, `--brand-paypal-overlap`, and themed
+`--brand-paypal-back-on-dark` / `--brand-paypal-front-on-dark` /
+`--brand-paypal-overlap-on-dark` pairs. Both P
+colours move between themes to preserve contrast: the back P uses `#002991` in
+light mode and `#008cff` in dark mode, while the front P uses `#0070ba` in light
+mode and `#60cdff` in dark mode. The back P's dark value clears 3:1 at 5.74:1;
+its light value would measure only 1.61:1 on the dark card. The front P is the
+mirror case on the light ground: its light value clears 3:1 at 5.22:1 on the
+white card, where its dark value would measure only 1.80:1. The crossing uses
+`#0066a8` in light mode so it remains darker than `#0070ba` and preserves the
+mark's depth cue; it clears 3:1 at 6.06:1. In dark mode it uses `#008cff`, the
+back P's value, retaining the existing treatment there. A two-tone mark
+also cannot take `currentColor`, so these are referenced as
+`fill-(--brand-paypal-*)` on the paths rather than inherited from the call site.
+
 Anything drawn on top of a provider colour must not assume a light or dark
 ground — they span `#0F0F0F` to `#EA4335`.

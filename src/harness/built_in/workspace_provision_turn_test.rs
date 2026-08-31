@@ -240,10 +240,14 @@ fn record(overlays: Vec<OverlayAgent>) -> CompanyRecord {
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
@@ -255,6 +259,7 @@ fn build_brain(
 ) -> (HarnessBrain, Arc<FsOps>) {
     let ops = Arc::new(FsOps::new(dir));
     let deps = HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: Arc::new(HostedProvider::new(HostedProviderConfig {
@@ -310,6 +315,8 @@ fn build_brain(
         workspace: None,
         search: None,
         tenant_search: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
     (
         HarnessBrain::new(Arc::new(HarnessPool::new()), deps, record(overlays)),
@@ -335,6 +342,7 @@ fn card(id: &str, assignee: &str) -> TaskRecord {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     }
 }
 
@@ -347,6 +355,7 @@ fn dispatch(task_id: &str) -> CycleRequest {
             run_id: None,
         }],
         event_seqs: Vec::new(),
+        policy: None,
     }
 }
 
@@ -438,7 +447,7 @@ async fn an_overlay_teammate_added_at_runtime_writes_on_its_first_turn() {
         name: "Analyst".to_string(),
         role: "Analyst".to_string(),
         description: Some("Reads the numbers.".to_string()),
-        tools: Vec::new(),
+        tools: None,
         model: None,
         harness: None,
     };

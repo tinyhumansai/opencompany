@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 /**
  * Issues #260 / #261 / #262: how the workflow create dialog validates input and
@@ -53,6 +53,19 @@ async function openCreateDialog(page: Page) {
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByText("New workflow", { exact: true })).toBeVisible();
   return dialog;
+}
+
+/**
+ * Clicks Create through the id-confirm gate (issue #1808) and waits for the
+ * dialog to close. Create mode shows the confirm on the first click rather
+ * than writing; the confirm's own action — also rendered "Create workflow",
+ * but portalled onto `document.body` and reached by test id rather than
+ * `dialog`-scoped role — is the one that fires the write.
+ */
+async function submitCreate(page: Page, dialog: Locator) {
+  await dialog.getByRole("button", { name: "Create workflow" }).click();
+  await page.getByTestId("workflow-id-confirm-create").click();
+  await expect(dialog).toBeHidden({ timeout: 30_000 });
 }
 
 /**
@@ -306,8 +319,7 @@ test("a condition's branches are picked, not typed, and the host checks the grap
   });
 
   // And the graph the pre-flight approved is the graph Create accepts.
-  await dialog.getByRole("button", { name: "Create workflow" }).click();
-  await expect(dialog).toBeHidden({ timeout: 30_000 });
+  await submitCreate(page, dialog);
 });
 
 /**
@@ -398,8 +410,7 @@ test("a valid workflow still saves", async ({ page }) => {
   await dialog.getByLabel("Edge to").click();
   await page.getByRole("option", { name: "done", exact: true }).click();
 
-  await dialog.getByRole("button", { name: "Create workflow" }).click();
-  await expect(dialog).toBeHidden({ timeout: 30_000 });
+  await submitCreate(page, dialog);
 });
 
 test("a new scheduled workflow discloses that it starts paused (#813)", async ({
@@ -447,11 +458,12 @@ test("the channel destination is a picker of wired channels, not free text (#813
 }) => {
   // #813 defect 4: typing a channel id that isn't wired only failed at delivery.
   // The target is now a picker whose options are the company's wired channels.
-  // #981: `operator` is deliberately never one of them — it is an in-memory
-  // response surface with no durable reader, so delivery refuses it by name
-  // and the picker no longer offers it. `engineering` is the e2e harness
-  // company's desk channel (`companies/e2e_harness/company.toml`), so it is
-  // always in the wired set instead.
+  // `engineering` is the e2e harness company's desk channel
+  // (`companies/e2e_harness/company.toml`), so it is always in the wired set.
+  // `operator` is too, as of #1757: it moved from an in-memory response
+  // surface delivery refused by name (#981) to a durable, journal-backed
+  // channel every company wires, so the picker now lists it as a real target
+  // alongside the desk channels rather than hiding it.
   const dialog = await openCreateDialog(page);
   await dialog.getByRole("button", { name: "Add node" }).click();
   const kind = dialog.getByLabel("Node kind").nth(1);
@@ -460,11 +472,11 @@ test("the channel destination is a picker of wired channels, not free text (#813
   await dialog.getByLabel("Send report to").click();
   await page.getByRole("option", { name: /^Channel/ }).click();
 
-  // The channel target is a combobox offering the wired desk channel, never
-  // the undeliverable `operator` surface.
+  // The channel target is a combobox offering both the wired desk channel and
+  // the durable operator channel.
   await dialog.getByLabel("Channel id").click();
   await expect(page.getByRole("option", { name: "engineering" })).toBeVisible();
-  await expect(page.getByRole("option", { name: "operator" })).not.toBeVisible();
+  await expect(page.getByRole("option", { name: "operator" })).toBeVisible();
 });
 
 test("submitting with an empty id surfaces the validation message on-screen (#813)", async ({

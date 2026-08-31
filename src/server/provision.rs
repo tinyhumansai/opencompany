@@ -17,18 +17,23 @@
 //! [`WebhookSink`](crate::server::webhook::WebhookSink); the default build
 //! records deliveries in memory.
 
+use std::str::FromStr;
+use std::sync::Arc;
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
+use crate::app::config::AuthMode;
 use crate::company::CompanyManifest;
+use crate::ports::CompanyStore;
 use crate::ports::types::{Actor, ActorKind, CompanyId};
 use crate::runtime::types::CycleReport;
 use crate::runtime::{RuntimeBuilder, company_id_from_name};
@@ -36,11 +41,13 @@ use crate::server::error::ApiError;
 use crate::server::graphql::auth::GqlAuth;
 use crate::server::platform_auth::{PlatformScope, acting_tenant, authorize_address};
 use crate::server::webhook::{WebhookEvent, WebhookKind};
+use crate::store::FsCompanyStore;
 
 /// Builds the provisioning + lifecycle route fragment.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/companies", post(provision))
+        .route("/api/v1/companies/provisioning", get(provisioning_info))
         .route("/api/v1/companies/{id}/pause", post(pause))
         .route("/api/v1/companies/{id}/resume", post(resume))
         .route(
@@ -74,6 +81,40 @@ fn not_found(id: &str) -> Response {
 // ---------------------------------------------------------------------------
 // Provisioning
 // ---------------------------------------------------------------------------
+
+/// What `GET /api/v1/companies/provisioning` reports: the sign-in mode a
+/// company provisioned on this host right now would land in, and whether that
+/// mode requires the create/reset dialog to collect wallet addresses.
+///
+/// Reachable by a console platform bearer, unlike `GET /api/v1/setup` (loopback
+/// / peer-gated), so the create/reset dialog can render mode-appropriate fields
+/// before it provisions rather than discovering the host's `wallet` override
+/// only when the manifest is refused (`auth_mode_wallet_no_wallets`).
+#[derive(Debug, Serialize)]
+struct ProvisioningInfoDto {
+    /// The effective sign-in mode: `wallet`, `email`, or `none`.
+    auth_mode: &'static str,
+    /// Whether provisioning requires at least one `[users].wallets` address.
+    wallets_required: bool,
+}
+
+/// `GET /api/v1/companies/provisioning` — the auth-mode preflight the create /
+/// reset dialog reads before building a manifest.
+async fn provisioning_info(
+    PlatformScope(_claims): PlatformScope,
+    State(state): State<AppState>,
+) -> Response {
+    // When no host-wide override is set, each company's own `[users].mode`
+    // decides — and the console builds an `email` manifest by default, so the
+    // default report is `email`. A `wallet` override is the case that forces
+    // the dialog to collect addresses.
+    let mode = state.auth_mode_override().unwrap_or_default();
+    let dto = ProvisioningInfoDto {
+        auth_mode: mode.as_str(),
+        wallets_required: mode == AuthMode::Wallet,
+    };
+    (StatusCode::OK, Json(dto)).into_response()
+}
 
 /// The JSON provisioning body: a manifest string plus an optional explicit id.
 #[derive(Debug, Deserialize)]
@@ -173,6 +214,86 @@ async fn provision(
         .into_response();
     }
 
+    // The same refusal boot applies to `serve --company`: a company with no
+    // sign-in on a host anyone can reach is an unauthenticated admin console,
+    // not a desktop app. A tenant's manifest can request `[users].mode =
+    // "none"`, but this host will not silently serve it wherever it binds —
+    // it is refused here exactly as it would be refused at boot.
+    //
+    // Checked here, before `id` is even resolved, rather than after
+    // `builder.build()` returns: `RuntimeBuilder::build` persists the
+    // `CompanyRecord` as one of its last steps and returns success, so a
+    // post-build refusal still leaves that record durably saved. The
+    // duplicate-id check further up treats any durable record as a live
+    // occupant of `id` — so a caller who fixed the manifest (switched to
+    // `email` or `wallet`) and retried the exact recovery this error message
+    // recommends got `company_exists` forever, for an id that was never
+    // actually provisioned (issue #1828 comment 3866012835). Resolving the
+    // effective auth mode from the manifest and the host override — the same
+    // two inputs `RuntimeBuilder::build` combines at
+    // `self.auth_mode_override.unwrap_or_else(...)` — lets this reproduce
+    // that decision without paying for the build, so a rejected request never
+    // reserves the id in the first place.
+    //
+    // Read ONCE, here, and reused for both this check and the builder below
+    // (`.with_auth_mode_override(auth_mode_override)`) rather than calling
+    // `state.auth_mode_override()` a second time at the builder. The override
+    // lives behind `AppState`'s `RwLock` and `setup.rs` can flip it from a
+    // concurrent request at any point — including during this request's own
+    // `.await`s between here and the builder (the duplicate-id store lookup,
+    // notably). Two independent reads could then observe two different
+    // values: this check validates against the first, but a build using the
+    // second could silently produce a runtime in a mode the validated
+    // manifest never agreed to — e.g. an admins-only manifest, checked and
+    // passed against `email`, built as `wallet` with no eligible wallet
+    // users. On a reset the old company is already archived by the time that
+    // divergence could happen, so the replacement would be the only copy left
+    // (issue #1828 comment 3873451846).
+    let auth_mode_override = state.auth_mode_override();
+    let effective_auth_mode = auth_mode_override
+        .unwrap_or_else(|| AuthMode::from_str(&manifest.users.mode).unwrap_or_default());
+    if !effective_auth_mode.has_login() && !state.config().is_local_only() {
+        return envelope(
+            StatusCode::BAD_REQUEST,
+            "auth_mode_none_not_allowed",
+            "this manifest sets `[users].mode = \"none\"`, which has no sign-in, but this \
+             host binds a routable address and would serve it to anyone who can reach it. \
+             Choose `email` or `wallet`, or bind loopback.",
+        );
+    }
+    // A `wallet`-mode host has no environment counterpart to
+    // `OPENCOMPANY_ADMIN_EMAIL`: `manifest_wallets` (`server/users/wallet.rs`)
+    // reads `[users].wallets` alone, with no deployment-wide bootstrap grant,
+    // because that variable exists for a *platform-provisioned* company whose
+    // creator the control plane knows only as an email address, never a
+    // wallet. The console's create/reset dialog always emits `[users].admins`
+    // — the only field it knows how to fill (`buildManifestToml`,
+    // `company-manifest.ts`) — which `email` mode reads and `wallet` mode
+    // never does. `manifest.validate()` above cannot catch this: it checks the
+    // manifest's own declared `[users].mode` (defaulted to `email`) against
+    // its own admin/wallet lists for self-consistency, and finds none here,
+    // because the mismatch only exists between the manifest and the host's
+    // override — which is exactly what `effective_auth_mode` (just resolved
+    // above, the same way `RuntimeBuilder::build` will) makes visible.
+    // Checked here, before `id` is resolved, for the same reason as the
+    // `none`-mode refusal immediately above: a request refused after
+    // `builder.build()` still leaves its `CompanyRecord` durably saved, so a
+    // caller who fixed the manifest and retried would find the id
+    // permanently reserved by a company that never actually provisioned —
+    // and on a reset, the old company is archived before this point is ever
+    // reached (issue #1828 comment 3866132491).
+    if effective_auth_mode == AuthMode::Wallet && manifest.users.wallets.is_empty() {
+        return envelope(
+            StatusCode::BAD_REQUEST,
+            "auth_mode_wallet_no_wallets",
+            "this host signs users in with wallets, but this manifest lists no \
+             `[users].wallets` — only `[users].admins`, which `wallet` mode never reads, and \
+             there is no deployment-wide wallet bootstrap the way `OPENCOMPANY_ADMIN_EMAIL` \
+             provides for `email` mode. Add at least one base58 wallet address to \
+             `[users].wallets`, or ask the host to switch modes.",
+        );
+    }
+
     let id = match explicit_id {
         Some(raw) => CompanyId::new(raw),
         None => company_id_from_name(&manifest.company.name),
@@ -208,13 +329,44 @@ async fn provision(
     // prefixed explicit id.
     let id = state.config().namespaced_company_id(id);
 
-    // Reject a duplicate id.
+    // Reject a duplicate id — checked against BOTH the live registry (a
+    // company currently running) and the durable store (any company, live or
+    // archived, that has ever existed under this id). Registry-only used to
+    // miss the second case entirely: an archive removes a company from the
+    // registry but never deletes its durable record, and `RuntimeBuilder::
+    // build` loads any existing durable record for `id` before building over
+    // it — so provisioning over an archived company's id, whether it is the
+    // company this very request just reset or any OTHER company's old id
+    // typed into Advanced, silently carried that record's old lifecycle,
+    // ledger and overlays into the supposedly clean replacement instead of
+    // being refused (issue #1828 comment 3865803905).
+    //
+    // The store lookup mirrors `RuntimeBuilder::build`'s own inherit-or-
+    // construct fallback (`self.store.unwrap_or_else(FsCompanyStore::new)`)
+    // so this check sees exactly the durable record the build below would
+    // load, on every storage backend including the fs default, which never
+    // populates `state.stores()`.
     if state.registry().get(&id).is_some() {
         return envelope(
             StatusCode::CONFLICT,
             "company_exists",
             &format!("company already exists: {id}"),
         );
+    }
+    let company_store: Arc<dyn CompanyStore> = match state.stores() {
+        Some(stores) => stores.company.clone(),
+        None => Arc::new(FsCompanyStore::new(state.home().to_path_buf())),
+    };
+    match company_store.load(&id).await {
+        Ok(Some(_)) => {
+            return envelope(
+                StatusCode::CONFLICT,
+                "company_exists",
+                &format!("company already exists: {id}"),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => return ApiError(err).into_response(),
     }
 
     // Quota: per-tenant then global.
@@ -250,6 +402,11 @@ async fn provision(
     // defaults when none is configured).
     let mut builder = RuntimeBuilder::new(state.home().to_path_buf(), manifest)
         .with_id(id.clone())
+        // Issue #1739: a company provisioned after boot reports like one boot
+        // registered. The host's tracker is process-wide and lives on the state
+        // for exactly this reason — a second wiring path is a second place to
+        // forget.
+        .with_analytics(state.analytics())
         .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
         .with_host_base_url(state.config().host_base_url())
         // Issue #752: a provisioned tenant is a company like any other, so it
@@ -259,8 +416,10 @@ async fn provision(
         .with_skills_registry(skills_registry)
         // A host-wide sign-in mode set by setup (or flipped later) must reach
         // every company built from here on, including one provisioned after
-        // that change — see `AppState::auth_mode_override`.
-        .with_auth_mode_override(state.auth_mode_override());
+        // that change — see `AppState::auth_mode_override`. Reuses the single
+        // snapshot read above (`auth_mode_override`), not a fresh call: see
+        // that binding's comment for why a second read here would be a race.
+        .with_auth_mode_override(auth_mode_override);
     if let Some(stores) = state.stores() {
         builder = builder.with_stores(stores);
     }
@@ -326,34 +485,64 @@ async fn provision(
         }
     };
 
-    // The same refusal boot applies to `serve --company`: a company with no
-    // sign-in on a host anyone can reach is an unauthenticated admin console,
-    // not a desktop app. A tenant's manifest can request `[users].mode =
-    // "none"`, but this host will not silently serve it wherever it binds —
-    // it is refused here exactly as it would be refused at boot.
-    if !runtime.auth_mode().has_login() && !state.config().is_local_only() {
-        return envelope(
-            StatusCode::BAD_REQUEST,
-            "auth_mode_none_not_allowed",
-            "this manifest sets `[users].mode = \"none\"`, which has no sign-in, but this \
-             host binds a routable address and would serve it to anyone who can reach it. \
-             Choose `email` or `wallet`, or bind loopback.",
-        );
-    }
-
-    let status = match runtime.status().await {
+    // The none-mode-on-a-routable-bind refusal is checked earlier, before `id`
+    // is resolved and before anything is persisted — see the comment there.
+    // By construction `runtime.auth_mode()` cannot disagree with that check:
+    // `RuntimeBuilder::build` resolves it from the exact same two inputs
+    // (`self.auth_mode_override.unwrap_or_else(...)`), read from the same
+    // `manifest` and the same host override, with no request-serialized
+    // mutation of either in between.
+    //
+    // Registered BEFORE the `status()` read below, not after: `builder.build()`
+    // already durably saved this company's `CompanyRecord` as one of its last
+    // steps (see the duplicate-id check's comment above), so by this point the
+    // company genuinely exists — `status()` only re-reads that same record for
+    // the response body. Registering first means a transient failure in that
+    // read (a store blip right after the write) still leaves the company live
+    // and addressable: the in-memory registry, not this request's response,
+    // is what the duplicate-id check and every other route key existence off
+    // of. Registering only after a successful `status()` left exactly that
+    // failure unrecoverable — the durable record made a retry's duplicate
+    // check say `company_exists`, while the registry never got the runtime
+    // that would make `company_exists` true, so no request could ever create
+    // OR address that id again (issue #1828 comment 3866132497).
+    let status = match register_and_report_status(&state, &id, &tenant, runtime).await {
         Ok(status) => status,
         Err(err) => return ApiError(err).into_response(),
     };
-    state
-        .registry()
-        .insert(id.clone(), std::sync::Arc::new(runtime));
+
+    (StatusCode::CREATED, Json(status)).into_response()
+}
+
+/// Registers `runtime` and records its ownership, then reads its status for
+/// the response body.
+///
+/// Registration happens first, deliberately — see the comment at the call
+/// site. A `status()` failure after this point still returns `Err` (the
+/// caller sees an error response), but by then the company is already live
+/// and addressable through `state.registry()`, exactly as if the read had
+/// succeeded: nothing downstream of this function can tell the two cases
+/// apart. Split out so that property is directly testable without a full
+/// HTTP round trip (`test.rs`).
+async fn register_and_report_status(
+    state: &AppState,
+    id: &CompanyId,
+    tenant: &str,
+    runtime: crate::runtime::CompanyRuntime,
+) -> crate::Result<crate::runtime::types::CompanyStatus> {
+    // Issue #1739: on a host provisioned into an empty registry, boot had no
+    // runtime to read cognition from and the analytics envelope recorded the
+    // default descriptor (`custom`/`unknown`). Now there is one, so relabel it
+    // — otherwise every event this tenant ever sends is mislabeled.
+    state.analytics().observe_cognition(runtime.cognition());
+    let runtime = std::sync::Arc::new(runtime);
+    state.registry().insert(id.clone(), runtime.clone());
     // The durable row was written and verified above, before the build, so this
     // is only the in-memory mirror the running process serves from (issue
     // #1050).
-    state.set_owner(id.clone(), tenant.clone());
+    state.set_owner(id.clone(), tenant.to_string());
 
-    (StatusCode::CREATED, Json(status)).into_response()
+    runtime.status().await
 }
 
 /// How many times [`persist_owner_with_retry`] attempts the durable write.
@@ -387,6 +576,50 @@ async fn persist_owner_with_retry(
                     attempt,
                     error = %err,
                     "persisting company ownership failed; retrying"
+                );
+                last = Some(err);
+            }
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
+}
+
+/// How many times [`archive_reconcile_status`] retries a transient
+/// `status()` failure. Mirrors [`OWNERSHIP_WRITE_ATTEMPTS`]'s reasoning: this
+/// read is the last chance to catch a genuinely-landed archive after
+/// `transition` already reported non-`OK`, and a lone blip should not be
+/// mistaken for "not archived" when a couple of retries would resolve it.
+const ARCHIVE_RECONCILE_READ_ATTEMPTS: usize = 3;
+
+/// Re-reads `runtime.status()` for `archive`'s non-`OK` reconciliation
+/// branch, retrying a transient failure instead of trusting a single `Err`.
+///
+/// `set_lifecycle` persists `lifecycle: "archived"` to the store BEFORE it
+/// appends the `LifecycleChanged` audit event (`src/company/runtime.rs`), so
+/// by the time this runs the write has already landed — a failure here is a
+/// read problem, not evidence the archive didn't happen. Collapsing that
+/// straight to "not archived" (the pre-fix `unwrap_or(false)`) had no other
+/// trigger to retry it: this reconciliation branch only runs once per
+/// request, and the create/reset dialog's own client-side reconciliation
+/// (`create-company-dialog.tsx`) has no visibility into the server registry —
+/// if ITS later status lookup succeeds and observes `archived`, it reports
+/// the reset as done and never calls `archive` again, so registry/owner
+/// cleanup was permanently skipped by a single passing blip (issue #1828
+/// comment 3875297944). No sleep between attempts, matching
+/// `persist_owner_with_retry`: this is for a failed round-trip, not a busy
+/// one, and a caller is waiting on this request.
+async fn archive_reconcile_status(
+    runtime: &std::sync::Arc<crate::runtime::CompanyRuntime>,
+) -> crate::Result<crate::runtime::types::CompanyStatus> {
+    let mut last = None;
+    for attempt in 1..=ARCHIVE_RECONCILE_READ_ATTEMPTS {
+        match runtime.status().await {
+            Ok(status) => return Ok(status),
+            Err(err) => {
+                tracing::warn!(
+                    attempt,
+                    error = %err,
+                    "archive reconciliation status() read failed; retrying"
                 );
                 last = Some(err);
             }
@@ -702,16 +935,160 @@ async fn archive(
         return resp;
     }
     let response = transition(&state, &auth, &id, "archived").await;
-    if response.status() == StatusCode::OK {
-        state.registry().remove(&id);
-        state.remove_owner(&id);
-        if let Some(ownership) = state.stores().and_then(|s| s.ownership.clone())
-            && let Err(err) = ownership.remove_owner(&id).await
-        {
-            tracing::warn!(company = %id, error = %err, "failed to remove persisted ownership");
-        }
+    // `response.status() == OK` is sufficient proof on its own: `transition`
+    // already re-read `status()` after `set_lifecycle` and its body already
+    // confirms `lifecycle: "archived"`. Re-reading a THIRD time to
+    // reconfirm what the response already proved is pure downside — a
+    // transient failure on that redundant read must not undo a response
+    // that already succeeded (issue #1828 comment 3875203599).
+    //
+    // The extra read below is reserved for reconciling a non-`OK` response.
+    // `CompanyRuntime::set_lifecycle` (`src/company/runtime.rs`) writes
+    // `lifecycle: "archived"` to the store BEFORE it appends the
+    // `LifecycleChanged` audit event, and `transition` above then re-reads
+    // `status()` after that — so a failure in either the event append or
+    // that re-read surfaces here as a non-200 `response` even though the
+    // durable record really is archived. Re-reading status directly, the
+    // same way the create/reset console dialog's own reconciliation does
+    // client-side (`create-company-dialog.tsx`, commit 1191ad67e), catches
+    // both failure points so an already-archived company is never left
+    // registered — still occupying its tenant/global quota slot and still
+    // showing up in `listCompanies()` — for a request whose write already
+    // succeeded (issue #1828 comment 3875046440).
+    //
+    // That reconciliation read itself retries a transient failure
+    // (`archive_reconcile_status` below) instead of collapsing a single `Err`
+    // straight to "not archived". This branch is the LAST place that can ever
+    // trigger cleanup: the create/reset dialog's own client-side
+    // reconciliation has no visibility into the server registry, so if ITS
+    // later status lookup succeeds and observes `archived`, it considers the
+    // reset done and never calls `archive` again — permanently skipping
+    // cleanup a single-shot blip on this read would otherwise have caused
+    // (issue #1828 comment 3875297944).
+    // The runtime confirmed archived, not just the id — `evict_archived_company`
+    // needs the specific instance so it can refuse to remove a replacement that
+    // has since taken this id over (a rebuild swap; see that function's comment).
+    let archived_runtime: Option<Arc<crate::runtime::CompanyRuntime>> =
+        if response.status() == StatusCode::OK {
+            state.registry().get(&id)
+        } else {
+            match state.registry().get(&id) {
+                Some(runtime) => {
+                    let confirmed = archive_reconcile_status(&runtime)
+                        .await
+                        .map(|status| status.lifecycle == "archived")
+                        .unwrap_or(false);
+                    confirmed.then_some(runtime)
+                }
+                None => None,
+            }
+        };
+    if let Some(runtime) = archived_runtime {
+        evict_archived_company(&state, &id, &runtime).await;
     }
     response
+}
+
+/// Removes an archived company from the live registry and drops both its
+/// in-memory and persisted ownership rows.
+///
+/// The single implementation of archive's post-transition cleanup, shared by
+/// [`archive`] and [`RegistryEvictor`] (the maintenance-loop hook) so
+/// the inline path and the stranded-cleanup retry cannot drift.
+///
+/// Two orderings matter here, each guarding a different way this call could
+/// destroy something it never actually confirmed (codex review on #1943, PR
+/// comments 3894439351 and 3894439358):
+///
+/// - **The persisted ownership row is removed BEFORE the registry entry and
+///   the in-memory owner, not after.** `MaintenanceTicker::tick` only
+///   retries a company it can still see in [`CompanyRegistry::list`]
+///   (`src/runtime/maintenance.rs`) — so a company de-registered here with
+///   its persisted-ownership deletion still failed can never be revisited.
+///   Failing closed (leaving the company registered) instead lets the next
+///   tick retry the whole eviction; failing the old way (registry gone,
+///   ownership row still failed to delete) orphans that row forever with
+///   nothing left in the registry to trigger a retry against it.
+/// - **The registry removal is conditional on `expected`, not "whatever is
+///   at `id`".** [`CompanyRegistry::insert`] is the one choke point every
+///   registration goes through, and it replaces an already-occupied slot
+///   unconditionally — a rebuild swap (`runtime::rebuild::rebuild_company`)
+///   is the production caller that can land a fresh runtime under this same
+///   id in the window between a caller observing `"archived"` and this call
+///   actually running. Removing by id alone would deregister that live
+///   replacement instead of doing nothing. The ownership rows above stay
+///   unconditional by id regardless: `POST /api/v1/companies` refuses
+///   `company_exists` for any id still registered (`provision`, this file),
+///   so the only thing that can ever replace an already-registered id is a
+///   rebuild of the SAME company — same owner, same durable lifecycle
+///   (`CompanyRuntime::status` reads it from the handed-over store, so a
+///   rebuild successor of an archived company reports `"archived"` too) —
+///   never a different company's row.
+pub(crate) async fn evict_archived_company(
+    state: &AppState,
+    id: &CompanyId,
+    expected: &Arc<crate::runtime::CompanyRuntime>,
+) {
+    let ownership = state.stores().and_then(|s| s.ownership.clone());
+    if evict_registry_and_ownership(state.registry(), &ownership, id, expected).await {
+        state.remove_owner(id);
+    }
+}
+
+/// The sequencing `evict_archived_company`'s doc comment above describes,
+/// pulled out of `AppState` so the ordering is unit-testable against a
+/// lightweight [`OwnershipStore`](crate::store::select::OwnershipStore) fake
+/// and a bare [`CompanyRegistry`] instead of a full `StorageHandles`.
+///
+/// Returns whether the persisted ownership row was successfully removed (or
+/// there was none configured) — the caller's cue to also clear the
+/// AppState-level in-memory owner cache, which stays unconditional by id
+/// regardless of the registry outcome below (see the "same company" argument
+/// in `evict_archived_company`'s doc comment).
+async fn evict_registry_and_ownership(
+    registry: &crate::runtime::CompanyRegistry,
+    ownership: &Option<Arc<dyn crate::store::select::OwnershipStore>>,
+    id: &CompanyId,
+    expected: &Arc<crate::runtime::CompanyRuntime>,
+) -> bool {
+    if let Some(ownership) = ownership
+        && let Err(err) = ownership.remove_owner(id).await
+    {
+        tracing::warn!(
+            company = %id,
+            error = %err,
+            "failed to remove persisted ownership; leaving the company registered for a later maintenance retry"
+        );
+        return false;
+    }
+    if registry.remove_if(id, expected).is_none() {
+        tracing::info!(
+            company = %id,
+            "kept the registered runtime — it was replaced since being observed archived"
+        );
+    }
+    true
+}
+
+/// The production [`CompanyEvictor`](crate::runtime::maintenance::CompanyEvictor):
+/// runs archive's cleanup against `AppState` for a company the maintenance loop
+/// found archived but still registered.
+pub struct RegistryEvictor {
+    state: AppState,
+}
+
+impl RegistryEvictor {
+    /// Builds an evictor over `state`.
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::maintenance::CompanyEvictor for RegistryEvictor {
+    async fn evict(&self, company: &CompanyId, expected: &Arc<crate::runtime::CompanyRuntime>) {
+        evict_archived_company(&self.state, company, expected).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

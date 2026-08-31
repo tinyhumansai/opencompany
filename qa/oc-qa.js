@@ -211,7 +211,24 @@
     if (isBlocked(run)) return "blocked";
     if (undeliveredCount(run.deliveries) > 0) return "undelivered";
     if (awaitingCount(run) > 0) return "awaiting-approval";
+    if (erroredNodeCount(run) > 0) return "degraded";
     return "ok";
+  }
+
+  /**
+   * How many nodes finished in error while the run itself carried on (issue
+   * #1865).
+   *
+   * `on_error: continue | route` and the iteration cap both leave a node
+   * `error` without failing the run, so every reading above this one is
+   * absent: no `error`, not cancelled, nothing parked, everything delivered.
+   * Without this arm the ladder fell straight through to `ok` and the probe
+   * reported PASS on a run that had a broken step in it — the same
+   * false-success shape every other arm here exists to close, and the reason
+   * the host's own ladder places `degraded` last, immediately before `Ok`.
+   */
+  function erroredNodeCount(run) {
+    return (run.nodes || []).filter((n) => n && n.status === "error").length;
   }
 
   /**
@@ -1198,7 +1215,18 @@
       rows.push(row("probe-workflow-run", WARN, `${target.id}: dryRun absent from the response`, "this host ignored the flag and ran for real — effects fired"));
     }
     if (res.body && res.body.detached !== true) {
-      const settled = { deliveries: (res.body && res.body.deliveries) || [], error: null, running: false };
+      // Keep the facts the host sent. Rebuilding this from `deliveries`
+      // alone discarded both `verdict` — the host's own answer, which
+      // `runVerdict` prefers over its fallback ladder — and `nodes`, which is
+      // the only evidence a step errored while the run carried on. A degraded
+      // run then scored `ok` and the probe reported PASS (issue #1865).
+      const settled = {
+        deliveries: (res.body && res.body.deliveries) || [],
+        nodes: (res.body && res.body.nodes) || [],
+        verdict: res.body && res.body.verdict,
+        error: null,
+        running: false,
+      };
       const verdict = runVerdict(settled);
       return push(rows, 
         row(

@@ -3,6 +3,7 @@ import { ExternalLink, MessageCircleHeart } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import type { FeedbackCategory, FeedbackSummary } from "@/api/types";
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -88,16 +89,18 @@ export function FeedbackView({ client, company }: Props) {
   const onDone = useCallback(() => setRound((n) => n + 1), []);
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-6">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Feedback</h1>
-          <p className="text-sm text-muted-foreground">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader
+        title="Feedback"
+        width="3xl"
+        description={
+          <>
             Flag a wrong result, a missing capability, or anything that felt off
             {hasBoard && " — then vote on what everyone else has asked for"}.
-          </p>
-        </div>
-
+          </>
+        }
+      />
+      <div className="mx-auto min-h-0 w-full max-w-3xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Flag something</CardTitle>
@@ -147,7 +150,7 @@ export function FeedbackView({ client, company }: Props) {
         )}
 
         <Card className="overflow-hidden">
-          <CardContent className="flex flex-col items-start gap-4 py-6 sm:flex-row sm:items-center sm:justify-between">
+          <CardContent className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">
               {/* Discord's own blurple, via the named token — see
                   `--brand-discord` in index.css for why it stays a fixed hex. */}

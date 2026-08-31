@@ -432,6 +432,25 @@ inside `../target/e2e`. Point it anywhere else and it is reused as it stands,
 with a line saying so — a mistyped or inherited value cannot take a directory
 you care about with it.
 
+A derived port makes a collision unlikely; it does not make one *loud*. On
+2026-08-25 a suite **passed** against the wrong server — a sibling agent's dev
+server held the port, `reuseExistingServer` adopted it, and the run drove another
+worktree's bundle serving a different company. No readiness check could have
+caught it: Playwright's `url` check reads the status code and discards the body,
+and `/healthz` is a hardcoded `{"status":"ok"}` naming no instance.
+
+So `test/e2e/global-setup.ts` — which runs *after* `webServer` resolves, and is
+therefore the only hook that sees the server actually adopted — asks `/spec` who
+answered and aborts before a single spec runs unless it is an OpenCompany host
+(`application/json`, `name` is `opencompany`) **and** the right one, by
+`instance_id` against the `instance-id` file the host mints under
+`PW_HOST_DATA_DIR`. Both halves are needed: a dev server proxies `/spec` to
+whatever host it points at, so the incident above satisfies the type check alone.
+Nothing is pinned or cached, so a host restarted between runs is not an impostor.
+Against a host you brought yourself there is no root of ours to compare against —
+set `PW_EXPECTED_INSTANCE_ID` to the id you expect. Full reasoning:
+[`test/e2e/host-identity.ts`](test/e2e/host-identity.ts).
+
 The `dist/` can be served as static files by any web server (or mounted by the
 OpenCompany host); use `window.OPENCOMPANY_CONFIG` to point it at the API.
 

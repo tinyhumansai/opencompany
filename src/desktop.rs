@@ -239,6 +239,17 @@ mod generated {
 /// An `archived` company is skipped. Archiving removes a company from the
 /// registry on purpose (`src/server/provision.rs`), and re-registering it at
 /// the next launch would undo that quietly.
+///
+/// ## What the desktop does now
+///
+/// Not this. The application starts every host through `adopt_companies`
+/// alone and lets an empty registry open the first-run wizard, because seeding
+/// answered the wizard's questions silently and then hid it for good — the
+/// reasoning is on `crate::desktop`'s caller side, in the tauri crate's
+/// `local::start_at`. The seed half stayed reachable, since the wizard itself
+/// ends by calling `seed_company` with the template the operator picked, and
+/// this function stayed whole because the two halves belong together for any
+/// caller that does want a company without a wizard.
 pub async fn bootstrap_companies(
     state: &AppState,
     preset_id: &str,
@@ -326,7 +337,62 @@ pub async fn seed_company(
     state: &AppState,
     preset_id: &str,
 ) -> Result<crate::ports::types::CompanyId> {
-    let manifest = first_run_manifest(preset_id)?;
+    seed_company_with(state, preset_id, SeedOverrides::default()).await
+}
+
+/// What the operator decides about a company seeded from a template.
+///
+/// Everything else is the template's. These two are not, and both are fixed at
+/// seed time rather than editable afterwards — the id is minted from the name
+/// here, and a company with no admin cannot be signed into at all.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeedOverrides<'a> {
+    /// What to call the company. `None` keeps the template's own
+    /// `[company].name`, which is what every seed before the first-run wizard
+    /// asked used, and what [`bootstrap_companies`] still passes.
+    pub name: Option<&'a str>,
+    /// The address that may sign in, written into `[users].admins`.
+    ///
+    /// No shipped product template names an admin, so on a host that asks
+    /// people to sign in, a seed without this produces a company nobody can
+    /// administer — setup completes, email sign-in is on, and the address the
+    /// operator just typed is ineligible. The designed path has always written
+    /// it (`manifest_from_setup`); the template path reached the console only
+    /// once a picked template began being seeded as itself, which is what makes
+    /// this reachable now.
+    ///
+    /// Ignored under `[users].mode = "none"`, where `validate_users` flags an
+    /// admin list as granting nothing and both seeding paths treat a flagged
+    /// manifest as a hard error.
+    pub admin_email: Option<&'a str>,
+}
+
+/// [`seed_company`], with the decisions the operator made about it.
+///
+/// Split from `seed_company` rather than folded into it so the no-decision
+/// callers — first-run bootstrap, tests — keep an entry point that says they
+/// made none.
+pub async fn seed_company_with(
+    state: &AppState,
+    preset_id: &str,
+    overrides: SeedOverrides<'_>,
+) -> Result<crate::ports::types::CompanyId> {
+    let mut manifest = first_run_manifest(preset_id)?;
+    if let Some(name) = overrides
+        .name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        manifest.company.name = name.to_string();
+    }
+    if let Some(email) = overrides
+        .admin_email
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        && manifest.users.mode != "none"
+    {
+        manifest.users.admins = vec![email.to_string()];
+    }
     let id = company_id_from_name(&manifest.company.name);
     // Issue #85: record which template this install started from. Only the
     // slug, never a host path — there is no source directory on a packaged

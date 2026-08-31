@@ -246,6 +246,9 @@ jobs:
               # `assert-single-tauri-app.sh` got in. `rust` already lists this
               # path; `frontend` is where the scripts actually execute.
               - 'scripts/ci/**'
+              # Same reasoning for the release-notes generator and its test,
+              # which also run in `Console`.
+              - 'scripts/release/**'
             desktop:
               - '.github/workflows/ci.yml'
               - 'src-tauri/**'
@@ -350,6 +353,18 @@ jobs:
       # override is a queue run whose required checks can all be skipped.
       - name: Assert merge-group CI wiring
         run: scripts/ci/assert-merge-group-workflow.sh
+
+      # Issue #1738. The desktop's shipped feature set lives on three command
+      # lines and in no manifest — `DESKTOP_RELEASE_FEATURES` in
+      # `release-desktop-macos.yml`, the `Desktop` lane's clippy and test steps
+      # below, and `scripts/desktop-dev.sh`. Until #1738 the dev script had no
+      # copy at all, so a developer ran the DEFAULT build and every user
+      # installed the release one. Here rather than in the `Desktop` job because
+      # this is a text check on repo config that needs no toolchain, and because
+      # `Desktop` is path-filtered on `src-tauri/**` — a drift introduced by
+      # editing only a workflow or only the dev script would not run that lane.
+      - name: Assert desktop feature sets agree
+        run: scripts/ci/assert-desktop-features.sh
 
   rust:
     needs: changes
@@ -599,6 +614,27 @@ jobs:
       # that produced #800 in the first place, one level up.
       - name: Test the sidecar brain
         run: scripts/ci/run-scoped-suite.sh "sidecar brain" sidecar brain::sidecar
+
+      # `analytics` (issue #1739): the Mixpanel transport, and the acceptance
+      # criterion that needs it. The port, the mocks, the enable/disable
+      # decision and the payload vocabulary are all in the DEFAULT build and run
+      # in the bare `cargo test` above — deliberately, since a content leak
+      # would be introduced at a call site rather than in the transport.
+      #
+      # What this lane adds is the pair that cannot be written without the
+      # transport compiled in: `a_self_hosted_build_makes_no_request` stands up
+      # a local collector, hands the process a token and an endpoint, declares
+      # nothing, and asserts ZERO requests; `a_hosted_tenant_reports` is its
+      # positive control against the same collector. Without the second, a zero
+      # request count would be indistinguishable from a test that sends nothing
+      # at all — which is the #770 shape one level down.
+      #
+      # It rides this job for the same reason `sidecar` and `export` do:
+      # `analytics = ["dep:reqwest"]` and `reqwest` is already in the default
+      # set via `oauth`, so there is nothing here this job has not already
+      # built.
+      - name: Test the analytics surface
+        run: scripts/ci/run-scoped-suite.sh "analytics" analytics analytics
 
       # Issue #428. The `Console E2E` job drives a REAL host, so it needs a
       # binary. Building one over there would mean a second submodule checkout
@@ -1552,6 +1588,19 @@ jobs:
       # Node-only and cheap; the rule itself is repository-wide.
       - run: ./scripts/ci/assert-md-line-cap.sh
 
+      # The release-notes generator, which is otherwise only ever exercised by a
+      # `workflow_dispatch` release — the one moment nobody wants to discover a
+      # `TypeError` in it. `node --test` with no framework and no package.json:
+      # the script has no dependencies, and adding an npm project under
+      # `scripts/` to run a dozen assertions would put a second one in a
+      # repository that has exactly one (`frontend/`).
+      #
+      # Rides the Console job for the reason the checks above do: Node-only and
+      # cheap. The `frontend` path filter gains `scripts/release/**` alongside
+      # this step — without it a PR editing only the generator skips `Console`,
+      # and the test is the one thing its own diff cannot run.
+      - run: node --test scripts/release/generate-release-notes.test.mjs
+
       # Exactly one Tauri app, and no script that picks it by working directory
       # rather than by name.
       #
@@ -2047,13 +2096,29 @@ jobs:
       # the previous step had already fixed. The guard read as present and was
       # decorative. The console wrapper's clippy below always passed it, so this
       # was an inconsistency inside one job rather than a deliberate choice.
+      #
+      # `--features` matches `DESKTOP_RELEASE_FEATURES` in
+      # `release-desktop-macos.yml` — see that file for why `acp` and
+      # `composio` are passed on the command line instead of being written into
+      # `src-tauri/Cargo.toml`. The short version: they are pure `cfg` switches
+      # that add no package, so the release build can turn them on and still
+      # satisfy `--locked`, and the default build stays lean.
+      #
+      # THIS LANE IS WHY THAT IS SAFE. Without these two flags here, clippy and
+      # the tests below would inspect the DEFAULT feature set while the shipped
+      # DMG carried a different one — a configuration nothing in CI had ever
+      # compiled, found first by whoever downloaded the release. That is the
+      # `feature-lanes.txt` pathology (issue #770) wearing a new hat: a build
+      # everybody reads as covered, selected by no lane. If the release
+      # workflow's feature string changes, change it here in the same commit.
       - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --no-deps --features opencompany/acp,opencompany/composio -- -D warnings
 
       # `--locked`, so a manifest edit whose lock was never regenerated is named
-      # here rather than absorbed — the desktop keeps its own `Cargo.lock`.
+      # here rather than absorbed — the desktop keeps its own `Cargo.lock`. The
+      # `--features` are the release set, for the reason above the clippy step.
       - name: Test
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features opencompany/acp,opencompany/composio
 
       # There used to be a SECOND Tauri app here, `frontend/src-tauri/`, with
       # three more steps of its own. It is deleted, and its absence is the

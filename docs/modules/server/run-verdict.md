@@ -6,7 +6,7 @@ the synchronous `POST …/workflows/{wid}/run` body and every row of
 `GET …/workflows/runs`:
 
 ```text
-running | failed | stopped | stranded | blocked | undelivered | awaiting-approval | ok
+running | failed | stopped | stranded | blocked | undelivered | awaiting-approval | degraded | ok
 ```
 
 **Always serialized**, unlike the optional fields around it. Its whole purpose
@@ -45,6 +45,7 @@ green on some surface:
 | `blocked` | `blockedNodes` | issue #881: carries no error, is not cancelled, is not running and routed no report — the shape that fell through every check |
 | `undelivered` | `deliveries` | issue #981: a report that will not go out without a change outranks one waiting on a human |
 | `awaiting-approval` | `pendingApprovals` **and** `pending` delivery rows | issue #846: a run that paused at a gate reached no `output` node, so a delivery-only read scored the gated case clean |
+| `degraded` | `nodes[].status` | issue #1865: no failure, stop, stranding, block or dropped report, but at least one `on_error: continue\|route` node errored and the graph kept going past it — ranked last, immediately above `ok`, since every other non-`ok` verdict is more actionable and none may be hidden behind this one |
 | `ok` | — | finished, delivered what it routed, waiting on nobody |
 
 ## A run nobody can act on any more (issue #1189)

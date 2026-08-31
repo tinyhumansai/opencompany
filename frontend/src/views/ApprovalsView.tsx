@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, Loader2, ShieldAlert, ShieldCheck, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, Clock, Loader2, ShieldAlert, ShieldCheck, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -8,6 +8,7 @@ import type { OpenCompanyClient } from "@/api/client";
 import {
   ApiError,
   type ApprovalSummary,
+  GRANT_DURATIONS,
   type GrantScope,
   type StandingGrant,
   type Verdict,
@@ -21,8 +22,10 @@ import {
   useAskerNames,
   useApprovalThreadLinks,
 } from "@/components/approval-card";
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { useApprovalDeadline } from "@/hooks/use-approval-deadline";
 import type { CompanyFeed } from "@/hooks/use-company";
 import { useStableList } from "@/hooks/use-stable-list";
 import {
@@ -31,7 +34,16 @@ import {
   batchPositions,
   staleDecisionLine,
 } from "@/lib/approval-wording";
-import { approvalSummary, grantHeadline, timeAgo, toolAction, untilLabel } from "@/lib/language";
+import { approvalsByDeadline } from "@/lib/approval-order";
+import {
+  approvalSummary,
+  decisionLabel,
+  grantHeadline,
+  grantSubject,
+  timeAgo,
+  toolAction,
+  untilLabel,
+} from "@/lib/language";
 import { approvalsForTask } from "@/lib/task-approvals";
 import { startVisiblePolling } from "@/lib/visible-poll";
 import { isRecord, parseNodeMessages } from "@/views/workflows/run-output";
@@ -98,6 +110,8 @@ interface Props {
   sub?: string | null;
   onResolved: (systemLine: string) => void;
   onGoToConversation: () => void;
+  /** Host thread id → console channel id, owned by the shell's chat hydration. */
+  chatChannelByThread?: Readonly<Record<string, string>>;
   /**
    * Called the instant a decide click starts, before the network call
    * (issue #1211) — so the shell can mark this approval as "this tab decided
@@ -115,8 +129,10 @@ export function ApprovalsView({
   sub,
   onResolved,
   onGoToConversation,
+  chatChannelByThread,
   onDecideStart,
 }: Props) {
+  const approvalTtlHours = useApprovalDeadline(client, company);
   // Issue #373: in-flight state is per approval, not a single module-wide slot.
   //
   // Approving is not a quick write — the host mints a grant and re-dispatches
@@ -129,7 +145,16 @@ export function ApprovalsView({
   // A map rather than a set of ids because the verdict has to survive the wait:
   // an approve and a decline are different promises to the operator ("the agent
   // is doing it" vs "recorded"), and the card says which one it is waiting on.
-  const [inFlight, setInFlight] = useState<ReadonlyMap<string, Verdict>>(() => new Map());
+  const [inFlight, setInFlight] = useState<ReadonlyMap<string, Verdict>>(
+    () => new Map(),
+  );
+  // Issue #1805: which cards have an in-flight deadline extension. Separate from
+  // `inFlight` (a verdict) — extending is not a decision, so it neither blocks
+  // nor is blocked by one being recorded; it only guards a double-press on its
+  // own button.
+  const [extending, setExtending] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const { approvals, now, queue } = feed;
   /**
    * The card the queue is narrowed to, or `null` for the whole queue (#883).
@@ -154,9 +179,22 @@ export function ApprovalsView({
    * tell the operator the opposite of the truth.
    */
   const visible = useMemo(
-    () => (focusTaskId === null ? approvals : approvalsForTask(approvals, focusTaskId)),
+    () =>
+      focusTaskId === null
+        ? approvals
+        : approvalsForTask(approvals, focusTaskId),
     [approvals, focusTaskId],
   );
+  /**
+   * The queue's priority order, before its pointer-stable snapshot (#1427).
+   *
+   * A deadline is the one ordering signal the host enforces without operator
+   * input, so the earliest one must not be stranded beneath arbitrary response
+   * order. Sorting before `useStableList` keeps #1414's guarantee intact: a
+   * polling response can update the intended order, but cannot rearrange cards
+   * while the operator is pointing at or tabbing through the queue.
+   */
+  const orderedVisible = useMemo(() => approvalsByDeadline(visible), [visible]);
   /**
    * The same rows, but in a pointer-stable order (#1414).
    *
@@ -169,10 +207,24 @@ export function ApprovalsView({
    * branch below reads `rows` rather than `visible` so the count, the empty
    * state and the list all agree on the one frozen view.
    */
-  const { items: rows, containerProps: queueHold } = useStableList(visible);
-  const askerNames = useAskerNames(client, company, approvals);
-  const threadLinks = useApprovalThreadLinks(client, company, rows);
-  const { grants, granterNames, refreshGrants } = useStandingGrants(client, company);
+  const {
+    items: rows,
+    containerProps: queueHold,
+    holding,
+  } = useStableList(orderedVisible);
+  // Relative timestamps above the queue can wrap at a formatting boundary just
+  // like roster names or grant membership. Keep that clock stable for the whole
+  // interaction region, then let the next render use the current feed time.
+  const heldNow = useRef(now);
+  if (!holding) heldNow.current = now;
+  const regionNow = holding ? heldNow.current : now;
+  const askerNames = useAskerNames(client, company, approvals, holding);
+  const threadLinks = useApprovalThreadLinks(client, company, rows, holding);
+  const { grants, granterNames, refreshGrants } = useStandingGrants(
+    client,
+    company,
+    holding,
+  );
   /**
    * How many rows each turn's batch still has waiting (#842).
    *
@@ -194,7 +246,16 @@ export function ApprovalsView({
    * focus-narrowed view cannot count the position over a subset and the total
    * over the whole.
    */
-  const batchPos = useMemo(() => batchPositions(approvals), [approvals]);
+  const batchPosLive = useMemo(() => batchPositions(approvals), [approvals]);
+  // The queue hold freezes `rows`, so a poll that expires or decides one card
+  // of a batch must not renumber the cards the operator is looking at: without
+  // the freeze a removed frozen card falls back to "1 of 1" (the line vanishes)
+  // and its surviving siblings get shorter counts — either can rewrap a card
+  // above the targeted control. Snapshot the map with the hold, reconcile the
+  // moment it releases (#1593).
+  const batchPosHeld = useRef(batchPosLive);
+  if (!holding) batchPosHeld.current = batchPosLive;
+  const batchPos = holding ? batchPosHeld.current : batchPosLive;
 
   const markInFlight = (id: string, verdict: Verdict | null) =>
     setInFlight((prev) => {
@@ -204,7 +265,11 @@ export function ApprovalsView({
       return next;
     });
 
-  async function decide(a: ApprovalSummary, verdict: Verdict, scope: GrantScope) {
+  async function decide(
+    a: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+  ) {
     // Per-row guard: only a double-press on THIS card is ignored. The global
     // early return that used to live here made every other card inert too.
     if (inFlight.has(a.id)) return;
@@ -212,7 +277,13 @@ export function ApprovalsView({
     markInFlight(a.id, verdict);
     const startedAt = Date.now();
     try {
-      const answer = await client.resolveApproval(a.id, verdict, undefined, company, { scope });
+      const answer = await client.resolveApproval(
+        a.id,
+        verdict,
+        undefined,
+        company,
+        { scope },
+      );
       // Issue #243: approving no longer just records a verdict — it hands the
       // agent a single-use grant and re-dispatches it to make the call. The old
       // "Approved: …" read as "done", which was the exact lie that made the
@@ -232,7 +303,8 @@ export function ApprovalsView({
       // guess. A turn continues once, when the last decision it parked lands,
       // so approving one of several releases nothing — and saying otherwise is
       // the one part of this flow that actively misleads.
-      const stillAwaiting = "stillAwaiting" in answer ? answer.stillAwaiting : undefined;
+      const stillAwaiting =
+        "stillAwaiting" in answer ? answer.stillAwaiting : undefined;
       // Issue #1449, and it comes FIRST because everything below it is written
       // for a decision that actually happened. The host answers `200` to a click
       // on a card whose deadline has passed — it has to, nothing failed — and
@@ -301,7 +373,8 @@ export function ApprovalsView({
         // making. The queue is the answer the response body never delivered.
         void feed.refresh();
       } else {
-        const msg = err instanceof ApiError ? err.message : "something went wrong";
+        const msg =
+          err instanceof ApiError ? err.message : "something went wrong";
         onResolved(`Couldn't record your decision — ${msg}`);
         toast.error(`Couldn't record your decision — ${msg}`);
       }
@@ -315,13 +388,81 @@ export function ApprovalsView({
     }
   }
 
+  // Issue #1805: push a card's deadline out so a stalled run does not
+  // default-deny before someone can decide it. Not a verdict — the card stays
+  // parked and decidable — so it runs on its own in-flight set and refreshes the
+  // feed to redraw the countdown from the new deadline the host reports.
+  async function extendDeadline(a: ApprovalSummary) {
+    if (extending.has(a.id)) return;
+    setExtending((prev) => new Set(prev).add(a.id));
+    try {
+      await client.extendApproval(a.id, company);
+      const line = `Extended the deadline for ${approvalSummary(a)}.`;
+      onResolved(line);
+      toast.success(line);
+      // The new deadline is on the host now; a refresh redraws the countdown.
+      void feed.refresh();
+    } catch (err) {
+      // A 404 means it is no longer parked (already decided or expired
+      // elsewhere) — reconcile by refreshing rather than reporting a failure.
+      if (err instanceof ApiError && err.status === 404) {
+        void feed.refresh();
+      } else {
+        const msg =
+          err instanceof ApiError ? err.message : "something went wrong";
+        toast.error(`Couldn't extend the deadline — ${msg}`);
+      }
+    } finally {
+      setExtending((prev) => {
+        const next = new Set(prev);
+        next.delete(a.id);
+        return next;
+      });
+    }
+  }
+
+  // Bulk decisions for the whole visible queue.
+  //
+  // Client-side and sequential on purpose, rather than a new batch route: each
+  // call goes through the existing, validated resolve path, and the host already
+  // serialises decisions behind its per-company lock. Sending them one at a time
+  // respects that lock, reuses the per-row drop-safety, and keeps the view honest
+  // if one fails partway - the rows that landed drop out, the rest stay.
+  //
+  // Scope is always `once`: a bulk action never mints a standing grant - that
+  // stays a deliberate per-tool choice.
+  //
+  // Approve is not terminal: each approval resumes the agent, so approving many
+  // at once starts several follow-up turns. Hence the confirm copy. Decline is
+  // terminal and lighter.
+  const [bulkInFlight, setBulkInFlight] = useState(false);
+
+  async function decideAll(verdict: Verdict) {
+    if (bulkInFlight || rows.length === 0) return;
+    const n = rows.length;
+    const question =
+      verdict === "approve"
+        ? `Approve ${n} ${n === 1 ? "request" : "requests"}? Each approval resumes the teammate, so this may start several tasks at once.`
+        : `Decline ${n} ${n === 1 ? "request" : "requests"}? This is final; the work behind them moves on without them.`;
+    if (!window.confirm(question)) return;
+    setBulkInFlight(true);
+    try {
+      for (const a of [...rows]) {
+        if (inFlight.has(a.id)) continue;
+        await decide(a, verdict, { kind: "once" });
+      }
+    } finally {
+      setBulkInFlight(false);
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="mx-auto w-full max-w-3xl px-4 py-6">
         {/* The queue's own count heading below only renders once loaded, so
             it can't be the page's one `h1` — this stays present through
             loading, error and empty states alike (issue #1221). */}
-        <h1 className="sr-only">Approvals</h1>
+        <PageHeader hidden title="Approvals" />
         {/* Issue #883: the filter says so, and offers the way out of itself.
             A narrowed queue that looked identical to the whole one would make a
             decided-elsewhere approval look like it had vanished. */}
@@ -338,88 +479,134 @@ export function ApprovalsView({
             </a>
           </div>
         )}
-        {/* Issue #1229: "nothing parked" and "we could not read what is parked"
-            are different facts, and only one of them is an instruction to stop
-            looking. The queue's own load state decides which is on screen —
-            `approvals` being empty cannot, because it is empty in both cases.
-            A queue that has been read once keeps its rows through a later
-            failure, so this branch is only ever the cold path. */}
-        {queue !== "ready" && approvals.length === 0 ? (
-          queue === "loading" ? (
-            <LoadingApprovals />
-          ) : (
-            <UnreadableApprovals onRetry={() => void feed.refresh()} />
-          )
-        ) : rows.length === 0 ? (
-          focusTaskId !== null ? (
-            <ClearedForTask />
-          ) : (
-            <EmptyApprovals onGoToConversation={onGoToConversation} />
-          )
-        ) : (
-          <>
-            <div className="mb-4 flex items-baseline justify-between">
-              <h2 className="text-sm font-medium text-muted-foreground">
-                {rows.length === 1
-                  ? "1 thing needs your approval"
-                  : `${rows.length} things need your approval`}
-              </h2>
-            </div>
-            {/* #971: nothing may vanish unannounced. Requests now age out on
-                their own, so the queue says so once, up front — mirroring the
-                standing-permissions section's "Each one expires on its own"
-                below. Each card carries its own deadline; this is the sentence
-                that stops that deadline being a surprise. */}
-            <p className="mb-3 text-xs text-muted-foreground">
-              Each one has a deadline. Anything still undecided by then is
-              declined on its own, and the work behind it moves on.
-            </p>
-            <div className="flex flex-col gap-3" {...queueHold}>
-              {rows.map((a) => (
-                <ApprovalCard
-                  key={a.id}
-                  approval={a}
-                  now={now}
-                  askerNames={askerNames}
-                  thread={threadLinks.get(a.id)}
-                  deciding={inFlight.get(a.id) ?? null}
-                  batchIndex={batchPos.get(a.id)?.index ?? 1}
-                  batchTotal={batchPos.get(a.id)?.total ?? 1}
-                  onDecide={(verdict, scope) => void decide(a, verdict, scope)}
-                />
-              ))}
-            </div>
-          </>
-        )}
-
-        {/* Below the queue, and shown even when the queue is empty — a standing
-            permission with nothing currently parked is exactly the state an
-            operator most needs to be able to find and take back. */}
-        <StandingPermissions
-          grants={grants}
-          now={now}
-          askerNames={askerNames}
-          granterNames={granterNames}
-          onRevoke={async (id) => {
-            try {
-              await client.revokeGrant(id, company);
-              toast.success("Permission revoked — this tool will ask again from its next call.");
-            } catch (err) {
-              // A 404 means it was already gone (revoked elsewhere, or expired).
-              // The operator's intent is satisfied either way, so this is not an
-              // error to them — only a stale list, which the refresh below fixes.
-              if (err instanceof ApiError && err.status === 404) {
-                toast.info("That permission was already gone.");
-              } else {
-                const msg = err instanceof ApiError ? err.message : "something went wrong";
-                toast.error(`Couldn't revoke it — ${msg}`);
-                throw err;
+        {/* #1427: permissions are a separate operator task, not the last queue
+            row. Keeping them before the pending list makes revocation reachable
+            even when a backlog is several screens long. The queue's hold props
+            wrap the whole region — permissions and rows together — so the
+            section stays still while an operator is acting on it. */}
+        <div {...queueHold}>
+          <StandingPermissions
+            grants={grants}
+            now={regionNow}
+            askerNames={askerNames}
+            granterNames={granterNames}
+            onRevoke={async (id) => {
+              try {
+                await client.revokeGrant(id, company);
+                toast.success(
+                  "Permission revoked — this tool will ask again from its next call.",
+                );
+              } catch (err) {
+                // A 404 means it was already gone (revoked elsewhere, or expired).
+                // The operator's intent is satisfied either way, so this is not an
+                // error to them — only a stale list, which the refresh below fixes.
+                if (err instanceof ApiError && err.status === 404) {
+                  toast.info("That permission was already gone.");
+                } else {
+                  const msg =
+                    err instanceof ApiError
+                      ? err.message
+                      : "something went wrong";
+                  toast.error(`Couldn't revoke it — ${msg}`);
+                  throw err;
+                }
+              } finally {
+                void refreshGrants();
               }
-            } finally {
-              void refreshGrants();
-            }
-          }}
-        />
+            }}
+          />
+
+          {/* Issue #1229: "nothing parked" and "we could not read what is parked"
+              are different facts, and only one of them is an instruction to stop
+              looking. The queue's own load state decides which is on screen —
+              `approvals` being empty cannot, because it is empty in both cases.
+              A queue that has been read once keeps its rows through a later
+              failure, so this branch is only ever the cold path. */}
+          {queue !== "ready" && approvals.length === 0 ? (
+            queue === "loading" ? (
+              <LoadingApprovals />
+            ) : (
+              <UnreadableApprovals onRetry={() => void feed.refresh()} />
+            )
+          ) : rows.length === 0 ? (
+            focusTaskId !== null ? (
+              <ClearedForTask />
+            ) : (
+              <EmptyApprovals onGoToConversation={onGoToConversation} />
+            )
+          ) : (
+            <>
+              {/* #1427: the count and deadline rule orient every viewport, not
+                  only the first one. The opaque background makes the header a
+                  real reading boundary over cards that scroll beneath it. */}
+              <div className="sticky top-0 z-10 -mx-4 mb-3 border-b bg-background px-4 py-3">
+                <div className="flex items-baseline justify-between gap-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">
+                    {rows.length === 1
+                      ? "1 thing needs your approval"
+                      : `${rows.length} things need your approval`}
+                  </h2>
+                  {rows.length > 1 && (
+                    <div className="flex shrink-0 items-center gap-2 self-center">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={bulkInFlight || inFlight.size > 0}
+                        onClick={() => void decideAll("deny")}
+                      >
+                        {bulkInFlight ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <X className="size-4" />
+                        )}
+                        Decline all
+                      </Button>
+                      <Button
+                        size="sm"
+                        disabled={bulkInFlight || inFlight.size > 0}
+                        onClick={() => void decideAll("approve")}
+                      >
+                        {bulkInFlight ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <Check className="size-4" />
+                        )}
+                        Approve all
+                      </Button>
+                    </div>
+                  )}
+                </div>
+                {/* #971: nothing may vanish unannounced. Requests now age out on
+                    their own, so the queue says so once, up front. Each card
+                    carries its own deadline; this is the sentence that stops
+                    that deadline being a surprise. */}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Each one has a deadline. — {approvalTtlHours} {approvalTtlHours === 1 ? "hour" : "hours"}. Anything still undecided by then is declined on its own, and the work behind it moves on.
+                </p>
+              </div>
+              <div className="flex flex-col gap-3">
+                {rows.map((a) => (
+                  <ApprovalCard
+                    key={a.id}
+                    approval={a}
+                    now={regionNow}
+                    askerNames={askerNames}
+                    chatChannelByThread={chatChannelByThread}
+                    thread={threadLinks.get(a.id)}
+                    deciding={inFlight.get(a.id) ?? null}
+                    batchIndex={batchPos.get(a.id)?.index ?? 1}
+                    batchTotal={batchPos.get(a.id)?.total ?? 1}
+                    onDecide={(verdict, scope) =>
+                      void decide(a, verdict, scope)
+                    }
+                    extending={extending.has(a.id)}
+                    onExtend={() => void extendDeadline(a)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -433,23 +620,74 @@ export function ApprovalsView({
  * a host that predates the route 404s, which is caught here so the section
  * simply does not appear rather than breaking the page.
  */
-function useStandingGrants(client: OpenCompanyClient, company: string | null) {
+function useStandingGrants(
+  client: OpenCompanyClient,
+  company: string | null,
+  /**
+   * True while the queue is interaction-held (#1593): the section renders above
+   * the queue, so a grants update that changes it would shift every
+   * approve/decline control while the operator is aiming at one. The freshest
+   * grants wait out the hold and land the moment it releases — the same
+   * hold-and-reconcile shape `useStableList` gives the rows below.
+   */
+  holding: boolean,
+) {
   const [grants, setGrants] = useState<StandingGrant[]>([]);
   // Actor id → what to call them. Without this the row reads "granted by
   // 019fd3d1bddf-000000000005", which is a runtime identifier in front of an
   // operator — the thing the glossary rule forbids, and useless besides.
-  const [granterNames, setGranterNames] = useState<Map<string, string>>(new Map());
+  const [granterNames, setGranterNames] = useState<Map<string, string>>(
+    new Map(),
+  );
+  // The newest grants while the queue is held. `null` means nothing pending; an
+  // empty list is a real answer and must not be mistaken for "nothing arrived".
+  const pending = useRef<StandingGrant[] | null>(null);
+  // Names can change card height too (fallback id/email → display name), so they
+  // use the same hold-and-reconcile path rather than updating above the queue.
+  const pendingNames = useRef<Map<string, string> | null>(null);
+  // Live is read inside `refreshGrants`, which is memoised and must not close
+  // over a stale render — the same ref pattern `useStableList` uses for `live`.
+  const holdingRef = useRef(holding);
+  holdingRef.current = holding;
 
   const refreshGrants = useCallback(async () => {
-    const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
+    const next = await client
+      .listGrants(company)
+      .catch(() => [] as StandingGrant[]);
+    if (holdingRef.current) {
+      pending.current = next;
+      return;
+    }
     setGrants(next);
   }, [client, company]);
+
+  // Grants that arrived during a hold render the moment it releases. Without
+  // this a grant minted elsewhere — or by the approve that started the hold —
+  // stays invisible until the next poll.
+  useEffect(() => {
+    if (holding) return;
+    if (pending.current !== null) {
+      const next = pending.current;
+      pending.current = null;
+      setGrants(next);
+    }
+    if (pendingNames.current !== null) {
+      const next = pendingNames.current;
+      pendingNames.current = null;
+      setGranterNames(next);
+    }
+  }, [holding]);
 
   useEffect(() => {
     let live = true;
     void (async () => {
-      const next = await client.listGrants(company).catch(() => [] as StandingGrant[]);
-      if (live) setGrants(next);
+      const next = await client
+        .listGrants(company)
+        .catch(() => [] as StandingGrant[]);
+      if (live) {
+        if (holdingRef.current) pending.current = next;
+        else setGrants(next);
+      }
     })();
     // Who the granter ids belong to. Two reads, both allowed to fail: the
     // roster is admin-only, so a member sees no names and the row falls back to
@@ -473,7 +711,8 @@ function useStandingGrants(client: OpenCompanyClient, company: string | null) {
       // "you" outranks the roster name: an operator reading their own audit
       // trail should not have to recognise their own user id or email.
       if (me) names.set(me.id, "you");
-      setGranterNames(names);
+      if (holdingRef.current) pendingNames.current = names;
+      else setGranterNames(names);
     })();
 
     // Slow on purpose. Mint and revoke from another browser are only
@@ -502,7 +741,7 @@ function useStandingGrants(client: OpenCompanyClient, company: string | null) {
  * that has no grants route at all, which reads back as an empty list. The
  * section appearing is itself the signal that something is open.
  */
-function StandingPermissions({
+export function StandingPermissions({
   grants,
   now,
   askerNames,
@@ -518,7 +757,9 @@ function StandingPermissions({
 }) {
   // Per row, not one flag for the section — #373's lesson: a single in-flight
   // slot makes deciding one row freeze every other row on the screen.
-  const [revoking, setRevoking] = useState<ReadonlySet<string>>(() => new Set());
+  const [revoking, setRevoking] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   if (grants.length === 0) return null;
 
   const mark = (id: string, busy: boolean) =>
@@ -531,30 +772,53 @@ function StandingPermissions({
 
   return (
     <section className="mt-8">
-      <h2 className="mb-1 text-sm font-medium text-muted-foreground">Standing permissions</h2>
+      <h2 className="mb-1 text-sm font-medium text-muted-foreground">
+        Standing permissions
+      </h2>
       <p className="mb-3 text-xs text-muted-foreground">
-        Tools you've allowed or blocked without asking each time. Each one expires on its own;
-        you can end it sooner.
+        Tools you've allowed or blocked without asking each time. Each one
+        expires on its own; you can end it sooner.
       </p>
       <div className="flex flex-col gap-2">
-        {grants.map((g) => {
+        {grants.map((g, index) => {
           const busy = revoking.has(g.id);
           const expired = g.expires_at_millis <= now;
           return (
-            <Card key={g.id}>
-              <CardContent className="flex flex-wrap items-center gap-3 py-3">
+            <Card key={g.id} size="sm">
+              <CardContent className="flex flex-wrap items-center gap-3">
                 <div className="min-w-0 flex-1">
                   {/* Phrased, never the raw identifier — the glossary rule. */}
-                  <p className="truncate text-sm font-medium">{grantHeadline(g)}</p>
+                  <p className="truncate text-sm font-medium">
+                    {grantHeadline(g)}
+                  </p>
                   <p className="text-xs text-muted-foreground">
-                    {askerNames.get(g.agent) ?? g.agent} ·{" "}
-                    {expired ? "expired" : `expires ${untilLabel(g.expires_at_millis, now)}`} ·
-                    {g.verdict === "deny" ? "declined" : "granted"} {timeAgo(g.at_millis, now)} by {granterLabel(g, granterNames)}
+                    {grantSubject(g, askerNames)} ·{" "}
+                    {expired
+                      ? "expired"
+                      : `expires ${untilLabel(g.expires_at_millis, now)}`}{" "}
+                    · grant {index + 1} of {grants.length} ·
+                    {g.verdict === "deny" ? "declined" : "granted"}{" "}
+                    {timeAgo(g.at_millis, now)} by{" "}
+                    {granterLabel(g, granterNames)}
                   </p>
                 </div>
                 <Button
                   variant="outline"
                   size="sm"
+                  /* The subject, not just the grant: two teammates holding the
+                     same tool and scope read identically in grantHeadline — and
+                     a workflow grant carries no agent at all — so button-only
+                     navigation would hear identical "Remove" buttons and could
+                     take back the wrong one (#1411). `grantSubject` resolves
+                     the workflow subject for that second kind. The accessible
+                     name leads with the visible "Remove" verb so speech-input
+                     users can say the control's label (WCAG 2.5.3 label in
+                     name). */
+                  aria-label={`Remove ${grantSubject(g, askerNames)}'s permission: ${grantHeadline(g)} — ${
+                    g.expires_at_millis <= now
+                      ? "expired"
+                      : `expires ${untilLabel(g.expires_at_millis, now)}`
+                  } — grant ${index + 1} of ${grants.length}`}
                   disabled={busy}
                   onClick={() => {
                     mark(g.id, true);
@@ -563,7 +827,11 @@ function StandingPermissions({
                       .finally(() => mark(g.id, false));
                   }}
                 >
-                  {busy ? <Loader2 className="size-4 animate-spin" /> : <X className="size-4" />}{" "}
+                  {busy ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <X className="size-4" />
+                  )}{" "}
                   Remove
                 </Button>
               </CardContent>
@@ -583,7 +851,10 @@ function StandingPermissions({
  * uuid. When the roster cannot be read (a member, not an admin) the row says
  * "someone with admin access", which is less information but not misleading.
  */
-function granterLabel(g: StandingGrant, granterNames: Map<string, string>): string {
+function granterLabel(
+  g: StandingGrant,
+  granterNames: Map<string, string>,
+): string {
   if (g.granted_by.kind !== "user") return "an automation";
   return granterNames.get(g.granted_by.id) ?? "someone with admin access";
 }
@@ -608,19 +879,30 @@ function granterLabel(g: StandingGrant, granterNames: Map<string, string>): stri
  * leaving its generic headline alone would not distinguish one request from
  * another.
  */
+function grantDurationLabel(expiresInMillis: number): string {
+  return (
+    GRANT_DURATIONS.find((duration) => duration.millis === expiresInMillis)
+      ?.label ?? `${Math.round(expiresInMillis / 86_400_000)} days`
+  );
+}
+
 export function ApprovalCard({
   approval: a,
   now,
   askerNames,
+  chatChannelByThread,
   thread,
   deciding,
   batchIndex,
   batchTotal,
   onDecide,
+  extending = false,
+  onExtend,
 }: {
   approval: ApprovalSummary;
   now: number;
   askerNames: Map<string, string>;
+  chatChannelByThread?: Readonly<Record<string, string>>;
   thread?: import("@/components/approval-card").ApprovalThreadLink | null;
   /** The verdict this card is waiting on, or `null` when it is idle (#373). */
   deciding: Verdict | null;
@@ -636,19 +918,26 @@ export function ApprovalCard({
    */
   batchTotal: number;
   onDecide: (verdict: Verdict, scope: GrantScope) => void;
+  /** Whether this card's deadline extension is in flight (#1805). */
+  extending?: boolean;
+  /** Push this approval's deadline out to a fresh window (#1805). Absent in
+   * read-only render contexts (some tests), where the button is inert. */
+  onExtend?: () => void;
 }) {
   // Per-card, like the in-flight verdict and for the same reason: two cards can
   // be open at once and each carries its own decision. Defaults to `once`, so a
   // card decided without touching the control behaves exactly as it did before
   // #374 — the scope is opt-in at every level, including this one.
   const [scope, setScope] = useState<GrantScope>({ kind: "once" });
-  const [declineScope, setDeclineScope] = useState<GrantScope>({ kind: "once" });
+  const [declineScope, setDeclineScope] = useState<GrantScope>({
+    kind: "once",
+  });
 
   // No cross-card dimming: another card being decided is not this card's
   // business, and treating it as such is the visual half of the #373 bug.
   return (
     <Card data-approval-id={a.id}>
-      <CardContent className="flex flex-col gap-3 py-4">
+      <CardContent className="flex flex-col gap-3">
         {/* Issue #1406: the headline no longer carries the decide buttons.
             Approve and Decline used to sit here, level with the title and above
             everything an operator reads to decide — the payload, and the scope
@@ -675,12 +964,18 @@ export function ApprovalCard({
           onChange={setScope}
           disabled={deciding !== null}
         />
-        <DeclineScopeControl approval={a} scope={declineScope} onChange={setDeclineScope} disabled={deciding !== null} />
+        <DeclineScopeControl
+          approval={a}
+          scope={declineScope}
+          onChange={setDeclineScope}
+          disabled={deciding !== null}
+        />
 
         <ApprovalMeta
           approval={a}
           now={now}
           askerNames={askerNames}
+          chatChannelByThread={chatChannelByThread}
           thread={thread}
           /* Honest copy for a request that spans an agent turn (#373): an
              approve is not done when the button stops spinning, it is handed
@@ -708,9 +1003,46 @@ export function ApprovalCard({
           data-testid="approval-decide"
           className="flex flex-wrap justify-end gap-2 border-t border-border pt-3"
         >
+          {/* Issue #1805: the deadline is not only shown, it can be moved. Only
+              offered when the host reports a deadline at all — an absent
+              `expires_at_millis` means this host has no deadlines, so there is
+              nothing to extend. Left of the verdicts because it is not one: it
+              buys the operator time to make the actual decision. */}
+          {typeof a.expires_at_millis === "number" && (
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label={`Extend the deadline: ${decisionLabel(a, askerNames, now)}`}
+              disabled={deciding !== null || extending}
+              onClick={onExtend}
+            >
+              {extending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Clock className="size-4" />
+              )}{" "}
+              Extend
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"
+            /* `decisionLabel`, not `approvalAction`: two same-kind cards read
+               identically from the kind alone, and button-only screen-reader
+               navigation never hears the card body (#1411). */
+            aria-label={`Decline: ${decisionLabel(a, askerNames, now)} — ${
+              declineScope.kind === "tool"
+                ? `don't ask again for this tool for ${grantDurationLabel(declineScope.expiresInMillis)}`
+                : "just this once"
+            }${
+              // Redacted cards already carry the exact timestamp in
+              // `decisionLabel`'s "composed … (…)"; appending the usual
+              // `request <timestamp>` suffix here too would announce the opaque
+              // epoch twice on every hidden card.
+              a.contents_hidden ? "" : ` — request ${a.at_millis}`
+            }${
+              batchTotal > 1 ? ` — approval ${batchIndex} of ${batchTotal}` : ""
+            }`}
             disabled={deciding !== null}
             /* A decline never carries a scope — there is nothing to grant,
                and the host refuses the pairing anyway. */
@@ -725,6 +1057,15 @@ export function ApprovalCard({
           </Button>
           <Button
             size="sm"
+            aria-label={`Approve: ${decisionLabel(a, askerNames, now)} — ${
+              scope.kind === "tool"
+                ? `let this ${
+                    a.workflow_id ? "workflow" : "teammate"
+                  } use this tool for ${grantDurationLabel(scope.expiresInMillis)}`
+                : "just this once"
+            }${a.contents_hidden ? "" : ` — request ${a.at_millis}`}${
+              batchTotal > 1 ? ` — approval ${batchIndex} of ${batchTotal}` : ""
+            }`}
             disabled={deciding !== null}
             onClick={() => onDecide("approve", scope)}
           >
@@ -796,7 +1137,9 @@ function WorkflowContentReview({ approval }: { approval: ApprovalSummary }) {
               <div key={i} className={i > 0 ? "border-t pt-1" : undefined}>
                 {m.text ? (
                   <div className="prose prose-sm max-w-none dark:prose-invert">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {m.text}
+                    </ReactMarkdown>
                   </div>
                 ) : (
                   <p className="whitespace-pre-wrap text-sm text-muted-foreground">
@@ -837,7 +1180,8 @@ function ClearedForTask() {
         <p className="font-medium">This card is clear</p>
         <p className="max-w-sm text-sm text-muted-foreground">
           Nothing it parked is still waiting on you. Other cards may still have
-          approvals of their own — use <span className="font-medium">Show all</span> to see them.
+          approvals of their own — use{" "}
+          <span className="font-medium">Show all</span> to see them.
         </p>
       </div>
     </div>
@@ -855,7 +1199,10 @@ function LoadingApprovals() {
   return (
     <div className="space-y-3" aria-busy="true" aria-label="Loading approvals">
       {Array.from({ length: 3 }).map((_, i) => (
-        <div key={i} className="h-28 animate-pulse rounded-xl border bg-muted/40" />
+        <div
+          key={i}
+          className="h-28 animate-pulse rounded-xl border bg-muted/40"
+        />
       ))}
     </div>
   );
@@ -899,7 +1246,11 @@ function UnreadableApprovals({ onRetry }: { onRetry: () => void }) {
   );
 }
 
-function EmptyApprovals({ onGoToConversation }: { onGoToConversation: () => void }) {
+function EmptyApprovals({
+  onGoToConversation,
+}: {
+  onGoToConversation: () => void;
+}) {
   return (
     <div className="mt-16 flex flex-col items-center gap-3 text-center">
       <div className="flex size-12 items-center justify-center rounded-2xl bg-status-done-soft text-status-done-text">
@@ -908,7 +1259,8 @@ function EmptyApprovals({ onGoToConversation }: { onGoToConversation: () => void
       <div className="space-y-1">
         <p className="font-medium">All clear</p>
         <p className="max-w-sm text-sm text-muted-foreground">
-          Nothing is waiting on you. Your company will park anything that needs a sign-off here.
+          Nothing is waiting on you. Your company will park anything that needs
+          a sign-off here.
         </p>
       </div>
       <Button variant="outline" size="sm" onClick={onGoToConversation}>

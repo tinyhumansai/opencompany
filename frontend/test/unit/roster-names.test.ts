@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { rosterDisplayName, rosterNameMap } from "@/lib/roster-names";
+import { rosterDisplayName, rosterIdKey, rosterNameMap } from "@/lib/roster-names";
 
 /**
  * The shared roster id -> display name resolver (issue #973).
@@ -21,6 +21,44 @@ describe("rosterDisplayName", () => {
     ]);
     expect(rosterDisplayName("019fa75dbc9b-000000000005", names)).toBe("Mark");
     expect(rosterDisplayName("backend_engineer", names)).toBe("backend dev");
+  });
+
+  it("resolves the kebab spelling the runtime mints the teammate's folder under (issue #1723)", () => {
+    // `agents/`/`artifacts/` member folders go through the host's `kebab_name`
+    // (`src/company/workspace_names.rs`), which turns `backend_engineer` into
+    // `backend-engineer` on every company that had not already created the
+    // folder under the verbatim id. Keyed only by the raw id, this map missed
+    // all of them — so #973's surface kept printing a handle on exactly the
+    // companies provisioned since that naming rule shipped.
+    const names = rosterNameMap([{ id: "backend_engineer", name: "Backend Engineer" }]);
+    expect(rosterDisplayName("backend-engineer", names)).toBe("Backend Engineer");
+    expect(rosterDisplayName("backend_engineer", names)).toBe("Backend Engineer");
+  });
+
+  it("never lets one teammate's alias shadow another's real id", () => {
+    // A teammate whose id genuinely IS the kebab form owns that key. The alias
+    // is a fallback for a spelling nobody claimed, not an overwrite.
+    // Asserted in BOTH roster orders: an alias that merely lost a race to the
+    // real id would pass one of them by luck.
+    for (const roster of [
+      [
+        { id: "backend_engineer", name: "Alias Owner" },
+        { id: "backend-engineer", name: "Real Owner" },
+      ],
+      [
+        { id: "backend-engineer", name: "Real Owner" },
+        { id: "backend_engineer", name: "Alias Owner" },
+      ],
+    ]) {
+      const names = rosterNameMap(roster);
+      expect(rosterDisplayName("backend-engineer", names)).toBe("Real Owner");
+      expect(rosterDisplayName("backend_engineer", names)).toBe("Alias Owner");
+    }
+  });
+
+  it("compares two spellings of one id under a single key", () => {
+    expect(rosterIdKey("backend_engineer")).toBe(rosterIdKey("backend-engineer"));
+    expect(rosterIdKey("devrel")).toBe("devrel");
   });
 
   it("falls back to the id itself for an id the roster does not carry", () => {

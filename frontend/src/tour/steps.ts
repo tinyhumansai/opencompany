@@ -33,10 +33,10 @@ export const TOUR: TourStop[] = [
   },
   {
     view: "overview",
-    target: '[data-tour="operator-overview"]',
+    target: '[data-tour="overview-graph"]',
     placement: "top",
     title: "Start here each day",
-    body: "Start with the decisions waiting for you and work that stopped. The company graph is one click away when you need its structure.",
+    body: "Your company at a glance: its departments, the work in flight, who's doing it, and what it remembers. Pull the graph around to explore it.",
   },
   {
     view: "chat",

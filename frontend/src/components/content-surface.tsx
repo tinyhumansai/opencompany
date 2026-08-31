@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { WindowDragBar } from "@/components/window-chrome";
+
 /**
  * The console's single content sheet — the "card" half of the two-layer shell
  * (issue #1178).
@@ -58,6 +60,20 @@ const CARD =
 export function ContentSurface({ children }: { children: ReactNode }) {
   return (
     <div className={CARD} data-testid="content-surface">
+      {/* The desktop window draws no title bar of its own, so the top of this
+          card is what a person reaches for to move the window — see
+          `window-chrome.tsx`. It renders nothing in a browser, and nothing off
+          macOS, where the native bar is still there.
+
+          Over the card rather than the whole window: the sidebar's own strip
+          drags in place, and a band spanning both would sit on top of the
+          switcher. The cost is that a page's top 28px stops taking a press,
+          which is only visible on the two canvases you can drag — the graph and
+          the workflow editor — and both have the rest of the sheet to grab.
+          OpenHuman's `WindowDragBar` makes the same trade for the same reason.
+
+          `CARD` is already `relative`, which is what this positions against. */}
+      <WindowDragBar />
       {children}
     </div>
   );

@@ -131,12 +131,24 @@ async function mockApi(page: Page) {
         // Edit a live control rather than a disabled explanation.
         editable: ["name", "role", "description"],
         isOrchestrator: false,
-        tools: { requested: [], companyAllow: ["web_search"], effective: ["web_search"] },
+        tools: { requested: [], companyAllow: ["web_search"], deskAllow: [], deskCeilingActive: false, effective: ["web_search"] },
         desks: [{ id: "research", name: "Research", lead: true }],
         inboxEnabled: false,
       });
     }
     if (path.endsWith("/me")) return json({ id: "op", email: "op@example.com", role: "admin" });
+    // Issue #1844: without this the fallback below answers `GET …/activation`
+    // with `[]` — truthy, so `shouldShowOnboardingGate` reads `isActivated` as
+    // `undefined` and, since `/me` above already resolves this operator as
+    // admin, opens the blocking gate over every one of this file's tests
+    // instead of the shell they actually exercise.
+    if (path.endsWith("/activation"))
+      return json({
+        nameConfirmed: true,
+        integrationConnected: true,
+        workflowRunSucceeded: true,
+        isActivated: true,
+      });
     if (path.endsWith("/events"))
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     return json([]);

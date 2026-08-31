@@ -1,49 +1,13 @@
-import { Building2, MessageSquareWarning, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { MessageSquareWarning, PanelLeftClose, PanelLeftOpen, Settings } from "lucide-react";
 
-import type { CompanyStatus } from "@/api/types";
 import type { View } from "@/components/app-shell";
 
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  useSidebar,
-} from "@/components/ui/sidebar";
+import { useSidebar } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { DiscordIcon } from "@/components/discord-icon";
-import { lifecycle } from "@/lib/language";
 import { DISCORD_INVITE_URL } from "@/lib/links";
 import { cn } from "@/lib/utils";
-
-// The lifecycle row carries its state in the label as well as the dot — a
-// coloured dot alone puts the whole signal on hue, which a colourblind reader
-// or a glance at the collapsed rail can miss.
-const TONE_DOT: Record<string, string> = {
-  live: "bg-status-done",
-  idle: "bg-status-blocked",
-  stopped: "bg-status-failed",
-};
-
-const TONE_TEXT: Record<string, string> = {
-  live: "text-status-done-text",
-  idle: "text-status-blocked-text",
-  stopped: "text-status-failed-text",
-};
-
-// Discord's brand blurple, lifted a step in dark mode so it clears the
-// sidebar's surface instead of sinking into it. Named tokens rather than raw
-// hex — the colour is deliberately not ours, and saying so in the token name
-// is what stops it being "fixed" into the palette later. See `--brand-discord`
-// in index.css.
-const DISCORD_BLURPLE =
-  "text-(--brand-discord-on-light) dark:text-(--brand-discord-on-dark)";
 
 /**
  * A sidebar row at rest: dimmed until you reach for it.
@@ -58,147 +22,185 @@ const DISCORD_BLURPLE =
 export const RESTING_ROW =
   "opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100 data-active:opacity-100";
 
-interface Props {
-  /** The company's lifecycle, shown as a dot + label. */
-  lifecycleState: string;
-  /**
-   * Issue #86: whether the governance kill switch is engaged. Overrides the
-   * lifecycle label, because a stopped company still reports `running` and this
-   * row is the one piece of company state on screen behind every view.
-   */
-  emergencyPaused?: boolean;
-  /** Every company this operator can reach, for the switcher. */
-  companies: CompanyStatus[];
-  activeCompany: string | null;
-  onSwitchCompany: (id: string) => void;
-  onBackToPicker?: () => void;
-  /** The active view, so the Feedback row can show as selected. */
-  view: View;
-  onNavigate: (view: View) => void;
+// Discord's brand blurple, lifted a step in dark mode so it clears the
+// sidebar's surface instead of sinking into it. Named tokens rather than raw
+// hex — the colour is deliberately not ours, and saying so in the token name
+// is what stops it being "fixed" into the palette later. See `--brand-discord`
+// in index.css.
+const DISCORD_BLURPLE =
+  "text-(--brand-discord-on-light) dark:text-(--brand-discord-on-dark)";
+
+/**
+ * Shared footprint for every button on the utility bar.
+ *
+ * Lifted from {@link SidebarCollapseButton}, which had it first and is now one
+ * of four: 28px square under the column, 32px on the rail so it lands on the
+ * same rhythm as the nav icons; the resting dim through the ink's alpha rather
+ * than `RESTING_ROW`'s `opacity-60`, because opacity dims the focus ring too
+ * and the ring is the only thing saying where the keyboard is on an unlabelled
+ * button. The three hover classes each replace exactly one of `ghost`'s, so
+ * tailwind-merge drops the original instead of leaving the two to race.
+ */
+const UTILITY_BUTTON = cn(
+  "shrink-0 text-sidebar-foreground/60",
+  "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground dark:hover:bg-sidebar-accent",
+  "focus-visible:ring-sidebar-ring/50",
+  "group-data-[collapsible=icon]:size-8",
+);
+
+/**
+ * One button on the utility bar: icon, tooltip, and a name a screen reader can
+ * read.
+ *
+ * `label` is the accessible name AND the tooltip text, deliberately the same
+ * string. These are icon-only in both sidebar states — unlike a nav row, which
+ * carries its own label once the column is open — so the tooltip is the only
+ * place the word appears on screen, and a tooltip is a visual affordance that
+ * cannot be relied on for the name.
+ */
+function UtilityButton({
+  label,
+  icon,
+  active,
+  onClick,
+  href,
+  className,
+  ...rest
+}: {
+  label: string;
+  icon: React.ReactNode;
+  /** Marks the button while its own page is open, the way a nav row does. */
+  active?: boolean;
+  onClick?: () => void;
+  /** An external destination — renders an anchor instead of a button. */
+  href?: string;
+  className?: string;
+  "data-tour"?: string;
+  "data-testid"?: string;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type={href ? undefined : "button"}
+            variant="ghost"
+            size="icon-sm"
+            aria-label={label}
+            // `aria-current`, not `data-active`: these are destinations, and
+            // this is the same thing the nav rows announce when their page is
+            // the one open. Absent — not `false` — when it is not, because
+            // `aria-current="false"` is announced by some readers.
+            aria-current={active ? "page" : undefined}
+            onClick={onClick}
+            className={cn(UTILITY_BUTTON, active && "text-sidebar-foreground", className)}
+            render={href ? <a href={href} target="_blank" rel="noreferrer" /> : undefined}
+            {...rest}
+          />
+        }
+      >
+        {icon}
+      </TooltipTrigger>
+      {/*
+        The raw tooltip primitive rather than `SidebarMenuButton`'s `tooltip`
+        prop, which hides its content unless the sidebar is collapsed. That is
+        right for a nav row and wrong here: expanded is exactly the state in
+        which a reader of this bar has never seen the word.
+      */}
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
 }
 
 /**
- * The sidebar's standing controls.
+ * The utility bar: one thin row of icons directly under the company switcher.
  *
- * No page carries a header of its own any more, so what is left of the old top
- * bar lives here: the company's state and the switcher. Collapsing is NOT one
- * of these — it is chrome rather than a destination, so it is a button in the
- * sidebar's header beside the host switcher (`SidebarCollapseButton`, below)
- * rather than a row in either menu. Theming and flagging are deliberately
- * absent — Settings owns both, under Appearance and "Something off?", and a
- * second entry point would just be two places to keep in step.
+ * Settings, Feedback, Discord and Collapse. Three of them go somewhere and one
+ * changes the chrome, but none is a place an operator *works* — they are
+ * reached once a session, if that. As full-width rows they cost four rows of a
+ * column whose remaining rows are the actual destinations, and Feedback and
+ * Discord pushed the company's own state and its switcher further down the
+ * footer every time the list grew.
+ *
+ * This is the shape OpenHuman's shell already uses for the same four
+ * (`vendor/openhuman/app/src/components/layout/shell/SidebarHeader.tsx`):
+ * a header band of icon-only tertiary buttons, tooltipped, with the collapse
+ * control at the end of the row. Settings keeps its `data-tour` anchor, so the
+ * guided tour's "Connect your tools" stop still has something to spotlight.
+ *
+ * ## The collapsed rail
+ *
+ * The rail is `--sidebar-width-icon` (3rem) less `SidebarHeader`'s `p-2` — 32px
+ * of content box, one icon wide. The row therefore becomes a column there, the
+ * same way the switcher row above it already does, and each button grows to
+ * 32px so the whole header reads as one stack with the nav icons below it.
  */
-export function SidebarControls({
-  lifecycleState,
-  emergencyPaused,
-  companies,
-  activeCompany,
-  onSwitchCompany,
-  onBackToPicker,
+export function SidebarUtilityBar({
   view,
   onNavigate,
-}: Props) {
-  const { label, tone } = lifecycle(lifecycleState, emergencyPaused);
+}: {
+  /** The active view, so Settings and Feedback can show as current. */
+  view: View;
+  onNavigate: (view: View) => void;
+}) {
   const { isMobile, setOpenMobile } = useSidebar();
 
   const navigate = (next: View) => {
     onNavigate(next);
+    // The sheet is the whole screen on a phone; leaving it open would hide the
+    // page just navigated to. Same rule the nav rows follow.
     if (isMobile) setOpenMobile(false);
   };
 
   return (
-    <SidebarMenu>
-      {/* Company state. Not a control — `cursor-default` and inert, so it does
-          not read as something to press. */}
-      <SidebarMenuItem>
-        <SidebarMenuButton
-          tooltip={label}
-          className={cn("cursor-default font-medium hover:bg-transparent", TONE_TEXT[tone])}
-        >
-          <span className="flex size-4 items-center justify-center">
-            <span
-              className={cn(
-                "size-2 rounded-full",
-                TONE_DOT[tone],
-                tone === "live" && "animate-pulse",
-              )}
-            />
-          </span>
-          <span>{label}</span>
-        </SidebarMenuButton>
-      </SidebarMenuItem>
+    // `role="group"` so the bar has a name of its own. It sits in the sidebar's
+    // header, which is outside the `Main navigation` landmark on purpose — the
+    // landmark is the destinations an operator works out of, and these are the
+    // utilities that act on the console itself.
+    <div
+      role="group"
+      aria-label="Console utilities"
+      data-testid="sidebar-utilities"
+      // Centred, not left-aligned under the switcher's glyph. Four icons in a
+      // 13.5rem column left no honest edge to align to: flush left they hung
+      // under the nameplate's text with a ragged right, and the row reads as
+      // one object rather than four list items when it is centred in the
+      // column it belongs to. On the rail it is already the full width, so
+      // centring is what the column does anyway.
+      className="flex items-center justify-center gap-1 group-data-[collapsible=icon]:flex-col"
+    >
+      <UtilityButton
+        label="Settings"
+        icon={<Settings />}
+        active={view === "settings"}
+        onClick={() => navigate("settings")}
+        data-tour="nav-settings"
+      />
+      <UtilityButton
+        label="Feedback"
+        icon={<MessageSquareWarning />}
+        active={view === "feedback"}
+        onClick={() => navigate("feedback")}
+      />
+      {/* Deliberately NOT dimmed with the others.
 
-      {/* Feedback is a destination like any nav item, but it belongs with the
-          standing controls at the bottom rather than in the working nav. */}
-      <SidebarMenuItem>
-        <SidebarMenuButton
-          tooltip="Feedback"
-          isActive={view === "feedback"}
-          onClick={() => navigate("feedback")}
-          className={RESTING_ROW}
-        >
-          <MessageSquareWarning />
-          <span>Feedback</span>
-        </SidebarMenuButton>
-      </SidebarMenuItem>
-
-      {/* Switching companies lived in the header block that was removed. It
-          is a real capability, so it moves here rather than disappearing —
-          hidden entirely when there is only one company to be in. */}
-      {(companies.length > 1 || onBackToPicker) && (
-        <SidebarMenuItem>
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={<SidebarMenuButton tooltip="Switch company" className={RESTING_ROW} />}
-            >
-              <Building2 />
-              <span>Switch company</span>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" side="right">
-              {companies.map((c) => (
-                <DropdownMenuItem
-                  key={c.id}
-                  onClick={() => onSwitchCompany(c.id)}
-                  className={c.id === activeCompany ? "font-medium" : undefined}
-                >
-                  {c.name}
-                </DropdownMenuItem>
-              ))}
-              {onBackToPicker && (
-                <DropdownMenuItem onClick={onBackToPicker}>All companies…</DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </SidebarMenuItem>
-      )}
-
-      <SidebarMenuItem>
-        {/* Deliberately NOT `RESTING_ROW`.
-
-            The resting dim is `opacity-60`, which is safe for a row of
-            near-white text — 16.87:1 becomes 6.60:1 — and destroys a
-            mid-tone hue: the blurple measures 6.36:1 at full strength and
-            3.04:1 dimmed, under the 4.5:1 a 14px label needs. Recovering
-            that inside the dim would mean lightening the blurple by five
-            steps, at which point it is a pale lavender and no longer reads
-            as Discord's colour at all.
-
-            So this row is not dimmed. Its hue already sets it apart from the
-            nav above, without help from the property doing the damage. */}
-        <SidebarMenuButton
-          tooltip="Join our Discord"
-          className={cn(
-            DISCORD_BLURPLE,
-            "hover:text-(--brand-discord-on-light) dark:hover:text-(--brand-discord-on-dark)",
-          )}
-          render={<a href={DISCORD_INVITE_URL} target="_blank" rel="noreferrer" />}
-        >
-          <DiscordIcon className="size-4" />
-          <span>Join our Discord</span>
-        </SidebarMenuButton>
-      </SidebarMenuItem>
-
-    </SidebarMenu>
+          The resting dim is safe for near-white text and destroys a mid-tone
+          hue: the blurple measures 6.36:1 at full strength and 3.04:1 dimmed.
+          Recovering that inside the dim would mean lightening the blurple until
+          it is a pale lavender that no longer reads as Discord's colour. The
+          hue already sets it apart without help from the property doing the
+          damage. */}
+      <UtilityButton
+        label="Join our Discord"
+        icon={<DiscordIcon className="size-4" />}
+        href={DISCORD_INVITE_URL}
+        className={cn(
+          DISCORD_BLURPLE,
+          "hover:text-(--brand-discord-on-light) dark:hover:text-(--brand-discord-on-dark)",
+        )}
+      />
+      <SidebarCollapseButton />
+    </div>
   );
 }
 

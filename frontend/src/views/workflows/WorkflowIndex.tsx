@@ -209,6 +209,12 @@ export function WorkflowIndex({
    */
   runsLoaded: boolean;
 }) {
+  const sortedWorkflows = [...workflows].sort((a, b) => {
+    const aLastRun = runsByWorkflow.get(a.id)?.[0]?.atMillis ?? Number.NEGATIVE_INFINITY;
+    const bLastRun = runsByWorkflow.get(b.id)?.[0]?.atMillis ?? Number.NEGATIVE_INFINITY;
+    return aLastRun === bLastRun ? 0 : bLastRun > aLastRun ? 1 : -1;
+  });
+
   return (
     <div className="h-full overflow-auto p-4" data-testid="workflow-index">
       {loading ? (
@@ -223,7 +229,7 @@ export function WorkflowIndex({
         </p>
       ) : mode === "cards" ? (
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {workflows.map((w) => (
+          {sortedWorkflows.map((w) => (
             <WorkflowCard
               key={w.id}
               workflow={w}
@@ -239,7 +245,7 @@ export function WorkflowIndex({
         // would drop the description while there was still room for it, and
         // keep it past the point where there wasn't (issue #1136).
         <div className="@container divide-y rounded-xl border">
-          {workflows.map((w) => (
+          {sortedWorkflows.map((w) => (
             <WorkflowRow
               key={w.id}
               workflow={w}

@@ -20,8 +20,8 @@ output = "Answers, plans, and short written drafts"
 human_role = "Steering the company and approving anything costly"
 
 [policy]
-# `full` lets ordinary turns flow without an approval prompt; costly or
-# external effects still route through the gate.
+# Policy-generated HITL is disabled. Agents call `request_approval` explicitly;
+# `readonly` remains a hard denial for mutations.
 mode = "full"
 
 [users]

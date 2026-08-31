@@ -41,30 +41,61 @@ const VIEWPORT_HEIGHT = 800;
  */
 let viewportHeight = VIEWPORT_HEIGHT;
 /**
- * Every live `ResizeObserver` callback, so a test can fire one.
+ * Every live `ResizeObserver` instance, so a test can fire the one watching a
+ * particular element.
  *
  * jsdom performs no layout and ships no `ResizeObserver` at all, so nothing
  * would ever call these on their own — which is the same reason the geometry
  * above is stubbed. The suite is asserting *which* anchoring call the component
  * makes when its box changes, not that a browser would have noticed.
+ *
+ * Target-tracking (rather than a flat array of bare callbacks) matters as of
+ * issue #1935: the component now registers two observers — rule 3 on the
+ * scroller's own box, rule 2b on the content column inside it — and a real
+ * browser only fires the one whose *observed element* actually resized. A
+ * mock that fired every registered callback regardless of target would have
+ * `shrinkViewport` (a scroller-box event) also trip rule 2b, which no browser
+ * would ever do for a resize the content column did not itself undergo.
  */
-let resizeCallbacks: Array<() => void> = [];
-
 class TestResizeObserver {
-  constructor(callback: () => void) {
-    resizeCallbacks.push(callback);
+  target: Element | null = null;
+  constructor(private readonly callback: ResizeObserverCallback) {
+    resizeObservers.push(this);
   }
-  observe() {}
-  unobserve() {}
-  disconnect() {}
+  observe(el: Element) {
+    this.target = el;
+  }
+  unobserve() {
+    this.target = null;
+  }
+  disconnect() {
+    this.target = null;
+  }
+  /** Invoke as a real observer would when its target resizes. */
+  fire() {
+    this.callback([] as unknown as ResizeObserverEntry[], this as unknown as ResizeObserver);
+  }
+}
+let resizeObservers: TestResizeObserver[] = [];
+
+/** Fire every observer currently watching `el`, as a browser would. */
+function fireResizeObservers(el: Element) {
+  act(() => {
+    for (const ro of resizeObservers) {
+      if (ro.target === el) ro.fire();
+    }
+  });
 }
 
 /** Shrink the pane by `px` and tell the component, as a browser would. */
 function shrinkViewport(px: number) {
   viewportHeight -= px;
-  act(() => {
-    for (const fire of resizeCallbacks) fire();
-  });
+  fireResizeObservers(scroller());
+}
+/** Grow the transcript column by `px` without touching any rule-2 prop. */
+function growContent(px: number) {
+  contentHeight += px;
+  fireResizeObservers(content());
 }
 /**
  * How tall the transcript is *right now* (issue #1224).
@@ -187,6 +218,11 @@ function scroller(): HTMLElement {
   return container.firstElementChild as HTMLElement;
 }
 
+/** The content column rule 2b observes — the scroller's one child. */
+function content(): HTMLElement {
+  return scroller().firstElementChild as HTMLElement;
+}
+
 beforeEach(() => {
   // React only treats `act` as a real boundary when this is set; without it
   // effects still run but React warns, and the warning is the honest signal
@@ -196,7 +232,7 @@ beforeEach(() => {
   scrollTop = 0;
   contentHeight = CONTENT_HEIGHT;
   viewportHeight = VIEWPORT_HEIGHT;
-  resizeCallbacks = [];
+  resizeObservers = [];
   savedResizeObserver = globalThis.ResizeObserver;
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = TestResizeObserver;
   stubGeometry();
@@ -530,5 +566,63 @@ describe("where an empty channel's intro sits", () => {
 
     expect(wrapper().className).toContain("justify-end");
     expect(wrapper().className).not.toContain("justify-start");
+  });
+});
+
+/**
+ * Rule 2b — content growing without moving any of rule 2's watched props
+ * (issue #1935 review, coderabbit 3892517543).
+ *
+ * `ChatLiveReceipt`'s "still waiting" note appears off a clock entirely
+ * internal to that component: none of `items.length`, `typing`, `queued` or
+ * `liveStepCount` change when it does, so rule 2 (keyed on exactly those)
+ * never fires. `growContent` below stands in for that note landing — the
+ * transcript column gets taller with no rule-2 dependency moving — which is
+ * the general shape of the gap, not just this one receipt's case of it.
+ *
+ * These fire only the observer targeting the *content* column, mirroring what
+ * a real `ResizeObserver` would do: a composer-driven scroller-box resize
+ * (`shrinkViewport`, exercised in "the composer growing under the
+ * transcript" above) must not also trip this one, and the reverse — asserted
+ * by rule 3's own suite still passing unchanged now that the mock is
+ * target-aware.
+ */
+describe("content growing without a tracked prop changing", () => {
+  it("follows a live receipt's stall note into view", () => {
+    const ch = channel("engineering");
+    render(ch, items(40, ch));
+    calls = [];
+
+    growContent(64);
+
+    expect(calls).toEqual([{ top: contentHeight, behavior: "smooth" }]);
+  });
+
+  it("leaves a reader alone who has scrolled up to read history", () => {
+    const ch = channel("engineering");
+    render(ch, items(40, ch));
+
+    scrollTop = 100;
+    act(() => {
+      scroller().dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    calls = [];
+
+    growContent(64);
+
+    expect(calls).toHaveLength(0);
+    expect(scrollTop).toBe(100);
+  });
+
+  it("does nothing while history is still on the wire", () => {
+    // Same gate rule 2 uses: a cold load's content grows repeatedly as
+    // history lands, and rule 1 owns the anchor until it has (issue #1224).
+    const ch = channel("engineering");
+    render(ch, [], true);
+    calls = [];
+
+    growContent(64);
+
+    expect(calls).toHaveLength(0);
   });
 });

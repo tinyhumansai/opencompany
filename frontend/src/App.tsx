@@ -13,6 +13,7 @@ import { signInWithHubToken, verifyCode } from "@/api/auth";
 import { isAddressableBaseUrl, isDesktopRuntime } from "@/api/transport";
 import {
   createLocalInstance,
+  renameLocalInstance,
   deleteLocalInstance,
   embeddedHost,
   localInstances,
@@ -24,6 +25,7 @@ import {
 import { ApiError } from "@/api/types";
 import { ConsoleChrome } from "@/components/host-switcher";
 import { ManageHostsPage } from "@/components/manage-hosts";
+import { RouteLoading } from "@/components/route-loading";
 import { Button } from "@/components/ui/button";
 import { resolveConfig } from "@/config";
 import {
@@ -183,7 +185,19 @@ export function App() {
 
   if (styleguide) {
     return (
-      <Suspense fallback={null}>
+      /* `min-h-screen` because this boundary is the whole document — there is
+         no console shell around it for `RouteLoading`'s `flex-1` to grow
+         inside, and without a height the loading line sits flush against the
+         top of the window (measured in Chromium at 1440x900: a 20px-tall
+         holder at y=0). Every other route's boundary is already inside the
+         shell's flex column, so they pass it nothing and are unchanged. */
+      <Suspense
+        fallback={
+          <div className="flex min-h-screen">
+            <RouteLoading title="Styleguide" label="Loading styleguide…" />
+          </div>
+        }
+      >
         <StandaloneStyleguide />
       </Suspense>
     );
@@ -588,6 +602,24 @@ function Console() {
           await refreshLocal();
         }
       : undefined,
+    // Setup, finishing, names the host after the company it just built. Matched
+    // by instance identity rather than by address, for the reason the registry
+    // gives everywhere else: the address is this launch's and the identity is
+    // the machine's.
+    onNameLocalHost: isDesktopRuntime()
+      ? async (label) => {
+          const instanceId = active?.identity?.instanceId;
+          if (!instanceId) return;
+          const local = embedded.instances.find(
+            (instance) => instance.instanceId === instanceId,
+          );
+          // A remote host, or one this shell does not own. Nothing to rename,
+          // and nothing wrong: the caller does not know which kind it is on.
+          if (!local) return;
+          await renameLocalInstance(local.id, label);
+          await refreshLocal();
+        }
+      : undefined,
     onEditHost: (id, change) => editConnection(id, change),
     // Selection has to move *with* the removal, in one step. `active` falls
     // through to the first connection when nothing is selected, so a console
@@ -649,6 +681,7 @@ function Console() {
             defaultCompany={active.defaultCompany}
             notice={active.id === bootstrapId ? auth.notice : undefined}
             forceLogin={active.id === bootstrapId && auth.failed === true}
+            isBootstrap={active.id === bootstrapId}
           />
         ) : (
           // The switcher rides along, because an operator whose local host is

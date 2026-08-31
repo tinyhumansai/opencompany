@@ -8,7 +8,7 @@ use tower::ServiceExt;
 
 use crate::company::CompanyManifest;
 use crate::ports::CompanyStore;
-use crate::ports::types::{CompanyId, CompanyRecord};
+use crate::ports::types::{CompanyId, CompanyRecord, SecretValue};
 use crate::runtime::RuntimeBuilder;
 use crate::server::ops::ConnectionsRuntime;
 use crate::server::ops::mailer::{MailCredentials, RecordingMailSender};
@@ -88,10 +88,14 @@ async fn state_from(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -117,7 +121,7 @@ fn mail_connections() -> (ConnectionsRuntime, RecordingMailSender) {
             port: 587,
             security: SmtpSecurity::Starttls,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
             from_name: "Acme".into(),
             from_email: "noreply@acme.test".into(),
         }));
@@ -877,10 +881,14 @@ async fn a_https_deployment_marks_the_cookie_secure() {
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -903,7 +911,7 @@ async fn a_https_deployment_marks_the_cookie_secure() {
                 port: 587,
                 security: SmtpSecurity::Starttls,
                 username: "u".into(),
-                password: "p".into(),
+                password: SecretValue("p".into()),
                 from_name: "Acme".into(),
                 from_email: "noreply@acme.test".into(),
             })),
@@ -1081,6 +1089,46 @@ async fn suspending_a_user_kills_their_session_at_once() {
 
     // And he cannot get a new link either.
     assert_eq!(request_dev_code(&state, "bob@example.com").await, None);
+}
+
+/// The same bound the self-service route enforces, on the admin route too: an
+/// over-long name written for somebody else would render on every surface that
+/// shows them and ride in every roster payload.
+#[tokio::test]
+async fn an_admin_cannot_set_an_over_long_display_name() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let (state, sender) = state_with_mail(&home).await;
+    let admin = login_via_link(&state, &sender, "ada@example.com").await;
+
+    let app = router(state.clone());
+    app.oneshot(post_with_cookie(
+        "/api/v1/companies/acme/users/invites",
+        serde_json::json!({ "email": "bob@example.com" }),
+        &admin,
+    ))
+    .await
+    .unwrap();
+    login_via_link(&state, &sender, "bob@example.com").await;
+    let bob_id = user_id(&state, &admin, "bob@example.com").await;
+
+    let long = "A".repeat(crate::server::users::MAX_DISPLAY_NAME_CHARS + 1);
+    let app = router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/companies/acme/users/{bob_id}"))
+                .header("content-type", "application/json")
+                .header("cookie", &admin)
+                .body(Body::from(
+                    serde_json::json!({ "display_name": long }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1268,6 +1316,25 @@ async fn a_temporary_password_is_a_boundary_not_a_suggestion() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // The read stays open, the write does not: a temporary password must not be
+    // spendable on the account's public name or face before it is replaced —
+    // the admin who reset it knows the value and conveyed it over a channel
+    // they do not control.
+    let app = router(state.clone());
+    let response = app
+        .oneshot(patch_with_cookie(
+            "/api/v1/companies/acme/auth/me",
+            serde_json::json!({ "displayName": "Bob the Temp" }),
+            &temp_cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(response).await["code"],
+        "password_change_required"
+    );
 
     let app = router(state.clone());
     let response = app
@@ -1695,7 +1762,7 @@ async fn state_refusing_mail_to(
             port: 587,
             security: SmtpSecurity::Starttls,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
             from_name: "Acme".into(),
             from_email: "noreply@acme.test".into(),
         }));
@@ -1833,9 +1900,11 @@ async fn inviting_someone_mails_them_a_credential_free_invitation() {
         "the mail must carry no login code: {}",
         mail.body
     );
-    // The inviter is named by local part, never by full address.
+    // The inviter is named from the local part, never by full address — and
+    // through `UserRecord::display_label`, so the name in this mail is the one
+    // the invitee will meet in the console a minute later.
     assert!(
-        mail.body.contains("ada"),
+        mail.body.contains("Ada"),
         "the mail must name who invited them: {}",
         mail.body
     );
@@ -1975,7 +2044,7 @@ async fn an_invite_revoked_while_its_mail_is_in_flight_stays_revoked() {
             port: 587,
             security: SmtpSecurity::Starttls,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
             from_name: "Acme".into(),
             from_email: "noreply@acme.test".into(),
         }));
@@ -2062,5 +2131,285 @@ async fn a_refused_invite_mails_nobody() {
         sender.sent().len(),
         after_first,
         "a rejected address must mail nobody"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The profile: naming yourself and choosing your own face
+// (docs/spec/runtime/avatars.md)
+// ---------------------------------------------------------------------------
+
+fn patch_with_cookie(uri: &str, body: serde_json::Value, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("cookie", cookie)
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn patch_me(
+    state: &AppState,
+    cookie: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = router(state.clone())
+        .oneshot(patch_with_cookie(
+            "/api/v1/companies/acme/auth/me",
+            body,
+            cookie,
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_json(response).await)
+}
+
+/// A person names themselves and picks a face, without an admin in the loop.
+/// The whole reason this route exists beside the admin one: your own identity
+/// in a company should not be something you have to ask for.
+#[tokio::test]
+async fn a_person_can_name_themselves_and_pick_a_face() {
+    let home = home();
+    let (state, sender) = state_with_mail(home.path()).await;
+    let cookie = login_via_link(&state, &sender, "ada@example.com").await;
+
+    let (status, me) = patch_me(
+        &state,
+        &cookie,
+        serde_json::json!({"displayName": "Ada L.", "avatar": "tiny:violet"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["displayName"], "Ada L.", "{me}");
+    assert_eq!(me["avatar"], "tiny:violet", "{me}");
+
+    // Persisted, not just echoed.
+    let response = router(state.clone())
+        .oneshot(get_with_cookie("/api/v1/companies/acme/auth/me", &cookie))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reread = body_json(response).await;
+    assert_eq!(reread["displayName"], "Ada L.", "{reread}");
+    assert_eq!(reread["avatar"], "tiny:violet", "{reread}");
+}
+
+/// A partial save leaves the field it did not mention alone — the reason both
+/// fields are double options. Without it, saving a name wipes the face.
+#[tokio::test]
+async fn editing_one_field_of_a_profile_leaves_the_other() {
+    let home = home();
+    let (state, sender) = state_with_mail(home.path()).await;
+    let cookie = login_via_link(&state, &sender, "ada@example.com").await;
+
+    patch_me(&state, &cookie, serde_json::json!({"avatar": "tiny:rose"})).await;
+    let (_, named) = patch_me(&state, &cookie, serde_json::json!({"displayName": "Ada"})).await;
+    assert_eq!(named["avatar"], "tiny:rose", "{named}");
+
+    // And each is individually resettable: `null` — or a blanked input, which is
+    // the same intent typed — goes back to the default.
+    let (_, unnamed) = patch_me(&state, &cookie, serde_json::json!({"displayName": "  "})).await;
+    assert!(
+        unnamed.get("displayName").is_none(),
+        "a blank name is not a name: {unnamed}"
+    );
+    assert_eq!(unnamed["avatar"], "tiny:rose", "{unnamed}");
+    let (_, bare) = patch_me(&state, &cookie, serde_json::json!({"avatar": null})).await;
+    assert!(
+        bare.get("avatar").is_none(),
+        "a reset is absent, not empty: {bare}"
+    );
+}
+
+/// The grammar's rule, on this route too: an avatar names something this host
+/// holds, never a URL the console would fetch on this person's behalf.
+#[tokio::test]
+async fn a_profile_avatar_may_not_be_a_url() {
+    let home = home();
+    let (state, sender) = state_with_mail(home.path()).await;
+    let cookie = login_via_link(&state, &sender, "ada@example.com").await;
+
+    for hostile in [
+        "https://tracker.example/beacon.gif",
+        "javascript:alert(1)",
+        "blob:01NOSUCHNODE",
+    ] {
+        let (status, refused) =
+            patch_me(&state, &cookie, serde_json::json!({"avatar": hostile})).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{hostile} was accepted: {refused}"
+        );
+    }
+}
+
+/// A display name is a bounded field: it renders on every surface that shows a
+/// person and rides in every roster payload, so a page of text parked in it
+/// would be served to everyone. The bound is a `400`, not a truncation.
+#[tokio::test]
+async fn a_profile_name_may_not_exceed_the_bound() {
+    let home = home();
+    let (state, sender) = state_with_mail(home.path()).await;
+    let cookie = login_via_link(&state, &sender, "ada@example.com").await;
+
+    let long = "A".repeat(crate::server::users::MAX_DISPLAY_NAME_CHARS + 1);
+    let (status, refused) =
+        patch_me(&state, &cookie, serde_json::json!({"displayName": long})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+    // Nothing was persisted, and a subsequent normal save still works.
+    let (status, _) = patch_me(
+        &state,
+        &cookie,
+        serde_json::json!({"displayName": "Ada L."}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// No session, no profile. There is no `user_id` in the path to point at
+/// somebody else, so this is the whole of the route's authority check.
+#[tokio::test]
+async fn a_profile_edit_needs_a_session() {
+    let home = home();
+    let (state, _sender) = state_with_mail(home.path()).await;
+    let response = router(state.clone())
+        .oneshot(patch_with_cookie(
+            "/api/v1/companies/acme/auth/me",
+            serde_json::json!({"displayName": "Nobody"}),
+            "oc_session_acme=not-a-session",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Materialization races (issue #1833)
+// ---------------------------------------------------------------------------
+
+/// A runtime over a company with no `[users] admins`, which is all these need:
+/// `local_owner_record` answers a mode question nobody asks it, so the manifest
+/// only has to produce a store.
+async fn users_runtime(home: &std::path::Path) -> Arc<crate::CompanyRuntime> {
+    let (connections, _sender) = mail_connections();
+    let state = state_from(
+        home,
+        manifest_without_admins(),
+        AppConfig::default(),
+        connections,
+    )
+    .await;
+    state.registry().get(&CompanyId::new("acme")).unwrap()
+}
+
+/// The loser of a race adopts the winner rather than being refused.
+///
+/// Deterministic where the race itself is not: it stages the exact state a
+/// losing caller finds itself in — an address already held, by an id that is not
+/// the one this caller minted — and asserts the outcome is the winner's record
+/// rather than a `Conflict`.
+///
+/// Before #1833 this returned `Err(Conflict)`, `graphql::auth` turned that into
+/// `GatesRefused`, and the desktop console reported the healthy host it was
+/// talking to as "Unreachable".
+#[tokio::test]
+async fn a_lost_materialization_race_adopts_the_winner() {
+    use crate::ports::users::{UserRecord, UserRole, UserStatus};
+
+    let home = home();
+    let runtime = users_runtime(home.path()).await;
+    let id = runtime.id();
+    let email = crate::ports::users::LoginIdentity::Local.key();
+
+    let winner = UserRecord {
+        id: "winner-id".to_string(),
+        email: email.clone(),
+        display_name: None,
+        avatar: None,
+        role: UserRole::Admin,
+        status: UserStatus::Active,
+        password_hash: None,
+        must_change_password: false,
+        created_at_millis: 1,
+        last_seen_at_millis: Some(1),
+        updated_at_millis: 1,
+    };
+    runtime.users().upsert_user(id, &winner).await.unwrap();
+
+    // The loser: same address, its own freshly generated id — which is exactly
+    // what makes the store refuse it.
+    let loser = UserRecord {
+        id: "loser-id".to_string(),
+        created_at_millis: 2,
+        ..winner.clone()
+    };
+
+    let adopted = crate::server::users::routes::insert_or_adopt(&runtime, loser)
+        .await
+        .expect("a lost race is not an error — the owner exists");
+
+    assert_eq!(
+        adopted.id, "winner-id",
+        "the loser must return the record that won, not its own"
+    );
+
+    // And the store still holds exactly one owner: adopting must not have
+    // written the loser's id alongside the winner's.
+    let held = runtime.users().list_users(id).await.unwrap();
+    let owners: Vec<_> = held.iter().filter(|u| u.email == email).collect();
+    assert_eq!(owners.len(), 1, "exactly one owner record: {held:?}");
+    assert_eq!(owners[0].id, "winner-id");
+}
+
+/// Concurrent callers converge on one owner.
+///
+/// The shape of the original bug: N requests arrive together on a cold store,
+/// all miss `find_user_by_email`, and each presents a different `generate_id()`
+/// for one address. On the desktop's first boot three of them raced; one won and
+/// two were refused 16ms later.
+///
+/// Timing-dependent by nature — it cannot *guarantee* an interleaving — so it is
+/// the companion to the deterministic test above rather than the proof. What it
+/// does catch is a regression that reintroduces the shape, and it fails reliably
+/// against the pre-#1833 code at this width.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_local_owner_materialization_yields_one_record() {
+    let home = home();
+    let runtime = users_runtime(home.path()).await;
+
+    let racers = 16;
+    let mut tasks = Vec::with_capacity(racers);
+    for _ in 0..racers {
+        let runtime = Arc::clone(&runtime);
+        tasks.push(tokio::spawn(async move {
+            crate::server::users::routes::local_owner_record(&runtime).await
+        }));
+    }
+
+    let mut ids = Vec::with_capacity(racers);
+    for task in tasks {
+        let record = task
+            .await
+            .expect("no racer panics")
+            .expect("no racer is refused its own company's owner");
+        ids.push(record.id);
+    }
+
+    let first = &ids[0];
+    assert!(
+        ids.iter().all(|id| id == first),
+        "every racer must see one owner, got {ids:?}"
+    );
+
+    let held = runtime.users().list_users(runtime.id()).await.unwrap();
+    let key = crate::ports::users::LoginIdentity::Local.key();
+    assert_eq!(
+        held.iter().filter(|u| u.email == key).count(),
+        1,
+        "exactly one owner record survives the race: {held:?}"
     );
 }

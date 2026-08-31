@@ -26,6 +26,7 @@ import type { OpenCompanyClient } from "@/api/client";
 import { DropZone } from "@/views/memory/DropZone";
 import { EngineSection } from "@/views/memory/EngineSection";
 import { Markdown } from "@/components/markdown";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -204,8 +205,15 @@ export function MemoryView({ client, company }: Props) {
 
   async function add(fields: { kind: MemoryKind; title: string; body: string }) {
     await createMemory(client, company, fields);
-    await load({ silent: true });
+    // Close the moment the write is confirmed, then reload in the background.
+    // The dialog's catch owns the "could not save the memory" toast, so only
+    // createMemory — an actual save failure — may reach it. Awaiting the reload
+    // here instead would route a reload failure into that same catch (a false
+    // save error) and skip this close, stranding the dialog open so the operator
+    // retries and writes a duplicate. `void load` is fire-and-forget: load
+    // handles its own errors via the page banner and never leaks a rejection.
     setAddOpen(false);
+    void load({ silent: true });
   }
 
   async function remove(entry: MemoryEntry) {
@@ -230,17 +238,18 @@ export function MemoryView({ client, company }: Props) {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-5xl space-y-5 px-4 py-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Brain</h1>
-            <p className="text-sm text-muted-foreground">
-              What your company remembers — facts, people, projects, and preferences your
-              teammates can recall.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader
+        title="Brain"
+        width="5xl"
+        description={
+          <>
+            What your company remembers — facts, people, projects, and preferences your
+            teammates can recall.
+          </>
+        }
+        actions={
+          <>
             {engine && (
               <span
                 className={cn(
@@ -289,8 +298,10 @@ export function MemoryView({ client, company }: Props) {
                 <Plus className="size-4" /> New memory
               </Button>
             </span>
-          </div>
-        </div>
+          </>
+        }
+      />
+      <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-5 overflow-y-auto px-4 py-6">
 
         <EngineSection
           client={client}
@@ -397,7 +408,7 @@ function HealthStrip({
   ];
   return (
     <Card data-testid="memory-health">
-      <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-3 py-4">
+      <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-3">
         {tiles.map((t) => (
           <div key={t.label} className="space-y-0.5">
             <p className="text-xs text-muted-foreground">{t.label}</p>
@@ -425,7 +436,7 @@ function MemoryCard({ entry, onDelete }: { entry: MemoryEntry; onDelete: () => v
   const badge = entryBadge(entry);
   return (
     <Card className="group" data-testid="memory-card">
-      <CardContent className="space-y-2 py-4">
+      <CardContent className="space-y-2">
         <div className="flex items-start justify-between gap-2">
           <p className="font-medium leading-snug">{entry.title}</p>
           <Badge variant="outline" className={cn("shrink-0 capitalize", badge.style)}>

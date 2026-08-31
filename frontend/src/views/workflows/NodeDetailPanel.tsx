@@ -13,7 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { nodeKindMeta } from "@/lib/workflow-sample";
 
-import { type NodeOutputView, parseNodeMessages } from "./run-output";
+import { type NodeOutputView, isRecord, parseNodeMessages } from "./run-output";
 
 /** A read-only inspector for a single graph node, overlaid on the canvas when
  * the operator clicks a node. Surfaces the fields already on the wire from
@@ -169,6 +169,18 @@ export function NodeDetailPanel({
           </DetailField>
         )}
 
+        {/* Issue #1866, found in the #1937 boundary sweep: a run-safety gate
+            an operator declared must be visible here, the same way onError/
+            retry above are — otherwise the panel silently claims a node has
+            "no extra details" while the runtime still enforces a gate on it. */}
+        {node.postcondition && (
+          <DetailField label="Postcondition">
+            <pre className="overflow-auto rounded-lg border bg-muted/40 p-2 font-mono text-2xs leading-snug">
+              {JSON.stringify(node.postcondition, null, 2)}
+            </pre>
+          </DetailField>
+        )}
+
         {/* Issue #596: what this node actually produced on the run being
             inspected — the make.com per-node output view. Only rendered when a
             run is being inspected (a live run's clicked node, or a past run
@@ -184,6 +196,7 @@ export function NodeDetailPanel({
           !node.schedule &&
           !node.destination &&
           !node.requiresApproval &&
+          !node.postcondition &&
           // Issue #850: `repeatable === false` renders the "not repeated on
           // approval" badge above, so a node whose only detail is that
           // declaration must not also claim it has no extra details.
@@ -244,6 +257,7 @@ export function OutputSection({ output }: { output: NodeOutputView }) {
   }
 
   const messages = parseNodeMessages(output.value);
+  const artifacts = parseRunArtifacts(output.value);
   return (
     <DetailField label="Output">
       <div className="space-y-2" data-testid="node-output">
@@ -282,10 +296,32 @@ export function OutputSection({ output }: { output: NodeOutputView }) {
               )}
             </div>
           ))
-        ) : (
+        ) : artifacts.length === 0 ? (
           <p className="text-xs text-muted-foreground" data-testid="node-output-none">
             This node produced no readable text — see the raw value below.
           </p>
+        ) : null}
+        {artifacts.length > 0 && (
+          <div className="space-y-1.5" data-testid="node-output-artifacts">
+            <p className="text-3xs uppercase tracking-wide text-muted-foreground">
+              Artifacts
+            </p>
+            {artifacts.map((artifact) => (
+              <a
+                key={`${artifact.workspaceNodeId}-${artifact.source}`}
+                className="block rounded-md border bg-muted/30 px-2 py-1.5 hover:border-primary/40"
+                href={`#/workspace/${encodeURIComponent(artifact.workspaceNodeId)}`}
+                data-testid="node-output-artifact"
+              >
+                <span className="block truncate text-xs font-medium text-primary">
+                  {artifact.title}
+                </span>
+                <span className="block truncate text-3xs text-muted-foreground">
+                  {artifact.source}
+                </span>
+              </a>
+            ))}
+          </div>
         )}
         <details>
           <summary className="cursor-pointer text-xs text-muted-foreground">
@@ -298,6 +334,27 @@ export function OutputSection({ output }: { output: NodeOutputView }) {
       </div>
     </DetailField>
   );
+}
+
+interface RunArtifactView {
+  source: string;
+  title: string;
+  workspaceNodeId: string;
+}
+
+/** Reads the host's card-less run-artifact rows defensively. */
+function parseRunArtifacts(raw: unknown): RunArtifactView[] {
+  if (!isRecord(raw) || !Array.isArray(raw.artifacts)) return [];
+  return raw.artifacts.flatMap((row) => {
+    if (!isRecord(row)) return [];
+    const source = typeof row.source === "string" ? row.source : "";
+    const title = typeof row.title === "string" ? row.title : source;
+    const workspaceNodeId =
+      typeof row.workspaceNodeId === "string" ? row.workspaceNodeId : "";
+    return source && title && workspaceNodeId
+      ? [{ source, title, workspaceNodeId }]
+      : [];
+  });
 }
 
 /** A labelled block inside the node inspector. */

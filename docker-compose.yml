@@ -20,6 +20,10 @@ services:
       # Which module spins up.
       OPENCOMPANY_COMPANY: ${OPENCOMPANY_COMPANY:-agentic_marketing_agency}
       OPENCOMPANY_DISCOVERABLE: ${OPENCOMPANY_DISCOVERABLE:-false}
+      # Optional: cargo features to compile the host with (e.g. "medulla").
+      # Blank = the small default build; the dev overlay reads it so a key has
+      # a live brain to talk to.
+      OPENCOMPANY_FEATURES: ${OPENCOMPANY_FEATURES:-}
       # Optional: unlocks live cognition. Blank = offline demo brain.
       TINYHUMANS_API_KEY: ${TINYHUMANS_API_KEY:-}
     ports:

@@ -1,9 +1,21 @@
 # Overview — the knowledge graph
 
-`#/company/graph` is the graph and nothing else: no page header or strip. No
-view has a top bar; its remaining controls live in the sidebar. The graph fills
-the shell's content surface beside the sidebar. `#/overview` is the operator
-landing page; it links here for the company's declared structure (issue #1321).
+`#/overview` is the graph and nothing else: no page header or strip. No view
+has a top bar; its remaining controls live in the sidebar. The graph fills the
+shell's content surface beside the sidebar.
+
+A company with **no desks** still draws: the model hangs a deskless worker, and
+an unplaced workflow, off the core node, so the roster, its tools and the saved
+flows are all there without a single pillar. The corner says "No desks yet" and
+offers the one control that changes it. The full-canvas empty state is reserved
+for a graph with nothing but its core node — a fact about the graph, not about
+desks. Those were one flag until recently, and it suppressed the canvas.
+
+Issue #1321 moved it to `#/company/graph` and gave `#/overview` to an operator
+landing page. That swap is undone — the graph is the overview again — and
+`#/company/graph` is kept as an alias, so links minted while it lived there
+still resolve. `OperatorOverview.tsx` remains in the tree but nothing routes
+to it.
 
 ## What it draws
 
@@ -189,3 +201,18 @@ running beyond the clipped edge. Below 900px the paddles become 80px by 40px
 and inset 12px; below 640px they become 56px by 32px and inset 8px. Keyboard
 `←` / `→` remains available at every width, so the smaller touch targets do not
 remove a way to turn the pillar wheel.
+
+Opening a card moves the legend as well (issue #1664). The detail panel is a
+300px right rail above 820px and a bottom sheet at or below it, and the legend
+used to sit at `z-10` under its `z-30` on the same bottom edge — so on a phone
+every kind label and the workflow-placement caveat disappeared the moment a node
+was selected. It is now `z-40`, the level the snapshot line and the paddles
+already use; above 820px its width stops short of the rail, and at or below it
+the legend lifts to sit on top of the sheet, capped so it scrolls rather than
+climbing into the desk selector. The sheet's height and the paddles' offset are
+percentages of the graph card rather than `vh`: the card is shorter than the
+window, so `62vh` was 68% of the box the sheet actually lives in, and the band
+above it that every other offset was derived from never existed. Where the
+legend ends up is measured in a browser at both sides of the breakpoint by
+`test/e2e/overview-responsive-chrome.spec.ts`, with the caveat shut and open —
+open is the legend's real height.

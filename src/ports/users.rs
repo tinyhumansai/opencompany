@@ -76,8 +76,26 @@ pub struct UserRecord {
     /// for every identity that has no mailbox to send to.
     pub email: String,
     /// An optional human-readable name for the console to render.
+    ///
+    /// `None` means **this person has not named themselves**, and is never
+    /// filled in with a guess: the console derives a readable name from the
+    /// login identity at render time (`steven.enamakel@…` reads as "Steven
+    /// Enamakel"), which keeps a guess looking like a guess and leaves this
+    /// field meaning "what they actually chose". Storing the derivation would
+    /// make the two indistinguishable — and would freeze a guess about somebody
+    /// into the record the moment they first signed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// The face this person wears, when they have chosen one — a
+    /// `tiny:<flavour>` mascot or a `blob:<nodeId>` upload
+    /// (`docs/spec/runtime/avatars.md`).
+    ///
+    /// `None` is the same "nobody has chosen" state [`Self::display_name`]
+    /// carries, and for the same reason: the console draws the mascot it hashes
+    /// from this user's id, so a person always has a face, and clearing this
+    /// field is how they get that default back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
     /// What the user may do.
     pub role: UserRole,
     /// Whether the user may currently authenticate.
@@ -122,6 +140,82 @@ impl UserRecord {
     /// The mailbox this user can be written to, if they have one.
     pub fn mailbox(&self) -> Option<String> {
         self.identity().mailbox().map(str::to_string)
+    }
+
+    /// What to call this person on screen: the name they chose, else one
+    /// derived from their login identity, else `None`.
+    ///
+    /// The fallback is [`derive_display_name`] — see there for why a derived
+    /// name is not written into [`Self::display_name`].
+    pub fn display_label(&self) -> Option<String> {
+        self.display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| derive_display_name(&self.email))
+    }
+}
+
+/// A readable name guessed from a login identity — `steven.enamakel@acme.com`
+/// reads as "Steven Enamakel".
+///
+/// # Why this is derived and never stored
+///
+/// A person who has not named themselves still has to be called something on
+/// every surface that shows them, and the honest options are the raw address,
+/// nothing, or a guess. The raw address is refused elsewhere on this page's own
+/// rule — being in a company should not hand everyone your mailbox — and
+/// nothing leaves a chat message attributed to a blank.
+///
+/// So: a guess, made at render time. Writing it into
+/// [`UserRecord::display_name`] instead would be the tempting version and is
+/// wrong in a way that does not show up until later — the field would no longer
+/// mean "what this person chose", so nothing could tell a guess from a decision,
+/// and a person who never touched their profile would look like one who had. It
+/// would also freeze whatever the guess was on the day they first signed in.
+///
+/// # What it will and will not guess
+///
+/// Only the **local part**, split on the separators people actually use, with
+/// each word capitalised. The domain is dropped: it is the half that identifies
+/// the mailbox rather than the person.
+///
+/// `None` for an identity with no name in it to find — a wallet key, the local
+/// owner of a company with no sign-in, or a local part with no letters. `None`
+/// means "cannot say", and a caller should render something honest (an initial,
+/// a role noun) rather than a guess this function refused to make.
+pub fn derive_display_name(identity_key: &str) -> Option<String> {
+    let LoginIdentity::Email(address) = LoginIdentity::parse(identity_key) else {
+        // A base58 public key and `local:owner` are identities, not names.
+        // Capitalising either would produce something that looks like a name and
+        // is not one, which is worse than admitting there is nothing here.
+        return None;
+    };
+    let local = address.split('@').next().unwrap_or_default();
+    // `steven+acme@…` is one mailbox with a routing tag; the tag is plumbing.
+    let local = local.split('+').next().unwrap_or(local);
+    let words: Vec<String> = local
+        .split(['.', '_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(capitalise)
+        .collect();
+    if words.is_empty() || !words.iter().any(|w| w.chars().any(char::is_alphabetic)) {
+        return None;
+    }
+    Some(words.join(" "))
+}
+
+/// Upper-cases the first character and leaves the rest alone.
+///
+/// The rest is left alone deliberately: lower-casing it would turn `McDonald`
+/// into `Mcdonald` and `JPMorgan` into `Jpmorgan`, and a local part that already
+/// carries capitals is one somebody chose to write that way.
+fn capitalise(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -637,6 +731,7 @@ mod test {
             id: "u1".to_string(),
             email: "ada@example.com".to_string(),
             display_name: Some("Ada".to_string()),
+            avatar: None,
             role: UserRole::Admin,
             status: UserStatus::Active,
             password_hash: None,
@@ -681,6 +776,7 @@ mod test {
             id: "u1".to_string(),
             email: "ada@example.com".to_string(),
             display_name: None,
+            avatar: None,
             role: UserRole::Member,
             status: UserStatus::Active,
             password_hash: Some("$argon2id$v=19$...".to_string()),
@@ -692,5 +788,65 @@ mod test {
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(json["mustChangePassword"], true);
         assert_eq!(serde_json::from_value::<UserRecord>(json).unwrap(), user);
+    }
+
+    #[test]
+    fn a_name_is_guessed_from_the_local_part() {
+        for (identity, expected) in [
+            ("steven.enamakel@acme.com", "Steven Enamakel"),
+            ("steven_enamakel@acme.com", "Steven Enamakel"),
+            ("steven-enamakel@acme.com", "Steven Enamakel"),
+            // A routing tag is plumbing, not a middle name.
+            ("steven+board@acme.com", "Steven"),
+            ("stevent95@acme.com", "Stevent95"),
+            // Already-capitalised local parts are left as written: lower-casing
+            // the rest would turn McDonald into Mcdonald.
+            ("McDonald@acme.com", "McDonald"),
+            // The domain is dropped — it names the mailbox, not the person.
+            ("ada@a.very.long.domain.example", "Ada"),
+        ] {
+            assert_eq!(
+                derive_display_name(identity).as_deref(),
+                Some(expected),
+                "{identity}"
+            );
+        }
+    }
+
+    /// "Cannot say" is a real answer, and has to stay distinguishable from a
+    /// guess: a base58 key title-cased would *look* like a name.
+    #[test]
+    fn nothing_is_guessed_where_there_is_no_name() {
+        for identity in [
+            "wallet:7cVfgArCheMR6Cs29HGxwPFXhAxrJ6UP3TcTZqSKz8bE",
+            "local:owner",
+            "123.456@acme.com",
+            "@acme.com",
+        ] {
+            assert_eq!(derive_display_name(identity), None, "{identity}");
+        }
+    }
+
+    /// A chosen name always wins the guess, and a blank one is not a name.
+    #[test]
+    fn display_label_prefers_what_the_person_chose() {
+        let mut user = UserRecord {
+            id: "u1".to_string(),
+            email: "steven.enamakel@acme.com".to_string(),
+            display_name: Some("Steve".to_string()),
+            avatar: None,
+            role: UserRole::Member,
+            status: UserStatus::Active,
+            password_hash: None,
+            must_change_password: false,
+            created_at_millis: 1,
+            last_seen_at_millis: None,
+            updated_at_millis: 1,
+        };
+        assert_eq!(user.display_label().as_deref(), Some("Steve"));
+        user.display_name = Some("   ".to_string());
+        assert_eq!(user.display_label().as_deref(), Some("Steven Enamakel"));
+        user.display_name = None;
+        assert_eq!(user.display_label().as_deref(), Some("Steven Enamakel"));
     }
 }

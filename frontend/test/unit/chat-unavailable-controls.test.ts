@@ -31,17 +31,38 @@ afterEach(() => {
 });
 
 describe("chat only renders controls it can perform (issue #1336)", () => {
-  it("does not offer a new-message action in the channel rail", () => {
+  it("offers the new-message picker in the channel rail when there is someone to message", () => {
     render(
       createElement(ChannelRail, {
         sections: [],
         activeId: null,
         unread: {},
         onSelect: () => {},
+        directMessages: [{ id: "dm:2", name: "Ade", kind: "dm", purpose: "" }],
+        onStartDirectMessage: () => {},
       }),
     );
 
-    expect(action("New message")).toBeNull();
+    const button = action("New message");
+    expect(button).not.toBeNull();
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("holds the new-message action back when nobody can be messaged", () => {
+    render(
+      createElement(ChannelRail, {
+        sections: [],
+        activeId: null,
+        unread: {},
+        onSelect: () => {},
+        directMessages: [],
+        onStartDirectMessage: () => {},
+      }),
+    );
+
+    const button = action("New message");
+    expect(button).not.toBeNull();
+    expect((button as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps working composer controls and holds unavailable ones back", () => {

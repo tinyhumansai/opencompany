@@ -355,11 +355,20 @@ export function Login({ client, company, notice, onSignedIn }: Props) {
     */
     <div className="flex min-h-svh flex-col bg-background">
       <header className="flex shrink-0 items-center justify-between border-b px-6 py-4">
-        <div className="flex items-center gap-2">
-          <div className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
+        {/* `data-slot` so a deployment can restyle the product mark with CSS
+            alone — the same convention `components/ui/*` already uses. Without a
+            handle here, every white-label deployment has to patch this JSX and
+            re-patch it on every update. */}
+        <div data-slot="brand" className="flex items-center gap-2">
+          <div
+            data-slot="brand-mark"
+            className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground"
+          >
             <Building2 className="size-4" />
           </div>
-          <span className="text-sm font-semibold">OpenCompany</span>
+          <span data-slot="brand-name" className="text-sm font-semibold">
+            OpenCompany
+          </span>
         </div>
         <ThemeToggle />
       </header>

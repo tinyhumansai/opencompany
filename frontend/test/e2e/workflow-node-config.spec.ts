@@ -97,7 +97,12 @@ test("authoring a tool_call node's config through the form round-trips to the ho
     await dialog.getByRole("combobox", { name: "Edge to" }).click();
     await page.getByRole("option", { name: "act", exact: true }).click();
 
+    // Issue #1808: create mode gates the write behind an id-confirm. The first
+    // click only opens it (portalled onto `document.body`, so it is reached by
+    // test id on the page, not scoped to `dialog`); the confirm's own action —
+    // also rendered "Create workflow" — is what fires the write.
     await dialog.getByTestId(SUBMIT).click();
+    await page.getByTestId("workflow-id-confirm-create").click();
     await expect(dialog).toBeHidden({ timeout: 15_000 });
 
     // The host stored exactly the keys the form emitted — not the node-id

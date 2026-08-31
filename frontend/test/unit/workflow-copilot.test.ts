@@ -323,4 +323,154 @@ describe("composeCopilotMessage", () => {
     // appear for this run.
     expect(message).not.toMatch(/collect.*finished/);
   });
+
+  /**
+   * PR #1883 review (Codex #3877606130). A `degraded` run — a node under
+   * `on_error: continue|route` errored and the graph kept going past it, or an
+   * agent node's turn truncated at the iteration cap (issue #1865) — has no
+   * top-level `error`, is not `cancelled` and blocked nobody, so before this
+   * fix `describeRun` fell through every arm to the bare "finished" reading
+   * even while the step trail it prints right beside that word named the
+   * errored node. That contradiction (`finished; steps: agent=error(...)`)
+   * is exactly the shape #881 already fixed once for `blocked`, just
+   * reachable through the newer verdict `describeRun` never consulted.
+   */
+  it("grounds the copilot on a degraded run instead of reading it as finished", () => {
+    const degradedRun = {
+      seq: 1,
+      atMillis: 1_700_000_000_000,
+      workflowId: "weekly_report",
+      scheduled: false,
+      runId: "run-1",
+      deliveries: [],
+      pendingApprovals: [],
+      verdict: "degraded" as const,
+      nodes: [
+        { nodeId: "collect", status: "error" as const, elapsedMs: 12 },
+        { nodeId: "send", status: "ok" as const, elapsedMs: 4 },
+      ],
+    };
+    const message = composeCopilotMessage(
+      { ...context, runs: [degradedRun] },
+      "did this run finish cleanly?",
+    );
+    expect(message).toContain("DEGRADED: collect");
+    expect(message).toMatch(/errored but the graph continued/);
+    // The bare "finished" reading this arm exists to replace must not also
+    // appear for this run.
+    expect(message).not.toMatch(/— finished;/);
+  });
+
+  /**
+   * The same fix's fallback half: a host predating issue #1865 sends no
+   * `verdict` field at all, but if it nevertheless sent the node trail (every
+   * host since #371), `describeRun` must still read the errored node off it
+   * rather than defaulting to "finished" — the same "prefer the host's word,
+   * fall back to the same signal it reads" shape `verdictOf` uses elsewhere
+   * in this console.
+   */
+  it("still reads a degraded run off its node trail when an older host sends no verdict", () => {
+    const degradedRun = {
+      seq: 1,
+      atMillis: 1_700_000_000_000,
+      workflowId: "weekly_report",
+      scheduled: false,
+      runId: "run-1",
+      deliveries: [],
+      pendingApprovals: [],
+      nodes: [{ nodeId: "collect", status: "error" as const, elapsedMs: 12 }],
+    };
+    const message = composeCopilotMessage(
+      { ...context, runs: [degradedRun] },
+      "did this run finish cleanly?",
+    );
+    expect(message).toContain("DEGRADED: collect");
+    expect(message).not.toMatch(/— finished;/);
+  });
+
+  /**
+   * PR #1883 review (codex, comment 3886484125). A native `requiresApproval`
+   * gate parks with no `blockedNodes` row at all — only a gated *call* inside
+   * an agent turn leaves one; `park_pending_gates` writes straight to
+   * `pendingApprovals` instead (issue #1189). So a run with an errored
+   * continue/route node AND a live approval card has `blocked.length === 0`
+   * and `erroredNodes.length > 0` at once, which before this fix fell into
+   * the `degraded` arm and told the operator the run was DONE-BUT-DEGRADED —
+   * `WorkflowRunVerdict::of` and `verdictOf` both rank `awaiting_count` ahead
+   * of `errored_nodes`/`degraded` for exactly this reason, and this run is
+   * still open, not settled.
+   */
+  it("grounds the copilot on a pending approval instead of a degraded run that is still waiting", () => {
+    const awaitingRun = {
+      seq: 1,
+      atMillis: 1_700_000_000_000,
+      workflowId: "weekly_report",
+      scheduled: false,
+      runId: "run-1",
+      deliveries: [],
+      pendingApprovals: ["gate-b"],
+      verdict: "degraded" as const,
+      nodes: [
+        { nodeId: "collect", status: "error" as const, elapsedMs: 12 },
+        { nodeId: "gate-b", status: "ok" as const, elapsedMs: 4 },
+      ],
+    };
+    const message = composeCopilotMessage(
+      { ...context, runs: [awaitingRun] },
+      "did this run finish cleanly?",
+    );
+    expect(message).not.toContain("DEGRADED");
+    expect(message).toMatch(/awaiting approval: gate-b/);
+  });
+
+  /**
+   * PR #1883 review (codex, comment 3892522597). `pendingApprovals` is only
+   * half of what the host's `awaiting_count` reads before it ever reaches
+   * `Degraded` — the other half is a `pending` delivery row. A cold-recipient
+   * email output node parks the REPORT for approval (`ParkedForApproval`)
+   * without ever touching `pendingApprovals`; that gate lives entirely on
+   * the delivery row (see `fully_stranded`'s doc: a pending delivery is "a
+   * *second* thing waiting on a person... untouched by the gate join"). So a
+   * run can carry an errored continue/route node, an EMPTY
+   * `pendingApprovals`, and a `pending` delivery all at once — a shape the
+   * sibling guard above (comment 3886484125) does not catch, because it only
+   * checks `pendingApprovals`. This is the legacy no-`verdict` fallback path:
+   * a fresh host would never send `verdict: "degraded"` for this shape at all
+   * (its own `awaiting_count` outranks `Degraded`), so this scenario is only
+   * reachable through `erroredNodes.length > 0` with `verdict` undefined.
+   */
+  it("grounds the copilot on an awaiting delivery instead of a degraded run when pendingApprovals is empty", () => {
+    const awaitingDeliveryRun = {
+      seq: 1,
+      atMillis: 1_700_000_000_000,
+      workflowId: "weekly_report",
+      scheduled: false,
+      runId: "run-1",
+      // Empty — this run's gate lives on the delivery row, not here. Before
+      // the fix, an empty `pendingApprovals` was (wrongly) enough on its own
+      // to let the `degraded` arm fire.
+      pendingApprovals: [],
+      deliveries: [
+        {
+          node: "send_report",
+          kind: "email",
+          status: "pending" as const,
+          detail: "this recipient has never written to the company — waiting in Approvals",
+          reason: "parked_for_approval",
+        },
+      ],
+      nodes: [
+        { nodeId: "collect", status: "error" as const, elapsedMs: 12 },
+        { nodeId: "send_report", status: "ok" as const, elapsedMs: 4 },
+      ],
+    };
+    const message = composeCopilotMessage(
+      { ...context, runs: [awaitingDeliveryRun] },
+      "did this run finish cleanly?",
+    );
+    expect(message).not.toContain("DEGRADED");
+    // The pending delivery is still visible in the grounding line — just not
+    // mislabeled as a degraded/broken run.
+    expect(message).toMatch(/send_report→email=pending/);
+  });
 });

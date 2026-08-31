@@ -141,6 +141,13 @@ echo "[e2e host] serving $company on $bind (data: $data_dir)" >&2
 host_env=(
   "OPENCOMPANY_CONSOLE_DIR=$root/frontend/dist"
   "OPENCOMPANY_DATA_DIR=$data_dir"
+  # Issue #1844: this script always boots from a wiped data root (see above),
+  # so without this every spec's very first navigation would hit the new
+  # blocking onboarding gate — none of them know the three-step funnel exists.
+  # Specs that DO want to see the gate drive it through `page.route()`
+  # interception instead of a real activation state, so this is safe to set
+  # unconditionally for both companies this script serves.
+  "OPENCOMPANY_SKIP_ACTIVATION_GATE=1"
 )
 
 passthrough=(HOME PATH TMPDIR TZ LANG LC_ALL RUST_LOG RUST_BACKTRACE)

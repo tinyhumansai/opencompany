@@ -292,14 +292,22 @@ pub fn skills() -> &'static [SkillDoc] {
 /// `*` grant does, and an agent with no `files` grant is meant to be offered no
 /// file tools. What is global here is where the starting belt is *authored*, not
 /// a minimum nobody can go under.
-///
-/// Falls back to the wildcard belt if the baseline carries none, so a missing or
-/// malformed `globals.toml` cannot leave every company grantless — the failure
-/// mode of a data-driven default has to be the old hardcoded one, not silence.
+/// Falls back to the authored default belt if the baseline carries none, so a
+/// missing or malformed `globals.toml` cannot leave every company grantless —
+/// the failure mode of a data-driven default has to preserve the shipped
+/// capability contract, not silently remove search, MCP, or workspace writes.
 pub fn default_tool_allow() -> Vec<String> {
     let authored = &baseline().default_tool_allow;
     if authored.is_empty() {
-        return vec!["*".into(), "media".into(), "composio".into()];
+        return vec![
+            "*".into(),
+            "workspace.*".into(),
+            "workspace.write".into(),
+            "media".into(),
+            "composio".into(),
+            "search".into(),
+            "mcp:*".into(),
+        ];
     }
     authored.clone()
 }

@@ -62,6 +62,7 @@ const start = (runId: string): Ev => ({
   workflowId: "greet",
   runId,
   scheduled: false,
+  startedBy: "operator",
 });
 const nodeStarted = (runId: string, nodeId: string): Ev => ({
   type: "workflow_node_started",

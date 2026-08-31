@@ -1,6 +1,6 @@
 # The runtime journal and its storage port
 
-The runtime journal (`src/runtime/journal.rs`) holds four things no other store
+The runtime journal (`src/runtime/journal.rs`) holds five things no other store
 holds:
 
 - the **at-most-once effect set** — the idempotency key of every side effect that
@@ -10,7 +10,13 @@ holds:
 - **single-use and standing grants**, minted when an operator approves a tool
   call;
 - **cycle brackets**, which is how a cycle interrupted by a host restart is
-  recognised and settled at the next boot.
+  recognised and settled at the next boot;
+- **blocked agent-node continuation state** (issue #1816/#1825) — the workflow
+  id and trigger input a blocked node's gated tool call needs to re-dispatch
+  its run after a restart (`BlockedNodeStashed`), plus the markers
+  (`BlockedNodeApproved`, `BlockedNodeDispatched`, `BlockedNodeReleased`) that
+  let `reconcile_stranded_blocked_nodes` tell a still-pending stash apart from
+  one already resumed at boot.
 
 It is deliberately not the [`EventLog`](events.md). `CompanyEvent` is a closed,
 binding enum with no marker variants, and the event log is *pruned* under a
@@ -72,9 +78,12 @@ would otherwise pass every assertion.
 
 Durability is chosen **per record kind**, not once for the journal:
 `EffectExecuted`, `GrantConsumed` and `StandingGrantRevoked` must survive losing
-the machine, because losing them makes the runtime repeat an external action; the
-other ten need only survive the process, because losing them makes it *re-ask*.
-The per-record decision and its reasoning live in
+the machine, because losing them makes the runtime repeat an external action —
+as must the blocked agent-node continuation records (`BlockedNodeStashed`,
+`BlockedNodeReleased`, `BlockedNodeApproved`, `BlockedNodeDispatched`, issue
+#1816/#1825), because losing one strands a decided approval with no re-park
+coming. Every other kind need only survive the process, because losing it makes
+the runtime *re-ask*. The full per-record decision and its reasoning live in
 [lifecycle.md](lifecycle.md#which-crash-a-journal-record-survives-issue-392).
 
 `append_journal` therefore carries a `Durability`, and a backend MUST NOT flatten

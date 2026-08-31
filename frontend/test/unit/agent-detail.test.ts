@@ -34,7 +34,7 @@ function agent(over: Partial<AgentDetailDto> = {}): AgentDetailDto {
     source: "overlay",
     editable: ["name", "role", "description"],
     isOrchestrator: false,
-    tools: { requested: [], companyAllow: ["workspace.*"], effective: ["workspace.*"] },
+    tools: { requested: null, companyAllow: ["workspace.*"], deskAllow: [], deskCeilingActive: false, effective: ["workspace.*"] },
     desks: [],
     inboxEnabled: false,
     ...over,
@@ -106,17 +106,38 @@ describe("whether a draft can be saved", () => {
 });
 
 describe("what an agent's tools amount to", () => {
-  it("names the standard grant rather than showing an empty request", () => {
-    // The inversion worth guarding: an agent that lists no tools holds
-    // everything the company allows. A surface that rendered `requested` would
-    // tell the operator this agent is powerless.
+  it("names the standard grant (null) rather than showing an empty request", () => {
+    // The inversion worth guarding: an agent that lists no tools of its own
+    // (`requested === null`) holds everything the company allows. A surface
+    // that rendered `requested` would tell the operator this agent is powerless.
     const summary = summarizeGrants({
-      requested: [],
+      requested: null,
       companyAllow: ["workspace", "composio"],
+      deskAllow: [],
+      deskCeilingActive: false,
       effective: ["workspace", "composio"],
     });
     expect(summary.standardGrant).toBe(true);
+    expect(summary.deniedAll).toBe(false);
     expect(summary.effective).toEqual(["workspace", "composio"]);
+    expect(summary.dropped).toEqual([]);
+  });
+
+  it("reads an explicit empty grant as a deny-all, not the standard grant", () => {
+    // Since #1804 the two empty states are opposites: `null` inherits the whole
+    // company grant, `[]` is a deliberate deny-all that holds nothing. A surface
+    // that conflated them would tell an operator their locked-down agent holds
+    // everything the company allows.
+    const summary = summarizeGrants({
+      requested: [],
+      companyAllow: ["workspace", "composio"],
+      deskAllow: [],
+      deskCeilingActive: false,
+      effective: [],
+    });
+    expect(summary.standardGrant).toBe(false);
+    expect(summary.deniedAll).toBe(true);
+    expect(summary.effective).toEqual([]);
     expect(summary.dropped).toEqual([]);
   });
 
@@ -124,9 +145,12 @@ describe("what an agent's tools amount to", () => {
     const summary = summarizeGrants({
       requested: ["workspace.read", "email.send"],
       companyAllow: ["workspace.*"],
+      deskAllow: [],
+      deskCeilingActive: false,
       effective: ["workspace.read"],
     });
     expect(summary.standardGrant).toBe(false);
+    expect(summary.deniedAll).toBe(false);
     expect(summary.dropped).toEqual(["email.send"]);
   });
 
@@ -134,6 +158,8 @@ describe("what an agent's tools amount to", () => {
     const summary = summarizeGrants({
       requested: ["email.send"],
       companyAllow: ["workspace"],
+      deskAllow: [],
+      deskCeilingActive: false,
       effective: [],
     });
     expect(summary.effective).toEqual([]);

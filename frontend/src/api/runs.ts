@@ -17,23 +17,36 @@ import type { TimelineEntry } from "./tasks";
 /**
  * Where one attempt stands.
  *
- * The two *parked* statuses are separated by *who unblocks the work* (epic
- * #183): `waiting_approval` means a **person** must act; `paused` means
- * anything else must — a dependency, a rate limit, a missing credential, a
- * retry, an operator's pause.
+ * The *parked* statuses are separated by *who unblocks the work* (epic #183):
+ * `waiting_approval` means a **person** must decide; `blocked` means a person
+ * must **answer** (issue #1861 — a rejected model id, an expired credential, a
+ * missing prerequisite, an agent's own question); `paused` means anything else
+ * must — a dependency, a rate limit, a retry, an operator's pause.
+ *
+ * `waiting_approval` and `blocked` are both "waiting on you" and still must not
+ * be collapsed: an approval has an effect behind it that approving performs,
+ * while a blocker has only a question to answer. The console offers different
+ * controls for the two, so it has to be able to tell them apart.
  *
  * `paused` is currently unreachable from a delegation, so nothing in the UI may
  * *depend* on seeing it — but it is handled everywhere a status is, because a
  * status the console cannot render is worse than one it never meets.
+ *
+ * `declined` is terminal and means the workflow compiler declined *by design* to
+ * automate the work ("better done once than built into a workflow", issue
+ * #1809) — neither an error nor an ordinary success, so it must never render in
+ * a failure tone.
  */
 export type RunStatus =
   | "pending"
   | "running"
   | "waiting_approval"
   | "paused"
+  | "blocked"
   | "succeeded"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "declined";
 
 /**
  * The coarse phase of a {@link RunStatus}, projected by the host.
@@ -216,9 +229,11 @@ export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   running: "Running",
   waiting_approval: "Waiting on you",
   paused: "Paused",
+  blocked: "Waiting on your answer",
   succeeded: "Succeeded",
   failed: "Failed",
   cancelled: "Cancelled",
+  declined: "Declined",
 };
 
 /**

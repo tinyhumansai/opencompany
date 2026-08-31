@@ -42,8 +42,8 @@ use crate::ports::skills_state::{SkillSource, SkillState, SkillStateStore};
 use crate::ports::store::CompanyStore;
 use crate::ports::tasks::{TaskRecord, TaskStore};
 use crate::ports::types::{
-    ChunkAddr, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompressedTrace, ContextChunk,
-    EventSeq, LedgerEntry, SecretValue, TemplateProvenance,
+    Attachment, ChunkAddr, ChunkMeta, CompanyEvent, CompanyId, CompanyRecord, CompressedTrace,
+    ContextChunk, EventSeq, LedgerEntry, SecretValue, TemplateProvenance,
 };
 use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
 use crate::ports::users::{InviteRecord, UserRecord, UserRole, UserStatus, UserStore};
@@ -143,6 +143,8 @@ fn sample_policy_override() -> crate::ports::types::PolicyOverride {
     PolicyOverride {
         mode: Some("auto".to_string()),
         always_approve: Some(vec!["payment.send".to_string()]),
+        auto_approve_under_usd: Some(Some(25.0)),
+        approval_ttl_hours: Some(48),
         set_by: Actor {
             kind: ActorKind::User,
             id: "user-conformance".to_string(),
@@ -160,18 +162,24 @@ fn sample_policy_override() -> crate::ports::types::PolicyOverride {
 /// dropped it would delete the teammate on the next restart, and on a hosted
 /// tenant there would be nothing to restore from.
 ///
-/// Deliberately **two** rows that differ in their optional fields, because the
-/// field's whole point is that those states stay apart across a round-trip:
+/// Deliberately **three** rows that differ in their optional fields, because the
+/// field's whole point is that those states stay apart across a round-trip. Since
+/// issue #1804 `tools` is a three-state grant, and all three must survive:
 ///
-/// - `aria_stone` has a `description` and a **narrowed** `tools` grant. Both are
-///   `skip_serializing_if`-elided when empty, so a backend that persisted only
-///   the required `id`/`name`/`role` triple would still round-trip a bare agent
-///   and pass. This row is what makes that fail.
-/// - `pax_ivory` has `description: None` and an **empty** `tools` list, which
-///   means the standard company-wide grant rather than "no tools" (see
+/// - `aria_stone` has a `description` and a **narrowed** `tools` grant
+///   (`Some(globs)`). Both are `skip_serializing_if`-elided when absent, so a
+///   backend that persisted only the required `id`/`name`/`role` triple would
+///   still round-trip a bare agent and pass. This row is what makes that fail.
+/// - `pax_ivory` has `description: None` and an **absent** `tools` grant
+///   (`None`), which means the standard company-wide grant — the teammate keeps
+///   tracking `[tools].allow` (see
 ///   [`OverlayAgent::tools`](crate::ports::types::OverlayAgent::tools)). A
-///   backend that rehydrated the absent key as anything other than empty would
-///   silently re-scope that teammate's tool belt.
+///   backend that rehydrated the absent key as `Some(vec![])` would silently
+///   demote that teammate to a deny-all belt.
+/// - `nix_slate` has an **explicit empty** `tools` grant (`Some(vec![])`), which
+///   since #1804 is a deliberate **deny-all** — the opposite of `None`. A backend
+///   that collapsed `Some(vec![])` into `None` (or dropped the empty array) would
+///   silently re-grant that teammate the whole company belt.
 fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
     use crate::ports::types::OverlayAgent;
     vec![
@@ -180,9 +188,10 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
             name: "Aria Stone".to_string(),
             role: "Head of Support".to_string(),
             description: Some("Answers customer mail and escalates refunds.".to_string()),
-            tools: vec!["docs.*".to_string(), "web".to_string()],
+            tools: Some(vec!["docs.*".to_string(), "web".to_string()]),
             // Both set, so a backend that drops either fails here — the same
-            // reason `tools` is non-empty on this one and empty on the next.
+            // reason `tools` is a narrowed `Some` here, `None` on the next, and
+            // an explicit empty `Some(vec![])` on the third.
             model: Some("claude-sonnet-4".to_string()),
             harness: Some("claude".to_string()),
         },
@@ -191,10 +200,24 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
             name: "Pax Ivory".to_string(),
             role: "Analyst".to_string(),
             description: None,
-            tools: Vec::new(),
+            // `None` = inherit the standard company-wide grant. Must rehydrate
+            // as `None`, never as `Some(vec![])` (which since #1804 is deny-all).
+            tools: None,
             // The absent half of the pair: `None` must rehydrate as `None`,
             // never as an empty string pinning the teammate to a nameless
             // harness.
+            model: None,
+            harness: None,
+        },
+        OverlayAgent {
+            id: "nix_slate".to_string(),
+            name: "Nix Slate".to_string(),
+            role: "Contractor".to_string(),
+            description: None,
+            // Explicit empty list = deliberate deny-all (issue #1804), the
+            // opposite of `None`. Must survive as `Some(vec![])`, never collapse
+            // to `None` (which would silently re-grant the whole company belt).
+            tools: Some(Vec::new()),
             model: None,
             harness: None,
         },
@@ -207,14 +230,30 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
 /// Its `members` name one manifest agent (`ceo`) and one overlay agent
 /// (`aria_stone`), which is the mixed case a real console desk produces, and
 /// `description` is `Some` so the `skip_serializing_if` field is exercised.
+///
+/// Two desks since issue #1835, one per responder mode: `support` never states
+/// a mode (the defaulted-and-skipped half — a pre-#1835 row must rehydrate as
+/// `Lead`), and `launch` is an `auto` channel, so every backend proves the
+/// mode a rail-created channel stores actually survives persistence rather
+/// than silently collapsing back to a lead desk.
 fn sample_overlay_desks() -> Vec<crate::ports::types::OverlayDesk> {
-    use crate::ports::types::OverlayDesk;
-    vec![OverlayDesk {
-        id: "support".to_string(),
-        name: "Support".to_string(),
-        description: Some("Customer mail triage.".to_string()),
-        members: vec!["ceo".to_string(), "aria_stone".to_string()],
-    }]
+    use crate::ports::types::{OverlayDesk, ResponderMode};
+    vec![
+        OverlayDesk {
+            id: "support".to_string(),
+            name: "Support".to_string(),
+            description: Some("Customer mail triage.".to_string()),
+            members: vec!["ceo".to_string(), "aria_stone".to_string()],
+            responder: ResponderMode::default(),
+        },
+        OverlayDesk {
+            id: "launch".to_string(),
+            name: "Launch week".to_string(),
+            description: None,
+            members: vec!["ceo".to_string(), "aria_stone".to_string()],
+            responder: ResponderMode::Auto,
+        },
+    ]
 }
 
 /// The console-added desk memberships the fixture seeds every record with, so
@@ -230,18 +269,22 @@ fn sample_overlay_desk_members() -> Vec<crate::ports::types::OverlayDeskMember> 
 }
 
 /// The operator's edits of a manifest-declared teammate: a renamed role, a
-/// cleared description (the empty-string form) and a narrowed tool scope, so a
-/// backend that drops the field — or that collapses "cleared" back into "not
-/// overridden" — is caught by the round-trip rather than in a console that
-/// silently re-inherits the blueprint after a restart.
+/// cleared description (the empty-string form), a narrowed tool scope and a
+/// chosen face, so a backend that drops the field — or that collapses "cleared"
+/// back into "not overridden" — is caught by the round-trip rather than in a
+/// console that silently re-inherits the blueprint after a restart.
 fn sample_agent_overrides() -> Vec<crate::ports::types::AgentOverride> {
     vec![crate::ports::types::AgentOverride {
         agent_id: "ceo".to_string(),
         name: Some("Robin".to_string()),
         role: Some("Chief Vibes".to_string()),
         description: Some(String::new()),
-        tools: Some(vec!["docs.*".to_string()]),
+        tools: Some(Some(vec!["docs.*".to_string()])),
         instructions: Some("Be exceedingly concise and decisive.".to_string()),
+        // A dropped avatar reads as "nobody has chosen", so the teammate's face
+        // would silently revert to the hashed default on the next restart — the
+        // same class of loss as re-inheriting the blueprint role.
+        avatar: Some("tiny:violet".to_string()),
         // Set rather than defaulted: this fixture exists to prove a store
         // round-trips the whole override, so every field it gains needs a real
         // value here or the new ones are covered by nothing.
@@ -282,6 +325,18 @@ fn record(id: &CompanyId) -> CompanyRecord {
         overlay_workflows: vec![sample_overlay_workflow()],
         overlay_budgets: sample_budget_overrides(),
         overlay_policy: Some(sample_policy_override()),
+        // Non-empty for the same reason: this is the one overlay that WIDENS
+        // `[tools].allow`, so a backend that drops it silently revokes an
+        // integration the operator granted from a connect surface and leaves
+        // the restored company "Connected" and reaching nobody (issue #1796).
+        overlay_tool_grants: Some(crate::ports::types::ToolGrantsOverride {
+            added: vec!["chargebee".to_string()],
+            set_by: crate::ports::types::Actor {
+                kind: crate::ports::types::ActorKind::User,
+                id: "admin@example.com".to_string(),
+            },
+            at_millis: 1_700_000_000_000,
+        }),
         // Non-empty so a backend that drops the field is caught: an empty map
         // survives every possible bug, including not persisting it at all.
         overlay_desk_tools: std::collections::BTreeMap::from([(
@@ -291,6 +346,9 @@ fn record(id: &CompanyId) -> CompanyRecord {
         disabled_workflows: vec!["digest".to_string()],
         template_provenance: Some(sample_provenance()),
         setup: Some(sample_setup_answers()),
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
@@ -338,6 +396,7 @@ pub async fn assert_isolation_by_company(
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -382,6 +441,28 @@ pub async fn assert_isolation_by_company(
         context.list(&beta, "").await.unwrap().is_empty(),
         "beta context leaked"
     );
+    // `beta` was never saved: the activation gate reads "never seen", exactly
+    // like a company with no bundle/document/row at all.
+    assert!(
+        !store.activation_gate_seen(&beta).await.unwrap(),
+        "a company that was never saved must report the activation gate as \
+         never seen"
+    );
+    // PR #1875 review finding: `alpha` WAS just saved, by this same
+    // activation-aware build, so the gate must already read "seen" —
+    // immediately, with no second save. A backend that leaves this at the
+    // `CompanyStore` trait's always-`false` default cannot tell a fresh
+    // company's second boot apart from a genuine pre-#1843 legacy record, and
+    // `RuntimeBuilder::build`'s grandfather back-fill would silently
+    // auto-activate every such company on that backend the moment it
+    // restarts before onboarding finishes — the exact bug #1843 fixed,
+    // reopened for whichever backend forgets this.
+    assert!(
+        store.activation_gate_seen(&alpha).await.unwrap(),
+        "a company just saved by activation-aware code must have the \
+         activation gate marked as seen — a backend inheriting the trait's \
+         always-false default would re-open the #1843 auto-activation bug"
+    );
 
     // `alpha` still sees its own data.
     let loaded = store.load(&alpha).await.unwrap().expect("alpha record");
@@ -409,7 +490,7 @@ pub async fn assert_isolation_by_company(
     );
     assert_eq!(
         aria.tools,
-        vec!["docs.*".to_string(), "web".to_string()],
+        Some(vec!["docs.*".to_string(), "web".to_string()]),
         "the teammate's narrowed tool grant decayed into the standard company grant"
     );
     let pax = loaded
@@ -417,9 +498,20 @@ pub async fn assert_isolation_by_company(
         .iter()
         .find(|agent| agent.id == "pax_ivory")
         .expect("the standard-grant teammate survived save/load");
-    assert!(
-        pax.tools.is_empty(),
-        "the standard-grant teammate came back with a narrowed tool belt"
+    assert_eq!(
+        pax.tools, None,
+        "the standard-grant teammate (None) came back as a narrowed or deny-all belt"
+    );
+    let nix = loaded
+        .overlay_agents
+        .iter()
+        .find(|agent| agent.id == "nix_slate")
+        .expect("the deny-all teammate survived save/load");
+    assert_eq!(
+        nix.tools,
+        Some(Vec::new()),
+        "the deny-all teammate (Some(vec![])) collapsed into None and silently \
+         re-gained the whole company grant"
     );
     // And the round-tripped teammate is on the roster, which is what the overlay
     // is for: a backend could persist the rows and still fail to make them count.
@@ -543,6 +635,63 @@ pub async fn assert_isolation_by_company(
     assert_eq!(context.list(&alpha, "").await.unwrap().len(), 1);
 }
 
+/// PR #1875 review finding: `CompanyStore::save` stamps `activation_gate_seen:
+/// true` unconditionally, on the reasoning (its own doc comment) that "every
+/// OTHER call site really is activation-aware code doing a normal write" —
+/// true for a `running` company, but not for one still `paused` on its first
+/// post-upgrade boot. `RuntimeBuilder::build`'s own "existing but not
+/// running" arm already knows this and deliberately leaves the marker exactly
+/// as recorded rather than migrating a paused legacy record — but that
+/// protection only covers saves `build` itself makes. Any OTHER ordinary
+/// write against the same still-paused, not-yet-migrated record — e.g.
+/// `company_logo::put_logo`'s plain load-modify-save cycle, which does not
+/// check lifecycle at all — used to stamp the marker `true` regardless,
+/// poisoning it before the company's own first `running` boot ever gets to
+/// decide. Once poisoned, the grandfather arm's `!gate_already_seen` guard
+/// can never fire again, and a genuinely legacy operator who resumes their
+/// paused company is shown the fresh-company onboarding funnel instead of
+/// being grandfathered in.
+pub async fn assert_paused_ordinary_save_preserves_activation_gate(store: Arc<dyn CompanyStore>) {
+    let id = CompanyId::new("paused-legacy");
+    let mut paused = record(&id);
+    paused.lifecycle = "paused".to_string();
+
+    // Simulate a legacy pre-#1843 bundle that is still unmigrated:
+    // `activation_gate_seen` explicitly `false`, exactly like a record no
+    // activation-aware `build` has ever decided.
+    store.save_importing(&paused, false).await.unwrap();
+    assert!(
+        !store.activation_gate_seen(&id).await.unwrap(),
+        "setup: the fixture must start gate-unseen"
+    );
+
+    // An ordinary write against the still-paused record — a console route
+    // like `company_logo::put_logo` that loads, mutates one field, and calls
+    // plain `save`, with no lifecycle check of its own.
+    paused.manifest.company.logo_url = Some("data:image/png;base64,AA==".to_string());
+    store.save(&paused).await.unwrap();
+
+    assert!(
+        !store.activation_gate_seen(&id).await.unwrap(),
+        "an ordinary write against a still-paused, not-yet-migrated legacy \
+         record must not stamp the activation gate marker `true` — only a \
+         `running` boot's own migration decision may, or a resumed legacy \
+         company is shown onboarding it should have been grandfathered past"
+    );
+
+    // Once the company is actually running, an ordinary save is still free to
+    // stamp the marker — the common case `save`'s `true` exists for, which
+    // the fix above must not break.
+    let mut running = paused.clone();
+    running.lifecycle = "running".to_string();
+    store.save(&running).await.unwrap();
+    assert!(
+        store.activation_gate_seen(&id).await.unwrap(),
+        "an ordinary write against a running company must still mark the \
+         activation gate as seen"
+    );
+}
+
 /// Event and ledger logs are append-only: prior entries never move or mutate
 /// when new ones are written, and a record re-save does not rewrite the ledger.
 pub async fn assert_append_only_event_and_ledger(
@@ -573,6 +722,7 @@ pub async fn assert_append_only_event_and_ledger(
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -587,6 +737,7 @@ pub async fn assert_append_only_event_and_ledger(
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -607,6 +758,7 @@ pub async fn assert_append_only_event_and_ledger(
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -643,6 +795,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
                     by: None,
                     chat: None,
                     deliverable: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -661,6 +814,7 @@ pub async fn assert_monotonic_event_seq(events: Arc<dyn EventLog>) {
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -706,6 +860,7 @@ pub async fn assert_event_subscription_surfaces_gap(events: Arc<dyn EventLog>) {
                     by: None,
                     chat: None,
                     deliverable: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -741,6 +896,7 @@ pub async fn assert_event_read_before(events: Arc<dyn EventLog>) {
                         by: None,
                         chat: None,
                         deliverable: None,
+                        attachments: Vec::new(),
                     },
                 )
                 .await
@@ -796,6 +952,7 @@ pub async fn assert_event_retention(events: Arc<dyn EventLog>) {
         workflow_id: "wf".to_string(),
         run_id: format!("run-{n}"),
         scheduled: false,
+        started_by: None,
     };
     let audit = |n: u64| CompanyEvent::LifecycleChanged {
         from: "running".to_string(),
@@ -1006,6 +1163,23 @@ pub async fn assert_export_totality(
 
     let mut appended = Vec::new();
     for i in 0..4 {
+        // Issue #1682: one fixture carries a populated attachment so the
+        // totality round-trip can catch a backend that drops the field —
+        // every empty-`Vec::new()` fixture above would still pass one, since
+        // an empty list is indistinguishable from a missing one after
+        // deserialization. Event 2 keeps the exact metadata (including the
+        // server-extracted text) so the byte-identical replay below pins it.
+        let attachments = if i == 2 {
+            vec![Attachment {
+                node_id: "node-attach-0".to_string(),
+                name: "Q3-report.pdf".to_string(),
+                mime: "application/pdf".to_string(),
+                size: 48_932,
+                extracted_text: Some("Q3 revenue grew 12% year over year.".to_string()),
+            }]
+        } else {
+            Vec::new()
+        };
         let ev = CompanyEvent::OperatorMessage {
             mentions: Vec::new(),
             parent: None,
@@ -1013,6 +1187,7 @@ pub async fn assert_export_totality(
             by: None,
             chat: None,
             deliverable: None,
+            attachments,
         };
         events.append(&id, ev.clone()).await.unwrap();
         appended.push(ev);
@@ -1134,6 +1309,23 @@ pub async fn assert_export_totality(
     for (i, stored) in read.iter().enumerate() {
         assert_eq!(stored.seq, EventSeq::new(i as u64));
         assert_eq!(stored.event, appended[i]);
+    }
+    // Issue #1682: the populated-attachment event's metadata survives the
+    // round-trip explicitly, not just as an equality side-effect — a backend
+    // that drops `attachments` (or loses the extracted text) fails here.
+    match &appended[2] {
+        CompanyEvent::OperatorMessage { attachments, .. } => {
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].node_id, "node-attach-0");
+            assert_eq!(attachments[0].name, "Q3-report.pdf");
+            assert_eq!(attachments[0].mime, "application/pdf");
+            assert_eq!(attachments[0].size, 48_932);
+            assert_eq!(
+                attachments[0].extracted_text.as_deref(),
+                Some("Q3 revenue grew 12% year over year.")
+            );
+        }
+        _ => unreachable!("fixture event 2 is an OperatorMessage"),
     }
 
     // All traces round-trip, newest last.
@@ -1374,6 +1566,7 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     };
 
     tasks.upsert(&alpha, &task("t1", "todo", 1)).await.unwrap();
@@ -1403,6 +1596,56 @@ pub async fn assert_task_store(tasks: Arc<dyn TaskStore>) {
     assert!(tasks.delete(&alpha, "t1").await.unwrap());
     assert!(!tasks.delete(&alpha, "t1").await.unwrap());
     assert_eq!(tasks.list(&alpha).await.unwrap().len(), 1);
+
+    // Issue #1865: seed every recently-added optional field with a meaningful
+    // value. An empty/`None` fixture would let a backend silently drop the
+    // bounced marker, output lineage, or workflow proposal without failing.
+    let populated = TaskRecord {
+        note: Some("retry after the transport failed".to_string()),
+        origin_chat_id: Some("chat-1".to_string()),
+        parent_task_id: Some("parent-1".to_string()),
+        output: Some(crate::ports::tasks::TaskOutput {
+            source: crate::ports::tasks::TaskOutputSource::Run {
+                run_id: "run-1".to_string(),
+                attempt: Some(2),
+            },
+            at_millis: 10,
+            artifacts: vec![crate::ports::tasks::TaskOutputArtifact {
+                artifact_id: "artifact-1".to_string(),
+                version: 3,
+                title: "Release notes".to_string(),
+                kind: crate::ports::ArtifactKind::Markdown,
+            }],
+            workflows: vec![crate::ports::tasks::TaskOutputWorkflow {
+                workflow_id: "release".to_string(),
+                run_id: Some("run-1".to_string()),
+                action: crate::ports::tasks::TaskOutputAction::Ran,
+            }],
+        }),
+        deliverable: crate::ports::tasks::TaskDeliverable::Workflow,
+        workflow_proposal: Some(crate::ports::tasks::TaskWorkflowProposal {
+            summary: "Publish the release notes".to_string(),
+            ops: serde_json::json!({"id": "release", "nodes": []}),
+            generated_at_millis: 11,
+            run_id: "run-1".to_string(),
+        }),
+        origin_run_id: Some("run-1".to_string()),
+        origin_workflow_id: Some("release".to_string()),
+        bounced: Some("the previous dispatch failed".to_string()),
+        ..task("t-populated", "todo", 12)
+    };
+    tasks.upsert(&alpha, &populated).await.unwrap();
+    let populated_back = tasks
+        .list(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == populated.id)
+        .expect("the populated card persists");
+    assert_eq!(
+        populated_back, populated,
+        "all populated fields must survive"
+    );
 
     // Issue #337: a card carrying a full plan round-trips **byte-identically**
     // on every backend.
@@ -1522,6 +1765,10 @@ pub async fn assert_user_store(users: Arc<dyn UserStore>) {
         id: id.to_string(),
         email: email.to_string(),
         display_name: Some(format!("name {id}")),
+        // Non-`None` so a backend that drops the column is caught here: a lost
+        // avatar reads as "never chose one", so the person's face would revert
+        // to the hashed default on the next read with nothing reporting it.
+        avatar: Some("tiny:indigo".to_string()),
         role: UserRole::Member,
         status: UserStatus::Active,
         password_hash: None,
@@ -1548,6 +1795,13 @@ pub async fn assert_user_store(users: Arc<dyn UserStore>) {
     let list = users.list_users(&alpha).await.unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].id, "u2");
+    // The whole record round-trips, not only the columns each backend happened
+    // to think of: a dropped display name or avatar silently reverts a person
+    // to the console's derived name and hashed face.
+    assert_eq!(
+        users.get_user(&alpha, "u1").await.unwrap().as_ref(),
+        Some(&user("u1", "ada@example.com", 1))
+    );
     assert_eq!(users.list_users(&beta).await.unwrap().len(), 1);
 
     // A user of one company is invisible to another, by id and by email.
@@ -3265,6 +3519,137 @@ pub async fn assert_delete_label_survives_a_concurrent_identical_put(
     }
 }
 
+/// Demands one search semantics under [`ContextStore::search`] from *every*
+/// backend.
+///
+/// This assertion exists because `fs`, `sqlite` and `mongodb` each carried their
+/// own copy of the search function, and all three copies were identically wrong:
+/// a `body.find(query)` substring test scored 1.0, and truncation to `limit`
+/// happened before any sorting. Three copies that agree by accident are three
+/// copies that drift apart again — so the semantics is pinned here rather than
+/// reviewed per backend.
+///
+/// What a store must do:
+///
+/// 1. **partial overlap counts**, because the memory loop searches with the
+///    whole incoming message as its query and that never comes back verbatim;
+/// 2. **the score ranks**, and rare words weigh more than words that appear
+///    everywhere;
+/// 3. **`limit` cuts *after* ranking**, not in read order;
+/// 4. **no overlap is no hit**, so an empty result still means "there is nothing
+///    here";
+/// 5. the score stays inside `[0, 1]`, as [`ChunkHit`] promises.
+pub async fn assert_context_search_ranking(context: Arc<dyn ContextStore>) {
+    let alpha = CompanyId::new("alpha");
+    let put = |label: &'static str, body: String| {
+        let context = context.clone();
+        let alpha = alpha.clone();
+        async move {
+            context
+                .put(
+                    &alpha,
+                    ContextChunk {
+                        label: label.to_string(),
+                        body,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Four older memories that share only the everyday words, and one that is
+    // really about the subject. In read order the right one is last — exactly
+    // the arrangement in which the old code returned the four oldest.
+    let mut noise = Vec::new();
+    for (label, body) in [
+        (
+            "task-outcome/a",
+            "Task: put the minutes of the meeting in the folder\nOutcome: done",
+        ),
+        (
+            "task-outcome/b",
+            "Task: send the agenda for the week to the team\nOutcome: done",
+        ),
+        (
+            "task-outcome/c",
+            "Task: check the addresses in the list of customers\nOutcome: done",
+        ),
+        (
+            "task-outcome/d",
+            "Task: put Monday's review in the agenda\nOutcome: done",
+        ),
+    ] {
+        noise.push(put(label, body.to_string()).await);
+    }
+    let target = put(
+        "task-outcome/e",
+        "Task: produce the quarterly overview of revenue for the north region\nOutcome: in the folder"
+            .to_string(),
+    )
+    .await;
+
+    // Today's question: same substance, different words. Under a substring test
+    // this yields zero hits.
+    let question =
+        "produce the quarterly overview of revenue for the north region again for the customer";
+
+    let all = context.search(&alpha, question, usize::MAX).await.unwrap();
+    assert!(
+        !all.is_empty(),
+        "partial overlap must hit; a substring test returned nothing here"
+    );
+    assert_eq!(
+        all[0].addr, target,
+        "the memory sharing the rare words belongs on top"
+    );
+    for hit in &all {
+        assert!(
+            (0.0..=1.0).contains(&hit.score),
+            "score outside the port contract [0,1]: {}",
+            hit.score
+        );
+    }
+    for hit in all.iter().skip(1) {
+        assert!(
+            hit.score < all[0].score,
+            "a hit on everyday words alone must not tie with the real one"
+        );
+    }
+
+    // `limit` must not cut in read order: with one slot the best must survive,
+    // not the oldest.
+    let one = context.search(&alpha, question, 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(
+        one[0].addr, target,
+        "limit belongs after ranking, not before it"
+    );
+
+    // The snippet shows where the hit is, not the start of the chunk.
+    assert!(
+        one[0].snippet.contains("quarterly"),
+        "the snippet must wrap the hit; got: {}",
+        one[0].snippet
+    );
+
+    // No overlap stays no hit.
+    assert!(
+        context
+            .search(&alpha, "shipbuilding", usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "without overlap nothing should come back"
+    );
+
+    // And the noise was not thrown away: it is still there, it just scores lower.
+    assert_eq!(
+        context.list(&alpha, "").await.unwrap().len(),
+        noise.len() + 1
+    );
+}
+
 /// Asserts the [`UsageMeter`] contract: isolation, record, and windowed query.
 pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     let alpha = CompanyId::new("alpha");
@@ -3279,6 +3664,7 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
         cost_usd: cost,
         kind: SampleKind::Inference,
         run_id: None,
+        model: None,
     };
 
     usage.record(&alpha, &sample(100, 0.1)).await.unwrap();
@@ -3319,6 +3705,7 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
         cost_usd: 0.03,
         kind: SampleKind::PlanningCall,
         run_id: None,
+        model: None,
     };
     usage.record(&alpha, &planning).await.unwrap();
     let back = usage
@@ -3331,6 +3718,41 @@ pub async fn assert_usage_meter(usage: Arc<dyn UsageMeter>) {
     assert_eq!(back, planning);
     assert_eq!(back.agent, "company");
     assert!(back.run_id.is_none(), "a planning pass has no attempt row");
+
+    // Issue #1749: the model slug round-trips on every backend, and does so as
+    // the *stored string* rather than only as a value that happens to compare
+    // equal. `by model` is an aggregation over what came back out of the
+    // store, so a backend that dropped or mangled the field would make the
+    // whole question unanswerable while every other assertion here still
+    // passed.
+    let with_model = UsageSample {
+        at_millis: 400,
+        agent: "ceo".to_string(),
+        provider: "byok".to_string(),
+        input_tokens: 12,
+        output_tokens: 4,
+        cached_input_tokens: 0,
+        cost_usd: 0.02,
+        kind: SampleKind::Inference,
+        run_id: None,
+        model: Some(crate::metering::ModelSlug::classify(
+            "anthropic/claude-sonnet-4-6",
+        )),
+    };
+    usage.record(&alpha, &with_model).await.unwrap();
+    let back = usage
+        .query(&alpha, 400)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.at_millis == 400)
+        .expect("the sample with a model persists");
+    assert_eq!(back, with_model);
+    assert_eq!(
+        back.model.map(|m| m.as_str()),
+        Some("anthropic-sonnet"),
+        "the stored slug must survive the backend's own encoding"
+    );
 }
 
 /// Asserts the [`UsageMeter`] retention contract: samples older than the 90-day
@@ -3349,6 +3771,7 @@ pub async fn assert_usage_retention(usage: Arc<dyn UsageMeter>) {
         cost_usd: 0.1,
         kind: SampleKind::Inference,
         run_id: None,
+        model: None,
     };
 
     // A fixed base far from epoch 0 so the cutoff math stays positive.
@@ -3482,6 +3905,11 @@ pub async fn assert_notification_store(notes: Arc<dyn NotificationStore>) {
         },
         created_at,
         title: format!("notification {id}"),
+        // Company-wide, which is what every row written before the field
+        // existed means — so the whole suite above this line is also the
+        // regression guard for that reading.
+        audience: None,
+        context: None,
     };
 
     // Empty: nobody has anything.
@@ -3622,6 +4050,103 @@ pub async fn assert_notification_store(notes: Arc<dyn NotificationStore>) {
         4,
         "beta's write must not change alpha"
     );
+
+    // ---- Targeted rows: an audience is a boundary, not a hint ----
+    //
+    // A mention notification names the people it is for. Every backend must
+    // enforce that identically, or one storage choice silently shows a person
+    // a message they were never addressed by.
+    let targeted = |id: &str, created_at: u64, audience: Option<Vec<&str>>| Notification {
+        id: id.to_string(),
+        kind: "mention".to_string(),
+        subject: Subject {
+            kind: SubjectKind::Message,
+            id: "42".to_string(),
+        },
+        created_at,
+        title: format!("someone mentioned you ({id})"),
+        audience: audience.map(|a| a.into_iter().map(str::to_string).collect()),
+        context: Some("engineering".to_string()),
+    };
+
+    let gamma = CompanyId::new("gamma");
+    notes
+        .append(&gamma, &targeted("for-ada", 100, Some(vec!["ada"])))
+        .await
+        .unwrap();
+    notes
+        .append(&gamma, &targeted("for-grace", 200, Some(vec!["grace"])))
+        .await
+        .unwrap();
+    notes
+        .append(&gamma, &targeted("for-everyone", 300, None))
+        .await
+        .unwrap();
+
+    // Each person sees their own row plus the company-wide one, and nobody
+    // else's.
+    let ada = notes.list(&gamma, "ada").await.unwrap();
+    let ada_ids: Vec<&str> = ada.iter().map(|v| v.notification.id.as_str()).collect();
+    assert_eq!(ada_ids, vec!["for-everyone", "for-ada"]);
+    let grace = notes.list(&gamma, "grace").await.unwrap();
+    let grace_ids: Vec<&str> = grace.iter().map(|v| v.notification.id.as_str()).collect();
+    assert_eq!(grace_ids, vec!["for-everyone", "for-grace"]);
+
+    // A person named by nothing still sees the company-wide row — an audience
+    // narrows, it does not opt anyone out of what was addressed to everybody.
+    let stranger = notes.list(&gamma, "stranger").await.unwrap();
+    assert_eq!(stranger.len(), 1);
+    assert_eq!(stranger[0].notification.id, "for-everyone");
+
+    // The context rides through, so a badge can be placed without the console
+    // having loaded that channel's transcript.
+    assert_eq!(ada[0].notification.context.as_deref(), Some("engineering"));
+    assert_eq!(
+        ada[1].notification.audience.as_deref(),
+        Some(&["ada".to_string()][..])
+    );
+
+    // The unread count is per person AND per audience: Ada has two visible
+    // rows, not three, so a badge built from this cannot count a colleague's
+    // mention.
+    let ada_unread = notes
+        .mark_read(&gamma, "ada", Some(&["for-ada".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ada_unread, 1,
+        "the company-wide row is still unread for Ada"
+    );
+
+    // Marking everything read is scoped the same way: it must not reach into
+    // Grace's targeted row, and Grace must be unaffected.
+    let ada_unread = notes.mark_read(&gamma, "ada", None).await.unwrap();
+    assert_eq!(ada_unread, 0);
+    let grace = notes.list(&gamma, "grace").await.unwrap();
+    assert!(
+        grace.iter().all(|v| v.read_at.is_none()),
+        "Ada marking all read must not touch Grace's own rows"
+    );
+
+    // And a person cannot mark somebody else's row read by naming its id.
+    let stranger_unread = notes
+        .mark_read(&gamma, "stranger", Some(&["for-grace".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        stranger_unread, 1,
+        "the stranger's own unread count is the company-wide row alone"
+    );
+    let grace = notes.list(&gamma, "grace").await.unwrap();
+    assert!(
+        grace
+            .iter()
+            .find(|v| v.notification.id == "for-grace")
+            .expect("grace still sees her row")
+            .read_at
+            .is_none(),
+        "naming another person's notification must not mark it read for them"
+    );
 }
 
 pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
@@ -3707,6 +4232,7 @@ pub async fn assert_workspace_store(ws: Arc<dyn WorkspaceStore>) {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
 
     assert!(ws.is_empty(&alpha).await.unwrap());
@@ -3879,6 +4405,7 @@ pub async fn assert_workspace_binary_store(ws: Arc<dyn WorkspaceStore>) {
         // about them through to storage.
         size: Some(999_999),
         sha256: Some("not-a-real-digest".to_string()),
+        adopted: false,
     };
 
     // A payload that is emphatically not text: a lone continuation byte, an
@@ -3986,6 +4513,7 @@ pub async fn assert_workspace_binary_store(ws: Arc<dyn WorkspaceStore>) {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
             ..node("note", "brief.md", None, None)
         },
         Some("# Brief"),
@@ -4132,6 +4660,7 @@ pub async fn assert_workspace_binary_store(ws: Arc<dyn WorkspaceStore>) {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
         ..node("swap-old", "report.md", None, None)
     };
     ws.create(&alpha, &old, Some("# old")).await.unwrap();
@@ -4392,6 +4921,7 @@ pub async fn assert_workspace_folder_claims(ws: Arc<dyn WorkspaceStore>) {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     ws.create(&alpha, &note, Some("body")).await.unwrap();
     let refused = ws
@@ -4528,6 +5058,113 @@ pub async fn assert_workspace_folder_claims(ws: Arc<dyn WorkspaceStore>) {
     assert_eq!(&after.node().id, &ids[0]);
 }
 
+/// The adoption lease every backend must honour (issue #1839).
+///
+/// #1801 gave the tree an empty-folder rollback: a folder one caller minted, then
+/// failed to write beneath, is removed by
+/// [`delete_if_empty`](WorkspaceStore::delete_if_empty). But a folder one caller
+/// mints, a second caller can *adopt* — and the adopter has a legitimate reason
+/// to write into it that the minter's rollback must not sweep away. The lease is
+/// how the store records that second writer:
+///
+/// * an [`adopt_or_create_folder`](WorkspaceStore::adopt_or_create_folder) that
+///   **adopts** stamps [`WorkspaceNode::adopted`], durably, before it returns;
+/// * `delete_if_empty` refuses a folder carrying the flag even while it is still
+///   childless — that is the whole point, since the adopter's write has not
+///   landed yet.
+///
+/// A freshly minted folder does **not** carry it, so the rollback #1801 exists
+/// for still works: a minted-unadopted-empty folder is deleted. This is what
+/// keeps "swept a genuine leak" and "kept a folder someone else is writing into"
+/// on opposite sides of one bit.
+pub async fn assert_workspace_adoption_lease(ws: Arc<dyn WorkspaceStore>) {
+    use crate::ports::workspace::FolderClaim;
+
+    let alpha = CompanyId::new("alpha");
+    let origin = WorkspaceOrigin::Agent {
+        id: "cmo".to_string(),
+    };
+
+    // -- A minted, unadopted folder is not leased --------------------------
+    let minted = ws
+        .adopt_or_create_folder(&alpha, None, "task-A", origin.clone())
+        .await
+        .expect("a free name is claimable");
+    assert!(minted.was_created(), "the name was free");
+    assert!(
+        !minted.node().adopted,
+        "a freshly minted folder carries no adoption lease"
+    );
+    let minted_id = minted.node().id.clone();
+
+    // -- A second claim adopts it, and stamps the lease durably ------------
+    let adopted = ws
+        .adopt_or_create_folder(&alpha, None, "task-A", origin.clone())
+        .await
+        .expect("an existing folder is adopted");
+    assert!(!adopted.was_created(), "the folder was already there");
+    assert!(
+        matches!(adopted, FolderClaim::Adopted(_)),
+        "a second claimer adopts rather than mints"
+    );
+    assert!(
+        adopted.node().adopted,
+        "adoption stamps the lease on the returned node"
+    );
+    assert_eq!(adopted.node().id, minted_id, "and it is the same folder");
+    // The flag is persisted, not only present on the returned value — a fresh
+    // read (the path `delete_if_empty` and the rollback take) must see it.
+    let seen = ws
+        .tree(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == minted_id)
+        .expect("the folder is in the tree");
+    assert!(
+        seen.adopted,
+        "the lease survives a round trip through the store"
+    );
+
+    // -- delete_if_empty refuses the adopted-empty folder ------------------
+    assert!(
+        !ws.delete_if_empty(&alpha, &minted_id)
+            .await
+            .expect("delete_if_empty must not error on an adopted folder"),
+        "an adopted folder is refused while still childless — its writer has not landed"
+    );
+    assert!(
+        ws.tree(&alpha)
+            .await
+            .unwrap()
+            .iter()
+            .any(|n| n.id == minted_id),
+        "and it must still be standing"
+    );
+
+    // -- but a minted, never-adopted empty folder still deletes ------------
+    let leak = ws
+        .adopt_or_create_folder(&alpha, None, "task-B", origin)
+        .await
+        .expect("a second free name is claimable");
+    assert!(leak.was_created());
+    let leak_id = leak.node().id.clone();
+    assert!(
+        ws.delete_if_empty(&alpha, &leak_id)
+            .await
+            .expect("delete_if_empty on an unadopted empty folder"),
+        "a minted, unadopted, empty folder is the #1801 leak and must still be swept"
+    );
+    assert!(
+        !ws.tree(&alpha)
+            .await
+            .unwrap()
+            .iter()
+            .any(|n| n.id == leak_id),
+        "and it must be gone"
+    );
+}
+
 /// Asserts that a reader concurrent with a writer on the SAME node never errors
 /// and never observes a partial body (issue #887).
 ///
@@ -4589,6 +5226,7 @@ pub async fn assert_workspace_sibling_names(ws: Arc<dyn WorkspaceStore>) {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
 
     // A folder to hold the contended name, plus the root as a second scope.
@@ -4710,6 +5348,7 @@ pub async fn assert_workspace_read_never_tears(ws: Arc<dyn WorkspaceStore>) {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     ws.create(&company, &node, Some(&whole_a))
         .await
@@ -4803,6 +5442,7 @@ fn folder_node(id: &str, name: &str) -> WorkspaceNode {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     }
 }
 
@@ -5032,6 +5672,32 @@ pub async fn assert_run_store(runs: Arc<dyn crate::ports::runs::RunStore>) {
         .unwrap();
     assert_eq!(never_ran.status, RunStatus::Cancelled);
     assert_eq!(never_ran.started_at_millis, None);
+
+    // A by-design decline (issue #1809) is terminal and round-trips like any
+    // other settle: neither an error nor a plain success, so the store must
+    // persist and read it back exactly. Kept on its own company so it does not
+    // perturb the r1..r4 list-count assertions below.
+    let gamma = CompanyId::new("gamma");
+    runs.create_run(&gamma, spec("g1", "card")).await.unwrap();
+    let declined = runs
+        .finish_run(
+            &gamma,
+            "g1",
+            RunOutcome::new(RunStatus::Declined)
+                .with_error("better done once than built into a workflow"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(declined.status, RunStatus::Declined);
+    assert!(
+        declined.finished_at_millis.is_some(),
+        "Declined is terminal, so it carries a finish time"
+    );
+    assert_eq!(
+        runs.get_run(&gamma, "g1").await.unwrap(),
+        Some(declined),
+        "a declined run round-trips byte-identically"
+    );
 
     // -- the step trace ------------------------------------------------------
 
@@ -5882,4 +6548,219 @@ pub async fn assert_journal_import(journal: Arc<dyn crate::ports::journal::Journ
     journal.complete_import(&beta, Vec::new()).await.unwrap();
     assert!(journal.journal_imported(&beta).await.unwrap());
     assert!(journal.read_journal(&beta).await.unwrap().is_empty());
+}
+
+/// The workflow-run join, on every backend.
+///
+/// Split out of [`assert_run_store`] rather than folded into it so a backend can
+/// be brought up against the join alone, and so the assertion reads as one idea.
+pub async fn assert_run_store_workflow_join(runs: Arc<dyn crate::ports::runs::RunStore>) {
+    use crate::ports::runs::{NewRun, RunFilter};
+
+    let alpha = CompanyId::new("alpha");
+
+    // Two nodes of one workflow run, plus an ordinary card dispatch beside them.
+    runs.create_run(
+        &alpha,
+        NewRun::for_workflow_node("w1", "wr-1", "solve", "programmer"),
+    )
+    .await
+    .unwrap();
+    runs.create_run(
+        &alpha,
+        NewRun::for_workflow_node("w2", "wr-1", "check", "verifier"),
+    )
+    .await
+    .unwrap();
+    runs.create_run(
+        &alpha,
+        NewRun::for_workflow_node("w3", "wr-2", "solve", "programmer"),
+    )
+    .await
+    .unwrap();
+    runs.create_run(&alpha, NewRun::for_task("t1", "card", "ceo"))
+        .await
+        .unwrap();
+
+    // The fields round-trip.
+    let one = runs.get_run(&alpha, "w1").await.unwrap().unwrap();
+    assert_eq!(one.workflow_run_id.as_deref(), Some("wr-1"));
+    assert_eq!(one.node_id.as_deref(), Some("solve"));
+    assert_eq!(one.task_id, None, "a workflow node attempts no card");
+    assert_eq!(one.chat_id, None, "and belongs to no conversation");
+
+    // A card dispatch belongs to no workflow — `None` is true, not a placeholder.
+    let card = runs.get_run(&alpha, "t1").await.unwrap().unwrap();
+    assert_eq!(card.workflow_run_id, None);
+    assert_eq!(card.node_id, None);
+
+    // The filter selects exactly one run's nodes.
+    let mine = runs
+        .list_runs(&alpha, &RunFilter::for_workflow_run("wr-1"))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = mine.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["w1", "w2"], "only wr-1's nodes");
+
+    // An unknown workflow run matches nothing rather than everything — the
+    // failure mode of a filter that is silently dropped.
+    assert!(
+        runs.list_runs(&alpha, &RunFilter::for_workflow_run("nope"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // An unfiltered list still sees them all, including the card dispatch.
+    let all = runs.list_runs(&alpha, &RunFilter::default()).await.unwrap();
+    assert_eq!(all.len(), 4);
+}
+
+/// Every backend's [`DeepTraceStore`](crate::ports::deep_trace::DeepTraceStore)
+/// must agree on isolation, replacement, ordering, pruning and purge.
+///
+/// The contract this pins is narrow but load-bearing: the store holds secrets,
+/// so "company A cannot see company B" and "purge really destroys" are not
+/// niceties, and a backend that quietly diverges on either is a disclosure bug
+/// rather than a bug.
+pub async fn assert_deep_trace_store(deep: Arc<dyn crate::ports::deep_trace::DeepTraceStore>) {
+    use crate::ports::deep_trace::{RunStepDetailRecord, TurnStepDetail};
+
+    let alpha = CompanyId::new("alpha");
+    let beta = CompanyId::new("beta");
+
+    let record = |run: &str, seq: u32, at: u64, reasoning: &str| RunStepDetailRecord {
+        run_id: run.to_string(),
+        step_seq: seq,
+        at_millis: at,
+        detail: TurnStepDetail {
+            reasoning: Some(reasoning.to_string()),
+            ..TurnStepDetail::default()
+        },
+    };
+
+    // -- a run with no detail reads as empty, not as an error ----------------
+
+    assert!(
+        deep.list_step_details(&alpha, "missing")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a run that recorded nothing reads empty"
+    );
+
+    // -- append and read back, ordered by step_seq ---------------------------
+
+    // Deliberately written out of order: the store orders, the caller does not.
+    deep.append_step_detail(&alpha, &record("r1", 2, 20, "second"))
+        .await
+        .unwrap();
+    deep.append_step_detail(&alpha, &record("r1", 0, 10, "first"))
+        .await
+        .unwrap();
+    deep.append_step_detail(&alpha, &record("r1", 1, 15, "middle"))
+        .await
+        .unwrap();
+
+    let got = deep.list_step_details(&alpha, "r1").await.unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(
+        got.iter().map(|r| r.step_seq).collect::<Vec<_>>(),
+        [0, 1, 2],
+        "details come back in step order regardless of write order"
+    );
+    assert_eq!(got[0].detail.reasoning.as_deref(), Some("first"));
+    assert_eq!(got[2].detail.reasoning.as_deref(), Some("second"));
+
+    // -- replacement on (run_id, step_seq), not duplication ------------------
+
+    // A reasoning run flushes partway and again at close under the same ordinal.
+    deep.append_step_detail(&alpha, &record("r1", 1, 30, "middle, finished"))
+        .await
+        .unwrap();
+    let got = deep.list_step_details(&alpha, "r1").await.unwrap();
+    assert_eq!(got.len(), 3, "a re-write replaces rather than stacking");
+    assert_eq!(
+        got[1].detail.reasoning.as_deref(),
+        Some("middle, finished"),
+        "the later write is the truth"
+    );
+
+    // -- per-company isolation ----------------------------------------------
+
+    deep.append_step_detail(&beta, &record("r1", 0, 10, "beta's secret"))
+        .await
+        .unwrap();
+    let alpha_view = deep.list_step_details(&alpha, "r1").await.unwrap();
+    assert_eq!(alpha_view.len(), 3, "beta's row is invisible to alpha");
+    assert!(
+        alpha_view
+            .iter()
+            .all(|r| r.detail.reasoning.as_deref() != Some("beta's secret")),
+        "a run id shared across companies must not leak"
+    );
+    assert_eq!(deep.list_step_details(&beta, "r1").await.unwrap().len(), 1);
+
+    // -- every field survives the round trip ---------------------------------
+
+    let rich = RunStepDetailRecord {
+        run_id: "r2".to_string(),
+        step_seq: 0,
+        at_millis: 99,
+        detail: TurnStepDetail {
+            reasoning: Some("why".to_string()),
+            arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+            output: Some("a\nb\n".to_string()),
+            display_detail: Some("listing".to_string()),
+            iteration: Some(3),
+            clipped: true,
+        },
+    };
+    deep.append_step_detail(&alpha, &rich).await.unwrap();
+    assert_eq!(
+        deep.list_step_details(&alpha, "r2").await.unwrap(),
+        vec![rich],
+        "read-back is byte-identical (the export-totality precondition)"
+    );
+
+    // -- purge one run leaves the others -------------------------------------
+
+    let removed = deep.purge_deep_trace(&alpha, Some("r2")).await.unwrap();
+    assert_eq!(removed, 1, "purge reports what it destroyed");
+    assert!(
+        deep.list_step_details(&alpha, "r2")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        deep.list_step_details(&alpha, "r1").await.unwrap().len(),
+        3,
+        "purging one run does not touch another"
+    );
+    assert_eq!(
+        deep.list_step_details(&beta, "r1").await.unwrap().len(),
+        1,
+        "purging alpha does not touch beta"
+    );
+
+    // Purging what is already gone is not an error.
+    assert_eq!(deep.purge_deep_trace(&alpha, Some("r2")).await.unwrap(), 0);
+
+    // -- purge the whole company ---------------------------------------------
+
+    let removed = deep.purge_deep_trace(&alpha, None).await.unwrap();
+    assert_eq!(removed, 3);
+    assert!(
+        deep.list_step_details(&alpha, "r1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        deep.list_step_details(&beta, "r1").await.unwrap().len(),
+        1,
+        "a company-wide purge is still scoped to that company"
+    );
 }

@@ -38,7 +38,16 @@ export function useHashView<T extends string>(
   valid: readonly T[],
   fallback: T,
   rewrite?: (head: string, sub: string | null) => [T, string | null] | null,
-): [T, string | null, (view: T, sub?: string) => void] {
+): [
+  T,
+  string | null,
+  (
+    view: T,
+    sub?: string,
+    /** Query state that belongs to the destination, beside its route. */
+    query?: Readonly<Record<string, string | null>>,
+  ) => void,
+] {
   const resolve = useCallback((): [T, string | null] => {
     const [head, sub] = readSegments();
     const rewritten = rewrite?.(head ?? "", sub ?? null);
@@ -94,10 +103,23 @@ export function useHashView<T extends string>(
   // The host scope rides along; every other query key is dropped, which is what
   // `useHashFlag`'s flags want — `?new` belongs to the screen it was opened
   // over, not to the one being navigated to.
-  const navigate = useCallback((next: T, nextSub?: string) => {
+  const navigate = useCallback((next: T, nextSub?: string, query?: Readonly<Record<string, string | null>>) => {
     const path = nextSub ? `${next}/${nextSub}` : next;
-    if (readSegments().join("/") !== path) {
-      window.location.hash = withHostParam(path).slice(1);
+    const nextHash = withHostParam(path, query);
+    // A navigation without an explicit query changes only the route. Preserve
+    // query state when the destination path is unchanged so durable link state
+    // (for example, a focused workflow run) remains represented by the URL.
+    const currentPath = window.location.hash.split("?")[0];
+    const nextPath = nextHash.split("?")[0];
+    const currentQuery = window.location.hash.includes("?")
+      ? window.location.hash.slice(window.location.hash.indexOf("?") + 1)
+      : "";
+    const destinationHash =
+      query === undefined && currentPath === nextPath && currentQuery
+        ? `${nextPath}?${currentQuery}`
+        : nextHash;
+    if (window.location.hash !== destinationHash) {
+      window.location.hash = destinationHash;
     }
     setRoute([next, nextSub ?? null]);
   }, []);

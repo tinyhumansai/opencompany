@@ -100,8 +100,13 @@ struct AgentFile {
     /// otherwise.
     #[serde(default)]
     model: Option<String>,
+    /// Carried verbatim onto [`Agent::tools`](crate::company::Agent::tools),
+    /// whose three-state contract (issue #1804) this mirrors: an absent `tools`
+    /// key parses to `None` (inherit the standard grant — every `agents/*.toml`
+    /// written before #1804), `tools = []` to `Some(vec![])` (explicit deny-all),
+    /// and `tools = [globs]` to `Some(globs)` (narrow).
     #[serde(default)]
-    tools: Vec<String>,
+    tools: Option<Vec<String>>,
     #[serde(default)]
     delegates_to: Vec<String>,
     #[serde(default)]
@@ -555,7 +560,10 @@ classes = ["judge", "evidence"]
         let agent = load_agents(dir.path()).expect("loads").remove(0);
         assert_eq!(agent.id, "critic");
         assert_eq!(agent.tier.as_deref(), Some("reasoning"));
-        assert_eq!(agent.tools, ["docs.*", "mcp:notion"]);
+        assert_eq!(
+            agent.tools,
+            Some(vec!["docs.*".to_string(), "mcp:notion".to_string()])
+        );
         assert_eq!(agent.delegates_to, ["research"]);
         assert_eq!(agent.budget_usd_daily, Some(5.0));
         assert_eq!(

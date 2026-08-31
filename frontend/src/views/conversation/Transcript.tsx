@@ -11,7 +11,7 @@
 // {@link ConversationLine} riding in `metadata.custom` says what to draw.
 
 import { useCallback, type ReactNode } from "react";
-import { ArrowDown, ArrowUp } from "lucide-react";
+import { ArrowDown, ArrowUp, TriangleAlert } from "lucide-react";
 import { AuiIf, ComposerPrimitive, ThreadPrimitive } from "@assistant-ui/react";
 
 import type { TurnStep } from "@/api/types";
@@ -47,6 +47,13 @@ interface Props {
   liveSteps?: TurnStep[];
   /** The in-flight steer strip, rendered between transcript and composer. */
   footer?: ReactNode;
+  /**
+   * The active thread is the durable Operator system channel (issue #1757):
+   * a read-only feed the server refuses to post to. Disables the composer
+   * the same way `ChatView`'s does, rather than letting the operator type
+   * and submit before the server's read-only guard finally refuses it.
+   */
+  readOnly?: boolean;
 }
 
 export function Transcript({
@@ -59,6 +66,7 @@ export function Transcript({
   openTurn,
   liveSteps,
   footer,
+  readOnly,
 }: Props) {
   const working = sending || !!openTurn;
 
@@ -129,6 +137,20 @@ export function Transcript({
 
       {footer}
 
+      {readOnly && (
+        <p
+          role="status"
+          className="flex shrink-0 items-center gap-1.5 border-t bg-muted/50 px-3 py-1.5 text-xs text-muted-foreground"
+        >
+          <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0">
+            The <span className="font-medium text-foreground">Operator</span> channel is a
+            read-only feed of workflow reports and notifications — a scannable “what happened”
+            view. There is nothing to reply to here.
+          </span>
+        </p>
+      )}
+
       <div className="border-t bg-background/80 backdrop-blur">
         <div className="mx-auto w-full max-w-3xl px-4 py-3">
           <ComposerPrimitive.Root
@@ -136,8 +158,9 @@ export function Transcript({
             className="relative flex items-end gap-2 rounded-xl border bg-card p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/50"
           >
             <ComposerPrimitive.Input
-              placeholder={`Message ${contact.name}…`}
+              placeholder={readOnly ? "This channel is read-only" : `Message ${contact.name}…`}
               rows={1}
+              disabled={readOnly}
               className={cn(
                 "max-h-40 min-h-9 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm shadow-none outline-none",
                 "placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
@@ -145,7 +168,20 @@ export function Transcript({
             />
             <ComposerPrimitive.Send
               render={
-                <Button size="icon" className="size-9 shrink-0 rounded-lg" aria-label="Send">
+                // `disabled` is spread in only when `readOnly` — the Radix Slot
+                // merge this `render` prop goes through lets an explicitly-set
+                // child prop win over the primitive's own computed `disabled`
+                // (empty composer / thread running), so an unconditional
+                // `disabled={readOnly}` would pin the button permanently
+                // enabled on every ordinary thread, where `readOnly` is
+                // `undefined`/`false`. Omitting the key when not read-only
+                // leaves the primitive's own disable logic in charge.
+                <Button
+                  size="icon"
+                  className="size-9 shrink-0 rounded-lg"
+                  aria-label="Send"
+                  {...(readOnly ? { disabled: true } : {})}
+                >
                   <ArrowUp className="size-4" />
                 </Button>
               }

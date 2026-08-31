@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use super::workflow_file::WorkflowNodeKind;
 use super::{
     CompanyManifest, Tools, grants_chargebee_explicit, grants_composio_explicit,
-    grants_media_explicit, grants_paypal_explicit, grants_search_explicit, load_dir_ledgers,
-    load_dir_skills, parse_workflow, walk_workspace,
+    grants_media_explicit, grants_paypal_explicit, grants_search_explicit,
+    grants_workspace_write_explicit, load_dir_ledgers, load_dir_skills, parse_workflow,
+    walk_workspace,
 };
-use crate::runtime::builder::effective_grants;
+use crate::runtime::builder::{agent_scoped_grants, effective_grants};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -102,16 +103,28 @@ fn every_company_skill_and_workspace_parses() {
 /// Whether a template belongs here is therefore a judgement about its charter —
 /// research, editorial, marketing, legal, product engineering — recorded here
 /// because it cannot be derived from content.
-const SEARCH_GRANTED_COMPANIES: [&str; 9] = [
+const SEARCH_GRANTED_COMPANIES: [&str; 21] = [
+    "agentic_accounting_firm",
     "agentic_consultation_firm",
+    "agentic_customer_support",
     "agentic_design_studio",
+    "agentic_enterprise_sales",
+    "agentic_game_business",
+    "agentic_game_studio",
+    "agentic_influencer_business",
     "agentic_law_firm",
     "agentic_marketing_agency",
     "agentic_media_company",
+    "agentic_pharma_startup",
     "agentic_product_team",
+    "agentic_realestate_company",
+    "agentic_recruiting_company",
     "agentic_research_lab",
     "agentic_software_company",
+    "agentic_venture_capital",
+    "agentic_venture_studio",
     "signals_opportunity_studio",
+    "startup_accelerator",
 ];
 
 /// Templates that must NEVER reach the metered search backend: `e2e_harness` and
@@ -134,6 +147,15 @@ const SEARCH_DENIED_COMPANIES: [&str; 4] = [
 /// path — nobody has decided their roster needs the web. Moving one into
 /// [`SEARCH_GRANTED_COMPANIES`] is an ordinary product call, not a violation.
 ///
+/// **Empty, and kept anyway.** `search` is in the global `default_allow` now,
+/// so a company that declares no `[tools]` section inherits it: the twelve
+/// templates that used to sit here were never *deciding* against search, they
+/// had simply never been edited, and their agents reported the tool as not
+/// enabled. They moved to the granted list unchanged. The bucket stays because
+/// the partition is the mechanism — the next template that genuinely wants to
+/// leave search off, without the hermetic-fixture argument that puts a company
+/// in [`SEARCH_DENIED_COMPANIES`], is declared here.
+///
 /// This list exists so the posture is a *partition* rather than an allow-list.
 /// An allow-list asserts a decision someone remembered, so it cannot notice a
 /// company nobody remembered: `agentic_software_company` shipped with nine
@@ -141,20 +163,7 @@ const SEARCH_DENIED_COMPANIES: [&str; 4] = [
 /// [`every_company_declares_a_search_posture`] asserts this list plus the other
 /// two covers `companies/` exactly, so a new template fails CI until whoever
 /// adds it writes the decision down here.
-const SEARCH_UNGRANTED_COMPANIES: [&str; 12] = [
-    "agentic_accounting_firm",
-    "agentic_customer_support",
-    "agentic_enterprise_sales",
-    "agentic_game_business",
-    "agentic_game_studio",
-    "agentic_influencer_business",
-    "agentic_pharma_startup",
-    "agentic_realestate_company",
-    "agentic_recruiting_company",
-    "agentic_venture_capital",
-    "agentic_venture_studio",
-    "startup_accelerator",
-];
+const SEARCH_UNGRANTED_COMPANIES: [&str; 0] = [];
 
 /// The subset of [`SEARCH_GRANTED_COMPANIES`] that restates the default belt
 /// verbatim and appends `search`. `signals_opportunity_studio` is deliberately
@@ -165,13 +174,20 @@ const SEARCH_UNGRANTED_COMPANIES: [&str; 12] = [
 /// are opt-in spend. `agentic_product_team` is excluded on that same
 /// research-lab argument: it produces documents and ledger rows, so it drops
 /// both opt-in namespaces too.
-const FULL_BELT_PLUS_SEARCH: [&str; 6] = [
+const FULL_BELT_PLUS_SEARCH: [&str; 8] = [
+    // Both restate the belt verbatim and append `chargebee` (#788) rather than
+    // `search`, which is already inherited. They belong here for the property
+    // this list actually guards — that an extended `allow` did not silently
+    // drop an inherited entry — which is independent of *which* namespace the
+    // template extended it with.
+    "agentic_accounting_firm",
     "agentic_consultation_firm",
     "agentic_design_studio",
     "agentic_law_firm",
     "agentic_marketing_agency",
     "agentic_media_company",
     "agentic_software_company",
+    "agentic_venture_studio",
 ];
 
 fn load_company(name: &str) -> CompanyManifest {
@@ -358,19 +374,27 @@ fn every_company_declares_a_search_posture() {
 }
 
 /// The footgun this suite exists to catch: `[tools].allow` **replaces** the
-/// default (`["*", "media", "composio"]`), it never extends it. A reviewer
-/// "simplifying" a grant to `allow = ["search"]` would silently strip
-/// files/docs/shell/code/web/subagent, `media` and `composio` from every agent
-/// in the company — no parse error, no warning, just a company that quietly
-/// lost its tool belt. This asserts both halves: the shipped form keeps the
-/// inherited entries, and the reduced form provably loses them.
+/// default (`globals/globals.toml`'s `default_allow`), it never extends it. A
+/// reviewer "simplifying" a grant to `allow = ["search"]` would silently strip
+/// files/docs/shell/code/web/subagent, workspace writes, `media`, `composio`
+/// and the MCP grants from every agent in the company — no parse error, no
+/// warning, just a company that quietly lost its tool belt. This asserts both
+/// halves: the shipped form keeps the inherited entries, and the reduced form
+/// provably loses them.
+///
+/// It used to open by asserting the default belt was search-free, which is no
+/// longer true — `search` ships in `default_allow`, so these templates now
+/// restate the default rather than restating-and-extending it. The invariant
+/// that mattered survives the change untouched: whatever the default carries,
+/// a template that writes its own `allow` must carry all of it.
 #[test]
 fn granting_search_never_strips_the_inherited_default_belt() {
     let default_allow = Tools::default().allow;
     assert!(
-        !grants_search_explicit(&default_allow),
-        "the default belt is expected to stay search-free (opt-in per #238); \
-         if that changed, these templates no longer need to restate it"
+        grants_search_explicit(&default_allow),
+        "`search` is expected to ship in the default belt now; if it was made \
+         opt-in again, these templates have to restate-and-extend once more \
+         and this test's premise needs rewriting rather than deleting"
     );
 
     for name in FULL_BELT_PLUS_SEARCH {
@@ -419,6 +443,123 @@ fn a_wildcard_never_confers_a_billing_namespace() {
     ] {
         assert!(!grants_chargebee_explicit(&grants), "{grants:?}");
         assert!(!grants_paypal_explicit(&grants), "{grants:?}");
+    }
+}
+
+/// Issue #788 follow-up, raised in review of the template ceilings: narrowing
+/// the *manifest* teammates does not protect a teammate an operator adds at
+/// runtime. `POST …/team` with no `tools` and no `focus` stores an empty grant,
+/// and empty means "the standard company-wide grant" — which, on a company that
+/// carries `chargebee`, silently included billing.
+#[test]
+fn a_teammate_created_with_no_grant_never_inherits_billing() {
+    use super::{CreationGrant, creation_default_grants};
+
+    let narrowed = |allow: &[String]| match creation_default_grants(allow) {
+        CreationGrant::Narrowed(list) => list,
+        other => panic!("expected a narrowed line for {allow:?}, got {other:?}"),
+    };
+
+    // The overwhelming majority: nothing withheld, so the inherit-everything
+    // contract is untouched and the stored teammate stays empty.
+    let plain = Tools::default().allow;
+    assert_eq!(
+        creation_default_grants(&plain),
+        CreationGrant::Standard,
+        "a company granting no BYO money namespace must keep `empty = standard`"
+    );
+
+    // The degenerate belt: filtering removes everything, and an empty line
+    // would read back as "inherit the whole company grant" — handing over the
+    // exact namespace the filter just removed. It must be refusable instead.
+    for only_money in [
+        vec!["chargebee"],
+        vec!["paypal"],
+        vec!["chargebee", "paypal", "hosting"],
+    ] {
+        let allow: Vec<String> = only_money.iter().map(|g| (*g).to_string()).collect();
+        assert_eq!(
+            creation_default_grants(&allow),
+            CreationGrant::NothingLeft,
+            "an all-withheld belt must not decode as inheritance: {allow:?}"
+        );
+    }
+
+    // A company that named `chargebee` for one teammate does not hand it to the
+    // next one somebody types into the console.
+    let mut billing = plain.clone();
+    billing.push("chargebee".to_string());
+    let defaulted = narrowed(&billing);
+    assert!(
+        !grants_chargebee_explicit(&defaulted),
+        "a new teammate must not inherit `chargebee`: {defaulted:?}"
+    );
+    // ...and loses nothing else on the way.
+    for inherited in &plain {
+        assert!(
+            defaulted.contains(inherited),
+            "withholding billing dropped the inherited `{inherited}`: {defaulted:?}"
+        );
+    }
+
+    // The same for the other two namespaces `*` refuses to confer.
+    for money in ["paypal", "hosting"] {
+        let mut allow = plain.clone();
+        allow.push(money.to_string());
+        let defaulted = narrowed(&allow);
+        assert!(
+            !defaulted.iter().any(|g| g == money),
+            "a new teammate must not inherit `{money}`: {defaulted:?}"
+        );
+    }
+
+    // `media`/`composio`/`search` ship in the default belt (#1674) and are NOT
+    // withheld — doing so would re-create that issue's complaint for every new
+    // teammate.
+    let defaulted = narrowed(&billing);
+    assert!(grants_media_explicit(&defaulted), "{defaulted:?}");
+    assert!(grants_composio_explicit(&defaulted), "{defaulted:?}");
+    assert!(grants_search_explicit(&defaulted), "{defaulted:?}");
+}
+
+/// The second half of the same hole: a teammate MINTED by an orchestrator whose
+/// own scope comes from its desk rather than its `tools` line. The minter copies
+/// its (empty) line, the new teammate is on no desk, and an empty line reads
+/// back as the whole company grant — so it would hold billing its own minter
+/// does not. Pinned as a data property of the shipped templates: no marketing
+/// teammate may be in a position to mint a biller by accident.
+#[test]
+fn a_deskless_teammate_minted_with_no_scope_never_inherits_billing() {
+    use super::{CreationGrant, creation_default_grants};
+
+    for company in [
+        "agentic_marketing_agency",
+        "agentic_accounting_firm",
+        "agentic_venture_studio",
+        "agentic_software_company",
+    ] {
+        let manifest = load_company(company);
+        // The state that makes the escalation reachable: a minter scoped only by
+        // its desk has an absent (`None`) `tools` line, so "copy the minter's
+        // line" stores an inherit grant on a teammate that sits on no desk.
+        let deskless = agent_scoped_grants(&manifest.tools.allow, &[], None);
+        assert!(
+            grants_chargebee_explicit(&deskless),
+            "{company}: precondition — an absent line on no desk must resolve to \
+             the company ceiling, or this test proves nothing"
+        );
+
+        // What both creation paths now store instead.
+        match creation_default_grants(&manifest.tools.allow) {
+            CreationGrant::Narrowed(narrowed) => {
+                let resolved = agent_scoped_grants(&manifest.tools.allow, &[], Some(&narrowed));
+                assert!(
+                    !grants_chargebee_explicit(&resolved),
+                    "{company}: a minted teammate must not inherit billing: {resolved:?}"
+                );
+            }
+            other => panic!("{company}: expected a narrowed creation grant, got {other:?}"),
+        }
     }
 }
 
@@ -614,6 +755,277 @@ fn the_marketing_campaign_preset_is_runnable() {
     assert_eq!(node("publish").config["agent_ref"], "copywriter");
 }
 
+/// The marketing agency's creative desk ceiling must not strip the company's
+/// workspace-write grant.
+///
+/// The desk states `["*", "workspace.write"]`, and the `*` half deliberately
+/// confers no workspace writes — [`grants_workspace_write_explicit`] matches
+/// only the bare `workspace` or the exact `workspace.write` token — so the
+/// write token has to be restated in the ceiling for the desk's agents to hold
+/// it. Their own AGENTS.md promises the `agents/<id>/` folder is always
+/// writable, and `agent_scoped_grants` would silently strip that promise with
+/// a `["*"]`-only ceiling. Pinned through the *three-level* narrowing (the
+/// `effective_grants` the search-posture tests use ignores desks, which is
+/// precisely how this gap shipped) so a future edit cannot quietly reintroduce
+/// the stripping.
+#[test]
+fn a_restricting_desk_does_not_strip_the_workspace_write_token() {
+    let manifest = load_company("agentic_marketing_agency");
+    let creative = manifest
+        .group_chats
+        .iter()
+        .find(|chat| chat.id == "creative")
+        .expect("the marketing agency declares the creative desk");
+    assert!(
+        !creative.tools.is_empty(),
+        "the creative desk must state a ceiling or this test asserts nothing"
+    );
+
+    for id in ["creative_director", "copywriter", "landing_page_builder"] {
+        let agent = manifest
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .unwrap_or_else(|| panic!("{id} is a member of the creative desk"));
+        let desk_refs: Vec<&[String]> = manifest
+            .group_chats
+            .iter()
+            .filter(|chat| chat.members.iter().any(|member| member == id))
+            .map(|chat| chat.tools.as_slice())
+            .collect();
+        let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, agent.tools.as_deref());
+
+        assert!(
+            grants_workspace_write_explicit(&grants),
+            "{id}: the creative desk ceiling ({:?}) must keep the company's \
+             workspace write grant; effective grants: {grants:?}",
+            creative.tools
+        );
+        // The desk still deliberately withholds the billed / third-party
+        // opt-ins the company grants at the top level.
+        assert!(
+            !grants_search_explicit(&grants),
+            "{id}: the creative desk must stay searchless; effective grants: {grants:?}"
+        );
+        assert!(
+            !grants_media_explicit(&grants),
+            "{id}: the creative desk must stay media-less; effective grants: {grants:?}"
+        );
+        assert!(
+            !grants_composio_explicit(&grants),
+            "{id}: the creative desk must stay composio-less; effective grants: {grants:?}"
+        );
+    }
+}
+
+/// The marketing agency's `chargebee` exclusion lives at the per-agent layer,
+/// not on the strategy/growth desk ceilings, so the console flow the manifest
+/// documents — naming a biller from the console — actually works.
+///
+/// A desk ceiling is manifest-only and cannot be widened from the console, so
+/// an exclusion stated there would make the billing grant unreachable by any
+/// shipped teammate. Pinned through the real three-level narrowing
+/// (`agent_scoped_grants`): a shipped member's own `tools` line excludes
+/// `chargebee`, while the desk level (no ceiling) admits an operator override
+/// that names it.
+#[test]
+fn a_marketing_biller_can_be_named_from_the_console() {
+    let manifest = load_company("agentic_marketing_agency");
+
+    // The desks this PR touched state no ceiling — the exclusion must not live
+    // on an unwidenable layer.
+    for id in ["strategy", "growth"] {
+        let desk = manifest
+            .group_chats
+            .iter()
+            .find(|chat| chat.id == id)
+            .unwrap_or_else(|| panic!("{id} desk"));
+        assert!(
+            desk.tools.is_empty(),
+            "{id}: the `chargebee` exclusion must not live on the desk ceiling \
+             (an unwidenable layer); found {:?}",
+            desk.tools
+        );
+    }
+
+    // Every shipped strategy/growth member holds the belt minus `chargebee`.
+    for id in [
+        "brand_strategist",
+        "seo_specialist",
+        "analytics_analyst",
+        "paid_ads_manager",
+        "email_marketer",
+    ] {
+        let agent = manifest
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .unwrap_or_else(|| panic!("{id} is a marketing teammate"));
+        let desk_refs: Vec<&[String]> = manifest
+            .group_chats
+            .iter()
+            .filter(|chat| chat.members.iter().any(|member| member == id))
+            .map(|chat| chat.tools.as_slice())
+            .collect();
+        let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, agent.tools.as_deref());
+        assert!(
+            !grants_chargebee_explicit(&grants),
+            "{id}: a shipped marketing teammate must not hold billing tools; \
+             effective grants: {grants:?}"
+        );
+    }
+
+    // An operator naming the biller from the console — adding `chargebee` to a
+    // strategy member's override — now survives the desk level.
+    let brand = manifest
+        .agents
+        .iter()
+        .find(|agent| agent.id == "brand_strategist")
+        .unwrap();
+    let mut override_tools = brand.tools.clone().unwrap_or_default();
+    override_tools.push("chargebee".to_string());
+    let strategy = manifest
+        .group_chats
+        .iter()
+        .find(|chat| chat.id == "strategy")
+        .unwrap();
+    let desk_refs: Vec<&[String]> = vec![strategy.tools.as_slice()];
+    let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, Some(&override_tools));
+    assert!(
+        grants_chargebee_explicit(&grants),
+        "the console override naming the biller must survive the desk layer; \
+         effective grants: {grants:?}"
+    );
+}
+
+/// The software company ships the billing ceiling and nobody holding it.
+///
+/// The template had no `chargebee` at all until #1854, which made the
+/// capability unreachable rather than withheld: `[tools].allow` has no runtime
+/// write path, so a company booted from this bundle could store a Chargebee key
+/// and have it reach no teammate, with nothing in the console able to fix it.
+///
+/// Granting it needed every agent to state a belt first. All nine omitted their
+/// `tools` line, and an omitted line inherits the WHOLE company grant — so the
+/// one-line version of this change would have handed billing to the QA engineer
+/// and the docs writer rather than to nobody. This pins both halves: the
+/// ceiling exists, and no shipped teammate resolves to holding it.
+#[test]
+fn the_software_company_ships_billing_that_reaches_nobody_yet() {
+    let manifest = load_company("agentic_software_company");
+
+    assert!(
+        grants_chargebee_explicit(&manifest.tools.allow),
+        "the ceiling must exist, or an operator has no way to name a biller: {:?}",
+        manifest.tools.allow
+    );
+
+    // The exclusion must not live on a desk: desk ceilings are manifest-only,
+    // so an exclusion there could never be widened from the console — which
+    // would make the ceiling above decorative.
+    for chat in &manifest.group_chats {
+        assert!(
+            chat.tools.is_empty(),
+            "{}: the `chargebee` exclusion must not live on the desk ceiling              (an unwidenable layer); found {:?}",
+            chat.id,
+            chat.tools
+        );
+    }
+
+    for agent in &manifest.agents {
+        let desk_refs: Vec<&[String]> = manifest
+            .group_chats
+            .iter()
+            .filter(|chat| chat.members.contains(&agent.id))
+            .map(|chat| chat.tools.as_slice())
+            .collect();
+        let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, agent.tools.as_deref());
+        assert!(
+            !grants_chargebee_explicit(&grants),
+            "{}: a shipped teammate must not hold billing tools; effective              grants: {grants:?}",
+            agent.id
+        );
+    }
+
+    // …and naming one from the console reaches the tools, which is the whole
+    // point of the ceiling being there.
+    let support = manifest
+        .agents
+        .iter()
+        .find(|agent| agent.id == "customer_support")
+        .expect("customer_support is on this roster");
+    let mut named = support.tools.clone().unwrap_or_default();
+    named.push("chargebee".to_string());
+    let desk_refs: Vec<&[String]> = manifest
+        .group_chats
+        .iter()
+        .filter(|chat| {
+            chat.members
+                .iter()
+                .any(|member| member == "customer_support")
+        })
+        .map(|chat| chat.tools.as_slice())
+        .collect();
+    let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, Some(&named));
+    assert!(
+        grants_chargebee_explicit(&grants),
+        "an operator naming the biller from the console must reach billing; \
+         effective grants: {grants:?}"
+    );
+}
+
+/// A creative member cross-seated onto an unrestricted desk must not widen to
+/// the company grant.
+///
+/// Desks combine by **union**, and a member scoped only by the creative desk
+/// ceiling would resolve to the full company grant — billing included — the
+/// moment an operator seats them on the strategy or growth desk, which state
+/// no ceiling. The `chargebee` exclusion must therefore ride on the member's
+/// own `tools` line (the company belt minus `chargebee`), not on the desk
+/// alone. Pinned through the same three-level narrowing the roster build uses.
+#[test]
+fn a_creative_member_cross_seated_on_an_unrestricted_desk_stays_billing_less() {
+    let manifest = load_company("agentic_marketing_agency");
+    let strategy = manifest
+        .group_chats
+        .iter()
+        .find(|chat| chat.id == "strategy")
+        .unwrap();
+    assert!(
+        strategy.tools.is_empty(),
+        "precondition: the strategy desk must be unrestricted or this test \
+         proves nothing"
+    );
+    let creative = manifest
+        .group_chats
+        .iter()
+        .find(|chat| chat.id == "creative")
+        .unwrap();
+
+    for id in ["creative_director", "copywriter", "landing_page_builder"] {
+        let agent = manifest
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .unwrap_or_else(|| panic!("{id} is a member of the creative desk"));
+        assert!(
+            agent.tools.as_deref().is_some_and(|t| !t.is_empty()),
+            "{id}: the `chargebee` exclusion must ride on the member's own \
+             `tools` line, not only on the creative desk ceiling"
+        );
+
+        // Seated on the creative desk AND the unrestricted strategy desk: the
+        // union would otherwise be the company grant.
+        let desk_refs: Vec<&[String]> = vec![creative.tools.as_slice(), strategy.tools.as_slice()];
+        let grants = agent_scoped_grants(&manifest.tools.allow, &desk_refs, agent.tools.as_deref());
+        assert!(
+            !grants_chargebee_explicit(&grants),
+            "{id}: cross-seating a creative member onto an unrestricted desk \
+             must not hand back billing; effective grants: {grants:?}"
+        );
+    }
+}
+
 /// Every seeded `output` node names a destination its own manifest can resolve,
 /// except the research lab, which deliberately proves that workflows can
 /// coordinate without desks (issue #963).
@@ -688,10 +1100,10 @@ fn every_seeded_output_destination_resolves_against_its_own_manifest() {
                 with_destination += 1;
                 assert_eq!(
                     destination.kind, "channel",
-                    "{label} uses destination kind `{}`. `owner` reports \
-                     Failed/OwnerFallbackFailed on a tenant with no mailbox — every freshly \
-                     provisioned one — and `email` would hardcode a recipient into a \
-                     shipped template.",
+                    "{label} uses destination kind `{}`. A seeded template routes to a real \
+                     desk channel: `owner` on a no-mailbox tenant now lands on the operator \
+                     channel (issue #1757) rather than the desk a template means to post in, \
+                     and `email` would hardcode a recipient into a shipped template.",
                     destination.kind
                 );
                 let target = destination.target.as_deref().unwrap_or("");

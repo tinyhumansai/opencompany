@@ -109,6 +109,11 @@ function makeClient(rows: WorkflowSummary[] = ROWS) {
       const id = path.match(/\/workflows\/([^/?]+)/)?.[1];
       if (id) deletes.push(decodeURIComponent(id));
     },
+    // Issue #1845: the week-1 nudge banner polls this on mount; an empty
+    // feed keeps it a no-op for every test in this file, which is not about
+    // the nudge.
+    notifications: async () => ({ notifications: [], unread: 0 }),
+    markNotificationsRead: async () => ({ unread: 0 }),
   } as unknown as OpenCompanyClient;
   return { client, graphGets, deletes };
 }
@@ -245,7 +250,7 @@ describe("leaving a workflow behind", () => {
   // rather than on the back button: the one nobody remembers to update is the
   // delete, and it is the one that leaves the drawer open the longest.
   for (const route of ["the back button", "a delete"] as const) {
-    it(`closes the per-workflow drawers on ${route}, so the next one does not inherit them`, async () => {
+    it(`closes the per-workflow drawers on ${route}, then opens both defaults for the next selection`, async () => {
       const { client } = makeClient();
       await mountAt("#/workflows/alpha", client);
 
@@ -274,15 +279,19 @@ describe("leaving a workflow behind", () => {
       }
 
       expect(container.querySelector('[data-testid="workflow-index"]')).not.toBeNull();
+      expect(container.querySelector('[data-testid="workflow-run-history"]')).toBeNull();
+      expect(container.querySelector('[data-testid="workflow-copilot"]')).toBeNull();
+
       await act(async () => {
         cards()[route === "the back button" ? 1 : 0].click();
       });
 
       expect(detailName()).toBe("Beta report");
-      // `beta`'s history panel was never asked for. Left open across the index
-      // it would come up over a workflow the operator has only just opened,
-      // showing that workflow's runs under a drawer they opened for another.
-      expect(container.querySelector('[data-testid="workflow-run-history"]')).toBeNull();
+      // The old workflow's drawers did close on the index. Opening a workflow
+      // from that index is a new request, and #1683 deliberately starts both
+      // panes for the newly selected workflow.
+      expect(container.querySelector('[data-testid="workflow-run-history"]')).not.toBeNull();
+      expect(container.querySelector('[data-testid="workflow-copilot"]')).not.toBeNull();
     });
   }
 

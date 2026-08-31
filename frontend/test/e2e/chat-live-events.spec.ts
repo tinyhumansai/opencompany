@@ -204,6 +204,11 @@ test("a running turn shows its tool rows in the channel", async ({ page }) => {
       chatId: ENGINEERING.id,
       toolCallId: "t1",
       label: "workspace_list",
+      // What came back. Carried onto the row since ACP turns started
+      // streaming: an ACP tool call has no arguments to derive a `detail`
+      // from and reports only this, so a dropped `result` left its finished
+      // rows saying nothing at all.
+      result: "3 files",
       status: "ok",
       elapsedMs: 120,
     },
@@ -222,6 +227,7 @@ test("a running turn shows its tool rows in the channel", async ({ page }) => {
   // The rows themselves, not a typing dot — and the finished one keeps the
   // elapsed time the frame carried.
   await expect(page.getByText("workspace_list").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("3 files").first()).toBeVisible();
   await expect(page.getByText("workspace_read").first()).toBeVisible();
   await expect(page.getByText("Replying…")).toHaveCount(0);
 

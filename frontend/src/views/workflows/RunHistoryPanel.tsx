@@ -5,17 +5,29 @@
 // further out again, to `run-health.ts`, because the workflow cards need the
 // same reading — see that file's header.
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { Info } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { observatoryHref } from "@/views/observatory/hash";
 import { Button } from "@/components/ui/button";
-import type {
-  DeliveryReport,
-  DeliveryStatus,
-  WorkflowGraph,
-  WorkflowRunNode,
-  WorkflowRunOutcome,
+import {
+  Popover,
+  PopoverContent,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import type { OpenCompanyClient } from "@/api/client";
+import {
+  fetchRunArtifacts,
+  type DeliveryReport,
+  type DeliveryStatus,
+  type RunArtifactRow,
+  type WorkflowGraph,
+  type WorkflowRunNode,
+  type WorkflowRunOutcome,
 } from "@/api/workflows";
+import { artifactHref } from "@/lib/task-output";
 
 import { BlockedNodeApprovals } from "./BlockedNodeApprovals";
 import { failedNodeOf, nodeName } from "./graph";
@@ -46,6 +58,162 @@ const DELIVERY_TONE: Record<DeliveryStatus, string> = {
   failed: "border-status-failed/40 bg-status-failed-soft",
 };
 
+/**
+ * Plain-English definitions for the run statuses this panel surfaces (issue
+ * #1798).
+ *
+ * A run row spells its terminal state in prose, but its at-a-glance signals —
+ * the coloured status dot, the "not delivered" badge, the "parked" badge — are
+ * a private vocabulary an operator cannot act on if they cannot read it. These
+ * one-liners give each its meaning, and they are the ONE source the dot's hover
+ * title, the badge titles and the header legend all read, so the three can
+ * never drift.
+ *
+ * The wording follows the semantics these terms are actually computed from, not
+ * a guess: `not delivered` from {@link isUndelivered}/{@link undeliveredCount}
+ * in `run-health.ts` (a report that will not reach its destination without a
+ * change), `stranded` from {@link isStranded} (paused for an approval no
+ * decision can still move), `blocked` from {@link isBlocked} (a step waiting on
+ * an approval), `stopped` from a cancelled run, `parked` from
+ * {@link liveParkedApprovalCount}. Keyed by the labels {@link runTone} returns
+ * (see `VERDICT_TONE` in `run-health.ts`) so a dot can be looked up directly.
+ */
+const RUN_STATUS_DEFINITIONS = {
+  running: "Still working through its steps — nothing here is final yet.",
+  ok: "Finished, with nothing left undelivered and nobody waiting on you — every report either reached its destination or didn't need to (a dry run, or one an earlier run already delivered).",
+  failed:
+    "The run ended in error — usually a step that failed and the workflow needs a fix, but sometimes nothing in the graph got the chance to run at all, and the error can be a host restart or a capability that failed to build rather than anything wrong with the workflow. Read the error before assuming the workflow needs correcting.",
+  // Codex review on #1821 (eleventh pass): this still asserted "the step
+  // that was mid-flight" as if every stopped run has one. A run cancelled
+  // before it ever reached the graph — `a_run_cancelled_before_it_starts_
+  // does_not_walk_the_graph` in `runner.rs` is exactly this path, and
+  // `RunHistoryPanel`'s own row body already treats an empty `startedNodes`
+  // as its own case — has no mid-flight step to speak of, so the row body's
+  // vacuous "every step that had started completed" holds trivially over
+  // zero steps, but this definite description does not: it names a step
+  // that, for that run, never existed. The trailing sentence states that
+  // case rather than leaving it implied by an empty set.
+  // Codex review on #1821 (thirteenth pass): `WorkflowNodeFinished` is
+  // appended best-effort (`runner.rs`'s progress collector logs a failed
+  // append and lets the run proceed unaffected) — the row body's
+  // `midFlightNode` hedge already treats a missing finish row as inconclusive
+  // rather than as proof a step was cut off. This definition still promised
+  // the mid-flight step's own completion "was recorded", unconditionally —
+  // true only when that node's finish append happened to succeed.
+  stopped:
+    "An operator stopped this run before it finished. A step that was mid-flight when the stop landed normally ran to completion — only a step stuck waiting on an outside call is cut off where it was — though its own completion record can go missing if that journal write silently failed. A run stopped before any step began has no such step at all.",
+  blocked:
+    "A step is waiting on you before the run can go on — usually a card sitting in Approvals, but a call that could not be queued for approval at all leaves nothing there to decide. That isn't always a workflow problem — the approvals queue itself can refuse the write, and no workflow change fixes that.",
+  stranded:
+    "The run paused for an approval, but nothing is waiting on you any more and no decision left can move it. Run it again if you still need it.",
+  "not delivered":
+    "The step ran, but its report never reached its destination and won't without a change.",
+  "awaiting approval":
+    "The run is parked on an approval and needs your decision in Approvals.",
+  parked: "The run filed this into the Approvals queue for you to decide.",
+} satisfies Record<string, string>;
+
+/** CodeRabbit review on PR #1821: `RUN_STATUS_DEFINITIONS` was `Record<string,
+ * string>` and `RUN_STATUS_LEGEND` was `readonly string[]`, so TypeScript
+ * accepted a legend entry with no matching definition, and the legend's own
+ * render site (`RUN_STATUS_DEFINITIONS[term]`, no fallback) had no guard
+ * against one. Deriving the legend's element type from the map's own keys
+ * makes that pairing a compile error instead of a convention — see the
+ * `typecheck:unit` regression test in `workflow-run-status-legend.test.ts`. */
+type RunStatusTerm = keyof typeof RUN_STATUS_DEFINITIONS;
+
+/** The statuses worth a standing key, in the order the legend lists them: the
+ * ones an operator hits without a definition anywhere else on the row.
+ *
+ * Exported so a unit test can assert membership directly against the source
+ * of truth the header legend renders from, rather than opening the tooltip
+ * portal (which mounts to `document.body`, not the render container) to read
+ * it back out of the DOM. */
+export const RUN_STATUS_LEGEND: readonly RunStatusTerm[] = [
+  "blocked",
+  "stranded",
+  "not delivered",
+  "parked",
+  "stopped",
+  "failed",
+];
+
+/** The status hover title for the run dot: its verdict word, plus the one-line
+ * definition when there is one. Falls back to the bare word for a verdict this
+ * map does not name (a host could grow an eighth — see `verdictOf`). */
+function statusDotTitle(label: string): string {
+  // `label` is any tone `verdictOf` returns, not narrowed to `RunStatusTerm` —
+  // that's the whole point of the fallback below — so the lookup is cast back
+  // to the pre-`satisfies` shape rather than widening the map's own type.
+  const def = (RUN_STATUS_DEFINITIONS as Record<string, string | undefined>)[
+    label
+  ];
+  return def ? `${label} — ${def}` : label;
+}
+
+/** The discoverable half of issue #1798: an info affordance in the panel header
+ * whose popover is a short key to the run statuses. The per-badge hover titles
+ * answer "what is THIS one"; this answers "what are all of them" for an
+ * operator who does not know a badge is hoverable.
+ *
+ * Codex review on #1821 (fifth pass): Base UI's `Tooltip.Trigger` only opens
+ * on hover or focus — by design, per Base UI's own split between Tooltip
+ * (glance-only) and Popover (press-activatable, and the one that focuses the
+ * popup itself rather than the virtual keyboard when opened by touch). A tap
+ * satisfies neither, and `closeOnClick` on the tooltip trigger actively
+ * cancels a pending open on click rather than starting one — so on a
+ * touch-only device this affordance, the ONE place the parked/blocked/
+ * stranded/not-delivered definitions previously described as "the panel's
+ * one keyboard- and touch-reachable affordance" (see the "make the parked
+ * badge discoverable" commit), was itself unreachable by touch. `Popover`
+ * opens on press out of the box; `openOnHover` keeps the existing hover
+ * discovery for the mouse case.
+ *
+ * Codex review on #1821 (sixth pass): the heading below used to be a plain
+ * `span`. `Popover.Popup` renders `role="dialog"` and only wires its own
+ * `aria-labelledby` when a `Popover.Title` is present to supply the id — a
+ * bare `span` supplies nothing, so a screen-reader user who opened this
+ * dialog heard an unnamed one. `PopoverTitle` is the primitive's own heading
+ * component for exactly this; using it is what makes the popup register the
+ * id in the first place. */
+function RunStatusLegend() {
+  return (
+    <Popover>
+      {/* Codex review on #1821 (eleventh pass): a bare `<button>` with no
+          padding, height or width sizes itself to its one child — the
+          `size-3.5` icon, ~14×14px — which is fine for a mouse but far below
+          what a touch tap can reliably hit. `icon-xs` is the smallest sized
+          hit-area the button scale already defines (`size-6`, 24×24px) and is
+          the same fix `TaskDetailView`'s redact trigger and the styleguide's
+          own Popover example (`render={<Button ... />}`) already use for an
+          icon-only trigger, rather than inventing a one-off pixel value here. */}
+      <PopoverTrigger
+        openOnHover
+        render={
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="What these run statuses mean"
+            data-testid="workflow-run-legend"
+            className="text-muted-foreground hover:text-foreground"
+          />
+        }
+      >
+        <Info className="size-3.5" aria-hidden="true" />
+      </PopoverTrigger>
+      <PopoverContent className="flex max-h-(--available-height) max-w-xs flex-col items-start gap-1 overflow-y-auto text-left">
+        <PopoverTitle>What these statuses mean</PopoverTitle>
+        {RUN_STATUS_LEGEND.map((term) => (
+          <span key={term} className="block">
+            <span className="font-medium">{term}</span> —{" "}
+            {RUN_STATUS_DEFINITIONS[term]}
+          </span>
+        ))}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 /** The delivery block of the run drawer: one line per attempt to route an
  * output node's report. This is the ONLY place an operator learns a report
  * didn't leave the building — a delivery failure never fails the run. */
@@ -75,6 +243,7 @@ export function DeliveryRows({ deliveries }: { deliveries: DeliveryReport[] }) {
           <Badge
             variant="outline"
             className="h-4 px-1.5 text-3xs font-normal border-status-failed/40 bg-status-failed-soft"
+            title={RUN_STATUS_DEFINITIONS["not delivered"]}
           >
             {undelivered} not delivered
           </Badge>
@@ -160,6 +329,8 @@ export function LastRunChip({ run }: { run: WorkflowRunOutcome }) {
  * operator. These rows come back from the company's journal, so they survive a
  * console reload and a run nobody was watching. */
 export function RunHistoryPanel({
+  client,
+  company,
   runs,
   graph,
   workflowName,
@@ -173,6 +344,15 @@ export function RunHistoryPanel({
   onLoadOlder,
   loadingOlder,
 }: {
+  /**
+   * The host client the lazy per-run "Files associated" fetch reads through
+   * (issue #1684). Optional, like {@link onFixWithCopilot}: when absent the
+   * files affordance is simply not offered — the live view always passes it, so
+   * the omission only happens in focused render tests that assert other rows.
+   */
+  client?: OpenCompanyClient;
+  /** The scoped company for that fetch — `null` for the default scope. */
+  company?: string | null;
   runs: WorkflowRunOutcome[];
   /**
    * The selected workflow's graph, for turning a node id into the name the
@@ -250,6 +430,7 @@ export function RunHistoryPanel({
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
           <span className="text-sm font-medium">Run history</span>
           <Badge variant="secondary">{runs.length}</Badge>
+          <RunStatusLegend />
           {workflowName && (
             <span className="max-w-full truncate text-xs text-muted-foreground">
               {workflowName}
@@ -279,6 +460,8 @@ export function RunHistoryPanel({
             {runs.map((run) => (
               <RunHistoryRow
                 key={run.seq}
+                client={client}
+                company={company}
                 run={run}
                 graph={graph}
                 now={now}
@@ -317,8 +500,14 @@ export function RunHistoryPanel({
  *
  * Clicking it overlays that run's node states on the canvas (issue #371) —
  * which is what makes a scheduled run's failure point visible, the case the
- * live canvas by definition cannot cover because nobody was watching. */
-function RunHistoryRow({
+ * live canvas by definition cannot cover because nobody was watching.
+ *
+ * Exported for {@link RunTraceSheet}, which renders the same row inside the
+ * traces-list transcript sheet — a run must read identically whether it's
+ * opened from a workflow's own history or from the company-wide list. */
+export function RunHistoryRow({
+  client,
+  company,
   run,
   graph,
   now,
@@ -330,6 +519,10 @@ function RunHistoryRow({
   fixDisabled,
   fixReason,
 }: {
+  /** The host client for this row's lazy files fetch (issue #1684), if wired. */
+  client?: OpenCompanyClient;
+  /** The scoped company for that fetch. */
+  company?: string | null;
   run: WorkflowRunOutcome;
   /** The selected workflow's graph, for node ids → names (issue #1007). */
   graph: WorkflowGraph | null;
@@ -376,7 +569,42 @@ function RunHistoryRow({
   // itself failed or the excess was dropped past the per-turn cap. Strictly
   // worse than a parked one — there is no card to click.
   const unparkable = blocked.reduce((n, b) => n + (b.unparkable ?? 0), 0);
+  // Codex review on #1821 (twelfth pass): `unparkable` sums two outcomes
+  // (`caps/mod.rs`'s `park_gated_calls`) that are NOT the same failure —
+  // `discarded` (this run's turn asked for more gated calls than one batch
+  // may raise, so the excess was dropped before the queue ever saw it —
+  // `MAX_APPROVAL_REQUESTS_PER_TURN`) and `parkFailed` (the queue itself
+  // refused the write, or this runtime has none wired). Only `run.approvals`
+  // — never `WorkflowBlockedNode.unparkable`, which the sum above reads —
+  // keeps the two apart, via `outcome`. The closing remedy sentence below
+  // named "the approvals queue itself may have refused it" as the cause for
+  // BOTH, which is wrong for a discarded call: it was never offered to the
+  // queue at all.
+  const runApprovals = run.approvals ?? [];
+  const discardedCalls = runApprovals.filter((a) => a.outcome === "discarded").length;
+  const parkFailedCalls = runApprovals.filter((a) => a.outcome === "parkFailed").length;
   const failedNode = failedNodeOf(run);
+  // Codex review on #1821 (eighth pass): `RunCancel` stops a run at the next
+  // node boundary — the node already executing normally finishes and is
+  // journaled, per the legend definition's own hedge ("only a step stuck
+  // waiting on an outside call is cut off where it was"). `startedNodes`
+  // names what the run was standing on; a settled run pairs every entry with
+  // a `nodes` finish row UNLESS that node is the one the stop actually cut
+  // off mid-flight (see `startedNodes`'s own doc comment in `api/workflows.ts`).
+  //
+  // Codex review on #1821 (ninth pass): `startedNodes`'s own doc comment says
+  // "absent must read as 'no start trail', never as 'nothing started'" — a
+  // host predating #1010/#382 sends nothing at all, which the `?? []`
+  // fallback below used to fold into "no node was mid-flight", so a
+  // cancelled run from that host always rendered the completed-cleanly
+  // sentence even though the run's actual boundary is unrecorded and
+  // unknowable. `knowsStartTrail` keeps that distinction: known-absent
+  // trail (`[]`, nothing had started) and unknown trail (`undefined`) are
+  // not the same fact.
+  const knowsStartTrail = run.startedNodes !== undefined;
+  const midFlightNode = (run.startedNodes ?? []).find(
+    (nodeId) => !nodes.some((n) => n.nodeId === nodeId),
+  );
   const errorMessage = run.error ? stripEnginePrefixes(run.error) : null;
   const duration = runDuration(run, now);
   // Completed, quiet runs are the common case. They need enough separation to
@@ -406,11 +634,41 @@ function RunHistoryRow({
       data-testid="workflow-run-row"
     >
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className={`size-1.5 rounded-full ${tone.dot}`} />
+        {/* Issue #1798: the run's verdict is otherwise a colour with no word.
+            Its hover title names the state and defines it — the same one-liner
+            the header legend lists — so the dot stops being a signal only a
+            reader who already knows the palette can act on. `title` alone is a
+            mouse-only affordance (Codex review on #1821, fifth pass): a
+            non-focusable, unlabelled span gives keyboard, touch and
+            screen-reader users nothing, since the header legend defines the
+            terms but never says which one applies to THIS row. `role="img"` +
+            `aria-label` puts the same one-liner in the accessibility tree, the
+            way any other status icon this console labels. */}
+        <span
+          className={`size-1.5 rounded-full ${tone.dot}`}
+          data-testid="workflow-run-status-dot"
+          title={statusDotTitle(tone.label)}
+          role="img"
+          aria-label={statusDotTitle(tone.label)}
+        />
         {run.scheduled && (
           <Badge variant="outline" className="h-4 px-1.5 text-3xs font-normal">
             scheduled
           </Badge>
+        )}
+        {/* The bridge to the Observatory: this panel says what each NODE did,
+            and that view says what each node's AGENT did — the steps, the tool
+            calls, the reasoning. Rendered only when the row carries a run id,
+            since a row journaled before #371 has none to address. */}
+        {run.runId && (
+          <a
+            href={observatoryHref(run.runId)}
+            className="text-2xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            data-testid="workflow-run-inspect"
+            onClick={(event) => event.stopPropagation()}
+          >
+            Inspect
+          </a>
         )}
         <span
           className="text-2xs text-muted-foreground"
@@ -440,6 +698,7 @@ function RunHistoryRow({
             variant="outline"
             className="h-4 px-1.5 text-3xs font-normal border-status-blocked/40 bg-status-blocked-soft"
             data-testid="workflow-run-parked"
+            title={RUN_STATUS_DEFINITIONS.parked}
           >
             parked {parked} approval{parked === 1 ? "" : "s"}
           </Badge>
@@ -523,7 +782,52 @@ function RunHistoryRow({
                 : `This run failed: ${errorMessage}`}
             </p>
             <p className="mt-1 text-2xs text-muted-foreground">
-              Review the error details, then correct the workflow and run it again.
+              {failedNode
+                ? "Review the error details, then correct the workflow and run it again."
+                : nodes.length > 0
+                  ? // Codex review on #1821 (ninth pass): `failedNode` null does
+                    // NOT mean nothing ran — a host restart can interrupt a run
+                    // after one or more nodes already completed, and none of
+                    // those finish rows carries an error (the synthetic outcome
+                    // the boot sweep writes belongs to no node). `nodes.length`
+                    // is the same signal `failureLocation` in `graph.ts` already
+                    // branches on for this exact case; this sentence collapsed
+                    // it into "nothing in the graph got the chance to run",
+                    // which is only true when `nodes` is empty too.
+                    //
+                    // Codex review on #1821 (tenth pass): `WorkflowNodeFinished`
+                    // is appended best-effort (`runner.rs`'s progress collector
+                    // — a failed append is `warn!`-logged and the run proceeds
+                    // unaffected), so a missing finish row is NOT proof the
+                    // node behind it never failed; the append for the actual
+                    // culprit can silently drop while `run.error` still lands.
+                    // Naming a specific alternate cause ("host or capability
+                    // problem") overclaimed what an absent row can prove — this
+                    // now says only that the record may be incomplete, the same
+                    // epistemic stance the legend definition above already
+                    // takes ("Read the error before assuming the workflow needs
+                    // correcting").
+                    `Review the error details — ${nodes.length} step${nodes.length === 1 ? "" : "s"} completed before this run ended. What actually went wrong may not be fully recorded here, so read the error before deciding whether the workflow needs a fix.`
+                  : // Codex review on #1821 (eighth pass): `failedNode` is null in
+                    // exactly the cases the legend definition above already hedges
+                    // on — a host restart, a capability that failed to build, or a
+                    // graph that would not compile — none of which a workflow edit
+                    // fixes. This sentence still said "correct the workflow"
+                    // unconditionally, contradicting the definition two rounds ago
+                    // fixed to say the opposite for this same run.
+                    //
+                    // Codex review on #1821 (twelfth pass): `nodes` being empty is
+                    // not proof nothing ran, for the same reason the sibling arm
+                    // above was fixed in the tenth pass — `WorkflowNodeFinished` is
+                    // appended best-effort (`runner.rs`), so the FIRST failing
+                    // node's own finish row can silently fail to journal while
+                    // `run.error` still lands, leaving `nodes` empty even though
+                    // that node executed. Naming "nothing in the graph got the
+                    // chance to run" as the reading overclaimed what an empty trail
+                    // can prove, the same overclaim the tenth pass removed from the
+                    // `nodes.length > 0` arm. This now says only that the record may
+                    // be incomplete, matching that arm's epistemic stance.
+                    "Review the error details — no step is recorded as having completed, but an empty trail here isn't proof nothing ran: a step's own record can fail to save even when it executed. Read the error before deciding whether this is a host/capability problem or the workflow itself."}
             </p>
             <details className="mt-1">
               <summary className="cursor-pointer text-2xs text-muted-foreground">
@@ -536,7 +840,33 @@ function RunHistoryRow({
           </div>
           {/* Issue #840 (PR-3): correction is an action, not part of the
               destructive error framing. Keeping it outside gives the neutral
-              control its ordinary token treatment. */}
+              control its ordinary token treatment.
+
+              `failedNode` gated it too (Codex review on #1821, eighth pass):
+              the copilot re-wires the WORKFLOW, so offering it for a run that
+              never traced to a step — a host restart, a failed capability
+              build, an uncompilable graph — offers to fix something the run
+              gave no evidence was broken.
+
+              Codex review on #1821 (twelfth pass): that premise doesn't hold.
+              `failedNode` comes from `failedNodeOf(run)`, which finds nothing
+              when the failing node's own `WorkflowNodeFinished` never
+              journaled (best-effort append, `runner.rs`) — the exact case the
+              tenth/eleventh-pass fixes above already established `nodes`
+              being empty does not prove nothing ran. The backend endpoint
+              this button drives (`fix_from_run` → `resolve_fix_error`) never
+              required a `failed_node_id` either: it only needs `run.error`
+              non-empty (guaranteed here, inside the `run.error ?` branch) and
+              works from the error text alone when no node is named — the
+              request this callback sends doesn't even carry a node id. The
+              copilot itself is the one that reads the error text and decides
+              automatable-or-not (`fix_evidence_prompt` in
+              `workflow_build.rs` tells it plainly: "If the failure cannot be
+              fixed by re-wiring the graph … say so"), surfaced back here as
+              `fixReason` when it declines. That is the explicit,
+              failure-text-grounded classification the button's gate should
+              defer to — not a frontend guess off a best-effort per-node
+              record that can go missing for a node that genuinely failed. */}
           {onFixWithCopilot && run.runId && (
             <div className="mt-1.5">
               <Button
@@ -563,9 +893,11 @@ function RunHistoryRow({
       ) : run.cancelled ? (
         // Issue #383, the third terminal reading. Deliberately not a
         // destructive Alert: nothing went wrong, somebody decided they had seen
-        // enough. It says "stopped", not "finished", because the node that was
-        // executing was dropped where it was rather than allowed to complete —
-        // so a side effect it had started may be half-done.
+        // enough. It says "stopped", not "finished", because a node still
+        // mid-flight when the stop lands — named by `midFlightNode` — is cut
+        // off rather than allowed to complete, and a side effect it had
+        // started may be half-done. `RunCancel` stops at the next node
+        // boundary otherwise, so that is the exception, not the rule.
         <p
           className="text-2xs text-muted-foreground"
           data-testid="workflow-run-cancelled"
@@ -574,8 +906,47 @@ function RunHistoryRow({
           {nodes.length > 0
             ? ` after ${nodes.length} step${nodes.length === 1 ? "" : "s"}`
             : " before any step finished"}
-          . The steps above completed; the one still running was stopped where
-          it was. Any approvals it had already raised are still waiting for you.
+          .{" "}
+          {midFlightNode
+            ? // Codex review on #1821 (tenth pass): `WorkflowNodeFinished` is
+              // appended best-effort — a failed append is logged and the run
+              // proceeds unaffected (`runner.rs`'s progress collector) — so an
+              // unmatched `startedNodes` entry is not proof the node was cut
+              // off; it is equally consistent with a node that completed
+              // normally but whose own finish record silently failed to
+              // journal. Naming a definitive hard abort overclaimed what a
+              // missing row alone can prove.
+              "The steps above completed; the one still running was either stopped where it was or finished without its own record being saved — its actual outcome isn't confirmed here."
+            : knowsStartTrail
+              ? // Codex review on #1821 (eighth pass): the legend definition
+                // above was fixed to say the mid-flight step "normally ran to
+                // completion and was recorded" — but this sentence still
+                // claimed unconditionally that a step was cut off, which is
+                // only true when `midFlightNode` names one. Most cancels land
+                // cleanly at a boundary with nothing interrupted at all.
+                //
+                // Codex review on #1821 (thirteenth pass): `WorkflowNodeStarted`
+                // is ALSO appended best-effort (`runner.rs`'s progress
+                // collector) — the same fire-and-forget semantics the
+                // tenth-pass fix already established for
+                // `WorkflowNodeFinished`. A node whose own start silently
+                // failed to journal never appears in `startedNodes` at all,
+                // so it can never become `midFlightNode` even if it was
+                // genuinely running when the stop landed. "Every step that
+                // had started completed" therefore only speaks for the steps
+                // the record actually captured, not for every step that in
+                // fact started — scoped the claim to what was recorded and
+                // added the hedge instead of promising the wider one.
+                "Every step recorded as started also finished and was recorded before the stop took effect — though a step whose own start silently failed to journal wouldn't appear here at all, so this can't rule out one being cut off unseen."
+              : // Codex review on #1821 (ninth pass): a host predating
+                // #1010/#382 sends no `startedNodes` at all, and its own doc
+                // comment says that must read as "no start trail", never as
+                // "nothing started" — so it must not be folded into the same
+                // claim as a settled run whose receipt confirms every started
+                // step finished. This run's actual cancel boundary is
+                // unrecorded and unknowable from here.
+                "Whether the step in progress when the stop landed finished is not recorded for this run."}{" "}
+          Any approvals it had already raised are still waiting for you.
         </p>
       ) : isBlocked(run) ? (
         // Issue #881, the fourth terminal reading — and the one that had NO
@@ -640,7 +1011,34 @@ function RunHistoryRow({
                 // either would be a diagnosis the console cannot make. Re-run
                 // is offered as an option, not as a remedy for a stated cause.
                 "Nothing here is waiting on you any more, and this run cannot be continued. Run the workflow again if you still need it."
-              : "Nothing here can be approved; change the policy and run the workflow again."}
+              : // Codex review on #1821 (eighth pass, same site as the sixth):
+                // `parkFailed` fires both when the approvals queue itself
+                // refused the write AND when this runtime never wired one at
+                // all — the frontend has no field naming which, per the
+                // legend definition's own hedge two rounds ago ("the
+                // approvals queue itself can refuse the write, and no
+                // workflow change fixes that"). "Change the policy" names a
+                // cause that is never the one in either code path; nothing
+                // about policy content is what failed here.
+                //
+                // Codex review on #1821 (twelfth pass): this named "the
+                // approvals queue itself may have refused it" as the cause
+                // even when every unparkable call was `discarded` — dropped
+                // by the per-turn cap before the queue ever saw it, a
+                // different and distinguishable cause (`run.approvals`'
+                // `outcome`, computed above). A run with ONLY `discarded`
+                // calls (and at least one, so the classification is positive
+                // rather than absent) gets its own sentence; a run with any
+                // `discarded` alongside `parkFailed` calls names both; every
+                // other case — `parkFailed` only, or a run whose `approvals`
+                // rows predate this classification and carry neither outcome
+                // — keeps the original sentence, which is this default
+                // rather than a claim this fold cannot back.
+                discardedCalls > 0 && parkFailedCalls === 0
+                  ? "Nothing here could be queued for approval — this run's turn asked for more approvals than one batch may raise, so the excess was dropped before the queue ever saw it. Run it again — a turn that asks for fewer approvals at once will queue cleanly."
+                  : discardedCalls > 0 && parkFailedCalls > 0
+                    ? "Nothing here could be queued for approval — some were dropped because this run's turn asked for more approvals than one batch may raise, and the rest because the approvals queue itself may have refused them, which no workflow change fixes. Run it again once you've cut how many approvals one turn asks for and confirmed the queue is healthy."
+                    : "Nothing here could be queued for approval — the approvals queue itself may have refused it, which no workflow change fixes. Run it again once that's resolved."}
         </p>
         {/* Issue #1014 (PR-B): the gated tool names per blocked node and a link
             per parked card to the Approvals queue — the sentence above says
@@ -765,7 +1163,181 @@ function RunHistoryRow({
           {notice}
         </p>
       ))}
+      {/* Issue #1684: the files this run produced, deep-linked into the card
+          that made each. Rendered ONLY when the run carries a `runId` — a
+          pre-#371 orphan row has nothing to key a per-run fetch on — and the
+          fetch is lazy, fired on first expand, so a collapsed row (the common
+          case in a long history) makes zero network calls. */}
+      {run.runId && client && (
+        <RunFilesSection
+          client={client}
+          company={company ?? null}
+          runId={run.runId}
+        />
+      )}
     </div>
+  );
+}
+
+/** The lazy "Files associated" disclosure on a run row (issue #1684).
+ *
+ * A native `<details>` so the row makes no request until an operator opens it —
+ * the whole point of the lazy per-run route behind it. The fetch fires once, on
+ * the first expand; a failed fetch clears the latch so the next open retries.
+ * Each file deep-links into its card's Artifacts tab at the run's version
+ * ({@link artifactHref}), with the workspace-node link offered as a second hop
+ * when the file was mirrored into the shared tree. */
+function RunFilesSection({
+  client,
+  company,
+  runId,
+}: {
+  client: OpenCompanyClient;
+  company: string | null;
+  runId: string;
+}) {
+  const [files, setFiles] = useState<RunArtifactRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const [truncated, setTruncated] = useState(false);
+  // A one-shot latch: the fetch runs on the first open and not on every toggle,
+  // and a collapse-then-reopen does not re-hit the route. Cleared on failure so
+  // a reopen can retry.
+  const requested = useRef(false);
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  // The scope the most recent request was made for, kept current on every
+  // render. A response that settles after a company/runId change can compare
+  // the scope it was fired for against this and recognise itself as stale —
+  // the race in issue #1693 where the previous request's `.then`/`.catch`
+  // would otherwise overwrite the new scope's state.
+  const scopeRef = useRef({ company, runId });
+  scopeRef.current = { company, runId };
+
+  const load = useCallback(() => {
+    if (requested.current) return;
+    requested.current = true;
+    setLoading(true);
+    setError(false);
+    const scope = { company, runId };
+    const stale = () =>
+      scopeRef.current.company !== scope.company ||
+      scopeRef.current.runId !== scope.runId;
+    fetchRunArtifacts(client, company, runId)
+      .then(({ files, truncated }) => {
+        if (stale()) return;
+        setFiles(files);
+        setTruncated(truncated);
+      })
+      .catch(() => {
+        if (stale()) return;
+        requested.current = false;
+        setError(true);
+      })
+      .finally(() => {
+        if (!stale()) setLoading(false);
+      });
+  }, [client, company, runId]);
+
+  // `RunHistoryPanel` keys each row only by `run.seq` (not by company), and
+  // journal sequences commonly repeat across companies and workflows. When an
+  // operator switches company or workflow while a row stays expanded, React
+  // can reuse THIS component instance for an unrelated run — the one-shot
+  // latch above then never re-fires, and the old scope's files (titles,
+  // paths) stay on screen under the new run. Reset on every scope change, and
+  // re-fetch immediately if the disclosure is already open — the `onToggle`
+  // handler below only fires on an open/close transition, not on a prop
+  // change while already open.
+  useEffect(() => {
+    requested.current = false;
+    setFiles(null);
+    setTruncated(false);
+    setError(false);
+    setLoading(false);
+    if (detailsRef.current?.open) {
+      load();
+    }
+  }, [company, runId, load]);
+
+  return (
+    <details
+      ref={detailsRef}
+      className="mt-1.5"
+      data-testid="workflow-run-files"
+      onToggle={(e) => {
+        if ((e.currentTarget as HTMLDetailsElement).open) load();
+      }}
+    >
+      <summary
+        className="cursor-pointer text-2xs text-muted-foreground"
+        data-testid="workflow-run-files-toggle"
+      >
+        Files associated
+      </summary>
+      <div className="mt-1 space-y-1">
+        {loading && (
+          <p className="text-2xs text-muted-foreground">Loading…</p>
+        )}
+        {error && (
+          <p
+            className="text-2xs text-status-failed-text"
+            data-testid="workflow-run-files-error"
+          >
+            Couldn't load this run's files. Reopen to try again.
+          </p>
+        )}
+        {files && files.length === 0 && (
+          <p
+            className="text-2xs text-muted-foreground"
+            data-testid="workflow-run-files-empty"
+          >
+            No files from this run.
+          </p>
+        )}
+        {truncated && (
+          <p
+            className="text-2xs text-muted-foreground"
+            data-testid="workflow-run-files-truncated"
+          >
+            Showing this run's newest files only.
+          </p>
+        )}
+        {files?.map((file) => (
+          <div
+            key={`${file.taskId}-${file.artifactId}`}
+            className="flex flex-col"
+            data-testid="workflow-run-file"
+          >
+            {/* The canonical Artifacts-tab hash the whole console navigates
+                by — no new routing, the Tasks view reads it and focuses the
+                card + artifact at the run's version. */}
+            <a
+              className="truncate text-2xs text-primary hover:underline"
+              href={artifactHref(file.taskId, file.artifactId, file.latestVersion)}
+            >
+              {file.title}
+            </a>
+            <span className="text-3xs text-muted-foreground">
+              {file.taskTitle ? `${file.taskTitle} · ` : ""}
+              {/* A legacy record (issue #244) has no source path; label it as
+                  such rather than showing an empty secondary line. */}
+              {file.source ?? "(legacy)"}
+              {file.workspaceNodeId && (
+                <>
+                  {" · "}
+                  <a
+                    className="hover:underline"
+                    href={`#/workspace/${encodeURIComponent(file.workspaceNodeId)}`}
+                    data-testid="workflow-run-file-workspace"
+                  >
+                    Open in workspace
+                  </a>
+                </>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -840,7 +1412,7 @@ function RunNodeChip({
  * operator leaves it open, and a settled row's duration is a fixed number that
  * re-rendering every second cannot change.
  */
-function useRunningClock(active: boolean): number {
+export function useRunningClock(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!active) return;

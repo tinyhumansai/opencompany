@@ -8,6 +8,7 @@ import { listTasks, type Task } from "@/api/tasks";
 import type { DeskDto } from "@/api/types";
 import { getWorkflow, listWorkflows, type WorkflowGraph } from "@/api/workflows";
 import { fromDto, type TeamMember } from "@/lib/team";
+import { PageHeader } from "@/components/page-header";
 import { adapt, buildMemoryGraph } from "./overview/kg/adapter";
 import { buildKnowledgeGraph } from "./overview/kg/model";
 import { ownedBy } from "./overview/pulse";
@@ -327,6 +328,16 @@ export function Overview({ client, company, companyName }: Props) {
   const memoryGraph = useMemo(() => buildMemoryGraph(sources.memories), [sources.memories]);
 
   /**
+   * Whether a settled read has actually told us what this company has.
+   *
+   * Both claims below rest on it. Only a fulfilled `/desks` may say a company
+   * has no desks — a rejected one draws the graph without pillars but must not
+   * assert anything about the company, which is the lie issue #1313 was about,
+   * pointed at the control instead of at the data.
+   */
+  const desksAnswered = !loading && sources.fetchedAt !== null && sources.desksRead;
+
+  /**
    * The snapshot line: what the page is, when it was taken, and the way to
    * take another. The graph is not live, and says so rather than leaving an
    * operator to assume a stale wheel is the current company.
@@ -391,7 +402,7 @@ export function Overview({ client, company, companyName }: Props) {
       {/* The graph is the page and draws no visible title of its own (issue
           #1221) — this names it for a screen reader the same way every other
           view's title does. */}
-      <h1 className="sr-only">Company overview</h1>
+      <PageHeader hidden title="Company overview" />
       {/* A complete read failure is the page's state, not a detail in the
           snapshot chrome. The opaque canvas keeps an unreachable host from
           looking like a genuinely empty company, and puts the retry beside the
@@ -449,17 +460,32 @@ export function Overview({ client, company, companyName }: Props) {
             toolLabels={adapted.toolLabels}
             statusSlot={statusSlot}
             covered={!!loadError}
-            emptyState={
-              !loading &&
-              sources.fetchedAt !== null &&
-              // Only a fulfilled read may claim the company has no desks. A
-              // rejected `/desks` draws the graph without pillars but must not
-              // overlay "No desks yet" on top of it — that is the same lie the
-              // empty state exists to avoid, pointed at the company instead of
-              // the control (issue #1313).
-              sources.desksRead &&
-              sources.desks.length === 0
-            }
+            // A company with no desks still has a graph, and it is drawn.
+            //
+            // These used to be one flag, and it suppressed the canvas outright
+            // — a company that had teammates, tools, saved workflows and a
+            // memory constellation but no `[[group_chat]]` got a blank field
+            // and a card telling it to create a desk. The model has never
+            // needed a desk to draw: a worker the company declares no desk for
+            // hangs off the core, and so does an unplaced workflow
+            // (`model.ts`'s `UNPLACED` leg). It was only the view that refused.
+            //
+            // So the two facts are now separate. `noDesks` is a fact about the
+            // company: no pillars, say so in the corner and offer the one
+            // control that changes it. `emptyState` is a fact about the graph:
+            // there is nothing beyond the core node to look at, which is the
+            // only case where covering an empty field with an explanation is
+            // better than leaving it bare.
+            //
+            // `graph.nodes` alone undercounts this: durable memory is passed
+            // to `KnowledgeGraph` separately via the `memory` prop rather than
+            // folded into `graph.nodes`, so a deskless company with a memory
+            // constellation but no roster, tasks, or workflows still has
+            // something to look at even though `graph.nodes` holds only the
+            // core. Counting `memoryGraph.nodes` too keeps that constellation
+            // reachable instead of covering it with "No desks yet".
+            noDesks={desksAnswered && sources.desks.length === 0}
+            emptyState={desksAnswered && graph.nodes.length <= 1 && memoryGraph.nodes.length === 0}
           />
         </Suspense>
       </div>

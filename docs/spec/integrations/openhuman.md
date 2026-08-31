@@ -20,10 +20,9 @@ wired to OpenCompany's own ports:
   OpenCompany [`ContextStore`](../runtime/ports-state.md#contextstore).
 - **Inference provider** → the hosted Medulla `Provider` (a `MockProvider`
   stands in for offline tests).
-- **Approval policy** → `ApprovalPolicy` maps the manifest `[policy].mode`
-  onto openhuman's `ToolPolicy`; the security-tier words
-  (readonly/supervised/full) line up 1:1, which is why the manifest reuses
-  them.
+- **Approval requests** → every agent gets the intrinsic `request_approval`
+  tool. `ApprovalPolicy` keeps hard `readonly` denials, but policy-generated
+  HITL is disabled; ordinary calls do not become approval prompts.
 - **Tools / skills** → injected through the builder's tool/skill seams from the
   company's manifest grants.
 

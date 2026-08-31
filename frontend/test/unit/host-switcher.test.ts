@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -118,5 +122,39 @@ describe("hostShortcutLabel", () => {
 
   it("prints nothing past the number row, so no row promises a key that does nothing", () => {
     expect(hostShortcutLabel(HOST_SHORTCUT_LIMIT)).toBeNull();
+  });
+});
+
+describe("the collapsed rail keeps the lifecycle signal (issue #1931 review)", () => {
+  // The collapsed sidebar shrinks `SidebarMenuButton` to the 32px glyph alone
+  // (`group-data-[collapsible=icon]:size-8!` in `ui/sidebar.tsx`), clipping the
+  // nameplate's two text lines out of the visible box — so without a rescue, a
+  // paused, suspended, archived, or emergency-stopped company loses the one
+  // place that fact was surfaced. `SidebarMenuButton`'s own `tooltip` prop
+  // already exists for this: it renders only while the rail is collapsed, so
+  // wiring the switcher's lifecycle-aware tooltip through it keeps the signal
+  // reachable on hover instead of losing it outright.
+  //
+  // A jsdom render of the full switcher needs `HostsContext`, which this file
+  // does not stand up; the source-contract idiom (`responsive-two-rail-band
+  // .test.ts` uses the same one for a media-query fact jsdom cannot evaluate)
+  // pins the wiring instead.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(resolve(here, "../../src/components/host-switcher.tsx"), "utf8");
+
+  it("derives the collapsed-rail tooltip from the same lifecycle line as the nameplate", () => {
+    expect(source).toContain(
+      'const switcherTooltip = lifecycleLine ? `${primary} — ${lifecycleLine}` : primary;',
+    );
+  });
+
+  it("wires the tooltip onto both the plain nameplate and the dropdown trigger", () => {
+    // The plain (non-menu) trigger passes it directly; the menu trigger goes
+    // through `SidebarHeaderTrigger`, which takes it as its own `tooltip` prop
+    // (split out because `useSidebar` throws outside a `SidebarProvider`) and
+    // forwards it onto its `SidebarMenuButton`.
+    expect(source).toContain("tooltip={switcherTooltip}");
+    expect(source).toContain("tooltip={tooltip}");
+    expect(source).toMatch(/tooltip: string;/);
   });
 });

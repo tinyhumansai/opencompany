@@ -217,7 +217,6 @@ impl Brain for SidecarBrain {
         let mut new_traces = Vec::new();
         let mut ledger_deltas: Vec<LedgerEntry> = Vec::new();
         let mut token_usage = TokenUsage::default();
-
         for (index, event) in req.events.iter().enumerate() {
             let seq = req
                 .event_seqs
@@ -236,12 +235,31 @@ impl Brain for SidecarBrain {
             // Drain the cycle's frames, deduping on callId (at-least-once).
             let mut seen: HashSet<String> = HashSet::new();
             let mut passes = 0usize;
+            // The provider response parser owns the atomic batch invariant:
+            // request_approval cannot share a model response with another call.
+            // Keep this transport streaming and reject any later actionable
+            // frame, since inference/tool answers may unblock the next frame.
+            let mut approval_requested = false;
             let mut frames = self.transport.cycle_frames(&cycle_id);
             while let Some(frame) = frames.next().await {
                 match frame? {
                     SidecarFrame::CycleComplete => break,
                     SidecarFrame::Effect(effect_frame) => {
                         if !seen.insert(effect_frame.call_id.clone()) {
+                            continue;
+                        }
+                        if approval_requested {
+                            self.transport
+                                .ack_effect(EffectResult {
+                                    call_id: effect_frame.call_id,
+                                    ok: false,
+                                    error: Some(
+                                        "effect cannot execute after a request_approval boundary"
+                                            .to_string(),
+                                    ),
+                                    result: None,
+                                })
+                                .await?;
                             continue;
                         }
                         let outcome = self.service_effect(host, &effect_frame).await?;
@@ -256,24 +274,40 @@ impl Brain for SidecarBrain {
                         if !seen.insert(call.call_id.clone()) {
                             continue;
                         }
+                        if approval_requested
+                            && context_op_from_call(&call.name, &call.args).is_none()
+                        {
+                            self.transport
+                                .answer_tool_call(ToolResultFrame {
+                                    call_id: call.call_id,
+                                    ok: false,
+                                    result: None,
+                                    error: Some(
+                                        "tool cannot execute after a request_approval boundary"
+                                            .to_string(),
+                                    ),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let requests_approval =
+                            call.name == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND;
                         let answer = self.service_tool_call(host, &call).await?;
+                        approval_requested |= requests_approval && answer.ok;
                         self.transport.answer_tool_call(answer).await?;
+                        // Keep draining so every sibling gets an explicit refusal.
                     }
                     SidecarFrame::Inference { call_id, request } => {
                         if !seen.insert(call_id.clone()) {
                             continue;
                         }
-                        // Honor the pass cap: stop draining once the sidecar has
-                        // asked for more inference passes than the budget allows.
+                        // Honor the pass cap while streaming: inference answers
+                        // are what unblock the sidecar's next frame.
                         if passes >= self.max_passes {
                             break;
                         }
                         passes += 1;
-                        // The inference inversion: the host runs the model pass.
                         let response = self.inference.infer(request).await?;
-                        // Fold the whole total (tokens, cache hits, cost) so the
-                        // runtime can meter the cycle — the host's client is the
-                        // only side that sees what the pass actually cost.
                         token_usage.fold(&response.token_usage);
                         self.transport.answer_inference(&call_id, response).await?;
                     }

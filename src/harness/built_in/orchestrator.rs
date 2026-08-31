@@ -59,6 +59,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use crate::ports::store::company_write_lock;
 
 use async_trait::async_trait;
+// Issue #1865: `.catch_unwind()` on the `run_workflow` tool's runner call —
+// see the call site in `RunWorkflowTool::execute` for why this path needs its
+// own catch rather than routing through `WorkflowSpawn`.
+use futures::future::FutureExt;
 use serde_json::{Value, json};
 
 use openhuman_core::openhuman as oh;
@@ -75,8 +79,11 @@ use crate::harness::lifecycle::ReviewDecision;
 use crate::harness::workflow_refs::WorkflowRefQueue;
 use crate::ports::events::EventLog;
 use crate::ports::facts::FactStore;
+use crate::ports::notifications::NotificationStore;
 use crate::ports::tasks::{TaskOutputAction, TaskOutputWorkflow};
-use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, OverlayAgent};
+use crate::ports::types::{
+    CompanyEvent, CompanyId, EventSeq, OnboardingStep, OverlayAgent, WorkflowNodeStatus,
+};
 use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunner};
 
 /// The manifest cognition-tier that marks the orchestrator agent.
@@ -261,8 +268,10 @@ tool in order to influence it. Anything substantial handed to a desk is opened a
 automatically, and so is anything substantial an operator asks a desk or teammate directly — the \
 hand-off IS the card, so never call `spawn_task` alongside a `delegate_to_desk` for the same work, \
 and never prefer one over the other to get something tracked. Reach for `spawn_task` only for work \
-that belongs on the board but must NOT start in this turn: something for later, for somebody else, \
-or waiting on a person. \
+that belongs on the board but must NOT start in this turn: something for later, or for somebody \
+else. Work that is waiting on a PERSON is not a card — a card notifies nobody and resumes \
+nothing. When you cannot proceed without something only the operator can give you, call \
+`escalate_to_human` with the question; the work parks and their answer restarts it. \
 WHEN YOU CAN DO THE WORK IN THIS TURN, DO IT — do not park it as a card for later. Asked to \
 capture a repeatable process (\"create a workflow that…\"), author it NOW with `create_workflow` — \
 a trigger plus agent / tool / condition / output steps — and say it is ready; it is enabled \
@@ -1562,6 +1571,19 @@ impl Tool for QueryCompanyTool {
                     Some(lead) => md.push_str(&format!(
                         "- **{id}** — lead: {lead} (delegate with `delegate_to_desk` desk=`{id}`)\n"
                     )),
+                    // A leadless answer is two different facts (issue #1835):
+                    // an `auto` channel has members but no lead by design —
+                    // "cannot be handed work" would be a lie about a staffed
+                    // channel — while a desk with nobody on the roster really
+                    // cannot take anything.
+                    None if record
+                        .as_ref()
+                        .is_some_and(|r| !r.desk_responder_mode(id).is_lead()) =>
+                    {
+                        md.push_str(&format!(
+                            "- **{id}** — channel without a lead; who answers is picked per message. `delegate_to_desk` cannot target it — use `delegate_to_teammate` with one of its members\n"
+                        ))
+                    }
                     None => md.push_str(&format!(
                         "- **{id}** — no member on the roster, so it cannot be handed work\n"
                     )),
@@ -1668,6 +1690,12 @@ fn summarize_event(event: &CompanyEvent) -> String {
             verdict,
             ..
         } => format!("approval {approval_id} {verdict:?}"),
+        // Issue #1805. Structural only, on the same terms as the parked/resolved
+        // arms: the id, and nothing else — `by` is a user id, dropped as every
+        // arm here drops it.
+        CompanyEvent::ApprovalExtended { approval_id, .. } => {
+            format!("approval {approval_id} extended")
+        }
         CompanyEvent::FeedbackFiled { .. } => "feedback filed".to_string(),
         CompanyEvent::PaymentReceived { amount_usd, .. } => format!("payment ${amount_usd:.2}"),
         CompanyEvent::LifecycleChanged { from, to, .. } => format!("lifecycle {from} → {to}"),
@@ -1841,6 +1869,18 @@ fn summarize_event(event: &CompanyEvent) -> String {
             tool,
             ..
         } => format!("workflow child {child_workflow_id} ran {tool} at node {node} unapproved"),
+        // Issue #1843. Structural only, like every arm here: which step, from
+        // a fixed vocabulary — no company or operator free text involved.
+        CompanyEvent::OnboardingStepCompleted { step } => match step {
+            OnboardingStep::NameConfirmed => "activation step: name confirmed".to_string(),
+            OnboardingStep::IntegrationConnected => {
+                "activation step: integration connected".to_string()
+            }
+            OnboardingStep::WorkflowRunSucceeded => {
+                "activation step: workflow run succeeded".to_string()
+            }
+        },
+        CompanyEvent::OnboardingCompleted { .. } => "activation completed".to_string(),
     }
 }
 
@@ -2863,9 +2903,11 @@ pub struct AddAgentTool {
     /// The id of the agent this tool is wired onto — the minter. Named in the
     /// mint log so an operator can see who added a teammate, and with what.
     minter: String,
-    /// The minter's own `tools` line, verbatim. Empty means the minter itself
-    /// holds the company's standard grant, in which case so does the teammate.
-    minter_tools: Vec<String>,
+    /// The minter's own `tools` line, verbatim (issue #1804's three-state
+    /// grant): `None` means the minter inherits the company's standard grant,
+    /// in which case so does the teammate; `Some(globs)` is the minter's own
+    /// explicit scope. `Some(vec![])` (deny-all) never mints anything reachable.
+    minter_tools: Option<Vec<String>>,
     /// The minter's **effective** grant — its line already narrowed by the
     /// company `allow`. The ceiling an explicit `tools` argument is clamped to.
     minter_grants: Vec<String>,
@@ -2891,7 +2933,7 @@ impl AddAgentTool {
         company: CompanyId,
         store: Arc<dyn CompanyStore>,
         minter: String,
-        minter_tools: Vec<String>,
+        minter_tools: Option<Vec<String>>,
         minter_grants: Vec<String>,
     ) -> Self {
         Self {
@@ -2918,7 +2960,7 @@ pub(crate) fn unscoped_add_agent(company: CompanyId, store: Arc<dyn CompanyStore
         store,
         "ceo".to_string(),
         // No line of its own — the minter inherits the company grant…
-        Vec::new(),
+        None,
         // …which for these fixtures is the catch-all, so the minter ceiling is
         // wide open and a test about *other* behaviour is not accidentally a
         // test about the #619 clamp. A test that cares about the clamp uses
@@ -3006,23 +3048,35 @@ impl Tool for AddAgentTool {
         // Issue #619: the company grant is the wrong ceiling. Clamp to the
         // MINTER's own scope, resolved before the store is touched so a refused
         // scope never leaves a half-written roster.
-        let tools = match requested {
-            // Nothing asked for: copy the minter's own line. Copying the *line*
-            // rather than its resolved grant is deliberate — an unscoped minter
-            // mints an unscoped teammate that keeps tracking `[tools].allow`,
-            // instead of freezing today's allow-list into the record as an
-            // explicit scope a later company-wide narrowing would not reach.
-            None => self.minter_tools.clone(),
-            // An explicitly empty list is the same request as none at all —
-            // "give them what you have" — not "grant everything".
-            Some(globs) if globs.is_empty() => self.minter_tools.clone(),
+        //
+        // The boolean says whether the request LEFT the grant unstated — the
+        // `None` and empty-list cases, which inherit the minter — rather than
+        // stating one explicitly. Only an unstated grant is filtered for the BYO
+        // real-money namespaces below; an explicitly requested billing namespace
+        // survives, narrowed to what the minter holds.
+        // `tools` is the teammate's own three-state grant line (issue #1804):
+        // `None` inherits the standard grant, `Some(vec![])` is an explicit
+        // deny-all, `Some(globs)` narrows. `unstated` marks the inherit path,
+        // the only one the BYO-billing filter below runs on.
+        let (mut tools, unstated): (Option<Vec<String>>, bool) = match requested {
+            // Nothing asked for: copy the minter's own line verbatim. Copying the
+            // *line* (which is itself `None` for an unscoped minter) rather than
+            // its resolved grant is deliberate — an unscoped minter mints an
+            // unscoped teammate that keeps tracking `[tools].allow`, instead of
+            // freezing today's allow-list into the record as an explicit scope a
+            // later company-wide narrowing would not reach.
+            None => (self.minter_tools.clone(), true),
+            // An explicitly empty list is a deliberate deny-all since #1804 — the
+            // most restrictive scope an agent can hand a new teammate — NOT
+            // "inherit". This is the contract inversion: `[]` no longer means
+            // "give them what you have".
+            Some(globs) if globs.is_empty() => (Some(Vec::new()), false),
             Some(globs) => {
                 // Narrow against what the minter actually holds. An empty result
-                // means nothing asked for was within reach, and storing that
-                // would read back as "inherit the whole company grant" — the
-                // exact inversion #619 exists to remove, reached through the
-                // most deliberate narrowing an agent can ask for.
-                let narrowed = agent_effective_grants(&self.minter_grants, &globs);
+                // means nothing asked for was within reach, so refuse rather than
+                // store `Some(vec![])` — an agent asking for tools it cannot
+                // reach meant to scope, not to mint a powerless teammate.
+                let narrowed = agent_effective_grants(&self.minter_grants, Some(&globs));
                 if narrowed.is_empty() {
                     return Ok(ToolResult::error(format!(
                         "None of the requested tools ({}) are within your own tool grant ({}), so \"{name}\" was not added. Ask for a subset of what you hold, or omit `tools` to give them the same grant you have.",
@@ -3034,7 +3088,7 @@ impl Tool for AddAgentTool {
                         },
                     )));
                 }
-                narrowed
+                (Some(narrowed), false)
             }
         };
 
@@ -3051,6 +3105,42 @@ impl Tool for AddAgentTool {
             .load(&self.company)
             .await?
             .ok_or_else(|| OpenCompanyError::CompanyNotFound(self.company.to_string()))?;
+
+        // The BYO real-money namespaces are not inherited by a minted teammate
+        // (#788/#789). What an unstated grant inherits depends on the minter:
+        // an empty minter line means the whole company allow-list (so an
+        // unscoped-looking mint from, say, a desk-restricted creative director
+        // would otherwise store an empty grant that reads back as billing it
+        // does not hold), and a non-empty minter line that itself names billing
+        // (the shipped bookkeeper) would hand it on. Both are filtered — the
+        // company allow-list when the minter line is empty, the minter's own
+        // line otherwise — before persistence.
+        //
+        // Same helper and same reasoning as the console `POST .../team` route,
+        // deliberately rather than incidentally: two creation paths that answer
+        // "what does an unstated grant mean" differently is how the first hole
+        // got here. `CreationGrant::Standard` leaves the copied line untouched,
+        // so nothing changes for the companies that grant none of these, and an
+        // explicitly requested billing namespace is untouched too.
+        if unstated {
+            // `tools` here is the minter's own line, copied verbatim: `None`
+            // for an unscoped minter (inherit the whole company allow-list),
+            // `Some(line)` for a scoped one (inherit exactly that line). The
+            // BYO-billing filter runs on whichever the teammate would inherit.
+            let inherited: &[String] = match tools.as_deref() {
+                None => &record.manifest.tools.allow,
+                Some(line) => line,
+            };
+            match crate::company::creation_default_grants(inherited) {
+                crate::company::CreationGrant::Standard => {}
+                crate::company::CreationGrant::Narrowed(narrowed) => tools = Some(narrowed),
+                crate::company::CreationGrant::NothingLeft => {
+                    return Ok(ToolResult::error(format!(
+                        "This company grants only billing namespaces, so \"{name}\" would inherit them. Pass an explicit `tools` list naming what they should hold."
+                    )));
+                }
+            }
+        }
 
         // Deduplication guard: reject a call whose `name` already names an
         // existing overlay teammate, so a trigger-happy orchestrator can't
@@ -3100,10 +3190,10 @@ impl Tool for AddAgentTool {
             minter = %self.minter,
             teammate = %id,
             teammate_name = %name,
-            scope = %if tools.is_empty() {
-                "inherited: the minter's own standard grant".to_string()
-            } else {
-                tools.join(", ")
+            scope = %match tools.as_deref() {
+                None => "inherited: the minter's own standard grant".to_string(),
+                Some([]) => "none: an explicit deny-all".to_string(),
+                Some(globs) => globs.join(", "),
             },
             "[add_agent] minted an overlay teammate"
         );
@@ -3116,10 +3206,10 @@ impl Tool for AddAgentTool {
         // The scope is in the result for the same reason it is in the log: the
         // minting agent should see what it handed over, and "the same tools you
         // hold" is a materially different answer from a named list.
-        let scope = if tools.is_empty() {
-            "They hold the same tools you do.".to_string()
-        } else {
-            format!("Their tools are scoped to: {}.", tools.join(", "))
+        let scope = match tools.as_deref() {
+            None => "They hold the same tools you do.".to_string(),
+            Some([]) => "They hold no tools.".to_string(),
+            Some(globs) => format!("Their tools are scoped to: {}.", globs.join(", ")),
         };
         Ok(ToolResult::success(format!(
             "Added {name} (id `{id}`) as {role} to the team. {scope} They'll be reachable as a teammate starting next turn."
@@ -3165,8 +3255,12 @@ pub fn orchestrator_tools(
     workflow_refs: WorkflowRefQueue,
     run_outputs: RunOutputCache,
     minter: String,
-    minter_tools: Vec<String>,
+    minter_tools: Option<Vec<String>>,
     minter_grants: Vec<String>,
+    // Issue #1865: where `run_workflow` files a `workflow_run_failed`
+    // notification on a run the agent itself started — see
+    // `RunWorkflowTool::notifications` for why this is optional.
+    notifications: Option<Arc<dyn NotificationStore>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(QueryCompanyTool::new(
         company.clone(),
@@ -3185,6 +3279,7 @@ pub fn orchestrator_tools(
         events.clone(),
         workflow_refs.clone(),
         run_outputs.clone(),
+        notifications,
     )));
     // `read_run_output` (issue #418) is the run tool's companion: it reads full
     // node output out of the same bounded cache the run tool populates, so a
@@ -3484,6 +3579,19 @@ pub struct RunWorkflowTool {
     /// so the read tool built in the same `build_agent` pass sees what this one
     /// stores. A cancelled or failed run stores nothing.
     run_outputs: RunOutputCache,
+    /// Issue #1865 (PR #1883 review comment 3877185396): where a failed run
+    /// files its `workflow_run_failed` notification, on the same terms as the
+    /// console run route, the cron scheduler, and the approval-resume path —
+    /// this tool is the one run-outcome chokepoint `WorkflowSpawn` does not
+    /// cover (see [`crate::runtime::WorkflowSpawn`]'s own `notifications` doc
+    /// comment), because an agent-started run stays inside the calling turn
+    /// rather than routing through `WorkflowSpawn::spawn`.
+    ///
+    /// `None` (the default build, and most of the tool's own tests) simply
+    /// skips the notification — the run itself still journals and answers the
+    /// tool call either way, exactly as `events` degrades above; only the
+    /// company-wide alert is lost.
+    notifications: Option<Arc<dyn NotificationStore>>,
 }
 
 impl RunWorkflowTool {
@@ -3491,8 +3599,10 @@ impl RunWorkflowTool {
     /// (`companies/<name>`, whose `workflows/` subtree holds the seed graphs),
     /// the company store (holding the runtime-authored graph bodies), the
     /// shared runner handle, the company's journal, the shared queue a
-    /// dispatched card's output link is staged on (issue #339), and the run
-    /// output cache the `read_run_output` companion reads back (issue #418).
+    /// dispatched card's output link is staged on (issue #339), the run
+    /// output cache the `read_run_output` companion reads back (issue #418),
+    /// and the company's notification store a failed run alerts through
+    /// (issue #1865).
     // Each argument is a distinct wired dependency; the tool is built from
     // exactly one place (`orchestrator_tools`), so there is nothing a parameter
     // struct would deduplicate — same rationale as `orchestrator_tools` above.
@@ -3506,6 +3616,7 @@ impl RunWorkflowTool {
         events: Option<Arc<dyn EventLog>>,
         workflow_refs: WorkflowRefQueue,
         run_outputs: RunOutputCache,
+        notifications: Option<Arc<dyn NotificationStore>>,
     ) -> Self {
         Self {
             company,
@@ -3516,6 +3627,7 @@ impl RunWorkflowTool {
             events,
             workflow_refs,
             run_outputs,
+            notifications,
         }
     }
 }
@@ -3661,8 +3773,85 @@ impl Tool for RunWorkflowTool {
                 )));
             }
         };
-        match runner.run(&self.company, &file, input, &ctx).await {
-            Ok(run) => {
+        // Issue #1865: this call sits inside an agent turn (see the #383
+        // comment above — the run is deliberately NOT spawned onto its own
+        // task, because spawning would reset the task-local `WORKFLOW_DEPTH`
+        // re-entry guard mid-chain), so it cannot route through
+        // `WorkflowSpawn`'s own `catch_unwind` the way the console run route
+        // and the cron scheduler do. Left uncaught, a panic in the runner
+        // future unwound straight past both journal-write arms below, so the
+        // run's `WorkflowRunStarted` never got a matching finish and
+        // `GET …/workflows/runs` read it `running: true` until the next boot
+        // sweep — which does not run on rebuild, so a panicked agent-run could
+        // zombie for the life of the process. This is its own catch rather
+        // than a second call into `WorkflowSpawn`: that type owns a
+        // `RunGuard`/supervisor registration this call already holds via
+        // `_run_guard` above, and re-raising (as the spawned-task catch does,
+        // so its `JoinHandle` still resolves to a `JoinError`) is wrong here —
+        // there is no task boundary to preserve, only a tool call to answer,
+        // so the payload is swallowed after the finish is journaled and this
+        // returns an ordinary `ToolResult::error` instead.
+        match std::panic::AssertUnwindSafe(runner.run(&self.company, &file, input, &ctx))
+            .catch_unwind()
+            .await
+        {
+            Err(_payload) => {
+                tracing::error!(
+                    company = %self.company,
+                    workflow = %wid,
+                    run_id = %ctx.run_id,
+                    "run_workflow: the runner panicked; journaling a finish so the run does not \
+                     read as in-flight forever"
+                );
+                if let Some(events) = self.events.as_ref() {
+                    let journaled = crate::runtime::record_run_finished(
+                        events,
+                        &self.company,
+                        &wid,
+                        false,
+                        &ctx.run_id,
+                        Err(crate::runtime::workflow_spawn::PANICKED_BEFORE_FINISH.into()),
+                    )
+                    .await;
+                    if !journaled {
+                        tracing::error!(
+                            company = %self.company,
+                            workflow = %wid,
+                            run_id = %ctx.run_id,
+                            "run_workflow: a panicked run's finish could not be journaled; it \
+                             will read as in-flight until the next boot sweep settles it"
+                        );
+                    }
+                }
+                // Issue #1865 (PR #1883 review comment 3877518535): a panic is
+                // unambiguously the worst reading a run can settle with —
+                // notify without needing a verdict computation, mirroring
+                // `WorkflowSpawn::spawn_admitted`'s own panic arm. Fired
+                // unconditionally like the journal write above, not gated on
+                // it landing — the two are independent stores, and a journal
+                // miss must not also cost the alert.
+                if let Some(notifications) = self.notifications.as_ref() {
+                    crate::runtime::file_run_unhealthy_notification(
+                        notifications.as_ref(),
+                        &self.company,
+                        &wid,
+                        &ctx.run_id,
+                        "failed",
+                        crate::runtime::PANICKED_BEFORE_FINISH,
+                    )
+                    .await;
+                }
+                // No re-raise: unlike `WorkflowSpawn`'s catch, there is no
+                // `JoinHandle` here to preserve a `JoinError` on — this call is
+                // itself the tool's execution, so the honest answer is an
+                // ordinary tool failure the agent can read and act on.
+                return Ok(ToolResult::error(format!(
+                    "Workflow `{wid}` hit an internal error while running. Its completed steps, \
+                     if any, are recorded in the run history. Don't retry it in a loop — check \
+                     the run history or ask an operator."
+                )));
+            }
+            Ok(Ok(run)) => {
                 tracing::debug!(
                     company = %self.company,
                     workflow = %wid,
@@ -3679,6 +3868,68 @@ impl Tool for RunWorkflowTool {
                         Ok(&run),
                     )
                     .await;
+                }
+                // Issue #1865 (PR #1883 review comment 3877518530): the same
+                // unhealthy-run classification `WorkflowSpawn::spawn_admitted`
+                // applies to its own settled runs — a stranded or blocked
+                // agent-started run is otherwise silent to every operator not
+                // watching this turn, especially a stranded run with no
+                // approval card to surface.
+                //
+                // Issue #1865 (PR #1883 review comment 3878430677): gated on
+                // `!run.cancelled`, matching `WorkflowSpawn::spawn_admitted`'s
+                // own `Ok(run) if run.cancelled => {}` arm (added for the same
+                // comment). The clean node-boundary cancel arm in
+                // `run_workflow_inner` carries `blocked_nodes: blocks.take()`
+                // forward, so a cancelled run reaches here with a non-empty
+                // `blocked_nodes` exactly like a genuinely blocked one — this
+                // must not tell an operator "a step is waiting on a person to
+                // decide something" about a run somebody already stopped.
+                //
+                // Stranded checked before blocked, same as `WorkflowSpawn`:
+                // `HarnessAgentRunner` pushes a `WorkflowBlockedNode` whenever
+                // a turn gated anything at all, parked or not, so a fully
+                // unparkable node lands in `blocked_nodes` exactly like one
+                // with a live card — only `stranded_approvals` equalling the
+                // full pending count, with no card still `Pending` delivery
+                // either, tells the two apart.
+                if let Some(notifications) = self.notifications.as_ref() {
+                    if run.cancelled {
+                        // Handled below by the `run.cancelled` arm, which
+                        // returns a `ToolResult::error` — no unhealthy
+                        // notification for a deliberate stop.
+                    } else if !run.pending_approvals.is_empty()
+                        && crate::ports::workflow_runner::stranded_approvals(
+                            &run.pending_approvals,
+                            &run.approvals,
+                        ) == run.pending_approvals.len()
+                        && !run
+                            .deliveries
+                            .iter()
+                            .any(|d| matches!(d.status, crate::ports::DeliveryStatus::Pending))
+                    {
+                        crate::runtime::file_run_unhealthy_notification(
+                            notifications.as_ref(),
+                            &self.company,
+                            &wid,
+                            &ctx.run_id,
+                            "stranded",
+                            "This run tried to park an approval and could not — nothing is \
+                             waiting on it any more, and nobody was asked.",
+                        )
+                        .await;
+                    } else if !run.blocked_nodes.is_empty() {
+                        crate::runtime::file_run_unhealthy_notification(
+                            notifications.as_ref(),
+                            &self.company,
+                            &wid,
+                            &ctx.run_id,
+                            "blocked",
+                            "This run stopped because a step is waiting on a person to decide \
+                             something.",
+                        )
+                        .await;
+                    }
                 }
                 // Issue #383: a cancelled run is `Ok`, so without this arm the
                 // agent would read the empty node summary as "the workflow did
@@ -3760,7 +4011,7 @@ impl Tool for RunWorkflowTool {
                     md,
                 ))
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::debug!(company = %self.company, workflow = %wid, error = %err, "run_workflow: run failed");
                 if let Some(events) = self.events.as_ref() {
                     let message = err.to_string();
@@ -3778,6 +4029,27 @@ impl Tool for RunWorkflowTool {
                             error: message.as_str(),
                             partial: err.partial_run(),
                         }),
+                    )
+                    .await;
+                }
+                // Issue #1865 (PR #1883 review comment 3877185396): this is
+                // the second run-outcome chokepoint alongside `WorkflowSpawn`
+                // — console, scheduled, and resumed failures already file a
+                // `workflow_run_failed` notification through that type, but
+                // an agent-started run never routed through it (see
+                // `WorkflowSpawn`'s own `notifications` doc comment) and so
+                // stayed silent to every operator not watching this turn.
+                // Fired unconditionally like the journal write above, not
+                // gated on it landing — the two are independent stores, and a
+                // journal miss must not also cost the alert.
+                if let Some(notifications) = self.notifications.as_ref() {
+                    crate::runtime::file_run_unhealthy_notification(
+                        notifications.as_ref(),
+                        &self.company,
+                        &wid,
+                        &ctx.run_id,
+                        "failed",
+                        crate::runtime::RUN_FAILED_DETAIL,
                     )
                     .await;
                 }
@@ -3907,6 +4179,42 @@ fn summarize_run(
     }
     if blocked.is_empty() && paused.is_empty() {
         md.push_str("\nThe run reached its terminal node(s) without pausing for approval.\n");
+    }
+
+    // Codex (PR #1883 review comment 3892522591): a node under `on_error =
+    // "continue"`/`"route"`, or one truncated at the iteration cap, settles
+    // this run as `Degraded` — `runner.rs` already turns that into a per-node
+    // notice (`errored_node_notice`) the console reads, but nothing here ever
+    // read it. An agent-started run only checked the blocked/paused and
+    // delivery cases above, so a run that silently continued past a broken
+    // step summarized as "reached its terminal node(s)" with no hint a step
+    // was skipped over — the model then reports a clean run to whoever asked
+    // for one, exactly the silence issue #981 closed for dropped deliveries
+    // two blocks below, just for a different fact.
+    //
+    // Read `run.nodes` directly rather than `run.notices`: `notices` also
+    // carries `blocked_notice` for every row already named above, and
+    // rendering the whole vector here would print those a second time. By the
+    // time a run settles, a row is still `Error` only when it is a genuine
+    // continued/capped error — the host's own blocked-node reclassification
+    // (mirroring `WorkflowRun::cancelled`'s) always leaves a blocked row
+    // `Blocked`, never `Error`, so this filter can never double up with
+    // `blocked` above. See `WorkflowNodeStatus::Blocked`'s doc.
+    let errored: Vec<&str> = run
+        .nodes
+        .iter()
+        .filter(|n| n.status == WorkflowNodeStatus::Error)
+        .map(|n| n.node_id.as_str())
+        .collect();
+    if !errored.is_empty() {
+        md.push_str(&format!(
+            "\n**{} step(s) did not finish cleanly, and the run continued past {}:** {}. This is \
+             NOT a clean run — check each step's own output for what went wrong before treating \
+             its results as complete.\n",
+            errored.len(),
+            if errored.len() == 1 { "it" } else { "them" },
+            errored.join(", ")
+        ));
     }
 
     // Issue #981: what happened to the reports. Nothing here read `deliveries`,
@@ -4326,6 +4634,8 @@ pub(crate) struct CreateWorkflowArgs {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
+    owner_desk: Option<String>,
+    #[serde(default)]
     nodes: Vec<CreateWorkflowArgNode>,
     #[serde(default)]
     edges: Vec<CreateWorkflowArgEdge>,
@@ -4493,12 +4803,14 @@ impl TryFrom<CreateWorkflowArgs> for RawWorkflow {
                 // which is the operator's to make, not the agent's to author.
                 repeatable: None,
                 destination: n.destination,
+                postcondition: None,
             });
         }
         Ok(Self {
             id: args.id,
             name: args.name,
             description: args.description,
+            owner_desk: RawWorkflow::normalize_owner_desk(args.owner_desk),
             nodes,
             edges: args
                 .edges
@@ -4629,6 +4941,10 @@ impl Tool for CreateWorkflowTool {
             self.events.as_ref(),
             draft,
             None,
+            // Issue #1843: an agent authoring a graph on its own initiative is
+            // not the human activation signal `by` exists to capture — keep
+            // this path unattributed, same as before this field existed.
+            None,
         )
         .await
         {
@@ -4694,6 +5010,10 @@ pub(crate) fn create_workflow_parameters_schema() -> Value {
                 "description": {
                     "type": "string",
                     "description": "An optional one-line description of what the workflow does."
+                },
+                "ownerDesk": {
+                    "type": ["string", "null"],
+                    "description": "Optional owning desk id. Use the stable desk id, not its display name. On update_workflow, send `null` to explicitly unassign the desk; omit the key to leave the current desk untouched."
                 },
                 "nodes": {
                     "type": "array",
@@ -4769,7 +5089,7 @@ mod tests {
             description: None,
             tier: tier.map(str::to_string),
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -6356,7 +6676,7 @@ members = ["legal_counsel"]
             name: "Dana Designer".to_string(),
             role: "Designer".to_string(),
             description: None,
-            tools: Vec::new(),
+            tools: None,
             model: None,
             harness: None,
         });
@@ -6399,7 +6719,7 @@ members = ["legal_counsel"]
                 name: "Dana Designer".to_string(),
                 role: "Designer".to_string(),
                 description: None,
-                tools: Vec::new(),
+                tools: None,
                 model: None,
                 harness: None,
             });
@@ -6996,7 +7316,7 @@ name = "Morning"
             name: "Fact Fetcher".to_string(),
             role: "Researcher".to_string(),
             description: None,
-            tools: Vec::new(),
+            tools: None,
             model: None,
             harness: None,
         });
@@ -7044,7 +7364,7 @@ name = "Morning"
             name: "Dana Designer".to_string(),
             role: "Designer".to_string(),
             description: None,
-            tools: Vec::new(),
+            tools: None,
             model: None,
             harness: None,
         });
@@ -7161,10 +7481,14 @@ name = "Morning"
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 
@@ -7198,10 +7522,12 @@ name = "Morning"
             Some("Owns acquisition experiments.")
         );
         assert!(!added.id.is_empty(), "a stable id must be minted");
-        // No `tools` given → the standard company-wide grant (empty list).
+        // No `tools` given → inherit the standard company-wide grant, which for
+        // an unscoped minter is `None` (keeps tracking `[tools].allow`), NOT an
+        // explicit empty list (which since #1804 is a deny-all).
         assert!(
-            added.tools.is_empty(),
-            "an add with no `tools` is the standard grant, not an empty shelf"
+            added.tools.is_none(),
+            "an add with no `tools` inherits the standard grant (None), not an empty deny-all shelf"
         );
     }
 
@@ -7214,7 +7540,7 @@ name = "Morning"
             company,
             store,
             "ceo".to_string(),
-            vec!["workspace".to_string()],
+            Some(vec!["workspace".to_string()]),
             vec!["workspace".to_string()],
         )
     }
@@ -7242,7 +7568,7 @@ name = "Morning"
         let record = store.load(&company).await.unwrap().expect("persisted");
         assert_eq!(
             record.overlay_agents[0].tools,
-            vec!["workspace".to_string()],
+            Some(vec!["workspace".to_string()]),
             "the minted teammate must be bounded by the agent that minted it, \
              not by the company"
         );
@@ -7266,9 +7592,9 @@ name = "Morning"
 
         let record = store.load(&company).await.unwrap().expect("persisted");
         assert!(
-            record.overlay_agents[0].tools.is_empty(),
-            "an empty line means the company's standard grant (#264), and a \
-             minter holding that grant hands on exactly it"
+            record.overlay_agents[0].tools.is_none(),
+            "an absent line (None) means the company's standard grant (#264/#1804), \
+             and an unscoped minter hands on exactly it — None, not an empty deny-all"
         );
     }
 
@@ -7293,7 +7619,7 @@ name = "Morning"
         let record = store.load(&company).await.unwrap().expect("persisted");
         assert_eq!(
             record.overlay_agents[0].tools,
-            vec!["workspace".to_string()],
+            Some(vec!["workspace".to_string()]),
             "`composio` is outside the minter's own grant and must be dropped"
         );
     }
@@ -7351,15 +7677,17 @@ name = "Morning"
         let record = store.load(&company).await.unwrap().expect("record");
         assert_eq!(
             record.overlay_agents[0].tools,
-            vec!["docs.*".to_string(), "email".to_string()],
+            Some(vec!["docs.*".to_string(), "email".to_string()]),
             "blanks are dropped and globs trimmed"
         );
     }
 
-    /// An empty `tools` array is the standard grant, not "no tools" — the same
-    /// as omitting the field entirely.
+    /// Since issue #1804 an explicit empty `tools` array is a deliberate
+    /// **deny-all**, NOT the standard grant — the contract inversion. Omitting
+    /// the field entirely is what inherits the standard grant (`None`); passing
+    /// `[]` deliberately hands the teammate no tools, stored as `Some(vec![])`.
     #[tokio::test]
-    async fn add_agent_tool_empty_tools_is_the_standard_grant() {
+    async fn add_agent_tool_empty_tools_is_an_explicit_deny_all() {
         let company = CompanyId::new("acme");
         let store = Arc::new(MemStore::seeded(seeded_record(&company)));
         let tool = unscoped_add_agent(company.clone(), store.clone());
@@ -7369,9 +7697,122 @@ name = "Morning"
             .await
             .expect("execute");
         assert!(!result.is_error, "{}", result.text());
+        assert!(
+            result.text().contains("hold no tools"),
+            "the mint result must state the deny-all plainly: {}",
+            result.text()
+        );
 
         let record = store.load(&company).await.unwrap().expect("record");
-        assert!(record.overlay_agents[0].tools.is_empty());
+        assert_eq!(
+            record.overlay_agents[0].tools,
+            Some(Vec::new()),
+            "an explicit empty array is a deny-all (Some(vec![])), not the standard grant (None)"
+        );
+    }
+
+    /// A minter whose own line names `chargebee` (the shipped bookkeeper) hands
+    /// that line on when `tools` is omitted — but an unstated grant never
+    /// confers billing (#788/#789), so the copied line is filtered before it is
+    /// stored. The #619 copy-the-line rule still holds for the non-BYO parts.
+    #[tokio::test]
+    async fn an_unstated_mint_from_a_billing_holding_minter_withholds_chargebee() {
+        let company = CompanyId::new("acme");
+        let mut record = seeded_record(&company);
+        record.manifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\
+             [tools]\n\
+             allow = [\"*\", \"workspace.*\", \"workspace.write\", \"media\", \"composio\", \
+             \"search\", \"mcp:*\", \"chargebee\"]\n",
+        )
+        .expect("valid manifest");
+        let store = Arc::new(MemStore::seeded(record));
+        let belt = vec![
+            "*".to_string(),
+            "workspace.*".to_string(),
+            "workspace.write".to_string(),
+            "media".to_string(),
+            "composio".to_string(),
+            "search".to_string(),
+            "mcp:*".to_string(),
+            "chargebee".to_string(),
+        ];
+        let tool = AddAgentTool::new(
+            company.clone(),
+            store.clone(),
+            "bookkeeper".to_string(),
+            Some(belt.clone()),
+            belt,
+        );
+
+        let result = tool
+            .execute(json!({ "name": "Jamie", "role": "Data Entry" }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error, "{}", result.text());
+
+        let record = store.load(&company).await.unwrap().expect("persisted");
+        let added = &record.overlay_agents[0];
+        assert!(
+            !added
+                .tools
+                .iter()
+                .flatten()
+                .any(|g| g == "chargebee" || g.starts_with("chargebee.")),
+            "an unstated mint must not hand on billing: {:?}",
+            added.tools
+        );
+        assert!(
+            added.tools.iter().flatten().any(|g| g == "*"),
+            "the rest of the minter's line is still copied verbatim (#619): {:?}",
+            added.tools
+        );
+    }
+
+    /// An EXPLICIT `tools` request naming `chargebee` survives — an unstated
+    /// grant is withheld, a stated one is narrowed to what the minter holds.
+    #[tokio::test]
+    async fn an_explicit_chargebee_request_from_a_billing_minter_is_honored() {
+        let company = CompanyId::new("acme");
+        let mut record = seeded_record(&company);
+        record.manifest = toml::from_str(
+            "[company]\nname = \"Acme\"\n\
+             [tools]\n\
+             allow = [\"*\", \"workspace.*\", \"workspace.write\", \"media\", \"composio\", \
+             \"search\", \"mcp:*\", \"chargebee\"]\n",
+        )
+        .expect("valid manifest");
+        let store = Arc::new(MemStore::seeded(record));
+        let belt = vec![
+            "*".to_string(),
+            "workspace.*".to_string(),
+            "workspace.write".to_string(),
+            "media".to_string(),
+            "composio".to_string(),
+            "search".to_string(),
+            "mcp:*".to_string(),
+            "chargebee".to_string(),
+        ];
+        let tool = AddAgentTool::new(
+            company.clone(),
+            store.clone(),
+            "bookkeeper".to_string(),
+            Some(belt.clone()),
+            belt,
+        );
+
+        let result = tool
+            .execute(json!({ "name": "Jamie", "role": "Data Entry", "tools": ["chargebee"] }))
+            .await
+            .expect("execute");
+        assert!(!result.is_error, "{}", result.text());
+
+        let record = store.load(&company).await.unwrap().expect("persisted");
+        assert_eq!(
+            record.overlay_agents[0].tools,
+            Some(vec!["chargebee".to_string()]),
+            "a stated billing namespace is narrowed to the minter's grant, not dropped"
+        );
     }
 
     /// A non-string `tools` item is a clean argument error, the same shape as a
@@ -7598,6 +8039,29 @@ name = "Morning"
         }
     }
 
+    /// A [`WorkflowRunner`] test double whose `run` always returns `Err` — the
+    /// engine-failed shape issue #1865's review comment 3877185396 flagged as
+    /// silent: `RunWorkflowTool`'s `Ok(Err(err))` arm journaled a finish but
+    /// filed no `workflow_run_failed` notification, unlike the console run
+    /// route, the cron scheduler, and the approval-resume path, which all
+    /// file one through `WorkflowSpawn`.
+    struct FailingRunner;
+
+    #[async_trait::async_trait]
+    impl WorkflowRunner for FailingRunner {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            _workflow: &WorkflowFile,
+            _input: Value,
+            _ctx: &crate::ports::WorkflowRunContext,
+        ) -> crate::Result<WorkflowRun> {
+            Err(crate::error::OpenCompanyError::Harness(
+                "the engine blew up".to_string(),
+            ))
+        }
+    }
+
     /// Writes `DEMO_WF` to `<dir>/workflows/demo.toml`.
     fn seed_demo_workflow(dir: &std::path::Path) {
         let wf = dir.join("workflows");
@@ -7649,8 +8113,9 @@ name = "Morning"
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
             "ceo".to_string(),
-            Vec::new(),
+            None,
             vec!["fs:*".to_string()],
+            None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         // Six before #186; `assign_task` + `review_task` made eight; #418's
@@ -7690,6 +8155,56 @@ name = "Morning"
         );
     }
 
+    /// A runner panic is converted into an agent-visible error, and the RAII
+    /// supervisor slot is gone when the tool returns. This covers both cleanup
+    /// obligations without changing the runner architecture.
+    #[tokio::test]
+    async fn panicking_run_cleans_up_its_active_attempt() {
+        struct PanickingRunner;
+
+        #[async_trait::async_trait]
+        impl WorkflowRunner for PanickingRunner {
+            async fn run(
+                &self,
+                _company: &CompanyId,
+                _workflow: &WorkflowFile,
+                _input: Value,
+                _ctx: &crate::ports::WorkflowRunContext,
+            ) -> crate::Result<WorkflowRun> {
+                panic!("test runner panic")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(PanickingRunner);
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let supervisor = crate::runtime::RunSupervisor::default();
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            supervisor.clone(),
+            None,
+            WorkflowRefQueue::default(),
+            RunOutputCache::default(),
+            None,
+        );
+
+        let result = tool
+            .execute(json!({"id": "demo"}))
+            .await
+            .expect("panic is converted to a tool result");
+        assert!(result.is_error, "panic must be agent-visible: {result:?}");
+        assert!(
+            result.output_for_llm(false).contains("internal error"),
+            "the result should not leak panic payload: {result:?}"
+        );
+        assert_eq!(supervisor.len(), 0, "the active attempt must be cleaned up");
+    }
+
     #[tokio::test]
     async fn run_workflow_tool_loads_and_invokes_the_runner() {
         let dir = tempfile::tempdir().unwrap();
@@ -7723,6 +8238,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo", "input": { "seed": 1 } }))
@@ -7769,6 +8285,7 @@ name = "Morning"
             None,
             refs.clone(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -7805,6 +8322,7 @@ name = "Morning"
             None,
             refs.clone(),
             RunOutputCache::default(),
+            None,
         );
         assert!(
             unwired
@@ -7827,6 +8345,7 @@ name = "Morning"
             None,
             refs.clone(),
             RunOutputCache::default(),
+            None,
         );
         assert!(
             unknown
@@ -7871,6 +8390,7 @@ name = "Morning"
             None,
             refs.clone(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -7878,6 +8398,163 @@ name = "Morning"
             .expect("execute");
         assert!(result.is_error, "a cancelled run reports as a stop");
         assert_eq!(refs.queued(), 0);
+    }
+
+    /// Issue #1861: an agent-initiated run that ends blocked badges the
+    /// operator, exactly as the console's and the scheduler's runs do.
+    ///
+    /// This is the one trigger nobody is watching a progress bar for, so the
+    /// badge is the only way a run that stopped waiting on a person becomes
+    /// visible without somebody thinking to open the run history.
+    #[tokio::test]
+    async fn a_blocked_agent_run_badges_the_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": {} }),
+            pending_approvals: vec!["worker".to_string()],
+            deliveries: Vec::new(),
+            cancelled: false,
+            nodes: Vec::new(),
+            notices: Vec::new(),
+            board: Vec::new(),
+            blocked_nodes: vec![crate::ports::workflow_runner::WorkflowBlockedNode {
+                node_id: "worker".to_string(),
+                tools: vec!["send_email".to_string()],
+                approval_ids: vec!["ap-1".to_string()],
+                unparkable: 0,
+                stranded: 0,
+            }],
+            approvals: Vec::new(),
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let notifications: Arc<dyn crate::ports::notifications::NotificationStore> =
+            Arc::new(crate::store::FsOps::new(dir.path().to_path_buf()));
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            WorkflowRefQueue::default(),
+            RunOutputCache::default(),
+            Some(notifications.clone()),
+        );
+        tool.execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+
+        let feed = notifications
+            .list(&CompanyId::new("acme"), "ceo")
+            .await
+            .expect("list");
+        assert_eq!(feed.len(), 1, "one badge for one unhealthy run: {feed:?}");
+        assert_eq!(feed[0].notification.kind, "workflow_run_blocked");
+    }
+
+    /// The same contract for the other unhealthy end: the run could not park
+    /// the approval at all, so nobody was asked and nothing is waiting.
+    #[tokio::test]
+    async fn a_stranded_agent_run_badges_the_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": {} }),
+            // Stranded is counted per pending *node* (`stranded_approvals`),
+            // not per gated call: the node is pending, and every approval row
+            // it owns failed to park, so there is nothing an operator can be
+            // asked about. A fixture with no pending node at all is not a
+            // stranded run under that reconciliation — it is an empty one.
+            pending_approvals: vec!["worker".to_string()],
+            deliveries: Vec::new(),
+            cancelled: false,
+            nodes: Vec::new(),
+            notices: Vec::new(),
+            board: Vec::new(),
+            blocked_nodes: Vec::new(),
+            approvals: vec![crate::ports::workflow_runner::WorkflowRunApprovalRow {
+                node_id: Some("worker".to_string()),
+                tool: Some("send_email".to_string()),
+                outcome: crate::ports::workflow_runner::WorkflowApprovalOutcome::ParkFailed,
+                approval_id: None,
+            }],
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let notifications: Arc<dyn crate::ports::notifications::NotificationStore> =
+            Arc::new(crate::store::FsOps::new(dir.path().to_path_buf()));
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            WorkflowRefQueue::default(),
+            RunOutputCache::default(),
+            Some(notifications.clone()),
+        );
+        tool.execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+
+        let feed = notifications
+            .list(&CompanyId::new("acme"), "ceo")
+            .await
+            .expect("list");
+        assert_eq!(feed.len(), 1, "{feed:?}");
+        assert_eq!(feed[0].notification.kind, "workflow_run_stranded");
+    }
+
+    /// A run that finished cleanly badges nobody. The badge means "this needs
+    /// you"; one per successful run would train the operator to ignore it.
+    #[tokio::test]
+    async fn a_healthy_agent_run_badges_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(StubRunner::new(WorkflowRun {
+            output: json!({ "nodes": { "worker": { "items": [] } } }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            cancelled: false,
+            nodes: Vec::new(),
+            notices: Vec::new(),
+            board: Vec::new(),
+            blocked_nodes: Vec::new(),
+            approvals: Vec::new(),
+        }));
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+
+        let notifications: Arc<dyn crate::ports::notifications::NotificationStore> =
+            Arc::new(crate::store::FsOps::new(dir.path().to_path_buf()));
+        let tool = RunWorkflowTool::new(
+            CompanyId::new("acme"),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            WorkflowRefQueue::default(),
+            RunOutputCache::default(),
+            Some(notifications.clone()),
+        );
+        tool.execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+
+        let feed = notifications
+            .list(&CompanyId::new("acme"), "ceo")
+            .await
+            .expect("list");
+        assert!(feed.is_empty(), "{feed:?}");
     }
 
     #[tokio::test]
@@ -7908,6 +8585,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -7982,6 +8660,7 @@ name = "Morning"
             None,
             refs,
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -8037,6 +8716,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "demo" }))
@@ -8044,6 +8724,65 @@ name = "Morning"
             .expect("execute");
         assert!(result.is_error, "expected an error result");
         assert!(result.output_for_llm(false).contains("wired"), "{result:?}");
+    }
+
+    /// Issue #1865 (PR #1883 review comment 3877185396): an agent-started run
+    /// that the engine returns `Err` on is the second run-outcome chokepoint
+    /// `WorkflowSpawn` does not cover — console, scheduled, and resumed
+    /// failures all file a `workflow_run_failed` notification through that
+    /// type, but this tool's own `Ok(Err(err))` arm used to journal a finish
+    /// and stop, leaving every agent-started failure invisible to an operator
+    /// not watching this turn. Reused `crate::store::FsOps` as the
+    /// notification-store double, the same one `WorkflowSpawn`'s own
+    /// equivalent test (`a_failed_run_does_not_leak_the_raw_engine_error_into_its_notification`
+    /// in `runtime::workflow_spawn`) uses.
+    #[tokio::test]
+    async fn run_workflow_tool_files_a_notification_when_the_engine_run_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_demo_workflow(dir.path());
+        let runner: Arc<dyn WorkflowRunner> = Arc::new(FailingRunner);
+        let handle = WorkflowRunnerHandle::default();
+        handle.set(&runner);
+        let company = CompanyId::new("acme");
+        let notifications: Arc<dyn NotificationStore> =
+            Arc::new(crate::store::FsOps::new(dir.path().to_path_buf()));
+
+        let tool = RunWorkflowTool::new(
+            company.clone(),
+            Some(dir.path().to_path_buf()),
+            Arc::new(MemStore::default()),
+            handle,
+            crate::runtime::RunSupervisor::default(),
+            None,
+            WorkflowRefQueue::default(),
+            RunOutputCache::default(),
+            Some(notifications.clone()),
+        );
+        let result = tool
+            .execute(json!({ "id": "demo" }))
+            .await
+            .expect("execute");
+        assert!(result.is_error, "the engine failed: {result:?}");
+
+        let notes = notifications
+            .list(&company, "anyone")
+            .await
+            .expect("list notifications");
+        let failed = notes
+            .iter()
+            .find(|n| n.notification.kind == "workflow_run_failed")
+            .expect(
+                "an agent-started run that fails must file the same durable notification a \
+                 console, scheduled, or resumed run does",
+            );
+        assert!(
+            failed
+                .notification
+                .title
+                .contains(crate::runtime::RUN_FAILED_DETAIL),
+            "{:?}",
+            failed.notification.title
+        );
     }
 
     #[tokio::test]
@@ -8063,6 +8802,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "nope" }))
@@ -8086,6 +8826,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool.execute(json!({})).await.expect("execute");
         assert!(result.is_error);
@@ -8109,6 +8850,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = tool
             .execute(json!({ "id": "../secrets" }))
@@ -8140,10 +8882,14 @@ name = "Morning"
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 
@@ -8220,6 +8966,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = run
             .execute(json!({ "id": "greeter" }))
@@ -8289,6 +9036,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
 
         let result = run
@@ -8368,6 +9116,7 @@ name = "Morning"
             None,
             refs.clone(),
             RunOutputCache::default(),
+            None,
         );
         assert!(
             !run.execute(json!({ "id": "greeter" }))
@@ -8470,6 +9219,7 @@ name = "Morning"
             None,
             WorkflowRefQueue::default(),
             RunOutputCache::default(),
+            None,
         );
         let result = run
             .execute(json!({ "id": "hosted" }))
@@ -8558,6 +9308,71 @@ name = "Morning"
                 .contains("slug = \"web_fetch\""),
             "the persisted graph carries the tool slug: {}",
             record.overlay_workflows[0].toml
+        );
+    }
+
+    /// Issue #1882 (tinysweeper): every other external boundary that turns a
+    /// caller-supplied `ownerDesk` into a [`RawWorkflow`] runs it through
+    /// [`RawWorkflow::normalize_owner_desk`] — the HTTP create route
+    /// (`server::ops::workflows`) and the proposal-apply path
+    /// (`workflow_create::raw_workflow_from_spec`) — so a blank/whitespace
+    /// string is stored as `None`, not `Some("   ")`. The orchestrator's
+    /// `create_workflow` tool passed `args.owner_desk` straight through
+    /// instead, so a whitespace `ownerDesk` persisted verbatim in the graph's
+    /// TOML and would defeat the `is_none()` fallback
+    /// `apply_workflow_proposal` relies on later.
+    #[tokio::test]
+    async fn create_workflow_tool_normalizes_a_blank_owner_desk() {
+        let company = CompanyId::new("acme");
+        let store: Arc<dyn CompanyStore> =
+            Arc::new(MemStore::seeded(record_with_assistant(&company)));
+        let tool = CreateWorkflowTool::new(
+            company.clone(),
+            None,
+            store.clone(),
+            None,
+            WorkflowRefQueue::default(),
+        );
+
+        let mut body = greeter_body();
+        body["ownerDesk"] = json!("   ");
+        let result = tool.execute(body).await.expect("execute");
+        assert!(!result.is_error, "{result:?}");
+
+        let record = store.load(&company).await.unwrap().unwrap();
+        assert_eq!(record.overlay_workflows.len(), 1);
+        assert!(
+            !record.overlay_workflows[0].toml.contains("owner_desk"),
+            "a blank owner_desk must normalize to None and be omitted from the \
+             persisted TOML, matching every other boundary that builds a \
+             RawWorkflow: {}",
+            record.overlay_workflows[0].toml
+        );
+    }
+
+    /// PR #1882 review (bot finding on `orchestrator.rs:4788`).
+    /// `UpdateWorkflowTool`'s description (built from this same schema via
+    /// `create_graph_schema`) tells the agent to send `"ownerDesk": null` to
+    /// unassign a desk, and `an_update_can_explicitly_clear_owner_desk_with_null`
+    /// proves `execute` honors that. But `execute` is called directly in that
+    /// test, bypassing the boundary a schema-constrained tool-calling client
+    /// actually enforces: before this fix `ownerDesk` was declared bare
+    /// `"type": "string"`, so such a client would reject the `null` argument
+    /// before the call ever reached `execute`'s presence check, leaving the
+    /// advertised clear operation reachable in tests but not in the field.
+    #[test]
+    fn owner_desk_schema_permits_null() {
+        let schema = create_workflow_parameters_schema();
+        let owner_desk_type = &schema["properties"]["ownerDesk"]["type"];
+        let permits_null = owner_desk_type
+            .as_array()
+            .map(|types| types.iter().any(|t| t == "null"))
+            .unwrap_or(false);
+        assert!(
+            permits_null,
+            "ownerDesk schema type must include \"null\" so a schema-constrained \
+             client can send the explicit-clear value the tool description \
+             promises; got {owner_desk_type:?}"
         );
     }
 
@@ -9029,6 +9844,7 @@ name = "Morning"
             None,
             refs,
             cache,
+            None,
         );
         (tool, runner)
     }
@@ -9241,6 +10057,86 @@ name = "Morning"
         assert!(
             md.contains("1 report(s) did NOT reach a destination"),
             "{md}"
+        );
+    }
+
+    /// Codex (PR #1883 review comment 3892522591): a node under `on_error =
+    /// "continue"`/`"route"` settles the run `Degraded`, and `runner.rs`
+    /// already writes a per-node notice for it — but `summarize_run` never
+    /// read `run.nodes`, so an agent-started run through this exact case
+    /// summarized as "reached its terminal node(s) without pausing for
+    /// approval" with no hint anything went wrong. This pins the fix: a row
+    /// still `Error` after settle must show up in the tool result.
+    #[test]
+    fn the_summary_says_when_a_node_errored_and_the_run_continued() {
+        let file = crate::company::parse_workflow(DEMO_WF).unwrap();
+        let degraded = WorkflowRun {
+            output: json!({ "nodes": { "worker": { "items": ["partial"] } } }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            cancelled: false,
+            nodes: vec![crate::ports::WorkflowRunNodeRow {
+                node_id: "worker".into(),
+                status: WorkflowNodeStatus::Error,
+                elapsed_ms: 12,
+                diagnostics: Vec::new(),
+            }],
+            notices: Vec::new(),
+            board: Vec::new(),
+            blocked_nodes: Vec::new(),
+            approvals: Vec::new(),
+        };
+        let md = summarize_run(&file, &degraded, "run-degraded", RunOutputStored::Stored);
+        assert!(
+            md.contains("did not finish cleanly, and the run continued past it"),
+            "{md}"
+        );
+        assert!(md.contains("worker"), "{md}");
+        assert!(
+            md.contains("NOT a clean run"),
+            "an agent skimming for the happy-path sentence must not miss this: {md}"
+        );
+
+        // A node that finished clean says nothing about it — an ordinary
+        // summary is unchanged.
+        let clean = WorkflowRun {
+            nodes: vec![crate::ports::WorkflowRunNodeRow {
+                node_id: "worker".into(),
+                status: WorkflowNodeStatus::Ok,
+                elapsed_ms: 12,
+                diagnostics: Vec::new(),
+            }],
+            ..degraded.clone()
+        };
+        let md = summarize_run(&file, &clean, "run-clean", RunOutputStored::Stored);
+        assert!(!md.contains("did not finish cleanly"), "{md}");
+        assert!(!md.contains("NOT a clean run"), "{md}");
+
+        // A blocked node must not ALSO print here — it is already named by the
+        // "Blocked, waiting on a person" paragraph above, sourced from
+        // `blocked_nodes`, not from a node row's own status (the host never
+        // leaves a blocked row `Error`; see `WorkflowNodeStatus::Blocked`'s doc).
+        let blocked = WorkflowRun {
+            nodes: vec![crate::ports::WorkflowRunNodeRow {
+                node_id: "worker".into(),
+                status: WorkflowNodeStatus::Blocked,
+                elapsed_ms: 12,
+                diagnostics: Vec::new(),
+            }],
+            blocked_nodes: vec![crate::ports::WorkflowBlockedNode {
+                node_id: "worker".into(),
+                tools: vec!["send_email".into()],
+                approval_ids: vec!["appr-1".into()],
+                unparkable: 0,
+                stranded: 0,
+            }],
+            ..degraded.clone()
+        };
+        let md = summarize_run(&file, &blocked, "run-blocked", RunOutputStored::Stored);
+        assert!(md.contains("Blocked, waiting on a person"), "{md}");
+        assert!(
+            !md.contains("did not finish cleanly"),
+            "a blocked row must not double up with the degraded paragraph: {md}"
         );
     }
 

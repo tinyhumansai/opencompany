@@ -13,6 +13,7 @@ import {
   type ComposioStatus,
 } from "@/api/composio";
 import type { ConnectionState } from "@/api/types";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { catalogWarning } from "@/lib/composio-catalog";
@@ -25,6 +26,7 @@ import {
   type GridProvider,
 } from "@/lib/provider-grid";
 import { ProviderDetail, type ConnectionSubject } from "@/views/connections/ProviderDetail";
+import { grantNamespace } from "@/components/grant-namespace";
 import { AccountChoiceSection } from "@/views/connections/AccountChoiceSection";
 import { CompanyCredentialCard } from "@/views/connections/CompanyCredentialCard";
 import { ComposioSection } from "@/views/connections/ComposioSection";
@@ -124,6 +126,11 @@ export function OAuthView({ client, company }: Props) {
   // with it: connecting a second Gmail is exactly when that section appears,
   // and releasing one is exactly when it stops being a choice (issue #820).
   const [connectionsGeneration, setConnectionsGeneration] = useState(0);
+
+  // Issue #1796: whether the `composio` grant is in flight. The grid renders the
+  // control, this owns the write — the grid is presentational by design, and
+  // giving it host state back is how the page came to have two provider lists.
+  const [grantingComposio, setGrantingComposio] = useState(false);
 
   const refresh = useCallback(async () => {
     // Both reads, together: the page's status and the accounts behind it are one
@@ -524,21 +531,23 @@ export function OAuthView({ client, company }: Props) {
   const connectedCount = connectedProviderCount(providers);
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">OAuth</h1>
-            <p className="text-sm text-muted-foreground">
-              The third-party accounts your company signs in to and acts through. It only uses
-              what you connect.
-            </p>
-          </div>
-          {load === "ready" && connectedCount > 0 && (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader
+        title="OAuth"
+        width="5xl"
+        description={
+          <>
+            The third-party accounts your company signs in to and acts through. It only uses
+            what you connect.
+          </>
+        }
+        trailing={
+          load === "ready" && connectedCount > 0 ? (
             <Badge variant="secondary">{connectedCount} connected</Badge>
-          )}
-        </div>
-
+          ) : null
+        }
+      />
+      <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
         {load === "unavailable" && (
           <Alert>
             <Info className="size-4" />
@@ -610,6 +619,24 @@ export function OAuthView({ client, company }: Props) {
           openMode={status?.openMode === true}
           degraded={status ? catalogWarning(status) : null}
           loading={load === "loading" || !reachSettled}
+          granting={grantingComposio}
+          onGrant={() => {
+            void (async () => {
+              setGrantingComposio(true);
+              try {
+                // Both generations bump: the grant changes what the page's
+                // status says about `granted`, and `ComposioSection` reads the
+                // same flag one card up. Refreshing one and not the other is
+                // the two-surfaces-disagreeing failure #582 is about.
+                if (await grantNamespace(client, company, "composio")) {
+                  setCredentialGeneration((n) => n + 1);
+                  await refresh();
+                }
+              } finally {
+                setGrantingComposio(false);
+              }
+            })();
+          }}
           onConnect={(p) => void connect(p)}
           onDisconnect={(p) => void disconnect(p)}
           onOpen={(p) => setOpened(p.slug)}

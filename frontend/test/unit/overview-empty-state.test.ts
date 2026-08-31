@@ -21,12 +21,18 @@ import type { OpenCompanyClient } from "@/api/client";
 // Captured on every render of the (mocked) graph so a test can read what
 // `Overview` actually decided.
 const { graphProps } = vi.hoisted(() => ({
-  graphProps: { emptyState: false },
+  graphProps: { emptyState: false, noDesks: false, nodeCount: 0 },
 }));
 
 vi.mock("@/views/overview/kg/KnowledgeGraph", () => ({
-  KnowledgeGraph: (props: { emptyState?: boolean }) => {
+  KnowledgeGraph: (props: {
+    emptyState?: boolean;
+    noDesks?: boolean;
+    graph?: { nodes: unknown[] };
+  }) => {
     graphProps.emptyState = !!props.emptyState;
+    graphProps.noDesks = !!props.noDesks;
+    graphProps.nodeCount = props.graph?.nodes.length ?? 0;
     return null;
   },
 }));
@@ -73,6 +79,8 @@ beforeEach(() => {
   document.body.appendChild(container);
   root = createRoot(container);
   graphProps.emptyState = false;
+  graphProps.noDesks = false;
+  graphProps.nodeCount = 0;
 });
 
 afterEach(() => {
@@ -108,6 +116,83 @@ describe("the overview empty state", () => {
 
     // The company may well have desks; the request just failed. Drawing the
     // graph without pillars is honest — claiming "No desks yet" is not.
+    expect(graphProps.emptyState).toBe(false);
+    expect(graphProps.noDesks).toBe(false);
+  });
+
+  /**
+   * A deskless company still has a graph, and the two facts are separate.
+   *
+   * They were one flag, and the flag suppressed the canvas: a company with a
+   * roster, tools and saved workflows but no `[[group_chat]]` got a blank
+   * field under "No desks yet". The model has always placed a worker with no
+   * desk on the core, so there was something to draw the whole time.
+   */
+  it("draws the graph for a deskless company that has a roster", async () => {
+    const mocks = fakeClient();
+    mocks.listDesks.mockResolvedValue([]);
+    (mocks.client.listTeam as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "engineer", name: "Engineer", role: "engineer", tools: ["workspace"] },
+    ]);
+
+    await render(mocks.client);
+
+    // The fact about the company: no pillars, and the corner says so.
+    expect(graphProps.noDesks).toBe(true);
+    // The fact about the graph: there is more than the core node, so it draws.
+    expect(graphProps.nodeCount).toBeGreaterThan(1);
+    expect(graphProps.emptyState).toBe(false);
+  });
+
+  it("covers the canvas only when nothing but the core node is left to draw", async () => {
+    const { client } = fakeClient();
+    await render(client);
+
+    expect(graphProps.nodeCount).toBe(1);
+    expect(graphProps.emptyState).toBe(true);
+    expect(graphProps.noDesks).toBe(true);
+  });
+
+  /**
+   * Codex review on PR #1931: durable memory is passed to `KnowledgeGraph`
+   * through its own `memory` prop rather than folded into `graph.nodes`, so a
+   * deskless company with no roster, tasks, or workflows but a nonempty
+   * memory constellation must not still be called `emptyState` — there is a
+   * memory graph to look at even though `graph.nodes` holds only the core.
+   */
+  it("stays hidden for a deskless company whose only content is durable memory", async () => {
+    const mocks = fakeClient();
+    const get = mocks.client.get as ReturnType<typeof vi.fn>;
+    get.mockImplementation((path: string) => {
+      if (path.endsWith("/memory")) {
+        return Promise.resolve({
+          items: [
+            {
+              id: "fact-1",
+              kind: "fact",
+              origin: "fact",
+              editable: true,
+              title: "Founded in 2024",
+              body: "The company was founded in 2024.",
+              source: "operator",
+              updatedAt: 0,
+            },
+          ],
+          totalContext: 0,
+          contextTruncated: false,
+        });
+      }
+      return Promise.resolve([]);
+    });
+
+    await render(mocks.client);
+
+    // The fact about the company: still no pillars.
+    expect(graphProps.noDesks).toBe(true);
+    // The fact about the graph proper: still only the core node.
+    expect(graphProps.nodeCount).toBe(1);
+    // But the memory constellation is not empty, so the empty state must not
+    // cover it.
     expect(graphProps.emptyState).toBe(false);
   });
 });

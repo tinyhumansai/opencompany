@@ -1,13 +1,26 @@
 # Checkpoints and Approvals
 
-The trust core of the product: agents act freely inside the fence; anything
-irreversible waits for the Operator. This doc is normative.
+Approvals are deliberate operator questions, not policy interception around
+ordinary tool calls. This doc is normative.
 
-## Checkpoint taxonomy
+## Current approval boundary
 
-Effect kinds that MAY require sign-off, grouped by what they risk:
+An agent raises a general approval with `request_approval` (`title`, yes/no
+`question`, optional `context`). Specialized tools may explicitly state that
+their own call stages one concrete approval; that is tool behavior, not policy.
+Approve and deny both resume the requesting agent with the decision.
 
-| Group | Effect kinds (examples) | Default in `supervised` mode |
+Policy-generated HITL is disabled. `[policy].mode`, `always_approve`, spend
+thresholds and per-call judgement do not manufacture cards. `readonly` and the
+emergency stop remain hard denials. An operator-authored workflow node with
+`requires_approval = true` remains an explicit gate.
+
+## Dormant policy-HITL taxonomy
+
+This legacy classifier remains for audit, hard denials, and a possible future
+policy-HITL mode. It does **not** create approval cards in the current product:
+
+| Group | Effect kinds (examples) | Legacy `supervised` default |
 | --- | --- | --- |
 | **Spend** | `payment.send`, `subscription.start`, x402 outbound above cap | approval above `auto_approve_under_usd` |
 | **Send** | `email.send`, `dm.external`, any first message to a new counterparty | approval for new counterparties; allowed for established threads |
@@ -16,34 +29,15 @@ Effect kinds that MAY require sign-off, grouped by what they risk:
 | **Hire** | outbound A2A engagement with a new company; firing a vendor | approval above threshold or first-time counterparty |
 | **Identity** | handle registration/renewal, key rotation, delegated signer mint/expand | always approval |
 
-`readonly` mode gates *every* effect; `full` mode auto-allows everything
-except `[policy].always_approve` entries. `auto` sits between `supervised` and
-`full`: the agent's own sandbox writes and its outward reads run unattended,
-and anything that leaves the company or spends on submit still parks — see
-[the tier line](grants.md#the-auto-tier).
+`readonly` still denies applicable effects, and the emergency stop still denies
+ahead of every policy rule. `supervised`, `auto`, `full`, `always_approve`, and
+the spend thresholds are otherwise classification and audit data only while
+policy HITL is disabled. In particular, `auto` does not park outbound or spend
+effects. Agents use `request_approval` when they need a decision.
 
-**The ladder is ordered, and that order is a guarantee.** `POLICY_MODES` runs
-`readonly` → `supervised` → `auto` → `full` by increasing autonomy, the console
-renders it in that order, and the gate owes it one property: for any given
-effect, permissiveness never decreases as you move up. An operator moving a
-company up a tier to be interrupted less must not be interrupted more.
-`the_tier_ladder_is_monotonic` in `src/policy/gate.rs` pins it across every tier
-and every branch of the taxonomy above, because it was false for two releases
-and every test named a single mode (issue #1454).
-
-**Under `auto` this table applies unchanged.** The tier is real but its work is
-on the [tool gate](grants.md#the-auto-tier), where `auto` waves through the
-`Standing::Grantable` sandbox writes that `supervised` parks. The *effect*
-taxonomy has no such bucket to wave through: every group it parks — a spend at
-or over the cap, a message to a counterparty nobody has talked to, a signature,
-a publish, an identity change, an engagement over the cap — is by definition
-something that leaves the company or spends money, which is the exact line
-`auto` says it stops at. The only inside-the-company group is the residual
-**Other**, and `supervised` already allows it. So `ManifestApprovalGate` has a
-named `auto` arm that delegates to the supervised taxonomy rather than an alias
-or a second copy of it; if a native effect ever genuinely belongs to `auto` and
-not to `supervised`, it gets its own line there, and whatever `auto` parks stays
-a subset of what `supervised` parks.
+The ordering and legacy evaluation tests remain so re-enabling policy HITL in a
+future migration cannot silently change the old classifier. They describe that
+dormant classifier, not current card creation.
 
 Three of the four names are OpenHuman's own security tiers. `auto` is not, so
 the mapping is no longer 1:1 and `PolicyMode::security_tier()` — the accessor
@@ -55,17 +49,13 @@ a workflow `tool_call` node has no `ApprovalPolicy` above it.
 ## Approval lifecycle
 
 ```text
-effect emitted ─▶ evaluate ─▶ Allow ─▶ execute, journal
-                      │
-                      ├─▶ Deny ─▶ returned to brain as refusal (it replans)
-                      │
-                      └─▶ RequireApproval ─▶ park (ApprovalId)
-                                              │  surfaces in approvals inbox + chat
-                                              ▼
-                            operator resolves: approve │ deny │ edit
-                                              │
-                                              ▼
-                            ApprovalResolved event ─▶ follow-up cycle
+agent calls request_approval ─▶ park (ApprovalId)
+                                  │  surfaces in approvals inbox + chat
+                                  ▼
+                     operator resolves: approve │ deny
+                                  │
+                                  ▼
+                     requesting agent continues
 ```
 
 - **Default-deny on silence**: parked approvals expire to `deny` after a
@@ -90,14 +80,33 @@ effect emitted ─▶ evaluate ─▶ Allow ─▶ execute, journal
   this path: an approval that disappears must never read as one that was
   granted. Each card carries its own `expiresAtMillis`, so nothing vanishes
   unannounced.
-- **Edit** lets the Operator amend the effect payload (fix the email, lower
-  the amount) and approve the amended version; the brain sees both the
-  original and the edit.
+- **Extend the deadline** (issue #1805). Showing the countdown is only half the
+  answer to a run that would default-deny over a weekend; the other half is a
+  lever to keep it alive. `POST
+  /api/v1/companies/{id}/approvals/{aid}/extend` (and the single-company
+  `/api/v1/company/approvals/{aid}/extend` alias) re-anchors a parked
+  approval's TTL window to *now*, giving it a fresh full deadline, and answers
+  with the new `expiresAtMillis` so the card redraws its countdown without a
+  reload. It is guarded by the same company auth as resolve — keeping a stalled
+  run alive is not an admin-only action — and 404s when nothing is parked under
+  that id, so extending an approval that has since resolved or expired is told,
+  not silently accepted. **A full fresh window, not "+N hours"**: the sweeper
+  and the console both read `parked_at + ttl`, so moving that one instant is the
+  whole of an extension and there is no second offset for a projection to
+  disagree on. **It survives a redeploy**: the move is journaled as
+  `ApprovalExtended` and replayed on boot (the gate is rehydrated from the moved
+  anchor), so an extension is not quietly reverted the next time the process
+  restarts. The payload timestamp (`at_millis`, the content's age) is left where
+  it is — extending a deadline does not make the request fresher.
+- **Edit applies only to concrete-action cards** staged by a specialized tool.
+  A `request_approval` card is a question, carries no action to edit, and only
+  returns its verdict to the requesting agent.
 - Resolution requires operator auth ([runtime/api.md](../runtime/api.md));
   the resolving `Actor` is journaled.
-- Approve executes the parked effect exactly once
-  (journal-before-execute, [runtime/lifecycle.md](../runtime/lifecycle.md));
-  deny feeds the refusal back so the brain replans rather than retries.
+- For `request_approval`, approve and deny both queue a verdict-bearing
+  `ApprovalContinuation`; neither executes an effect or mints execution
+  authority. Concrete-action cards explicitly staged by specialized tools keep
+  their own execute-or-grant semantics.
 - **Resolution is idempotent.** Resolving an approval that is no longer parked
   — a double-submit, a retried request, two operators on the same queue —
   is a no-op with a fixed reply. It writes no journal record and runs no
@@ -163,11 +172,12 @@ harness.
 Resolving is two halves with very different durations, and the runtime keeps
 them apart:
 
-1. **Settle** — record the verdict, journal it, mint the grant (or execute the
-   native effect). Milliseconds. When it returns, the operator's decision is
-   permanent.
-2. **Follow-up cycle** — a full agent turn, so the brain learns the verdict and
-   re-issues the granted call. Can take minutes.
+1. **Settle** — record the verdict and journal an `ApprovalContinuation` carrying
+   the requesting agent and conversation. Milliseconds. When it returns, the
+   operator's decision is permanent.
+2. **Follow-up cycle** — a full agent turn that tells the requester approved or
+   denied. It does not replay `request_approval` or automatically invoke the
+   proposed action. Can take minutes.
 
 The follow-up always runs on its **own task**, which the resolve then awaits.
 That makes it drop-safe: a client that disappears mid-turn — a closed tab, or a
@@ -182,12 +192,17 @@ continuation then arrives on the event stream's `agent_reply` frame. The
 blocking form remains the default and its response body is unchanged.
 
 A follow-up cycle that *fails* is logged host-side and leaves a recoverable
-state, never a stranded one: the verdict and grant are already durable, and
-re-approving is the idempotent no-op above, so a retry mints no second grant.
+state, never a stranded one: the verdict and continuation are already durable,
+and re-approving is the idempotent no-op above.
 
-## Approving a blocked tool call: single-use grants
+## Dormant concrete-action grant model
 
-Moved to [`grants.md`](grants.md) — this file was over the repository's 500-line limit. See that page for the full detail. What moved, in the order it appears there:
+Policy-generated blocked-tool cards are disabled. [`grants.md`](grants.md)
+documents the retained concrete-action machinery for in-flight records,
+specialized tools that deliberately stage an action, and a possible future
+policy-HITL mode. It is not the lifecycle of `request_approval`.
+
+What lives there, in the order it appears:
 
 - single-use grants: what approving a blocked **tool** call mints, versus a **native** effect the runtime performs itself (approving one of those executes it, per the lifecycle above);
 - [standing grants](grants.md#standing-grants-this-tool-for-this-teammate-until-a-deadline) — this tool, for this teammate, until a deadline — and [what can never be granted broadly](grants.md#what-can-never-be-granted-broadly);
@@ -196,20 +211,17 @@ Moved to [`grants.md`](grants.md) — this file was over the repository's 500-li
 - [what an `always_approve` entry names](grants.md#what-an-always_approve-entry-names-issue-684) (issue #684);
 - [precedence at the tool gate](grants.md#precedence-at-the-tool-gate), and its step 7, [per-call judgement](grants.md#per-call-judgement-issue-338) (issue #338).
 
-## Approvals inside a workflow run (issue #395)
+## Explicit approvals inside a workflow run
 
-A workflow run is not a cycle, and for a long time that meant nothing a run
-parked ever reached this queue. Two distinct holes, both now closed.
+A workflow has two current explicit paths: an agent node can deliberately call
+`request_approval`, and an author can mark a node `requires_approval = true`.
+Policy classification adds no workflow gates.
 
-**A gated tool call inside an `agent` node.** The node's turn runs on the same
-pool and the same `ApprovalPolicy` as chat, so a blocked call *was* recorded on
-the shared request queue — but the only drain lived inside `run_cycle` behind a
-`CycleHost`, which the workflow path never reaches. The request sat there until
-the next chat cycle cleared the queue, and the operator was never asked. The
-node now takes a queue boundary before its turn, claims only the tail its own
-turn added, and parks each entry. Approving one is the ordinary single-use grant
-above: the workflow has already finished with the refusal narrated, so the
-approved call **runs standalone** and does not feed downstream nodes.
+**An agent node calls `request_approval`.** The node claims its run-scoped
+approval queue and parks the question. Resolving it resumes that requesting
+agent with the verdict; it does not replay a blocked tool or feed a fabricated
+tool result into downstream nodes. The workflow run that produced the question
+has already settled.
 
 **A node marked `requires_approval`.** The engine reports these as node ids on
 the run outcome, which reached the HTTP response and the `WorkflowRunFinished`
@@ -292,7 +304,7 @@ channel rather than only logged.
 An approval is not only a queue entry; it is an interruption of a conversation.
 So a park records **which conversation** — `ApprovalParked.thread`, stamped by
 the cycle from its own trigger events, surfaced on `ApprovalSummary.thread`, and
-carried onto `GrantedCall.origin_thread` when the approval mints a grant.
+carried onto the explicit decision continuation when the approval resolves.
 
 The id is `OperatorMessage.chat`: a desk id for a channel, a roster agent id for
 a direct message. `Effect.agent` cannot stand in for it, and that is the whole
@@ -303,9 +315,8 @@ raised inside the wrong one of the two.
 It follows the work rather than the queue entry. A resolution inherits the
 thread of the approval it settles, so a follow-up turn that needs a **second**
 sign-off re-parks in the channel the first was asked in instead of falling out
-of the conversation. And the redeemed grant's continuation is journaled into
-that thread too — approving something visibly causes the next thing to happen,
-in the place the operator was already reading.
+of the conversation. The verdict continuation is journaled into that thread too,
+so the decision visibly returns to the place the operator was already reading.
 
 The stamp is refused rather than guessed. A cycle batching two conversations,
 or an addressed turn beside an unaddressed one, or beside a task dispatch,
@@ -319,7 +330,12 @@ card can appear live. It is deliberately thin — an id, a dotted kind, a thread
 because the effect's payload is redacted in exactly one place and must not
 acquire a second. A reader re-reads the approvals feed for the rest.
 
-### One turn is asked about once (issue #842)
+### Dormant policy-card batching (issue #842)
+
+This section describes retained legacy cards from a turn that policy gated in
+several places. Current agents create one intentional question per
+`request_approval` call, so this batching path does not manufacture or combine
+their requests.
 
 A research turn that reaches `espn.com`, `bbc.com` and `theguardian.com` parks
 three approvals, and asking three times is the same fact told badly: it is one
@@ -381,7 +397,11 @@ Absent means "the host did not say which turn this came from", and folding two
 unknowns together would invent a batch out of a shared silence. Each is shown
 alone, exactly as before this existed.
 
-## Delegation levels (standing rules)
+## Dormant delegation levels (standing rules)
+
+These examples describe the retained policy compiler and a possible future
+policy-HITL mode. They do not create approval prompts while policy HITL is
+disabled.
 
 Prosumers adjust the fence in plain language, which compiles to policy:
 

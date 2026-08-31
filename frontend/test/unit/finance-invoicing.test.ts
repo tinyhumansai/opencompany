@@ -117,3 +117,69 @@ describe("resolveFinancePage", () => {
     expect(resolveFinancePage("wallet")).toBe("wallet");
   });
 });
+
+/**
+ * The Grant control on the Chargebee panel (issue #1796).
+ *
+ * `PUT …/tools/grants` is admin-only, and both finance pages always supply
+ * `onGrant`, so the panel — not the page — is where the viewer's role has to be
+ * honoured. Offering a member a button whose only possible outcome is a 403
+ * toast replaces the "cannot be fixed from this page" dead end with a subtler
+ * one, which is the opposite of what this change is for.
+ */
+describe("the Chargebee panel's grant control", () => {
+  /** Configured, but the company does not grant `chargebee`. */
+  const UNGRANTED = { ...STATUS, granted: false };
+
+  function client(role: "admin" | "member"): OpenCompanyClient {
+    return {
+      scopeFor: () => "/api/v1/companies/acme",
+      get: async (path: string) => {
+        if (path.endsWith("/auth/me")) {
+          return { id: "u1", email: "a@b.c", role, company: "acme", hasPassword: true };
+        }
+        if (path.endsWith("/billing/chargebee")) return UNGRANTED;
+        throw new ApiError(404, "not_found", "no invoices");
+      },
+    } as unknown as OpenCompanyClient;
+  }
+
+  it("offers an admin the grant, next to the remedy", async () => {
+    await show(client("admin"));
+
+    const remedy = at("chargebee-remedy");
+    expect(remedy).not.toBeNull();
+    // The dead-end sentence is gone from the product.
+    expect(remedy?.textContent).not.toContain("cannot be fixed from this page");
+    const grant = at("chargebee-grant");
+    expect(grant).not.toBeNull();
+    expect(grant?.textContent).toContain("Grant chargebee");
+  });
+
+  it("withholds the control from a member, and keeps the remedy", async () => {
+    await show(client("member"));
+
+    // The member still needs to know why invoicing reaches no teammate.
+    expect(at("chargebee-remedy")).not.toBeNull();
+    expect(at("chargebee-grant")).toBeNull();
+  });
+
+  it("offers nothing on a host built without Chargebee", async () => {
+    // The grant would succeed and change nothing: this build has no billing
+    // tools to hand out, so the remedy is a different binary.
+    const notInBuild = {
+      scopeFor: () => "/api/v1/companies/acme",
+      get: async (path: string) => {
+        if (path.endsWith("/auth/me")) {
+          return { id: "u1", email: "a@b.c", role: "admin", company: "acme", hasPassword: true };
+        }
+        if (path.endsWith("/billing/chargebee")) return { ...UNGRANTED, inBuild: false };
+        throw new ApiError(404, "not_found", "no invoices");
+      },
+    } as unknown as OpenCompanyClient;
+    await show(notInBuild);
+
+    expect(at("chargebee-remedy")).not.toBeNull();
+    expect(at("chargebee-grant")).toBeNull();
+  });
+});

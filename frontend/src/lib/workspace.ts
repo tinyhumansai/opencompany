@@ -15,10 +15,28 @@ export type { FsNode } from "@/api/workspace";
 
 import { type LocalScope, scopedKey, scopedKeyAdoptingLegacy } from "@/connections/types";
 
-import type { FsNode, RepairOutcome } from "@/api/workspace";
+import { isBinary, type FsNode, type RepairOutcome } from "@/api/workspace";
 import { rosterDisplayName, type RosterNames } from "@/lib/roster-names";
 
 /* ---- queries ---- */
+
+/**
+ * How many **notes** the workspace holds, for the header's count (#1763).
+ *
+ * `kind` is only `"folder" | "file"`, so an uploaded image is a `file` too —
+ * filtering on `kind === "file"` alone reports one uploaded image and no prose
+ * as "1 note". The header's noun is notes and its description is "every note
+ * this company's teammates can read and write", which a binary asset is not:
+ * `isBinary` is what separates the two, and it is the same single test
+ * (`mime !== undefined`) the pane already uses to decide whether to render a
+ * note or offer a download.
+ *
+ * Folders are excluded for the reason the header comment already gives: a
+ * folder is how the tree is arranged rather than a thing the workspace holds.
+ */
+export function countNotes(nodes: FsNode[]): number {
+  return nodes.filter((n) => n.kind === "file" && !isBinary(n)).length;
+}
 
 export function childrenOf(nodes: FsNode[], parentId: string | null): FsNode[] {
   return nodes
@@ -35,6 +53,10 @@ export function childrenOf(nodes: FsNode[], parentId: string | null): FsNode[] {
       const bDerived =
         b.kind === "folder" && b.name.toLowerCase() === DERIVED_DIR;
       if (aDerived !== bDerived) return aDerived ? 1 : -1;
+      if (a.updatedAt != null && b.updatedAt != null) {
+        const updatedAt = b.updatedAt - a.updatedAt;
+        if (updatedAt !== 0) return updatedAt;
+      }
       return a.name.localeCompare(b.name);
     });
 }
@@ -453,6 +475,30 @@ export function isRosterRoot(folder: FsNode | undefined): boolean {
 }
 
 /**
+ * The roster id whose subtree `id` sits in, or `undefined` when it sits in
+ * nobody's (issue #1723).
+ *
+ * `agents/<roster-id>/…` and `artifacts/<roster-id>/…` are the two subtrees
+ * whose whole contents are already attributed by the folder they hang under —
+ * every node beneath one was written by that teammate, and the row for the
+ * folder itself is labelled with their name. A per-row provenance pill in
+ * there repeats the same fact once per row: on a `artifacts/<agent>/<task>/`
+ * subtree that is four identical pills stacked vertically, each one eating the
+ * width the *name* needs in a 256px pane.
+ *
+ * Scoped to the second level, and to the same two roots {@link isRosterRoot}
+ * names, for the reason that function gives: a folder somebody named
+ * "artifacts" inside their own subtree is theirs, and nothing under it is a
+ * roster id.
+ */
+export function rosterOwnerOf(nodes: FsNode[], id: string | null): string | undefined {
+  const ancestry = pathOf(nodes, id);
+  const [root, owner] = ancestry;
+  if (!root || !owner || !isRosterRoot(root)) return undefined;
+  return owner.kind === "folder" ? owner.name : undefined;
+}
+
+/**
  * A folder's full path as one line, with roster ids resolved (issue #1381).
  *
  * The Move dialog listed every folder by bare `name`, so two `Drafts` under
@@ -782,4 +828,23 @@ export function clearLegacyLocal(scope: LocalScope): void {
   } catch {
     /* storage unavailable — nothing to clear */
   }
+}
+
+/**
+ * The count the Workspace header shows, or `undefined` for "not known yet".
+ *
+ * `nodes` starts empty with `loading` true, so a plain `countNotes(nodes)` put
+ * an authoritative `0` beside the title on every fresh visit before the tree
+ * request had settled — and if that request failed, it went on reporting zero
+ * next to the load error, stating a fact about a workspace nobody had managed
+ * to read. `PageHeader` omits the badge for `undefined` precisely because "no
+ * notes yet" and "this page is not counting" are different claims.
+ *
+ * Keyed on whether a tree has ever loaded, not on `loading`: a non-silent
+ * refresh raises `loading` over a tree already on screen, and blanking the
+ * badge there would be a flicker rather than honesty. Once a tree is known, a
+ * later failed refresh keeps the last count instead of retracting it.
+ */
+export function headerNoteCount(noteCount: number, treeKnown: boolean): number | undefined {
+  return treeKnown ? noteCount : undefined;
 }

@@ -22,8 +22,6 @@ mod agent_upstream_input_test;
 /// Issue #899 (Stage 1): end-to-end proof that approving a call gated inside an
 /// agent node's own tool loop AUTO-CONTINUES the blocked run — one continuation,
 /// after the last decision, and none for a wholly refused block.
-#[cfg(test)]
-mod blocked_node_continuation_test;
 /// Issues #881 / #880: end-to-end proof that a node whose deliverable was
 /// parked for approval reports `blocked`, stops its branch instead of handing
 /// its apology downstream, and that the run says what it parked.
@@ -49,8 +47,6 @@ mod gated_tool_turn_test;
 /// Issue #978: a run that fans out to N gated nodes is cleared by approving,
 /// not multiplied by it — the composition of #395, #243 and #469 that each of
 /// their own suites is blind to.
-#[cfg(test)]
-mod parallel_gate_fanout_test;
 /// Issue #1192: a node whose `publish_artifact` was refused for want of a
 /// destination says so on the run, instead of the refusal reaching the operator
 /// only as whatever prose the model wrote about it.
@@ -63,9 +59,6 @@ pub mod runner;
 pub mod translate;
 /// Issue #1098: a scheduled workflow granted a standing permission stops
 /// re-asking on every run — two runs, because a single-run test cannot see it.
-#[cfg(test)]
-mod workflow_standing_grant_test;
-
 pub use caps::{HarnessAgentRunner, build_capabilities};
 pub use delivery::{DeliveryParking, WorkflowDeliveryDeps, deliver_outputs, deliver_outputs_dry};
 pub use runner::{HarnessWorkflowRunner, run_workflow};

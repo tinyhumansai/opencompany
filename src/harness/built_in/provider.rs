@@ -30,7 +30,7 @@
 //! (openhuman's own `merge_openhuman_usage_meta` helper is `pub(crate)`, hence
 //! the local re-expression in [`inject_usage_meta`].)
 
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
 use async_trait::async_trait;
 
@@ -45,7 +45,7 @@ use tinyagents::{Result as TaResult, TinyAgentsError};
 use crate::app::config::EnvSource;
 use crate::company::Inference;
 use crate::company::credentials::{Credential, TinyhumansTokenSource};
-use crate::company::inference::{self, EnvDefault, InferenceDecl};
+use crate::company::inference::{self, EnvDefault, InferenceDecl, InferenceSource};
 use crate::ports::SecretStore;
 use crate::ports::types::CompanyId;
 
@@ -80,6 +80,47 @@ const OPENHUMAN_USAGE_META_KEY: &str = "openhuman_usage_meta";
 pub trait HarnessModel: ChatModel<()> {
     /// Stable provider slug attributed to usage samples (e.g. `managed`, `byok`).
     fn telemetry_provider_id(&self) -> String;
+
+    /// The model the most recent turn resolved to, folded onto the closed
+    /// [`ModelSlug`] vocabulary (issue #1749) — the model half of the same
+    /// attribution [`telemetry_provider_id`](Self::telemetry_provider_id)
+    /// answers the provider half of.
+    ///
+    /// A [`ModelSlug`] rather than a `String` because the model name on the
+    /// wire is operator-authored free text on any BYOK or `openai_compatible`
+    /// deployment; see the [`model`](crate::metering::model) module docs. The
+    /// raw name is classified **inside the implementation**, at the same place
+    /// it is put on the wire, and never leaves it.
+    ///
+    /// `None` before the first turn (nothing has been resolved yet) and for an
+    /// implementation with no model identity to give — which is why this has a
+    /// default: a test double that reports a provider has nothing useful to say
+    /// here, and `None` is the honest answer rather than a fabricated one.
+    ///
+    /// ## Read live, and therefore approximate under concurrency
+    ///
+    /// Read *after* the turn, exactly as `telemetry_provider_id` is, so a
+    /// console BYOK or model-table switch re-attributes the next turn without a
+    /// rebuild. The cost of that shape is the same one the provider slug already
+    /// pays and is worth stating plainly: one company's agents share one
+    /// provider, so when two agents on **different workload tiers** have turns
+    /// in flight at once, the sample recorded second can read the slug the first
+    /// one resolved. It mis-sorts tokens between two of that company's own
+    /// slugs; it never crosses a company boundary, never changes a total, and
+    /// never invents a model the company did not run. Making it exact needs the
+    /// turn's own requested tier carried from the roster to the cost hook, which
+    /// is a change to the agent record rather than to this seam.
+    ///
+    /// That bound — *two models the company actually ran* — is the whole reason
+    /// implementations publish only after their call succeeds. A cache written
+    /// before the request went out would widen the window to include a model
+    /// that produced no usage at all (a turn still in flight, or one rejected
+    /// with a 401), and a concurrent turn that *did* run would then be recorded
+    /// against it. That is a different and worse error than mis-sorting between
+    /// two live models, so it is one every implementation must not make.
+    fn telemetry_model(&self) -> Option<crate::metering::ModelSlug> {
+        None
+    }
 }
 
 /// Resolve a [`HostedProvider`] configuration (and its default model) from the
@@ -436,12 +477,135 @@ fn attach_tools(
     body: &mut serde_json::Value,
     tools: Vec<serde_json::Value>,
     tool_choice: &ToolChoice,
+    supports_parallel_control: bool,
 ) {
     if tools.is_empty() {
         return;
     }
     body["tool_choice"] = wire_tool_choice(tool_choice);
     body["tools"] = serde_json::Value::Array(tools);
+    // Profile metadata is local; put the turn-boundary promise on the actual
+    // OpenAI-compatible request so the remote model cannot validly emit an
+    // effectful sibling beside `request_approval`.
+    if supports_parallel_control {
+        body["parallel_tool_calls"] = serde_json::Value::Bool(false);
+    }
+}
+
+// ## Guarding intra-turn history growth
+//
+// Turn limits bound how long a turn can run, but not how large its history can
+// grow. Each model call includes the preceding history again, so a turn that
+// runs many tool iterations can repeatedly resend an increasingly large input.
+//
+// openhuman already provides `ContextCompressionMiddleware` (summarization at
+// 90% of the window) and `ImageAwareMessageTrimMiddleware` (deterministic
+// trimming as a fallback), but installs them only behind this gate in
+// `vendor/openhuman/.../tinyagents/mod.rs:2216`:
+//
+// ```text
+// if let Some(window) = context_window.filter(|w| *w > 0) { … }
+// ```
+//
+// On this `direct_model` path, `effective_context_window` obtains that value as
+// `direct.profile().and_then(|p| p.max_input_tokens)`. `MANAGED_PROFILE` did not
+// set the field, so it returned `None` and neither middleware was installed.
+//
+// ### Failure mode observed at the provider boundary
+//
+// A large-context provider was measured on 2026-08-15, using one request per
+// measurement:
+//
+// ```text
+//  18,281 input tokens  → HTTP 200, finish_reason "stop",   response "1"
+// 245,781 input tokens  → HTTP 200, finish_reason "stop",   response "1"
+// 280,781 input tokens  → HTTP 200, finish_reason "stop",   response "1"
+// 350,781 input tokens  → HTTP 200, finish_reason "stop",   response "1"
+// ~438,000 input tokens → HTTP 200, finish_reason "failed", response "",
+//                         usage {prompt_tokens: 0, completion_tokens: 0}
+// ```
+//
+// This is silent failure rather than a provider error: HTTP remains successful,
+// the response is empty, and usage is zero. A generic empty-response path then
+// handles the failure, while a token budget cannot observe the oversized call.
+//
+// ### Default derivation
+//
+// The 240,000-token default is intended for large-context models and remains
+// configurable. A 272,000-token advertised window provides a representative
+// lower bound for a 272k-class combined model, rather than relying on whichever
+// backing model happens to accept a larger request.
+//
+// Two margins apply:
+//
+// 1. `estimate_text_tokens` estimates tokens as `bytes / 4`. In the measured
+//    sample, 61,299 bytes represented 18,281 tokens, or 3.35 bytes per token.
+//    `bytes / 4` estimates 15,325 tokens, 16% below the actual count; the actual
+//    count is therefore approximately 1.19 times the estimate.
+// 2. Compression and deterministic trimming activate at 90% of the configured
+//    window (`SUMMARIZE_THRESHOLD_FRACTION` and `window - window / 10`).
+//
+// 272,000 / 1.19 ≈ 228,000 tokens of safe estimated budget; dividing by 0.9
+// gives approximately 253,000. Rounding down to 240,000 starts compression at
+// approximately 216,000 estimated tokens, or approximately 258,000 actual
+// tokens under the measured ratio, about 5% below the advertised 272,000-token
+// window.
+
+/// Configurable context-window default, in tokens, for managed inference.
+///
+/// This default suits large-context models. Set `OPENCOMPANY_CONTEXT_WINDOW` to
+/// the provider's advertised window with an appropriate estimation margin when
+/// using a smaller model. Set it to `off` or `0` to restore the previous
+/// unbounded behavior.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 240_000;
+
+/// Read and trim an environment variable.
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+/// Return the context window advertised by the managed model profile, or
+/// `None` when context compression and trimming are disabled.
+///
+/// `MANAGED_PROFILE` is shared by `HostedProvider` and `TenantProvider`, so this
+/// is currently one value for every configured model. Per-model values would
+/// require `profile()` to know the asynchronously resolved `InferenceDecl` and
+/// are outside the scope of this fix.
+pub fn context_window() -> Option<u64> {
+    static VALUE: OnceLock<Option<u64>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let selected = match env_string("OPENCOMPANY_CONTEXT_WINDOW") {
+            None => Some(DEFAULT_CONTEXT_WINDOW),
+            Some(raw) if raw.eq_ignore_ascii_case("off") || raw == "0" => None,
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => {
+                    eprintln!(
+                        "context window: OPENCOMPANY_CONTEXT_WINDOW='{raw}' is not a positive \
+                         integer; using the default of {DEFAULT_CONTEXT_WINDOW} tokens"
+                    );
+                    Some(DEFAULT_CONTEXT_WINDOW)
+                }
+            },
+        };
+        match selected {
+            // Compression starts at 90% of the advertised window. Reporting
+            // both values distinguishes the activation threshold from the hard
+            // model limit.
+            Some(value) => eprintln!(
+                "context window: {value} tokens; compression starts at approximately {} \
+                 estimated tokens",
+                value / 10 * 9
+            ),
+            None => eprintln!(
+                "context window: disabled; no compression or trimming, so a long turn may \
+                 grow until the provider rejects or silently fails it"
+            ),
+        }
+        selected
+    })
 }
 
 /// The capability profile the hosted / tenant managed inference surface
@@ -459,7 +623,24 @@ static MANAGED_PROFILE: LazyLock<ModelProfile> = LazyLock::new(|| ModelProfile {
         ..Modalities::default()
     },
     tool_calling: true,
-    parallel_tool_calls: true,
+    // An explicit approval request is a turn boundary. Asking the provider for
+    // at most one native tool call prevents a sibling effect from being emitted
+    // in the same assistant message and running before the operator sees the
+    // request. The policy queue adds a second serial-execution barrier for a
+    // provider that violates this capability contract.
+    parallel_tool_calls: false,
+    // This field activates both `ContextCompressionMiddleware` and
+    // `ImageAwareMessageTrimMiddleware`. `TurnModels::effective_context_window`
+    // reads `direct.profile().and_then(|p| p.max_input_tokens)`, and the turn
+    // harness installs those middlewares only for a positive value.
+    //
+    // Leaving this as `None` permits unbounded history growth during a turn that
+    // runs many tool iterations. The observed failure at approximately 438k
+    // input tokens was HTTP 200 with `finish_reason: "failed"`, an empty message,
+    // and zero usage rather than a diagnosable provider error. The configurable
+    // 240,000-token default and its 272,000/1.19/0.9 rationale are documented
+    // above; `OPENCOMPANY_CONTEXT_WINDOW=off` restores the previous behavior.
+    max_input_tokens: context_window(),
     ..ModelProfile::default()
 });
 
@@ -583,6 +764,64 @@ fn parse_tool_calls(payload: &serde_json::Value) -> Vec<ToolCall> {
         .collect()
 }
 
+/// Extract the visible text from an OpenAI-compatible `content`-shaped field.
+///
+/// The field may be either a plain string (`"hi"`) or an array of content
+/// parts (`[{"type":"text","text":"hi"},…]`) — some providers, and reasoning
+/// models on their `reasoning` field, use the array form. Concatenates the
+/// `text` of every text part; a part counts as text when its `type` is `"text"`
+/// or absent (but a `text` field is present). Returns an empty string when the
+/// value is `null`, absent, or carries no text.
+fn extract_content_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                let is_text = part
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "text")
+                    .unwrap_or(true);
+                if is_text && let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(text);
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+/// Find a refusal encoded as an array-of-parts `content` part
+/// (`{"type":"refusal","refusal":"…"}`) rather than the scalar sibling
+/// `message.refusal` field.
+///
+/// `extract_content_text` only concatenates `"text"`-typed parts, so a
+/// refusal part in the same array is silently dropped and never reaches
+/// visible `content` — it must be recovered separately so the
+/// reasoning-fallback guard can still detect it and refuse to promote
+/// leaked reasoning over it. Concatenates every nonempty refusal part in
+/// order — mirroring how `extract_content_text` concatenates every
+/// `"text"`-typed part rather than stopping at the first, since a provider
+/// splitting a refusal across multiple parts is otherwise silently
+/// truncated to just the first fragment. Returns `None` when the value
+/// isn't an array or carries no refusal part.
+fn extract_array_refusal_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let parts = value?.as_array()?;
+    let mut out = String::new();
+    for part in parts {
+        let is_refusal = part.get("type").and_then(|t| t.as_str()) == Some("refusal");
+        if !is_refusal {
+            continue;
+        }
+        if let Some(refusal) = part.get("refusal").and_then(|r| r.as_str()) {
+            out.push_str(refusal);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Parse an OpenAI-compatible chat-completion payload into a tinyagents
 /// [`ModelResponse`], preserving token usage, native tool calls, AND the managed
 /// billing envelope.
@@ -593,15 +832,20 @@ fn parse_tool_calls(payload: &serde_json::Value) -> Vec<ToolCall> {
 /// amount. `content` is **optional**: a tool-call-only turn carries `content:
 /// null`. Errors only when the response carries neither text nor a tool call.
 fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResponse> {
-    let content = payload
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Content may be a plain string OR an array of `{type:"text",text:…}`
+    // parts; tolerate both.
+    let raw_content = payload.pointer("/choices/0/message/content");
+    let content_is_null = raw_content.is_some_and(serde_json::Value::is_null);
+    let mut content = extract_content_text(raw_content);
     let tool_calls = parse_tool_calls(&payload);
-    if content.is_empty() && tool_calls.is_empty() {
+    if tool_calls.len() > 1
+        && tool_calls
+            .iter()
+            .any(|call| call.name == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND)
+    {
         return Err(TinyAgentsError::Model(
-            "inference response carried neither choices[0].message.content nor tool_calls"
+            "inference returned request_approval with sibling tool calls; the whole batch was \
+             refused so the approval boundary cannot be crossed"
                 .to_string(),
         ));
     }
@@ -609,6 +853,200 @@ fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResp
         .pointer("/choices/0/finish_reason")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+
+    // Reasoning-model fallback: a reasoning-only turn returns `content: null`
+    // with the visible text under `reasoning` / `reasoning_content` (string or
+    // array-of-parts). Recover it so the turn is not lost to a hard error —
+    // but only when the model actually finished. Any finish reason other than
+    // a true completion (`length` truncation, `content_filter`, `failed` —
+    // the documented HTTP-200-empty-response silent failure, see
+    // docs/spec/runtime/providers.md — or any other/unknown value) means the
+    // chain of thought itself may be unfinished, so promoting it here would
+    // hand downstream consumers a partial or incorrect thought as if it were
+    // the final answer. Allow-list the known-good completions instead of
+    // blocklisting the failures we happened to think of, so an unrecognized
+    // failure reason fails closed. Fall through to the empty-response error
+    // below otherwise.
+    // Only `stop` means "finished, with prose, asking for nothing else".
+    // `tool_calls` and `function_call` were in this list until PR #1779's
+    // review: both assert the model requested an ACTION, so a response
+    // carrying one of them has not produced a final answer at all — whether
+    // or not the call body parses. Promoting a chain of thought over a
+    // requested action is the same class of substitution the truncation
+    // guard below prevents, so they are excluded here rather than handled by
+    // a special case per payload shape.
+    let genuinely_finished = matches!(finish_reason.as_deref(), Some("stop"));
+    // `tool_calls` above is the *parsed* result: `parse_tool_calls` requires a
+    // `/message/tool_calls` array AND drops any entry missing `function.name`,
+    // and it never reads the legacy singular `message.function_call` field at
+    // all. So a malformed tool-call entry, or a legacy `finish_reason:
+    // "function_call"` response using `message.function_call`, leaves the
+    // parsed `tool_calls` empty even though the model requested an action —
+    // which would let this branch silently swap the requested action for
+    // ordinary prose instead of surfacing the parse/empty error below. Check
+    // the *raw* payload for either call shape, independent of finish_reason,
+    // so a genuinely-requested-but-unparseable call can never be promoted
+    // (Codex review on #1779, comment 3862781739).
+    let raw_tool_call_requested = payload
+        .pointer("/choices/0/message/tool_calls")
+        .is_some_and(|v| match v {
+            serde_json::Value::Null => false,
+            serde_json::Value::Array(arr) => !arr.is_empty(),
+            // A present-but-non-array value (e.g. an object) is not a shape
+            // `parse_tool_calls` or the legacy `function_call` check can
+            // recognize, but it is not an absence either — fail closed
+            // rather than let it read as "nothing requested" and fall
+            // through to the reasoning fallback below.
+            _ => true,
+        })
+        || payload
+            .pointer("/choices/0/message/function_call")
+            .is_some_and(|v| !v.is_null());
+    // How many entries the *raw* array actually carried, when it is an
+    // array at all (legacy `function_call` and non-array shapes have no
+    // raw count to compare against, and are already fully covered by the
+    // `tool_calls.is_empty()` arm below since `parse_tool_calls` only reads
+    // the array shape). Used to catch a *partial* parse: `parse_tool_calls`
+    // silently drops any entry missing `function.name` (it is a
+    // `filter_map`), so a raw array of one valid call and one malformed one
+    // survives parsing as a single-element `tool_calls` — nonempty, so the
+    // `tool_calls.is_empty()` check alone does not fire, and the malformed
+    // entry (a genuinely requested action) is discarded without a trace
+    // (CodeRabbit review on #1779, comment 3877118065).
+    let raw_tool_call_count = payload
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())
+        .map(std::vec::Vec::len);
+    // `finish_reason` can assert an action was requested (`tool_calls`, or
+    // the legacy `function_call` value) even when there is no raw call body
+    // for `raw_tool_call_requested` above to find at all — it only reads
+    // "requested" off a *present, nonempty* `tool_calls` array or a present
+    // legacy `function_call` field, so a missing field or an explicit empty
+    // `tool_calls: []` both read as "nothing requested" to it. When
+    // `content` is also empty this self-corrects anyway, via the
+    // content-and-tool_calls-both-empty catch-all below. But array-shaped
+    // `content` can carry a genuinely nonempty text preamble on its own —
+    // no `reasoning` fallback involved — which makes that catch-all a
+    // no-op too, so the response would return successfully with just the
+    // preamble and no tool call, silently dropping the action the finish
+    // reason itself declared (CodeRabbit review on #1779, comment
+    // 3877608728).
+    let finish_reason_declares_action = matches!(
+        finish_reason.as_deref(),
+        Some("tool_calls") | Some("function_call")
+    );
+    // A tool call was genuinely requested — either the raw payload carries
+    // one (whether or not `parse_tool_calls` accepted it), or the finish
+    // reason alone asserts one — but not every entry survived parsing:
+    // either none did, or some did and some were silently dropped. This
+    // must error even when `content` is nonempty: array-shaped content can
+    // carry a text preamble alongside the malformed (or entirely missing)
+    // call, which would otherwise pass the empty-turn check below and let
+    // the harness silently return the preamble as if it were the whole
+    // answer — the same class of substitution the reasoning-fallback guard
+    // above exists to prevent, just via the *content* channel instead of
+    // `reasoning` (CodeRabbit review on #1779, comments 3872084060 and
+    // 3877608728).
+    if (raw_tool_call_requested || finish_reason_declares_action)
+        && (tool_calls.is_empty() || raw_tool_call_count.is_some_and(|n| n != tool_calls.len()))
+    {
+        let detail = finish_reason
+            .as_deref()
+            .map(|r| format!(" (finish_reason: {r})"))
+            .unwrap_or_default();
+        return Err(TinyAgentsError::Model(format!(
+            "inference response requested a tool call that failed to parse{detail}"
+        )));
+    }
+    // Resolve the refusal, independent of `content`'s shape, ONCE: a
+    // provider can express it as the scalar sibling `message.refusal` field,
+    // or — some providers/gateways normalize a Responses-API-style refusal
+    // this way — as a `{"type":"refusal","refusal":"…"}` part inside
+    // array-shaped `content` itself. `extract_content_text` only
+    // concatenates `"text"`-typed parts, so a refusal-typed part (alone or
+    // alongside a text part) never reaches `content` and `content` can
+    // already be nonempty (a leaked lead-in sentence) by the time this runs.
+    // The scalar field wins when a payload somehow carries both; either one
+    // alone is still the provider's own visible safety response and must be
+    // detected regardless of what shape `content` took (Codex reviews on
+    // #1779, comments 3874381270, 3875001349, 3875101974).
+    let refusal_text = payload
+        .pointer("/choices/0/message/refusal")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_array_refusal_text(payload.pointer("/choices/0/message/content")));
+
+    if tool_calls.is_empty() && !raw_tool_call_requested {
+        if let Some(refusal) = refusal_text {
+            // A refusal is a *completed* decision, not a partial one — unlike
+            // the reasoning fallback below, its precedence must not depend on
+            // `finish_reason`. Gating it on `genuinely_finished` let a
+            // refusal that ends with e.g. `finish_reason: "content_filter"`
+            // (arguably the *more* likely finish reason for an actual
+            // content-policy refusal) fall through untouched, leaving
+            // whatever text or reasoning leaked alongside it to win instead
+            // and silently discard the refusal (Codex review on #1779,
+            // comment 3875167298). It always wins over leaked text/reasoning,
+            // independent of how the turn finished.
+            content = refusal;
+        } else if finish_reason.as_deref() == Some("failed") && !content.is_empty() {
+            // `finish_reason: "failed"` is the documented HTTP-200-empty-
+            // response silent provider failure (docs/spec/runtime/providers.md).
+            // It is a *completed* disclaimer that the turn did not succeed —
+            // like a refusal, not a partial/unfinished state — so it must not
+            // be overridden by whatever text leaked alongside it, the same
+            // way `genuinely_finished` already keeps a truncated/filtered/
+            // failed *reasoning* stream from being promoted below. That gate
+            // only covers the `reasoning` fallback though: `content` itself is
+            // extracted unconditionally at the top of this function (string OR
+            // array-shaped), so a provider that emits real text — a leaked
+            // lead-in sentence, or a fuller partial reply — before reporting
+            // `failed` had that text returned as a successful answer with no
+            // finish_reason check at all. Discard it here so the response
+            // falls through to the empty-turn error below, naming `failed` for
+            // diagnosis (CodeRabbit review on #1779, comment 3878355364).
+            content.clear();
+        } else if genuinely_finished && content_is_null && content.is_empty() {
+            // Reasoning-model fallback: a reasoning-only turn returns
+            // `content: null` with the visible text under `reasoning` /
+            // `reasoning_content` (string or array-of-parts). Only promote it
+            // when the model actually finished — a truncated (`length`),
+            // filtered (`content_filter`), failed, or otherwise-unfinished
+            // chain of thought is not a final answer, and promoting it here
+            // would hand downstream consumers a partial or incorrect thought
+            // as if it were.
+            //
+            // `content.is_empty()` alone is not enough to detect the
+            // reasoning-only shape: it is also true for an explicit
+            // `content: ""` or a non-text content array (e.g. an image-only
+            // part) — both a genuine, visible provider response that
+            // `extract_content_text` simply can't render as text. Requiring
+            // the *raw* field to be absent/null before promoting keeps that
+            // response from being silently swapped for leaked
+            // chain-of-thought (CodeRabbit review on #1779, comment
+            // 3877224319).
+            content = extract_content_text(payload.pointer("/choices/0/message/reasoning"));
+            if content.is_empty() {
+                content =
+                    extract_content_text(payload.pointer("/choices/0/message/reasoning_content"));
+            }
+        }
+    }
+
+    // Only a genuinely empty turn (no text anywhere, no tool call) is an error.
+    // Fold `finish_reason` into the message so a truncation (`length`) or
+    // `content_filter` stop is diagnosable rather than hidden behind a generic
+    // "carried neither" string.
+    if content.is_empty() && tool_calls.is_empty() {
+        let detail = finish_reason
+            .as_deref()
+            .map(|r| format!(" (finish_reason: {r})"))
+            .unwrap_or_default();
+        return Err(TinyAgentsError::Model(format!(
+            "inference response carried neither choices[0].message.content nor tool_calls{detail}"
+        )));
+    }
 
     let usage = parse_usage(&payload);
     // USD is only present on the managed envelope; the raw `/openai/v1`
@@ -737,6 +1175,19 @@ pub struct HostedProvider {
     client: reqwest::Client,
     product_identity: bool,
     telemetry_provider: &'static str,
+    /// The classified model of the most recent **successful** turn (issue
+    /// #1749), so the synchronous
+    /// [`telemetry_model`](HarnessModel::telemetry_model) reports what the last
+    /// call that actually reached the backend ran on.
+    ///
+    /// Written only after the request returns 2xx: a turn that failed produced
+    /// no usage, so publishing its model would name one that never ran for
+    /// whichever concurrent turn reads the cache next.
+    ///
+    /// Behind an [`Arc`] because this type derives `Clone` and a clone is the
+    /// same provider — a cloned handle must see the same last-turn model, not a
+    /// private copy that never updates.
+    telemetry_model: Arc<RwLock<Option<crate::metering::ModelSlug>>>,
 }
 
 impl HostedProvider {
@@ -747,6 +1198,7 @@ impl HostedProvider {
             client: reqwest::Client::new(),
             product_identity: true,
             telemetry_provider: "subscription",
+            telemetry_model: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -759,6 +1211,7 @@ impl HostedProvider {
             client: reqwest::Client::new(),
             product_identity: false,
             telemetry_provider: inference::provider_slug(provider),
+            telemetry_model: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -792,12 +1245,15 @@ impl ChatModel<()> for HostedProvider {
         }
         // Native tool calling: expose the turn's tools so the model emits
         // structured `tool_calls` instead of hand-written `<tool_call>` XML.
-        attach_tools(&mut body, wire_tools(&request.tools), &request.tool_choice);
-
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
+        attach_tools(
+            &mut body,
+            wire_tools(&request.tools),
+            &request.tool_choice,
+            self.product_identity,
         );
+
+        let base_url = self.config.base_url.trim_end_matches('/');
+        let url = format!("{base_url}/chat/completions");
         let mut http = self.client.post(&url).json(&body);
         if self.product_identity {
             // The normal constructor is the managed TinyHumans path. The
@@ -831,10 +1287,30 @@ impl ChatModel<()> for HostedProvider {
                 self.config.credential.invalidate();
             }
             let text = response.text().await.unwrap_or_default();
-            return Err(TinyAgentsError::Model(format!(
-                "hosted inference returned {status}: {text}"
-            )));
+            let error = format!("hosted inference returned {status}: {text}");
+            let models_url = format!("{base_url}/models");
+            // The hosted, TinyHumans-managed backend has no harness-scoped
+            // inference config to point to — it always resolves the company's
+            // default `[inference]`.
+            if let Some(advice) = model_unavailable_advice(status, &error, &models_url, None, None)
+            {
+                return Err(TinyAgentsError::Model(advice));
+            }
+            return Err(TinyAgentsError::Model(error));
         }
+
+        // Published only now, once *this* request has come back 2xx, and
+        // classified from the same `model` that went on the wire — so the raw
+        // string stops here and the cost hook reaches only a vocabulary member
+        // (#1749). The cache is shared by every clone of this handle, so a turn
+        // that never ran must not publish into it: a rejected request (a 401
+        // from an early-rotated bearer, say) produces no usage of its own, and
+        // writing before the call would let a *concurrent* agent's successful
+        // turn read this model and attribute its tokens to one that never ran.
+        // Leaving the last successful turn's model in place is the honest
+        // reading, and it keeps the documented approximation to what it says on
+        // the tin: two models that both actually ran.
+        *self.telemetry_model.write().unwrap() = Some(crate::metering::ModelSlug::classify(model));
 
         let payload: serde_json::Value = response.json().await.map_err(|e| {
             TinyAgentsError::Model(format!("hosted inference response was not JSON: {e}"))
@@ -850,6 +1326,10 @@ impl HarnessModel for HostedProvider {
         // constructor carries the selected provider's slug for that one
         // unmetered roster-design call.
         self.telemetry_provider.to_string()
+    }
+
+    fn telemetry_model(&self) -> Option<crate::metering::ModelSlug> {
+        *self.telemetry_model.read().unwrap()
     }
 }
 
@@ -936,7 +1416,9 @@ pub async fn request_plan(
     if let Some(cap) = max_tokens {
         body["max_tokens"] = serde_json::json!(cap);
     }
-    attach_tools(&mut body, tools, tool_choice);
+    let supports_parallel_control =
+        decl.is_proxied() || inference::normalize_provider(&decl.provider) == "openrouter";
+    attach_tools(&mut body, tools, tool_choice, supports_parallel_control);
     Ok(RequestPlan {
         url,
         model,
@@ -944,6 +1426,108 @@ pub async fn request_plan(
         headers,
         body,
     })
+}
+
+/// Substrings that mark a provider 4xx as "you asked for a model that isn't
+/// there", matched case-insensitively. The wording is the provider's and
+/// varies: the managed backend says `Model '<id>' is not available`, an
+/// OpenAI-compatible BYOK endpoint says `The model '<id>' does not exist`, and
+/// OpenRouter says `<id> is not a valid model ID`.
+const MODEL_UNAVAILABLE_SIGNATURES: &[&str] = &[
+    "is not available",
+    "not a valid model",
+    "model not found",
+    "unknown model",
+    "invalid model",
+    "does not exist",
+];
+
+/// Rewrites a provider "unknown/unavailable model" refusal into an
+/// operator-actionable message, or `None` for any other error (issue #1811).
+///
+/// A configured model id is company/operator data — not a repo default — so the
+/// only fix is to change it. Raw, it reaches the operator as an unactionable
+/// `inference returned 400 Bad Request: {"error":"Model '<id>' is not
+/// available. Use GET /openai/v1/models to list available models."}` and the
+/// task merely reads *Failed*. This says what to do and keeps the provider's own
+/// words (which carry the bad id and the list-models hint) at the end for
+/// support.
+///
+/// `models_url` is the catalog endpoint for the request that actually failed —
+/// `{base_url}/models`, the same pattern [`discover_local_model`] already uses.
+/// Callers derive it from the same `base_url` that built the chat-completions
+/// URL rather than this function assuming TinyHumans' `/openai/v1/models`: for
+/// a direct OpenRouter, Ollama, or arbitrary `openai_compatible` BYOK endpoint
+/// (issue #1811 follow-up) that path 404s and points the operator at the wrong
+/// catalog.
+///
+/// Gated two ways to stay quiet on everything else: a 4xx only (a 5xx is the
+/// provider's fault and must not be reframed as a misconfiguration), and the
+/// body must name a `model` (so a 4xx about something else — `user does not
+/// exist` — is never mistaken for a model error). Deliberately not an allowlist
+/// of model ids: that would rot as providers add models, so this recognises the
+/// *refusal*, not the catalogue.
+///
+/// `harness` names the `built_in` harness this request ran as, when the
+/// caller has one — `None` only for a caller with no harness concept at all
+/// (e.g. the managed [`HostedProvider`]). Every caller with a harness passes
+/// its *real*, declared-or-implicit id (`HarnessScope::id`) regardless of
+/// whether that harness is the company's default: the default harness's own
+/// `[harness.inference]` beats the company mapping exactly like a named
+/// harness's does (`default_harness_inference`, `src/company/manifest.rs`),
+/// so suppressing the name whenever a harness happened to be the default sent
+/// its operator to a table its request never consulted (Codex review on
+/// #1824's #1811 follow-up). `agent.model` only takes effect on an `acp`
+/// harness (`Manifest::validate`, `src/company/manifest.rs`) — never a real
+/// lever for any caller in this module — so this deliberately never suggests
+/// it.
+///
+/// `source` is the resolved [`InferenceDecl::source`] for this request, when
+/// known. A console-saved runtime override (`InferenceSource::Runtime`)
+/// outranks *both* manifest tables (`resolve_effective_scoped`'s precedence),
+/// so naming a `[harness.inference].models` or `[inference].models` mapping
+/// while a runtime override is active sends the operator to edit a table that
+/// is shadowed and will not change the outcome (Codex review on #1824).
+fn model_unavailable_advice(
+    status: reqwest::StatusCode,
+    error: &str,
+    models_url: &str,
+    harness: Option<&str>,
+    source: Option<InferenceSource>,
+) -> Option<String> {
+    if !status.is_client_error() {
+        return None;
+    }
+    let haystack = error.to_ascii_lowercase();
+    if !haystack.contains("model") {
+        return None;
+    }
+    if !MODEL_UNAVAILABLE_SIGNATURES
+        .iter()
+        .any(|signature| haystack.contains(signature))
+    {
+        return None;
+    }
+    let where_to_fix = match (source, harness) {
+        (Some(InferenceSource::Runtime), Some(id)) => format!(
+            "update harness `{id}`'s saved runtime inference override (Settings → Inference) — \
+             it takes precedence over any `[harness.inference].models` or `[inference].models` \
+             mapping"
+        ),
+        (Some(InferenceSource::Runtime), None) => "update the saved runtime inference override \
+             (Settings → Inference) — it takes precedence over the company's `[inference].models` \
+             mapping"
+            .to_string(),
+        (_, Some(id)) => format!(
+            "update harness `{id}`'s own `[harness.inference].models` mapping (or the company's \
+             `[inference].models`, if `{id}` doesn't declare its own)"
+        ),
+        (_, None) => "update the company's `[inference].models` mapping".to_string(),
+    };
+    Some(format!(
+        "the configured inference model is not available from the provider — {where_to_fix}, to \
+         one the provider offers (list them with `GET {models_url}`). {error}"
+    ))
 }
 
 /// Issues a prepared [`RequestPlan`] against `client`, returning the raw JSON
@@ -957,6 +1541,8 @@ async fn send_plan(
     client: &reqwest::Client,
     plan: &RequestPlan,
     credential: &Credential,
+    harness: Option<&str>,
+    source: Option<InferenceSource>,
 ) -> anyhow::Result<serde_json::Value> {
     let mut request = client.post(&plan.url).json(&plan.body);
     if let Some(bearer) = &plan.bearer {
@@ -979,10 +1565,22 @@ async fn send_plan(
             credential.invalidate();
         }
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "inference returned {status}: {}",
-            scrub(text)
-        ));
+        let error = format!("inference returned {status}: {}", scrub(text));
+        // `plan.url` is always `{base_url}/chat/completions` (see
+        // `RequestPlan::url`'s doc and `request_plan`'s construction of it), so
+        // this recovers the same `base_url` the failed request actually used —
+        // OpenRouter's, Ollama's, or an arbitrary `openai_compatible` endpoint's,
+        // not a hard-coded TinyHumans path.
+        let models_url = plan
+            .url
+            .strip_suffix("/chat/completions")
+            .map(|base| format!("{base}/models"))
+            .unwrap_or_else(|| plan.url.clone());
+        if let Some(advice) = model_unavailable_advice(status, &error, &models_url, harness, source)
+        {
+            return Err(anyhow::anyhow!("{advice}"));
+        }
+        return Err(anyhow::anyhow!("{error}"));
     }
     response
         .json()
@@ -1011,6 +1609,18 @@ pub struct TenantProvider {
     /// the config the last turn actually used (cost attribution follows the
     /// switch).
     slug: RwLock<&'static str>,
+    /// The classified model of the most recently **completed** turn (issue
+    /// #1749), so the synchronous
+    /// [`telemetry_model`](HarnessModel::telemetry_model) reports the model the
+    /// last successful turn actually resolved to — which on this path means
+    /// *after* the tenant `[inference].models` table has been applied, so a
+    /// BYOK tenant's table switch re-attributes the next turn for the same
+    /// reason `slug` does.
+    ///
+    /// Written only once the request has come back 2xx, so a rejected turn —
+    /// which meters nothing — cannot name the model for a concurrent turn that
+    /// did run.
+    model: RwLock<Option<crate::metering::ModelSlug>>,
     /// Which harness's config and credential slots this provider resolves
     /// against. Two `built_in` harnesses on one company each get their own
     /// provider, differing only in this — which is what lets one ride the
@@ -1036,6 +1646,8 @@ impl TenantProvider {
             // Replaced by the resolved slug on the first turn; until then the
             // company is on the default it booted with.
             slug: RwLock::new("subscription"),
+            // No turn has been issued yet, so there is no model to name.
+            model: RwLock::new(None),
             scope: inference::HarnessScope::default(),
         }
     }
@@ -1105,9 +1717,38 @@ impl ChatModel<()> for TenantProvider {
         )
         .await
         .map_err(|e| TinyAgentsError::Model(e.to_string()))?;
-        let payload = send_plan(&self.client, &plan, decl.credential())
-            .await
-            .map_err(|e| TinyAgentsError::Model(e.to_string()))?;
+        // Always this harness's real id — `self.scope.id` is meaningful
+        // whether or not this is the company's *default* harness (the
+        // default's own `[harness.inference]` beats the company mapping the
+        // same way a named harness's does; `is_default` only routes which
+        // secret keys get read, and must not also gate whether the advice
+        // names the harness — see `model_unavailable_advice`'s doc).
+        let harness = Some(self.scope.id.as_str());
+        let payload = send_plan(
+            &self.client,
+            &plan,
+            decl.credential(),
+            harness,
+            Some(decl.source),
+        )
+        .await
+        .map_err(|e| TinyAgentsError::Model(e.to_string()))?;
+        // Classified from `plan.model` — the exact string that goes on the wire,
+        // *after* the tenant `[inference].models` table has been applied — so
+        // the sample names what actually ran rather than the tier that was
+        // asked for. `plan.model` is operator-authored text on a BYOK or
+        // `openai_compatible` tenant and stops here: the only model identity
+        // that leaves this method is the vocabulary member (issue #1749).
+        //
+        // Published *after* `send_plan` returns `Ok`, i.e. once this request has
+        // actually come back 2xx. The cache is read by whichever turn finishes
+        // next, and one provider is shared across concurrently running agents,
+        // so publishing before the call would let a request that is still in
+        // flight — or one that was rejected outright — name the model for
+        // another agent's successful turn. A failed turn produces no usage of
+        // its own, so keeping the last *successful* model is strictly more
+        // accurate than advertising one that never ran.
+        *self.model.write().unwrap() = Some(crate::metering::ModelSlug::classify(&plan.model));
         model_response_from_payload(payload)
     }
 }
@@ -1116,12 +1757,28 @@ impl HarnessModel for TenantProvider {
     fn telemetry_provider_id(&self) -> String {
         (*self.slug.read().unwrap()).to_string()
     }
+
+    fn telemetry_model(&self) -> Option<crate::metering::ModelSlug> {
+        *self.model.read().unwrap()
+    }
 }
 
 /// A minimal live probe: one `ping` turn against the resolved config, used by
 /// the console's "Test" button. The error is scrubbed of the credential by
 /// [`send_plan`].
-pub async fn probe(decl: &InferenceDecl) -> anyhow::Result<()> {
+///
+/// `harness` is the real id of the harness whose config `decl` resolved from,
+/// when the caller has one — `None` for the first-run wizard's
+/// [`decl_for_probe`](crate::company::inference::decl_for_probe), which runs
+/// before any company (and so any harness) exists. The console "Test" route
+/// (`test_config`) always has a company and therefore a default harness id,
+/// declared-or-implicit, and passes it: a missing-model repair hint otherwise
+/// names the company's `[inference].models` even when the failing config came
+/// from that harness's own `[harness.inference]`, sending the operator to a
+/// table its request never consulted — the same gap already closed for live
+/// turns in [`TenantProvider::invoke`] (Codex review on #1824's #1811
+/// follow-up).
+pub async fn probe(decl: &InferenceDecl, harness: Option<&str>) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let messages = vec![serde_json::json!({ "role": "user", "content": "ping" })];
     // The connectivity probe exposes no tools — it only checks the endpoint
@@ -1136,11 +1793,54 @@ pub async fn probe(decl: &InferenceDecl) -> anyhow::Result<()> {
         &ToolChoice::Auto,
     )
     .await?;
-    let payload = send_plan(&client, &plan, decl.credential()).await?;
-    payload
-        .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| anyhow::anyhow!("probe response missing choices[0].message.content"))?;
+    let payload = send_plan(
+        &client,
+        &plan,
+        decl.credential(),
+        harness,
+        Some(decl.source),
+    )
+    .await?;
+    // Route through the exact same parser the turn path calls
+    // (`model_response_from_payload`), not a hand-rolled subset of it. An
+    // earlier revision called `extract_content_text` directly here, which
+    // picked up the array-shaped-content case but not the
+    // `reasoning`/`reasoning_content` fallback for reasoning-only turns
+    // (`content: null`, `finish_reason: "stop"`) that lives inside
+    // `model_response_from_payload` — so an endpoint answering with that shape
+    // still passed every real turn while this probe reported the connection
+    // broken (Codex review on #1779, comment 3864906472). Giving the probe a
+    // second, narrower copy of the parsing logic is exactly how it drifted
+    // from the turn path the first time; calling the shared function directly
+    // means there is only one content path to keep in sync.
+    let response = model_response_from_payload(payload)
+        .map_err(|e| anyhow::anyhow!("probe response carried no usable content: {e}"))?;
+    // `model_response_from_payload` accepts a tool-call-only reply — correct
+    // for a real turn, where the model may have been offered tools and
+    // legitimately chose to call one instead of answering in prose. This
+    // probe offers none (`Vec::new()` above), so a tool call here can only
+    // be the endpoint hallucinating or defaulting to an action it was never
+    // given, not a valid response to `ping`. Letting it through would report
+    // a broken endpoint as reachable, passing the setup wizard or console
+    // Test action for a provider that cannot complete the bare chat turn it
+    // exists to verify (CodeRabbit review on #1779, comment 3877827976).
+    //
+    // Checking `content.is_empty()` alone only catches a tool-call-*only*
+    // reply. An endpoint can also emit a text preamble alongside a genuinely
+    // parsed tool call (`content` nonempty AND `tool_calls` nonempty) —
+    // `model_response_from_payload` accepts that combination for a real turn
+    // too, so it clears this guard with content to spare even though a tool
+    // call the probe never offered was still requested. Require the tool-call
+    // list to be empty as well so any tool call at all — bare or alongside
+    // text — fails the probe (CodeRabbit review on #1779, comment
+    // 3878355375).
+    if response.message.content.is_empty() || !response.message.tool_calls.is_empty() {
+        return Err(anyhow::anyhow!(
+            "probe response carried a tool call — endpoint requested an \
+             action instead of (or alongside) answering a turn that offered \
+             no tools"
+        ));
+    }
     Ok(())
 }
 
@@ -1585,6 +2285,848 @@ mod tests {
         assert!(resp.usage.is_none());
     }
 
+    /// Some OpenAI-compatible providers return `content` as an array of parts
+    /// (`[{"type":"text","text":"…"}]`) rather than a bare string. The parser
+    /// must concatenate the `text` of each text part instead of treating the
+    /// non-string value as empty and hard-erroring. Regression for bug #1.
+    #[test]
+    fn parses_content_as_array_of_text_parts() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Hello, " },
+                        { "type": "text", "text": "world" }
+                    ]
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("array content parses");
+        assert_eq!(resp.text(), "Hello, world");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// A non-null but empty visible content field is not the documented
+    /// reasoning-only shape. It must not cause internal reasoning to be
+    /// promoted as the assistant answer.
+    #[test]
+    fn empty_string_content_does_not_fall_back_to_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "internal thought"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("empty string content must not promote reasoning");
+        assert!(err.to_string().contains("neither"));
+    }
+
+    /// An absent visible content field is distinct from an explicit null and
+    /// must not activate the reasoning-only fallback.
+    #[test]
+    fn absent_content_does_not_fall_back_to_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "reasoning": "internal thought"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("absent content must not promote reasoning");
+        assert!(err.to_string().contains("neither"));
+    }
+
+    /// An unsupported content shape is not equivalent to null content.
+    #[test]
+    fn unsupported_content_does_not_fall_back_to_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "image_url", "image_url": {} }],
+                    "reasoning": "internal thought"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("unsupported content must not promote reasoning");
+        assert!(err.to_string().contains("neither"));
+    }
+
+    /// A reasoning-only turn returns `content: null` with the visible text under
+    /// a `reasoning` field and no tool calls. It must fall back to the reasoning
+    /// text and parse rather than hard-erroring — the managed reasoning brain
+    /// (deepseek/qwen via OpenRouter) is the exact source of the crash.
+    #[test]
+    fn reasoning_only_turn_falls_back_to_reasoning_text() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "The answer is 42."
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("reasoning-only turn parses");
+        assert_eq!(resp.text(), "The answer is 42.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// A refusal turn: `content: null`, `finish_reason: "stop"`, a nonempty
+    /// `message.refusal`, and `reasoning` the model emitted before declining.
+    /// The refusal is the provider's own visible safety response and must win
+    /// over the internal reasoning — promoting the reasoning instead would
+    /// expose exactly the content the model declined to return (CodeRabbit
+    /// review on #1779, comment 3872084054).
+    #[test]
+    fn a_refusal_wins_over_leaked_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "The user wants help with something I should decline.",
+                    "refusal": "I can't help with that."
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// A refusal turn where the array-shaped `content` field itself encodes
+    /// the refusal as a `{"type":"refusal","refusal":"…"}` part instead of
+    /// the scalar sibling `message.refusal` field — some providers/gateways
+    /// normalize a Responses-API-style refusal part into the Chat
+    /// Completions `content` array. `extract_content_text` only concatenates
+    /// `"text"`-typed parts, so the refusal part contributes nothing and
+    /// `content` comes back empty; without an array-aware refusal check the
+    /// scalar `message.refusal` lookup also finds nothing, and the reasoning
+    /// fallback would promote the leaked pre-refusal reasoning as the
+    /// visible answer. The refusal must still win (Codex review on #1779,
+    /// comment 3874381270).
+    #[test]
+    fn a_refusal_wins_over_leaked_reasoning_when_refusal_is_an_array_content_part() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "refusal", "refusal": "I can't help with that." }
+                    ],
+                    "reasoning": "The user wants help with something I should decline."
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// Multiple `{"type":"refusal",…}` parts in the same array-shaped
+    /// `content`. `extract_array_refusal_text`'s `find_map` stops at the
+    /// first match, so only the first part's text is recovered — the
+    /// analogous `extract_content_text` concatenates every `"text"`-typed
+    /// part instead of stopping at the first, so the refusal path must do
+    /// the same or it silently truncates the provider's own visible safety
+    /// response (CodeRabbit review on #1779, comment 3878506287).
+    #[test]
+    fn a_refusal_wins_and_is_not_truncated_when_content_array_has_multiple_refusal_parts() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "refusal", "refusal": "I can't help with that. " },
+                        { "type": "refusal", "refusal": "Here's why." }
+                    ]
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that. Here's why.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// A mixed array: a `"text"`-typed part alongside a `{"type":"refusal",…}`
+    /// part in the same `content` array. `extract_content_text` concatenates
+    /// only the text part, so `content` is already nonempty by the time the
+    /// refusal-precedence block is reached — without checking for an array
+    /// refusal independent of `content`'s emptiness, the block is skipped
+    /// entirely and the turn "succeeds" with just the leaked text fragment,
+    /// silently discarding the provider's actual safety response (Codex
+    /// review on #1779, comment 3875001349).
+    #[test]
+    fn a_refusal_wins_over_leaked_text_when_content_array_mixes_text_and_refusal_parts() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Sure, here's a start: " },
+                        { "type": "refusal", "refusal": "I can't help with that." }
+                    ]
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// An array-shaped `content` with only a `"text"`-typed part (no
+    /// `{"type":"refusal",…}` part at all) alongside a nonempty *scalar*
+    /// `message.refusal` sibling field. `extract_content_text` concatenates
+    /// the text part, so `content` is nonempty; `extract_array_refusal_text`
+    /// finds no refusal-typed part, so `array_refusal` is `None`. Gating the
+    /// refusal-precedence block on `content.is_empty() || array_refusal.is_some()`
+    /// alone therefore skips the block entirely and never even looks at the
+    /// scalar `message.refusal` field, leaking the text fragment as the
+    /// answer instead of surfacing the provider's actual safety response
+    /// (Codex review on #1779, comment 3875101974).
+    #[test]
+    fn a_scalar_refusal_wins_over_leaked_text_in_array_shaped_content() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Sure, here's a start: " }
+                    ],
+                    "refusal": "I can't help with that."
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// The mixed-array refusal case above (Codex review comment 3875001349)
+    /// only reproduced with `finish_reason: "stop"`. The refusal-precedence
+    /// block was gated on `genuinely_finished`, so the identical payload with
+    /// `finish_reason: "content_filter"` — arguably the *more* likely finish
+    /// reason a real content-policy refusal ends with — skipped the block
+    /// entirely: `content` was already nonempty from the leaked text part,
+    /// so the empty-response check at the bottom accepted it and returned
+    /// the leaked lead-in as if it were the whole answer, silently
+    /// discarding the refusal. A refusal is a completed decision, not a
+    /// partial one, so its precedence must not depend on `finish_reason` the
+    /// way the reasoning fallback's does (Codex review on #1779, comment
+    /// 3875167298).
+    #[test]
+    fn a_refusal_wins_over_leaked_text_regardless_of_finish_reason() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Sure, here's a start: " },
+                        { "type": "refusal", "refusal": "I can't help with that." }
+                    ]
+                }
+            }]
+        });
+        let resp = model_response_from_payload(payload).expect("refusal turn parses");
+        assert_eq!(resp.text(), "I can't help with that.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// The sibling fallback field: some providers emit the reasoning-only
+    /// text under `reasoning_content` (array-of-parts shape) instead of
+    /// `reasoning`, with `reasoning` itself absent. `extract_content_text`
+    /// handles the array shape and `model_response_from_payload` only tries
+    /// `reasoning_content` once `reasoning` comes back empty — this test
+    /// exercises that second fallback specifically, which the existing
+    /// `reasoning`-field and `content_filter`-error tests do not cover
+    /// (CodeRabbit nitpick on #1779, comment ed359cf20f434c7f7f83c058).
+    #[test]
+    fn reasoning_only_turn_falls_back_to_array_shaped_reasoning_content() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "",
+                    "reasoning_content": [
+                        { "type": "text", "text": "The answer is " },
+                        { "type": "text", "text": "42." }
+                    ]
+                }
+            }]
+        });
+        let resp =
+            model_response_from_payload(payload).expect("reasoning_content-only turn parses");
+        assert_eq!(resp.text(), "The answer is 42.");
+        assert!(resp.message.tool_calls.is_empty());
+    }
+
+    /// An explicit `content: ""` (not `null`) is a *visible* empty response,
+    /// not the documented reasoning-only shape — `extract_content_text`
+    /// reduces both to the same empty string, so the old `content.is_empty()`
+    /// check could not tell them apart and promoted `reasoning` anyway. That
+    /// substitutes internal chain-of-thought for whatever unsupported/empty
+    /// response the provider actually sent, the same class of bug the
+    /// refusal-precedence guard above exists to prevent, just triggered by an
+    /// empty string instead of a populated field (CodeRabbit review on
+    /// #1779, comment 3877224319).
+    #[test]
+    fn explicit_empty_string_content_does_not_promote_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "The user wants help with something I should decline."
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("explicit empty-string content must not promote reasoning");
+        assert!(
+            !err.to_string().contains("decline"),
+            "leaked reasoning must not appear in the error, got: {err}"
+        );
+    }
+
+    /// Same gap as above, via the array-content path: a non-text content
+    /// array (e.g. an image-only part) extracts to an empty string too, but
+    /// the raw field is neither absent nor `null` — it is the provider's
+    /// actual (just non-text) response, and must not be silently swapped for
+    /// leaked reasoning (CodeRabbit review on #1779, comment 3877224319).
+    #[test]
+    fn non_text_array_content_does_not_promote_reasoning() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } }
+                    ],
+                    "reasoning": "The user wants help with something I should decline."
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("non-text array content must not promote reasoning");
+        assert!(
+            !err.to_string().contains("decline"),
+            "leaked reasoning must not appear in the error, got: {err}"
+        );
+    }
+
+    /// A genuinely empty turn truncated by `finish_reason: "length"` (max_tokens
+    /// hit) is still an error — but the message must name the finish reason so
+    /// the truncation is diagnosable rather than hidden behind a generic string.
+    #[test]
+    fn truncated_empty_response_errors_with_finish_reason() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "role": "assistant", "content": "" }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err("truncated empty turn errors");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("length"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A reasoning-only turn truncated by `finish_reason: "length"` (max_tokens
+    /// hit mid chain-of-thought) must still error, even though `reasoning`
+    /// carries text — the reasoning-fallback exists to recover a *complete*
+    /// answer that only landed under `reasoning`, not to promote a cut-off
+    /// chain of thought into a fabricated final reply. Pre-fix, this payload
+    /// parsed successfully with `resp.text() == "The answer is"`, silently
+    /// handing a partial thought to downstream consumers as if it were the
+    /// finished answer (Codex review on #1779).
+    #[test]
+    fn truncated_reasoning_only_turn_errors_instead_of_promoting_partial_thought() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "The answer is"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("truncated reasoning-only turn must not parse as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("length"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Same as above but for `content_filter` — a filtered reasoning stream is
+    /// just as unfinished as a truncated one and must not be promoted either.
+    #[test]
+    fn content_filtered_reasoning_only_turn_errors() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "Let's think about how to"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("content-filtered reasoning-only turn must not parse as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("content_filter"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// `finish_reason: "failed"` is the documented HTTP-200-empty-response
+    /// silent provider failure (see docs/spec/runtime/providers.md — observed
+    /// on an oversized request, empty message, zero usage). The pre-fix guard
+    /// blocklisted only `length`/`content_filter`, so a reasoning-only turn
+    /// carrying `failed` still fell through and promoted whatever partial
+    /// reasoning the provider emitted before failing — handing downstream
+    /// consumers an unfinished thought as if it were the answer (Codex
+    /// follow-up review on #1779, comment 3860281502). Must error instead.
+    #[test]
+    fn failed_finish_reason_reasoning_only_turn_errors() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "failed",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "The answer is"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("failed reasoning-only turn must not parse as success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Same as `failed_finish_reason_reasoning_only_turn_errors`, but the
+    /// leaked text lives in the *primary* `content` field (array-shaped, the
+    /// form round #8 of this PR taught `extract_content_text` to parse) rather
+    /// than `reasoning`. `content` is extracted unconditionally at the top of
+    /// `model_response_from_payload`, with no `finish_reason` check of its
+    /// own — only the `reasoning` fallback is gated on `genuinely_finished`.
+    /// Pre-fix, this payload parsed successfully with the leaked lead-in
+    /// sentence returned as the answer, silently discarding the provider's own
+    /// `failed` disclaimer (CodeRabbit review on #1779, comment 3878355364).
+    #[test]
+    fn failed_finish_reason_with_leaked_array_content_errors() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "failed",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Let me look that up for you" }
+                    ]
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("failed turn with leaked content must not parse as success");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("look that up"),
+            "leaked content must not appear in the error, got: {msg}"
+        );
+        assert!(
+            msg.contains("failed"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// The legacy `finish_reason: "function_call"` shape carries the request
+    /// under the singular `message.function_call` field, which
+    /// `parse_tool_calls` never reads (it only parses the modern
+    /// `message.tool_calls` array). Pre-fix, `finish_reason: "function_call"`
+    /// sat in the `genuinely_finished` allow-list, so with `tool_calls` empty
+    /// (nothing there to parse) and `content: null`, this fell straight into
+    /// the reasoning fallback and silently swapped the requested action for
+    /// prose — the caller never even sees a tool call was dropped. Must error
+    /// instead (Codex follow-up review on #1779, comment 3862781739).
+    #[test]
+    fn legacy_function_call_with_reasoning_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "function_call",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function",
+                    "function_call": { "name": "get_weather", "arguments": "{}" }
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("a raw legacy function_call must not be dropped for promoted reasoning");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("function_call"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A raw `tool_calls` array can be *partially* malformed: one entry
+    /// parses (has `function.name`), one does not. `parse_tool_calls`'s
+    /// `filter_map` drops the malformed entry and returns the single valid
+    /// one — a nonempty `Vec`, so `tool_calls.is_empty()` alone never
+    /// catches it. Pre-fix, the response is returned successfully with only
+    /// the surviving call, silently discarding a genuinely requested action
+    /// (CodeRabbit review on #1779, comment 3877118065). The guard must
+    /// compare the raw array length against the parsed count, not just
+    /// check for emptiness.
+    #[test]
+    fn partially_malformed_tool_calls_array_errors_instead_of_dropping_one_call() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call_1", "type": "function", "function": { "name": "get_weather", "arguments": "{}" } },
+                        { "id": "call_2", "type": "function", "function": { "arguments": "{}" } }
+                    ]
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a partially malformed tool_calls array must not silently drop the malformed entry",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool call"),
+            "error must name the dropped tool call for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A malformed modern `tool_calls` entry (missing `function.name`) is
+    /// dropped by `parse_tool_calls`'s `filter_map`, leaving the *parsed*
+    /// `tool_calls` empty even though the raw payload clearly requested one.
+    /// The raw-payload guard must catch this too, not just the legacy
+    /// `function_call` field, so a request that fails to parse surfaces as
+    /// the empty-response error rather than a promoted reasoning answer.
+    #[test]
+    fn malformed_modern_tool_call_with_reasoning_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function",
+                    "tool_calls": [{ "id": "call_1", "type": "function", "function": { "arguments": "{}" } }]
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a malformed raw tool_calls entry must not be dropped for promoted reasoning",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_calls"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Array-shaped `content` can carry a text preamble ("Let me check
+    /// that…") alongside a `tool_calls` entry the model genuinely requested
+    /// but that fails to parse (missing `function.name`). `content` reads
+    /// nonempty via `extract_content_text` while `parse_tool_calls` drops the
+    /// call, so a check that only looks at content-or-tool_calls emptiness
+    /// passes and the harness would silently return just the preamble,
+    /// dropping the requested action entirely. The raw-payload guard must
+    /// catch this regardless of whether prose content is also present
+    /// (CodeRabbit review on #1779, comment 3872084060).
+    #[test]
+    fn malformed_tool_call_beside_array_content_preamble_errors_instead_of_silently_dropping() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Let me check that for you." }
+                    ],
+                    "tool_calls": [{ "id": "call_1", "type": "function", "function": { "arguments": "{}" } }]
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a malformed raw tool_calls entry beside preamble content must not be silently dropped",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_calls"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A non-array `message.tool_calls` (e.g. an object instead of a list) is
+    /// neither a legacy `function_call` nor something `.as_array()` accepts,
+    /// so pre-fix the raw-payload guard silently read it as "no call
+    /// present" and fell through to the reasoning fallback below — the exact
+    /// class of substitution the array/legacy checks above exist to prevent,
+    /// just for a shape neither one covers. Must error instead of promoting
+    /// (CodeRabbit review on #1779, comment 3872083353).
+    #[test]
+    fn non_array_tool_calls_with_reasoning_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function",
+                    "tool_calls": {}
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a non-array raw tool_calls value must not be dropped for promoted reasoning",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stop"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A `finish_reason: "tool_calls"` response that carries no call body at
+    /// all (no `tool_calls` field, no legacy `function_call` field) must
+    /// error rather than promote `reasoning` into the final answer. The
+    /// finish reason itself asserts the model requested an action; treating
+    /// it as "genuinely finished" let the raw-payload guard (which only
+    /// checks for a *present* call) miss the case where there is no call
+    /// field to find. Pre-fix, this silently swapped the requested action
+    /// for prose (Codex review on #1779, comment 3864692178).
+    #[test]
+    fn tool_calls_finish_reason_with_missing_call_body_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("a tool_calls finish reason with no call body must not promote reasoning");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_calls"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Same gap, but the provider sends an explicit empty `tool_calls: []`
+    /// array instead of omitting the field — the raw-payload guard treats an
+    /// empty array as "nothing requested" (correctly, for `parse_tool_calls`
+    /// purposes) but that must not be read as license to promote reasoning
+    /// when the finish reason itself claims an action was intended.
+    #[test]
+    fn tool_calls_finish_reason_with_empty_call_array_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function",
+                    "tool_calls": []
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a tool_calls finish reason with an empty call array must not promote reasoning",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_calls"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Same gap again, but via the *content* channel instead of `reasoning`:
+    /// array-shaped `content` carrying a nonempty text preamble ("Let me
+    /// check that…") makes `content` nonempty on its own, with no reasoning
+    /// fallback involved at all. `raw_tool_call_requested` reads a present
+    /// but empty `tool_calls: []` array the same as an absent field (both
+    /// "nothing requested"), so the explicit raw-payload guard never fires;
+    /// and because `content` is already nonempty, the final
+    /// content-and-tool_calls-both-empty catch-all below never fires either.
+    /// The response would be returned successfully with the preamble as the
+    /// full text and no tool call — silently dropping the action the
+    /// `finish_reason` itself asserts was requested (CodeRabbit review on
+    /// #1779, comment 3877608728).
+    #[test]
+    fn tool_calls_finish_reason_with_empty_array_beside_content_preamble_errors_instead_of_dropping_action()
+     {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Let me check that for you." }
+                    ],
+                    "tool_calls": []
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a tool_calls finish reason with an empty call array must not let a content \
+             preamble stand in for the requested action",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tool_calls"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Legacy sibling of the above: `finish_reason: "function_call"` with no
+    /// `message.function_call` field at all, beside a nonempty array-shaped
+    /// `content` preamble.
+    #[test]
+    fn function_call_finish_reason_with_missing_call_body_beside_content_preamble_errors_instead_of_dropping_action()
+     {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "function_call",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Let me check that for you." }
+                    ]
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a function_call finish reason with no call body must not let a content preamble \
+             stand in for the requested action",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("function_call"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// The legacy sibling of the above: `finish_reason: "function_call"` with
+    /// no `message.function_call` field present at all.
+    #[test]
+    fn function_call_finish_reason_with_missing_call_body_errors_instead_of_promoting() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "function_call",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "I should call the weather function"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload).expect_err(
+            "a function_call finish reason with no call body must not promote reasoning",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("function_call"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// Any other non-success finish reason — including ones this module does
+    /// not name explicitly — must fail closed rather than be assumed safe to
+    /// promote. The guard is an allow-list of genuine textual completions
+    /// (`stop` only — see [`model_response_from_payload`] for why
+    /// `tool_calls`/`function_call` are excluded), not a blocklist of known
+    /// failures, so an unrecognized value never silently promotes reasoning.
+    #[test]
+    fn unrecognized_finish_reason_reasoning_only_turn_errors() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "error",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "Working through it"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("unrecognized finish_reason must not promote reasoning to an answer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error"),
+            "error must name finish_reason for diagnosis, got: {msg}"
+        );
+    }
+
+    /// A missing `finish_reason` altogether is unproven, not proven-complete —
+    /// the allow-list requires an explicit good status, so this must also fail
+    /// closed rather than assume the omission means success.
+    #[test]
+    fn missing_finish_reason_reasoning_only_turn_errors() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": "Working through it"
+                }
+            }]
+        });
+        let err = model_response_from_payload(payload)
+            .expect_err("missing finish_reason must not promote reasoning to an answer");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("finish_reason"),
+            "no finish_reason detail should be appended when none was present, got: {msg}"
+        );
+    }
+
     /// A tool-call-only turn carries `content: null` and a `tool_calls` array.
     /// It must parse into a response whose message has no text block but the
     /// tool call intact (id, name, arguments parsed from the JSON string), so the
@@ -1618,6 +3160,26 @@ mod tests {
         assert_eq!(calls[0].arguments, serde_json::json!({ "sku": "A-1" }));
         assert!(calls[0].invalid.is_none());
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn request_approval_with_siblings_refuses_the_whole_model_response() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}},
+                        {"id":"c2","type":"function","function":{"name":"request_approval","arguments":"{\"title\":\"Run\",\"question\":\"Proceed?\"}"}}
+                    ]
+                }
+            }]
+        });
+        let error = model_response_from_payload(payload)
+            .expect_err("an approval boundary cannot share one tool-call batch");
+        assert!(error.to_string().contains("sibling tool calls"));
     }
 
     /// A missing/empty tool-call `id` is back-filled with a stable `tool-{index}`
@@ -1664,10 +3226,24 @@ mod tests {
             format: tinyagents::harness::tool::ToolFormat::default(),
         }]);
         let mut body = serde_json::json!({ "model": "chat-v1" });
-        attach_tools(&mut body, tools, &ToolChoice::Required);
+        attach_tools(&mut body, tools, &ToolChoice::Required, true);
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "check_inventory");
         assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["parallel_tool_calls"], false);
+        let mut unsupported = serde_json::json!({ "model": "local" });
+        attach_tools(
+            &mut unsupported,
+            wire_tools(&[ToolSchema {
+                name: "check_inventory".to_string(),
+                description: "look up stock".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+                format: tinyagents::harness::tool::ToolFormat::default(),
+            }]),
+            &ToolChoice::Required,
+            false,
+        );
+        assert!(unsupported.get("parallel_tool_calls").is_none());
 
         // An assistant tool-call turn → null content + wire tool_calls; the tool
         // result → a `tool` role message carrying its `tool_call_id`.
@@ -1715,7 +3291,61 @@ mod tests {
             profile.tool_calling,
             "native tool calling must be advertised"
         );
+        assert!(
+            !profile.parallel_tool_calls,
+            "one native call per assistant message keeps request_approval a turn boundary"
+        );
     }
+
+    /// The profile must advertise a context window because it activates
+    /// `ContextCompressionMiddleware` and `ImageAwareMessageTrimMiddleware`.
+    /// A missing value leaves intra-turn history unbounded and can end in the
+    /// observed silent provider failure: HTTP 200, `finish_reason: "failed"`, an
+    /// empty response, and zero usage.
+    #[test]
+    fn both_providers_advertise_the_same_context_window() {
+        let expected = super::context_window();
+        // `OPENCOMPANY_CONTEXT_WINDOW=off|0` is the documented escape hatch that
+        // restores unbounded history, so `None` is legitimate only there; every
+        // other environment must still advertise a window.
+        let explicitly_disabled = std::env::var("OPENCOMPANY_CONTEXT_WINDOW")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw.eq_ignore_ascii_case("off") || raw == "0"
+            })
+            .unwrap_or(false);
+        if explicitly_disabled {
+            assert_eq!(
+                expected, None,
+                "OPENCOMPANY_CONTEXT_WINDOW=off|0 must disable the window"
+            );
+        } else {
+            assert!(
+                expected.is_some(),
+                "the default profile must advertise a context window"
+            );
+        }
+        let hosted = HostedProvider::new(HostedProviderConfig {
+            base_url: "https://example.test/v1".to_string(),
+            credential: Credential::None,
+            extra_headers: Vec::new(),
+        });
+        assert_eq!(
+            hosted
+                .profile()
+                .expect("hosted profile is advertised")
+                .max_input_tokens,
+            expected
+        );
+        // TenantProvider returns the same `MANAGED_PROFILE`, so tenant-provided
+        // credentials receive the same history protection as the hosted route.
+        assert_eq!(*MANAGED_PROFILE_WINDOW, expected);
+    }
+
+    /// Read the static profile directly to verify that both `profile()`
+    /// implementations draw from the same source.
+    static MANAGED_PROFILE_WINDOW: std::sync::LazyLock<Option<u64>> =
+        std::sync::LazyLock::new(|| super::MANAGED_PROFILE.max_input_tokens);
 
     /// A stub that records the `Authorization` header of every request it
     /// answers, so a test can prove which bearer actually went out.
@@ -1982,6 +3612,10 @@ mod tests {
             plan.body.get("tool_choice").is_none(),
             "no tool_choice without tools"
         );
+        assert!(
+            plan.body.get("parallel_tool_calls").is_none(),
+            "no parallel-tool setting without tools"
+        );
         assert_eq!(plan.bearer.as_deref(), Some("or-key"));
         assert!(plan.url.ends_with("/chat/completions"), "{}", plan.url);
         assert!(
@@ -2008,7 +3642,7 @@ mod tests {
         )
         .await
         .expect("plan");
-        assert_eq!(defaulted.model, "deepseek/deepseek-v4-pro");
+        assert_eq!(defaulted.model, "openai/gpt-5.6-sol-pro");
 
         // A concrete slug is still forwarded untouched, so a caller can name any
         // model in OpenRouter's catalog.
@@ -2210,6 +3844,67 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Spawns an in-process OpenAI-compatible stub whose `message.content` is
+    /// the given raw JSON value rather than a plain string — used to exercise
+    /// the array-of-text-parts content shape end to end.
+    async fn spawn_stub_content(content: serde_json::Value) -> String {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let content = content.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": { "role": "assistant", "content": content }
+                        }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Spawns an in-process OpenAI-compatible stub whose full `message` object
+    /// is the given raw JSON value — used to exercise shapes `spawn_stub_content`
+    /// cannot, such as a reasoning-only turn (`content: null` with the visible
+    /// text under `reasoning`/`reasoning_content` instead).
+    async fn spawn_stub_message(message: serde_json::Value) -> String {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let message = message.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "finish_reason": "stop",
+                            "message": message
+                        }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
     /// The live-switch contract: the same `TenantProvider` instance routes turn
     /// 1 to stub A, then — after the operator flips the runtime override in the
     /// secret store — routes turn 2 to stub B, with **no rebuild** of the
@@ -2257,6 +3952,91 @@ mod tests {
             second.text(),
             "reply-from-B",
             "the switch took effect next turn"
+        );
+    }
+
+    /// Issue #1749: the model half of the same live-attribution contract, and
+    /// the BYOK containment it exists for.
+    ///
+    /// A tenant `[inference].models` entry is **operator free text** — this one
+    /// is named after a customer, which is exactly the shape of the leak. The
+    /// provider must report a vocabulary member for it, and the raw name must
+    /// not appear anywhere in what the meter would persist.
+    #[tokio::test]
+    async fn a_tenant_model_is_reported_as_a_slug_and_never_as_the_operators_name() {
+        let url = spawn_stub("ok").await;
+        let company = CompanyId::new("acme");
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemSecrets::default());
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(url.clone());
+        let provider = TenantProvider::new(company.clone(), secrets.clone(), manifest, None);
+
+        assert_eq!(
+            provider.telemetry_model(),
+            None,
+            "no turn has run, so there is no model to name"
+        );
+
+        let save = |model: &str| {
+            let mut models = BTreeMap::new();
+            models.insert("chat-v1".to_string(), model.to_string());
+            let secrets = Arc::clone(&secrets);
+            let company = company.clone();
+            let url = url.clone();
+            async move {
+                inference::save_runtime_config(
+                    &company,
+                    secrets.as_ref(),
+                    &inference::RuntimeInference {
+                        provider: "openai_compatible".into(),
+                        base_url: Some(url),
+                        models,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // A self-hosted model named after the customer it was built for.
+        save("northwind-legal-review-v2").await;
+        provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect("turn");
+        assert_eq!(
+            provider.telemetry_model(),
+            Some(crate::metering::ModelSlug::OTHER),
+            "a model this build cannot name reports the fallback"
+        );
+        let sample = crate::metering::inference_sample(
+            &crate::ports::types::TokenUsage {
+                input: 10,
+                output: 5,
+                cached_input: 0,
+                cost_usd: 0.01,
+            },
+            "ceo",
+            &provider.telemetry_provider_id(),
+            provider.telemetry_model(),
+        )
+        .expect("a real turn meters");
+        let persisted = serde_json::to_string(&sample).expect("serialize");
+        assert!(
+            !persisted.to_ascii_lowercase().contains("northwind"),
+            "the operator's model name reached what the meter persists: {persisted}"
+        );
+
+        // …and a model the vocabulary does know, through the same path.
+        save("anthropic/claude-sonnet-4-6").await;
+        provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect("turn");
+        assert_eq!(
+            provider.telemetry_model().map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "a table switch re-attributes the next turn, exactly as the provider slug does"
         );
     }
 
@@ -2320,6 +4100,600 @@ mod tests {
             seen.lock().unwrap().as_deref(),
             Some(crate::product::PRODUCT_IDENTITY),
             "every hosted chat-completions request must attach the product identity header"
+        );
+    }
+
+    /// A stub that rejects every chat-completion with `status`, the way an
+    /// early-rotated bearer is rejected in production.
+    async fn spawn_rejecting_stub(status: axum::http::StatusCode) -> String {
+        use axum::Router;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move { (status, "rejected") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Issue #1749, the concurrency half: a turn that **failed** must not
+    /// publish its model into the shared cache.
+    ///
+    /// One `TenantProvider` is shared by every agent on a company, and
+    /// `telemetry_model()` is read after a turn finishes — by whichever turn
+    /// finishes, not necessarily the one that wrote last. So publishing before
+    /// the request is issued lets a rejected turn (or one still in flight) name
+    /// the model for a *different* agent's successful turn, attributing real
+    /// tokens to a model that produced none. That is strictly worse than the
+    /// documented approximation, which is bounded to two models that both ran.
+    ///
+    /// A failed turn meters nothing of its own, so the honest state after one
+    /// is the last **successful** turn's model, unchanged.
+    #[tokio::test]
+    async fn a_rejected_tenant_turn_leaves_the_last_successful_model_in_place() {
+        let ok = spawn_stub("ok").await;
+        let rejecting = spawn_rejecting_stub(axum::http::StatusCode::UNAUTHORIZED).await;
+
+        let company = CompanyId::new("acme");
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemSecrets::default());
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(ok.clone());
+        let provider = TenantProvider::new(company.clone(), secrets.clone(), manifest, None);
+
+        let point_at = |base_url: String, model: &str| {
+            let mut models = BTreeMap::new();
+            models.insert("chat-v1".to_string(), model.to_string());
+            let secrets = Arc::clone(&secrets);
+            let company = company.clone();
+            async move {
+                inference::save_runtime_config(
+                    &company,
+                    secrets.as_ref(),
+                    &inference::RuntimeInference {
+                        provider: "openai_compatible".into(),
+                        base_url: Some(base_url),
+                        models,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // A turn that runs, on a model the vocabulary names.
+        point_at(ok.clone(), "anthropic/claude-sonnet-4-6").await;
+        provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect("the successful turn");
+        assert_eq!(
+            provider.telemetry_model().map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "a completed turn names its model"
+        );
+
+        // …then a turn on a *differently* named model that the endpoint
+        // rejects outright.
+        point_at(rejecting.clone(), "openai/gpt-5.2").await;
+        let err = provider
+            .invoke(&(), user_request("hi"))
+            .await
+            .expect_err("the endpoint rejects this turn");
+        assert!(err.to_string().contains("401"), "{err}");
+
+        assert_eq!(
+            provider.telemetry_model().map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "a rejected turn produced no usage, so it must not overwrite the \
+             model of the turn that did run — a concurrent agent's cost hook \
+             reads this value"
+        );
+    }
+
+    /// The same contract on [`HostedProvider`], whose cache is behind an `Arc`
+    /// precisely so every clone of the handle shares it — which is what makes a
+    /// premature write observable by another agent's turn.
+    #[tokio::test]
+    async fn a_rejected_hosted_turn_leaves_the_last_successful_model_in_place() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Answers the first turn and rejects every one after it, so a single
+        // endpoint gives us one success followed by one 401.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Json(serde_json::json!({
+                            "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+                        }))
+                        .into_response()
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "rotated").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let provider = HostedProvider::new(HostedProviderConfig {
+            base_url: format!("http://{addr}"),
+            credential: Credential::None,
+            extra_headers: Vec::new(),
+        });
+
+        let asking_for = |model: &str| ModelRequest {
+            model: Some(model.to_string()),
+            ..user_request("hi")
+        };
+
+        provider
+            .invoke(&(), asking_for("anthropic/claude-sonnet-4-6"))
+            .await
+            .expect("the successful turn");
+        assert_eq!(
+            provider.telemetry_model().map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "a completed turn names its model"
+        );
+
+        let err = provider
+            .invoke(&(), asking_for("openai/gpt-5.2"))
+            .await
+            .expect_err("the endpoint rejects this turn");
+        assert!(err.to_string().contains("401"), "{err}");
+
+        assert_eq!(
+            provider.telemetry_model().map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "a rejected turn produced no usage, so it must not overwrite the \
+             model of the turn that did run — every clone of this handle shares \
+             the cache it would have overwritten"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both turns reached the stub"
+        );
+    }
+
+    /// Codex review on #1779 (comment 3864824480): `model_response_from_payload`
+    /// learned to parse array-shaped `content` (`parses_content_as_array_of_text_parts`
+    /// above), but `probe` — the setup wizard's and the console's "Test" button
+    /// connectivity check — still read `content.as_str()` directly. An endpoint
+    /// answering with array-shaped content therefore passed every real turn
+    /// while its own connection probe reported the connection broken. `probe`
+    /// must route through `model_response_from_payload` itself, the same
+    /// parser the turn path calls, rather than any narrower stand-in for it.
+    #[tokio::test]
+    async fn probe_accepts_array_shaped_content() {
+        let url = spawn_stub_content(serde_json::json!([
+            { "type": "text", "text": "pong" }
+        ]))
+        .await;
+
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(url);
+        let decl = inference::resolve_effective(&company, &manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+
+        probe(&decl, None)
+            .await
+            .expect("array-shaped content must be recognized as a successful probe");
+    }
+
+    /// Codex review on #1779 (comment 3864906472): the array-content fix above
+    /// made `probe` call `extract_content_text` directly instead of the shared
+    /// `model_response_from_payload` — which picked up the array-shaped-content
+    /// case but not the `reasoning`/`reasoning_content` fallback for a
+    /// reasoning-only turn (`content: null`, `finish_reason: "stop"`, visible
+    /// text under `reasoning`) that lives inside `model_response_from_payload`.
+    /// A managed reasoning provider answering with that shape passed every
+    /// real turn while its own connection probe reported the connection
+    /// broken — blocking the setup wizard and the console's "Test" button for
+    /// a valid provider. `probe` must route through the exact same parser the
+    /// turn path calls so the two paths cannot diverge again.
+    #[tokio::test]
+    async fn probe_accepts_reasoning_only_content() {
+        let url = spawn_stub_message(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning": "42 is the answer."
+        }))
+        .await;
+
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(url);
+        let decl = inference::resolve_effective(&company, &manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+
+        probe(&decl, None)
+            .await
+            .expect("reasoning-only content must be recognized as a successful probe");
+    }
+
+    /// CodeRabbit review on #1779 (comment 3877827976): `probe` routes
+    /// through the shared `model_response_from_payload`, which is correct
+    /// for a real turn but accepts a tool-call-only reply as a success —
+    /// tool calls are a valid outcome when the caller offered tools. `probe`
+    /// offers none (`Vec::new()`), so an endpoint answering `ping` with a
+    /// tool call instead of prose never actually answered the bare chat turn
+    /// the probe exists to verify. Without an explicit check for visible
+    /// text, the setup wizard or console Test action would report such an
+    /// endpoint as reachable.
+    #[tokio::test]
+    async fn probe_rejects_tool_call_only_reply() {
+        let url = spawn_stub_message(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "lookup_weather", "arguments": "{}" }
+                }
+            ]
+        }))
+        .await;
+
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(url);
+        let decl = inference::resolve_effective(&company, &manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = probe(&decl, None)
+            .await
+            .expect_err("a tool-call-only reply to a no-tools probe must not pass");
+        assert!(
+            err.to_string().contains("tool call"),
+            "error should name why the probe failed: {err}"
+        );
+    }
+
+    /// CodeRabbit review on #1779 (comment 3878355375): the tool-call guard
+    /// above only checked `content.is_empty()`, which catches a tool-call-
+    /// *only* reply but not a mixed one — a text preamble alongside a
+    /// genuinely parsed tool call. `model_response_from_payload` accepts that
+    /// combination for a real turn (the finish-reason-declares-an-action
+    /// guard only fires when `tool_calls` fails to parse), so `content` comes
+    /// back nonempty and the pre-fix check let it through even though the
+    /// probe offered no tools and the endpoint still requested one. Must
+    /// still fail the probe.
+    #[tokio::test]
+    async fn probe_rejects_tool_call_alongside_text_preamble() {
+        let url = spawn_stub_message(serde_json::json!({
+            "role": "assistant",
+            "content": "Let me check that for you.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "lookup_weather", "arguments": "{}" }
+                }
+            ]
+        }))
+        .await;
+
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let mut manifest = manifest_inference("openai_compatible");
+        manifest.base_url = Some(url);
+        let decl = inference::resolve_effective(&company, &manifest, None, &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = probe(&decl, None)
+            .await
+            .expect_err("a tool call alongside text in a no-tools probe must not pass");
+        assert!(
+            err.to_string().contains("tool call"),
+            "error should name why the probe failed: {err}"
+        );
+    }
+
+    /// Issue #1811: the managed backend's raw refusal for a model id that does
+    /// not exist is rewritten into an actionable message that names the fix and
+    /// keeps the provider's own words (the bad id + the list-models hint) at the
+    /// end for support. No `harness` in play (the managed backend has no
+    /// harness-scoped config), so the fix is named as the company mapping.
+    #[test]
+    fn a_missing_model_400_becomes_actionable() {
+        let raw = concat!(
+            "inference returned 400 Bad Request: ",
+            r#"{"error":"Model 'deepseek/deepseek-v4-pro' is not available. "#,
+            r#"Use GET /openai/v1/models to list available models.","errorCode":"BAD_REQUEST"}"#,
+        );
+        let advice = model_unavailable_advice(
+            reqwest::StatusCode::BAD_REQUEST,
+            raw,
+            "https://api.tinyhumans.ai/openai/v1/models",
+            None,
+            None,
+        )
+        .expect("recognised as a missing model");
+        assert!(
+            !advice.contains("agent's model"),
+            "a built_in harness never honours `agent.model` (`Manifest::validate`), so it must \
+             not be suggested as a fix: {advice}"
+        );
+        assert!(
+            advice.contains("the company's `[inference].models` mapping"),
+            "with no harness scope, the company-level mapping is the only place to fix it: \
+             {advice}"
+        );
+        assert!(
+            advice.contains("deepseek/deepseek-v4-pro"),
+            "the offending id survives for support: {advice}"
+        );
+        assert!(
+            advice.contains("GET https://api.tinyhumans.ai/openai/v1/models"),
+            "the caller-supplied catalog endpoint is used: {advice}"
+        );
+    }
+
+    /// Codex review on #1824: a named `built_in` harness with its own
+    /// `[harness.inference]` resolves independently of the company mapping
+    /// (`resolve_effective_scoped`), so the advice must name *that* harness
+    /// rather than blanket-pointing at `[inference].models` — the earlier wording
+    /// sent its operator to a table the failing request never consulted, and
+    /// separately suggested `agent.model`, which a `built_in` harness rejects
+    /// outright. This assertion set does not compile against the pre-fix
+    /// 3-argument `model_unavailable_advice`, i.e. it fails (to build) on the
+    /// pre-fix code exactly as it must.
+    #[test]
+    fn scoped_harness_advice_names_its_own_harness() {
+        let raw = "inference returned 400 Bad Request: openai/made-up is not a valid model ID";
+        let advice = model_unavailable_advice(
+            reqwest::StatusCode::BAD_REQUEST,
+            raw,
+            "https://openrouter.ai/api/v1/models",
+            Some("research-harness"),
+            Some(InferenceSource::Manifest),
+        )
+        .expect("recognised as a missing model");
+        assert!(
+            advice.contains("harness `research-harness`'s own `[harness.inference].models`"),
+            "the failing harness is named, not just the company: {advice}"
+        );
+        assert!(
+            advice.contains("the company's `[inference].models`"),
+            "the company fallback (when the harness declares none of its own) is still \
+             mentioned: {advice}"
+        );
+        assert!(
+            !advice.contains("agent's model"),
+            "still never suggests the non-lever `agent.model`: {advice}"
+        );
+    }
+
+    /// Codex review on #1824 (round 2): a saved console runtime override
+    /// outranks *both* manifest tables (`resolve_effective_scoped`'s
+    /// precedence — runtime > manifest > env-default), so while one is active
+    /// the earlier wording sent the operator to edit a `[harness.inference]` /
+    /// `[inference]` table that is shadowed and would not change the outcome.
+    /// This assertion set does not compile against the pre-fix 4-argument
+    /// `model_unavailable_advice` (no `source` parameter), i.e. it fails to
+    /// build on the pre-fix code exactly as it must.
+    #[test]
+    fn runtime_override_advice_names_the_override_not_the_shadowed_manifest() {
+        let raw = "inference returned 400 Bad Request: openai/made-up is not a valid model ID";
+
+        let scoped = model_unavailable_advice(
+            reqwest::StatusCode::BAD_REQUEST,
+            raw,
+            "https://openrouter.ai/api/v1/models",
+            Some("research-harness"),
+            Some(InferenceSource::Runtime),
+        )
+        .expect("recognised as a missing model");
+        assert!(
+            scoped.contains("harness `research-harness`'s saved runtime inference override"),
+            "the active override is named, not a shadowed manifest table: {scoped}"
+        );
+        assert!(
+            !scoped.contains("update harness `research-harness`'s own `[harness.inference]"),
+            "the manifest-table phrasing (the non-Runtime branch) must not be the suggested fix \
+             while an override shadows it: {scoped}"
+        );
+
+        let default = model_unavailable_advice(
+            reqwest::StatusCode::BAD_REQUEST,
+            raw,
+            "https://openrouter.ai/api/v1/models",
+            None,
+            Some(InferenceSource::Runtime),
+        )
+        .expect("recognised as a missing model");
+        assert!(
+            default.contains("update the saved runtime inference override"),
+            "the company-scoped override is named: {default}"
+        );
+        assert!(
+            !default.contains("update the company's `[inference].models` mapping"),
+            "the manifest-table phrasing (the non-Runtime branch) must not be the suggested fix \
+             while an override shadows it: {default}"
+        );
+    }
+
+    /// Issue #1811 follow-up (Codex review on #1824): a direct OpenRouter,
+    /// Ollama, or arbitrary `openai_compatible` BYOK endpoint must get *its own*
+    /// catalog URL in the advice, not the TinyHumans-managed `/openai/v1/models`
+    /// path. Before the fix this string was hard-coded regardless of
+    /// `models_url`, so this assertion fails on the pre-fix code even though the
+    /// raw provider error here (OpenRouter's own wording) never mentions
+    /// `/openai/v1/models` at all.
+    #[test]
+    fn byok_provider_advice_points_at_its_own_catalog() {
+        let raw = "inference returned 400 Bad Request: openai/made-up is not a valid model ID";
+        let advice = model_unavailable_advice(
+            reqwest::StatusCode::BAD_REQUEST,
+            raw,
+            "https://openrouter.ai/api/v1/models",
+            None,
+            None,
+        )
+        .expect("recognised as a missing model");
+        assert!(
+            advice.contains("GET https://openrouter.ai/api/v1/models"),
+            "OpenRouter's own catalog endpoint is named: {advice}"
+        );
+        assert!(
+            !advice.contains("openai/v1/models"),
+            "the TinyHumans-managed path must not leak into a direct-provider hint: {advice}"
+        );
+    }
+
+    /// The BYOK / OpenAI-compatible and OpenRouter phrasings for the same class
+    /// are all recognised — the signature set is the provider's wording, not a
+    /// catalogue of model ids.
+    #[test]
+    fn other_provider_phrasings_are_recognised() {
+        for body in [
+            "inference returned 404 Not Found: The model `gpt-9` does not exist",
+            "inference returned 400 Bad Request: openai/made-up is not a valid model ID",
+        ] {
+            assert!(
+                model_unavailable_advice(
+                    reqwest::StatusCode::BAD_REQUEST,
+                    body,
+                    "https://example.com/v1/models",
+                    None,
+                    None,
+                )
+                .is_some(),
+                "should be recognised as a missing model: {body}"
+            );
+        }
+    }
+
+    /// A valid model that fails for another reason must pass through untouched:
+    /// a 401 (bad key), a 4xx about something other than a model, and any 5xx
+    /// (the provider's own fault — reframing it as a config error would send the
+    /// operator to change a model that is fine).
+    #[test]
+    fn unrelated_failures_are_left_alone() {
+        assert_eq!(
+            model_unavailable_advice(
+                reqwest::StatusCode::UNAUTHORIZED,
+                "inference returned 401 Unauthorized: invalid api key",
+                "https://example.com/v1/models",
+                None,
+                None,
+            ),
+            None,
+            "a bad key is not a missing model"
+        );
+        assert_eq!(
+            model_unavailable_advice(
+                reqwest::StatusCode::BAD_REQUEST,
+                "inference returned 400 Bad Request: user does not exist",
+                "https://example.com/v1/models",
+                None,
+                None,
+            ),
+            None,
+            "a 4xx that never names a model is not a missing model"
+        );
+        assert_eq!(
+            model_unavailable_advice(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "inference returned 500: the model host crashed",
+                "https://example.com/v1/models",
+                None,
+                None,
+            ),
+            None,
+            "a 5xx is the provider's fault, not the operator's config"
+        );
+    }
+
+    /// Spawns a stub that rejects every chat completion with a
+    /// provider-flavoured "model not available" 400, the shape `probe`'s
+    /// caller (the console "Test" button) hits when an operator has typed a
+    /// model id the endpoint does not serve.
+    async fn spawn_model_unavailable_stub() -> String {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "Model 'gpt-5.9-ghost' is not available. Use GET /v1/models to \
+                                  list available models."
+                    })
+                    .to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// `probe`'s repair hint must name the harness whose table the failing
+    /// request actually read (Codex review on #1824's #1811 follow-up):
+    /// `test_config` (src/server/ops/inference.rs) resolves against the
+    /// company's default harness and now threads its real id through, the
+    /// same distinction `TenantProvider::invoke` already makes for live
+    /// turns. Before the fix `probe` hard-coded `None` for every caller, so a
+    /// company whose default harness declares its own `[harness.inference]`
+    /// got a repair hint pointing at the company-level `[inference].models`
+    /// table — one its request never consulted.
+    #[tokio::test]
+    async fn probe_names_the_harness_that_owns_the_failing_config() {
+        let base_url = spawn_model_unavailable_stub().await;
+        let decl = inference::decl_for_probe("openai_compatible", Some(&base_url), None, None);
+
+        let err = probe(&decl, Some("embedded"))
+            .await
+            .expect_err("the stub rejects every model");
+        assert!(
+            err.to_string().contains("harness `embedded`"),
+            "the hint must name the owning harness: {err}"
+        );
+
+        let err = probe(&decl, None)
+            .await
+            .expect_err("the stub rejects every model");
+        assert!(
+            !err.to_string().contains("harness `"),
+            "with no harness in play (the first-run wizard), the hint must not invent one: {err}"
         );
     }
 }

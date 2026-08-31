@@ -218,6 +218,29 @@ export interface SetupInput {
    * preset cannot override.
    */
   company?: DesignedCompany | null;
+  /**
+   * What to call the company, as the review step asks for it.
+   *
+   * Applies to either path above. Omitted or blank means "derive it", which is
+   * what every company built here used to get: the host takes the first clause
+   * of {@link DesignedCompany.industry}, so the answer to "what kind of company
+   * are you setting up?" silently became the company's name — and its id, which
+   * is then permanent.
+   */
+  name?: string | null;
+  /**
+   * The address that will be able to sign in, for the template path.
+   *
+   * {@link DesignedCompany.adminEmail} carries the same thing for a designed
+   * company. This one exists because a seeded template has no designed company
+   * to carry it in, and no shipped template names an admin — so a template plus
+   * a sign-in mode would otherwise finish setup into a company nobody can
+   * administer.
+   *
+   * Snake case, unlike the camelCase inside {@link DesignedCompany}: the top
+   * level of this request is read field-for-field by the host.
+   */
+  admin_email?: string | null;
 }
 
 /** The company the wizard designed, as the review step hands it over. */
@@ -286,8 +309,17 @@ export interface SetupRoster {
   agents: SetupRosterAgent[];
   /** Which curated roster framed the proposal, e.g. `ecommerce`. */
   template: string;
-  /** `model` — designed from the answers. `fallback` — the curated team. */
-  source: "model" | "fallback";
+  /**
+   * `model` — designed from the answers. `fallback` — the curated team matched
+   * from them. `preset` — the roster of the template the operator *picked*,
+   * shipped whole.
+   *
+   * The last one is the only source the console may send back as a
+   * {@link SetupInput.template} rather than as a designed company: it is the
+   * one case where the host can seed the real thing — that template's belt and
+   * prompts as well as its roster — instead of rebuilding it from this screen.
+   */
+  source: "model" | "fallback" | "preset";
   /**
    * The jobs the operator named, as the **host** split them.
    *
@@ -309,6 +341,8 @@ export interface SetupRoster {
    * Why this is the curated team, when it is. Absent on the `model` path.
    *
    * `"no_model"` — no credential was reachable, so no design pass ran.
+   * `"model_unreachable"` — a credential is wired, but its provider did not
+   * answer in time.
    * `"not_designable"` — a model answered and the answer was unusable: too thin,
    * unreadable, or the reference team handed back unchanged. In practice, the
    * answers were too sparse to design from.
@@ -318,7 +352,7 @@ export interface SetupRoster {
    * falsehood in the second case — and it pointed the operator at adding a key
    * when what they actually needed was to say more about their business.
    */
-  reason?: "no_model" | "not_designable";
+  reason?: "no_model" | "model_unreachable" | "not_designable";
 }
 
 /**

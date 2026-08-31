@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/tinyhumansai/opencompany/refs/heads/main/gitbooks/.gitbook/assets/opencompany.png" alt="OpenCompany" />
+  <picture>
+    <source srcset="gitbooks/.gitbook/assets/opencompany-hero.gif" type="image/gif" />
+    <img src="gitbooks/.gitbook/assets/opencompany-hero.png" alt="OpenCompany: run an entire company with a headcount of one" />
+  </picture>
 </p>
 
 <h1 align="center">OpenCompany</h1>
@@ -10,43 +13,46 @@
 
 <p align="center">
   OpenCompany is the operating layer for one-person businesses powered by
-  agents. You bring the vision and the judgment calls. Your agents do the work —
+  agents. You bring the vision and the judgment calls. Your agents do the work:
   every function, around the clock, at the speed of software.
 </p>
 
 <p align="center">
   <a href="https://github.com/tinyhumansai/opencompany/blob/main/LICENSE"><img src="https://img.shields.io/github/license/tinyhumansai/opencompany?style=flat-square" alt="License: GPL-3.0" /></a>
   <a href="https://github.com/tinyhumansai/opencompany/stargazers"><img src="https://img.shields.io/github/stars/tinyhumansai/opencompany?style=flat-square" alt="GitHub stars" /></a>
-  <a href="https://github.com/tinyhumansai/opencompany/issues"><img src="https://img.shields.io/github/issues/tinyhumansai/opencompany?style=flat-square" alt="Open issues" /></a>
-  <a href="https://github.com/tinyhumansai/opencompany/pulls"><img src="https://img.shields.io/github/issues-pr/tinyhumansai/opencompany?style=flat-square" alt="Open pull requests" /></a>
+  <a href="https://github.com/tinyhumansai/opencompany/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22"><img src="https://img.shields.io/github/issues/tinyhumansai/opencompany/good%20first%20issue?style=flat-square&label=good%20first%20issues&color=7057ff" alt="Good first issues" /></a>
   <a href="https://github.com/tinyhumansai/opencompany/commits/main"><img src="https://img.shields.io/github/last-commit/tinyhumansai/opencompany?style=flat-square" alt="Last commit" /></a>
   <img src="https://img.shields.io/badge/status-work%20in%20progress-orange?style=flat-square" alt="Work in progress" />
+</p>
+
+<p align="center">
+  <a href="https://tinyhumans.ai/opencompany"><img src="https://img.shields.io/badge/website-tinyhumans.ai-2F6EF4?style=flat-square" alt="Website" /></a>
+  <a href="https://discord.tinyhumans.ai"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://x.com/tinyhumansai"><img src="https://img.shields.io/badge/X-@tinyhumansai-000000?style=flat-square&logo=x&logoColor=white" alt="X" /></a>
+  <a href="https://www.reddit.com/r/tinyhumansai/"><img src="https://img.shields.io/badge/Reddit-r%2Ftinyhumansai-FF4500?style=flat-square&logo=reddit&logoColor=white" alt="Reddit" /></a>
 </p>
 
 > [!WARNING]
 > **🚧 Work in progress.** OpenCompany is under active development and moving
 > fast. APIs, the CLI, the example harnesses, and the docs will change without
-> notice, and things may be incomplete or break between commits. Explore it,
-> fork it, build on it — but don't depend on anything staying put yet. Not
-> production-ready.
+> notice. Explore it, fork it, build on it, but don't depend on anything
+> staying put yet. Not production-ready.
 
 ---
 
 ## The company of one
 
-For a century, ambition meant headcount. Want to ship a product? Hire
-engineers. Want customers? Hire marketers, then sales, then support. Every new
-capability was a new payroll line, a new manager, a new quarter of ramp-up.
+For a century, ambition meant headcount. Want to ship a product? Hire engineers.
+Want customers? Hire marketers, then sales, then support. Every new capability
+was a new payroll line, a new manager, a new quarter of ramp-up.
 
-That tax is gone.
-
-OpenCompany turns a single operator into a full org chart. Opportunity scouts,
-founders, engineers, designers, marketers, lawyers, finance, support,
-recruiters — instantiated as agents, coordinated by one host, working while you
-sleep. You stay where humans are irreplaceable: **capital, taste, and the
+That tax is gone. OpenCompany turns a single operator into a full org chart.
+Scouts, founders, engineers, designers, marketers, lawyers, finance, support and
+recruiters, all instantiated as agents, coordinated by one host, working while
+you sleep. You stay where humans are irreplaceable: **capital, taste, and the
 decisions that actually matter.** Everything else is delegated.
 
-This isn't a chatbot with a to-do list. It's a **company runtime** — a durable
+This isn't a chatbot with a to-do list. It's a **company runtime**: a durable
 host that stands up a roster of specialized agents, gives each one a clear
 mandate, and runs them as a coordinated business on top of the OpenHuman and
 TinyHumans runtimes.
@@ -54,8 +60,8 @@ TinyHumans runtimes.
 ## What one person can now run
 
 Every folder under [`companies/`](companies/) is a complete company you can
-launch today — a roster of agents, their responsibilities, and the handful of
-moments where a human signs off:
+launch today, with a roster of agents, their responsibilities, and the handful
+of moments where a human signs off:
 
 | You want to run a… | Your agents handle | You keep |
 | --- | --- | --- |
@@ -64,6 +70,7 @@ moments where a human signs off:
 | **[VC Firm](companies/agentic_venture_capital/)** | Deal flow, diligence, memos, portfolio support | The final "yes" |
 | **[Consulting Firm](companies/agentic_consultation_firm/)** | Research, analysis, modeling, decks, implementation plans | Executive workshops |
 | **[Software Company](companies/agentic_software_company/)** | PM, design, frontend, backend, QA, security, docs, support, DevRel | Product direction |
+| **[Product Team](companies/agentic_product_team/)** | A triaged queue, a groomed backlog, a defended roadmap | Prioritization calls & roadmap sign-off |
 | **[Marketing Agency](companies/agentic_marketing_agency/)** | Creative, copy, SEO, paid, email, landing pages, analytics | Campaign sign-off |
 | **[Design Studio](companies/agentic_design_studio/)** | Branding, UI, motion, illustration, user testing | Creative direction |
 | **[Media Company](companies/agentic_media_company/)** | Finding, verifying, writing, illustrating, distributing stories | Editorial standards |
@@ -77,14 +84,45 @@ moments where a human signs off:
 | **[Accounting Firm](companies/agentic_accounting_firm/)** | Bookkeeping, tax, payroll, forecasting, audit prep | Signing the filings |
 | **[Law Firm](companies/agentic_law_firm/)** | Research, drafting, litigation support, discovery, compliance | Approving filings |
 | **[Pharma Startup](companies/agentic_pharma_startup/)** | Literature, molecule discovery, simulation, trial planning | The lab work |
+| **[Research Lab](companies/agentic_research_lab/)** | Source-backed research reports with the evidence attached | Setting the question & accepting findings |
+| **[Math Lab](companies/agentic_math_lab/)** | Verified answers to computational problems, with the programs that produced them | Stating the problem & accepting the answer |
 | **[Signals + Opportunity Studio](companies/signals_opportunity_studio/)** | Scouting signals, clustering pains, ranking opportunities into a weekly brief | Which opportunities to fund |
 
-Nineteen companies. One operator. Pick one and run it — or run several at once.
+Twenty-two companies. One operator. Pick one and run it, or run several at once.
+[`companies/README.md`](companies/README.md) has the full catalog.
 
-**Signals and the Opportunity Engine are a template, not kernel code.** The
-[Signals + Opportunity Studio](companies/signals_opportunity_studio/) realizes
-them as a roster, a charter, and a weekly `[[schedule]]` over the existing
-channel, memory, and brain ports — nothing new in the runtime.
+## Quickstart
+
+You do not need a software background to run a company. You need
+[Docker Desktop](https://www.docker.com/products/docker-desktop/), a terminal,
+and about fifteen minutes. On Windows the terminal must be POSIX —
+[WSL](https://learn.microsoft.com/windows/wsl/install) or Git Bash — because the
+quickstart below uses `export` and `./scripts/launch-demo.sh`.
+
+```sh
+git clone --recurse-submodules https://github.com/tinyhumansai/opencompany.git
+cd opencompany
+export TINYHUMANS_API_KEY="th-..."          # grab yours at tinyhumans.ai
+export OPENCOMPANY_FEATURES="medulla"       # compile in the hosted Medulla brain the key unlocks
+./scripts/launch-demo.sh marketing up
+```
+
+The first run takes a few minutes while it downloads and builds. When it
+settles, open **<http://localhost:5173>**. That's the console, where you watch
+your agents work and answer anything waiting on you.
+`./scripts/list-demos.sh` lists the other businesses you can launch in place of
+`marketing`, and `./scripts/launch-demo.sh marketing down` shuts it all down.
+
+Prefer to build the host from source, deploy it somewhere, or change the runtime
+itself? That path lives in [docs/running-locally.md](docs/running-locally.md):
+Cargo builds, Compose, feature flags, the Tauri desktop preview, and
+DigitalOcean / AWS deploys.
+
+> **You'll want a TinyHumans API key.** It's what unlocks Medulla and lets the
+> agents think and act. Without one you can still launch a company and look
+> around; the agents just won't do real work. Grab a key at
+> **[tinyhumans.ai](https://tinyhumans.ai)** and
+> `export TINYHUMANS_API_KEY="th-..."`.
 
 ## Why it works
 
@@ -94,7 +132,7 @@ channel, memory, and brain ports — nothing new in the runtime.
 - **Humans in the loop where it counts.** Every harness names the exact
   decisions reserved for you. Delegate the work; keep the judgment.
 - **Built on proven runtimes.** OpenCompany is a light host over OpenHuman and
-  the TinyHumans agent modules — it reuses their runtime instead of
+  the TinyHumans agent modules, so it reuses their runtime instead of
   reinventing it.
 - **Rust-fast and inspectable.** An Axum HTTP surface, a small default build,
   and deeper capabilities behind feature flags. Simple to start, honest to
@@ -104,214 +142,57 @@ channel, memory, and brain ports — nothing new in the runtime.
 ## The engine: Medulla
 
 A company of one only works if something can hold the whole company in its head.
-That something is **Medulla** — TinyHumans' orchestrator model, purpose-built to
+That something is **Medulla**, TinyHumans' orchestrator model, purpose-built to
 run large fleets of agents as a single coordinated business.
 
-Medulla is **orchestrator-first**. Every event — a customer email, a market
-signal, a finished task — lands on a deep orchestration tier that reads the full
-picture, decides what matters, and fans the work out across your agents. It
-compresses the noise coming in, compiles the right output for each channel going
-out, and routes results back into the loop. One brain, many hands.
+Medulla is orchestrator-first. Every event, whether a customer email, a market
+signal or a finished task, lands on a deep orchestration tier that reads the full
+picture, decides what matters, and fans the work out across your agents. As your
+company grows from nine agents to nine hundred, Medulla is what keeps it
+coherent, on-strategy, and moving without you in every message. It's a hosted
+model: you reach it with a TinyHumans API key, and OpenCompany is the open host
+that points your companies at it.
 
-It's the difference between a pile of chatbots and an actual org that runs. As
-your company grows from nine agents to nine hundred, Medulla is what keeps it
-coherent, on-strategy, and moving — without you in every message.
+## Make it yours
 
-**Medulla is a hosted model.** You reach it with a **TinyHumans API key**;
-OpenCompany is the open host that points your companies at it.
-
-> Grab your key and request Medulla access at
-> **[tinyhumans.ai](https://tinyhumans.ai)**.
-
-## New to this?
-
-You do not need a software background to run a company. Three things, and
-about fifteen minutes.
-
-1. **[Docker Desktop](https://www.docker.com/products/docker-desktop/)**, a
-   free app that runs OpenCompany in a self-contained box so it cannot make a
-   mess of your machine.
-2. **A TinyHumans API key** from [tinyhumans.ai](https://tinyhumans.ai). This
-   is what lets the agents think and act. Skip it at first if you like: without
-   a key you can still launch a company and look around, the agents just will
-   not do real work.
-3. **A terminal.** On a Mac that is the app called Terminal, on Linux you
-   already know, and on Windows install
-   [WSL](https://learn.microsoft.com/windows/wsl/install) or Git Bash first,
-   because these commands expect a Unix-style shell.
-
-Then three lines. Copy one, press enter, wait for it to finish, and move to the
-next:
-
-```sh
-git clone --recurse-submodules https://github.com/tinyhumansai/opencompany.git
-cd opencompany
-./scripts/launch-demo.sh marketing up
-```
-
-The first run takes a few minutes while it downloads and builds. When it
-settles, open **http://localhost:5173**: that is the console, where you watch
-your agents work and answer anything waiting on you. Run
-`./scripts/list-demos.sh` to see the other businesses you can launch in place
-of `marketing`, and `./scripts/launch-demo.sh marketing down` when you are
-finished.
-
-Making it yours means editing `companies/<name>/company.toml`, a plain text
-file naming the roles, what each one owns, and where you want to be asked
-before anything happens. It is written to be read by people, and changing a
-role is editing a few lines rather than programming.
-[Your first company](gitbooks/get-started/your-first-company.md) walks through
-it.
-
-The rest of this section is the from-source path, for changing the host itself.
-
-## Start your company
-
-```sh
-# 0. Get a TinyHumans API key (unlocks Medulla, the orchestrator) and set it
-export TINYHUMANS_API_KEY="th-..."
-
-# 1. Pull in the OpenHuman + TinyAgents runtimes
-git submodule update --init --recursive
-
-# 2. Check a company definition before you launch it
-cargo run --bin opencompany -- check companies/agentic_marketing_agency
-
-# 3. Launch that company on the host — pick any folder under companies/
-cargo run --bin opencompany -- serve --company companies/agentic_marketing_agency
-```
-
-The host is one configurable backend; each folder under
-[`companies/`](companies/) is a business definition (a `company.toml` manifest
-plus docs), not its own program. Point `--company` at a different folder to run
-a different business.
-
-Without a key you can still build, inspect, and explore every company in
-`companies/`. Add the key when you're ready to put Medulla in the driver's seat
-and let the agents run for real.
-
-To let companies trade with other agents on tiny.place, build with the
-`tinyplace` feature and pass `serve --discoverable` to opt every loaded company
-into going public (register a `@handle`, publish an Agent Card, and answer
-inbound A2A `tasks/send` over SIWX + x402). See
-[`docs/modules/server/README.md`](docs/modules/server/README.md) for the full
-discovery flow and the `TINYPLACE_API_URL` / `OPENCOMPANY_PUBLIC_URL` settings.
-
-Each company folder holds a `company.toml` (the manifest — the team, the
-output, the human's role) and a `README.md` describing the business. Edit the
-manifest to reshape the team; `opencompany check` reports any problems in plain
-language. Adding a new business is a new folder, not a new program.
-
-```sh
-cargo build               # the host (the one configurable backend)
-```
-
-## Run it anywhere (Docker)
-
-One script spins up a company **and** its [operator console](frontend/) in
-development mode. Pass a friendly site name (or any directory name under
-`companies/`) and keep the stack attached to the terminal:
-
-```sh
-./scripts/launch-demo.sh marketing up     # console → :5173, host API → :8080
-# Press Ctrl-C when finished, then destroy its containers and network:
-./scripts/launch-demo.sh marketing down
-# Or destroy the stack and its persistent data volume:
-./scripts/launch-demo.sh marketing down -v
-```
-
-The launcher bind-mounts the local checkout. Vite hot-updates frontend edits;
-`cargo-watch` rebuilds and restarts the backend when Rust source, Cargo files,
-or company definitions change. The first start builds the development images
-and dependencies; later launches reuse named Cargo and `node_modules` caches.
-
-Use `./scripts/list-demos.sh` to list friendly names and every available
-company. Each company uses a separate Compose project and persistent data
-volume. `down` removes its containers and network but keeps that volume;
-`down -v` deletes the volume and its data too.
-
-For custom ports, credentials, or feature flags, copy `.env.example` to `.env`
-before launching. For production-like images without source mounts or hot
-reload, run `OPENCOMPANY_COMPANY=marketing docker compose up --build` directly.
-
-The same two images deploy to DigitalOcean (App Platform spec in
-[`.do/app.yaml`](.do/app.yaml)), AWS (Fargate task in
-[`deploy/`](deploy/aws-ecs-task-definition.json)), or any Docker host. See
-[`deploy/README.md`](deploy/README.md).
-
-Compile against vendored TinyAgents, or preview an OpenHuman launch:
-
-```sh
-cargo check --features tiny
-cargo run --bin opencompany -- open-human --dry-run -- status
-```
-
-Preview the Tauri desktop host (calls `cargo tauri` directly with OpenHuman's
-preflight ported into Rust — CEF on macOS, `wry` on Linux/Windows):
-
-```sh
-cargo run --bin opencompany -- open-human --mode desktop --dry-run
-cargo run --bin opencompany -- open-human --mode desktop            # launch
-cargo run --bin opencompany -- open-human --mode desktop --release  # bundle
-```
-
-## Under the hood
-
-OpenCompany is a Rust 2024 crate: one configurable host. Business types are
-data, not code — a manifest plus docs — and the operator console is a separate
-Vite app.
-
-```text
-src/app/                Runtime config and shared state
-src/company/            Company manifest parsing, validation, and boot
-src/ports/              Kernel port traits and shared types
-src/store/              File-based CompanyStore/EventLog/Memory/Context/Secrets
-src/policy/             Manifest-driven ApprovalGate
-src/brain/              Offline EchoBrain (the default cognition seam)
-src/feedback/           Feedback items, privacy scrubber, GitHub issue filing
-src/runtime/            CompanyRuntime, CycleRunner, cron scheduler, registry
-src/server/             Axum HTTP router and handlers
-src/server/users/       Human sign-in: magic link, passwords, sessions, invites
-src/openhuman/          OpenHuman launcher seams
-src/tiny/               Tinyagents/OpenHuman status surface
-src/bin/opencompany.rs  CLI entrypoint
-companies/              19 business definitions (a company.toml + docs each)
-frontend/               Company-agnostic operator console (Vite + React)
-docs/spec/              Architecture reference
-docs/modules/           Per-package design docs
-vendor/openhuman/       OpenHuman git submodule
-vendor/openhuman/vendor/tinyagents/
-                        TinyAgents inherited from OpenHuman
-```
-
-Package surfaces: **`app`** (config + shared state), **`company`** (manifest
-parsing, validation, and boot), **`ports`** (kernel trait seams),
-**`store`** (file-based default stores), **`policy`** (approval gate),
-**`brain`** (offline cognition seam), **`runtime`** (company runtime + cycle
-loop), **`server`** (Axum router), **`openhuman`** (launcher seams),
-**`tiny`** (vendored TinyAgents status).
-
-See [docs/spec/README.md](docs/spec/README.md) for the architecture reference
-and [companies/README.md](companies/README.md) for the full company catalog.
+Each company folder holds a `company.toml`, a plain text file naming the roles,
+what each one owns, and where you want to be asked before anything happens. It's
+written to be read by people; changing a role is editing a few lines rather than
+programming. `opencompany check` reports any problems in plain language, and
+adding a new business is a new folder, not a new program.
+[Your first company](gitbooks/get-started/your-first-company.md) walks through it.
 
 ## Documentation
 
-The full docs live in [`gitbooks/`](gitbooks/README.md): what OpenCompany is,
-what one person can run, how [Medulla](gitbooks/overview/medulla.md) drives it,
-and the [tiny.place economy](gitbooks/overview/tiny-place.md). Builders should
-start with the [developer section](gitbooks/developers/README.md) — build,
-CLI, architecture, authoring companies, deployment, and configuration.
+| Where | What's there |
+| --- | --- |
+| [`gitbooks/`](gitbooks/README.md) | The full docs: what OpenCompany is, what one person can run, how [Medulla](gitbooks/overview/medulla.md) drives it |
+| [`docs/running-locally.md`](docs/running-locally.md) | Docker, Compose, from-source builds, feature flags, desktop preview, deploy targets |
+| [`docs/repository-layout.md`](docs/repository-layout.md) | Where everything lives in the tree and what each package owns |
+| [`docs/spec/README.md`](docs/spec/README.md) | Architecture reference |
+| [`gitbooks/developers/`](gitbooks/developers/README.md) | Build, CLI, authoring companies, deployment, configuration |
+| [`qa/`](qa/README.md) | Checking a release against a deployed tenant |
 
-Checking a release against a deployed tenant is [`qa/`](qa/README.md): a
-zero-dependency console script and the checklist that goes with it.
+## Contributing
+
+New here? Start with the
+[good first issues](https://github.com/tinyhumansai/opencompany/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+which are scoped to be finishable in a sitting.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the local checks to run before opening a
+pull request, and anything big enough to break an existing company starts as an
+[RFC](https://github.com/tinyhumansai/opencompany/discussions/categories/rfcs)
+rather than a PR.
 
 ## Community
 
 [Discussions](https://github.com/tinyhumansai/opencompany/discussions) is where
-questions get answered and large changes get argued out before they are built —
-sorted by what you are doing (running a company, agents and runs, storage and
-tenancy, self-hosting, RFCs) rather than by post type.
+questions get answered and large changes get argued out before they're built.
 [SUPPORT.md](SUPPORT.md) says which channel takes what.
+
+- **Discord**: <https://discord.tinyhumans.ai>
+- **X**: [@tinyhumansai](https://x.com/tinyhumansai)
+- **Reddit**: [r/tinyhumansai](https://www.reddit.com/r/tinyhumansai/)
+- **Website**: [tinyhumans.ai/opencompany](https://tinyhumans.ai/opencompany)
 
 ## License
 

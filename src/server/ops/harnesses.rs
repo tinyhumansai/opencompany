@@ -123,7 +123,12 @@ async fn list_harnesses(
     // Declared entries are untouched: a manifest that names a `[[harness]]`
     // is stating what that deployment has, and this route does not get to
     // second-guess it.
-    let can_run_local = state.acp_agents().is_some();
+    //
+    // Issue #1814: `can_run_local_acp()`, not `acp_agents().is_some()`. The
+    // desktop wires a factory on every build, so the bare accessor said yes on
+    // a desktop compiled without `acp` — the one host where this route's whole
+    // purpose applied and it silently did nothing.
+    let can_run_local = state.can_run_local_acp();
     let runs_here = |harness: &Harness| match harness.kind.as_str() {
         "built_in" => true,
         "acp" => {
@@ -209,10 +214,14 @@ mod test {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -309,10 +318,18 @@ agent = "claude"
     ///
     /// Issue #1245's detected-harness follow-up made every CLI this build
     /// drives bindable without a `[[harness]]`. That is true only where the
-    /// host has an `AcpAgentFactory`, which just the embedded desktop wires —
-    /// `opencompany serve` builds `AppState` without one. Offering them
-    /// anyway let an admin bind a hosted teammate to a CLI on somebody else's
-    /// machine: accepted by `PATCH`, then dead on the next rebuild.
+    /// host can actually run one. Offering them anyway let an admin bind a
+    /// hosted teammate to a CLI on somebody else's machine: accepted by
+    /// `PATCH`, then dead on the next rebuild.
+    ///
+    /// Issue #1814 corrects what "can run one" means. It is NOT "an
+    /// `AcpAgentFactory` was wired" — the desktop shell wires one on every
+    /// build, including one compiled without `acp`, where the runtime then
+    /// forces `acp_agents = None` and every such lane resolves `unavailable`.
+    /// So the wired-factory half below asserts the CLIs are offered only under
+    /// `acp`, and asserts the opposite without it: this test used to encode
+    /// the bug, passing in the default lane precisely because it agreed with
+    /// it.
     #[tokio::test]
     async fn a_coding_cli_is_offered_only_where_this_host_can_run_one() {
         // Two homes, not one: `state_with_manifest` seeds a fixed admin, and
@@ -352,15 +369,28 @@ agent = "claude"
         assert_eq!(status, StatusCode::OK, "{body}");
         let list = body.as_array().unwrap();
         for id in ["claude", "codex"] {
-            let found = list.iter().find(|h| h["id"] == id).expect("cli listed");
-            assert_eq!(found["kind"], "acp", "{id}");
-            assert_eq!(found["transport"], "local", "{id}");
-            assert_eq!(found["agent"], id);
-            assert_eq!(found["detected"], true, "{id}");
-            assert_eq!(
-                found["default"], false,
-                "a detected CLI must never become the company default"
-            );
+            let found = list.iter().find(|h| h["id"] == id);
+            if cfg!(feature = "acp") {
+                let found = found.expect("cli listed");
+                assert_eq!(found["kind"], "acp", "{id}");
+                assert_eq!(found["transport"], "local", "{id}");
+                assert_eq!(found["agent"], id);
+                assert_eq!(found["detected"], true, "{id}");
+                assert_eq!(
+                    found["default"], false,
+                    "a detected CLI must never become the company default"
+                );
+            } else {
+                // Issue #1814. A factory alone is not enough: without `acp`
+                // this build cannot turn it into an engine, so offering `{id}`
+                // here would be the desktop reproducing the very trap this
+                // route exists to close.
+                assert!(
+                    found.is_none(),
+                    "a build that cannot run `{id}` must not offer it, \
+                     even with a factory wired: {body}"
+                );
+            }
         }
     }
 

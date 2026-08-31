@@ -20,6 +20,9 @@ import {
   type BoardQuery,
   type BoardVote,
   type ReadMarker,
+  type ChatMentionInput,
+  type MarkNotificationsReadResponse,
+  type NotificationFeedResponse,
   type MentionablesResponse,
   type PresenceListResponse,
   type ReadStateResponse,
@@ -42,9 +45,12 @@ import {
   type FinancesDto,
   type GrantScope,
   type HarnessDto,
+  type BudgetPauseMarker,
   type InboxDto,
   type InboxMessageDto,
+  type OperatorChannelDto,
   type PageManifestDto,
+  type ProvisioningInfo,
   type ResolveReceipt,
   type SetBudgetInput,
   type StandingGrant,
@@ -278,7 +284,7 @@ export class OpenCompanyClient {
    * lifetime — an object URL leaks until it is revoked, and only the component
    * holding it knows when that is.
    */
-  async getBlob(path: string): Promise<Blob> {
+  async getBlob(path: string, signal?: AbortSignal): Promise<Blob> {
     const headers: Record<string, string> = {};
     Object.assign(headers, this.authHeaders());
 
@@ -288,8 +294,14 @@ export class OpenCompanyClient {
         method: "GET",
         headers,
         credentials: "include",
+        signal,
       });
-    } catch {
+    } catch (err) {
+      // An aborted fetch is the caller's own doing — a preview that scrolled
+      // out of view tore the request down deliberately — not a connection
+      // failure. Let the `AbortError` through so the caller can tell
+      // "cancelled" from "couldn't reach the host" (codex review finding).
+      if (err instanceof Error && err.name === "AbortError") throw err;
       throw new ApiError(
         0,
         "network_error",
@@ -480,6 +492,29 @@ export class OpenCompanyClient {
      * is exactly why this returns a union rather than the detached type.
      */
     detach?: boolean,
+    /**
+     * Workspace node ids of files attached to this message (issue #1682).
+     *
+     * Ids only — each was returned by `uploadChatAttachment` after the file's
+     * bytes were uploaded. The host re-resolves every id within this company's
+     * own workspace and takes the name / mime / size from the store, so the
+     * client neither can nor needs to send those. Sent only when non-empty, so
+     * a message with no attachment keeps the exact pre-#1682 body shape — the
+     * same omitted-field rule `deliverable` and `detach` follow.
+     */
+    attachments?: string[],
+    /**
+     * Who this message names, as the picker resolved them.
+     *
+     * Sent only when the picker actually resolved something, so an ordinary
+     * post keeps the exact body shape it had before mentions existed — the
+     * same omitted-field rule `deliverable` and `detach` follow.
+     *
+     * The host re-validates every entry against the live roster and demotes
+     * what no longer resolves, so this is a suggestion, not an instruction.
+     * Omitting it entirely asks the host to extract from the text instead.
+     */
+    mentions?: ChatMentionInput[],
   ): Promise<ChatPostResult> {
     const body: {
       text: string;
@@ -487,6 +522,8 @@ export class OpenCompanyClient {
       parent?: string;
       deliverable?: MessageIntent;
       detach?: boolean;
+      attachments?: string[];
+      mentions?: ChatMentionInput[];
     } = {
       text,
     };
@@ -496,6 +533,11 @@ export class OpenCompanyClient {
     // Sent only when asked for, so an ordinary post keeps the exact body shape
     // it had before #983 — the same omitted-field rule `deliverable` follows.
     if (detach) body.detach = detach;
+    if (attachments && attachments.length > 0) body.attachments = attachments;
+    // `undefined` means the client has no directory and asks the host to
+    // extract mentions. An explicit empty list means the loaded directory
+    // resolved none and must suppress fallback extraction.
+    if (mentions !== undefined) body.mentions = mentions;
     return this.request<ChatPostResult>("POST", `${this.scope(company)}/chat`, body);
   }
 
@@ -527,6 +569,11 @@ export class OpenCompanyClient {
    */
   listDesks(company?: string | null): Promise<DeskDto[]> {
     return this.request<DeskDto[]>("GET", `${this.scope(company)}/desks`);
+  }
+
+  /** The identity of the company's durable, read-only Operator feed. */
+  getOperatorChannel(company?: string | null): Promise<OperatorChannelDto> {
+    return this.request<OperatorChannelDto>("GET", `${this.scope(company)}/operator-channel`);
   }
 
   /**
@@ -631,11 +678,56 @@ export class OpenCompanyClient {
   }
 
   /**
-   * Everything an `@` can name. Presence uses only `people`, for the
-   * user-id → label map the live frames deliberately do not carry.
+   * This person's notification feed, filtered to one `kind` — mentions by
+   * default.
    *
-   * A host that predates this route answers 404; callers treat that as an
-   * empty directory rather than throwing on load.
+   * The durable half of a mention: the live feed only reaches an open browser,
+   * so a mention that landed overnight is here and nowhere else. Issue #1845's
+   * week-1 nudge banner is the second consumer, passing `kind:
+   * "workflow_nudge"` — see the route's own docs
+   * (`src/server/ops/notifications.rs`) for why this is a query parameter
+   * rather than a second route.
+   *
+   * A host that predates this route answers 404; callers treat that as an empty
+   * feed and simply show no badge/banner, rather than throwing on load.
+   */
+  notifications(company?: string | null, kind?: string): Promise<NotificationFeedResponse> {
+    const query = kind ? `?kind=${encodeURIComponent(kind)}` : "";
+    return this.request<NotificationFeedResponse>(
+      "GET",
+      `${this.scope(company)}/notifications${query}`,
+    );
+  }
+
+  /**
+   * Mark notifications read for this person.
+   *
+   * Omitting `ids` marks everything they can see — what "clear the badge"
+   * means. An explicitly empty array marks nothing, which is a different
+   * instruction and is honoured as one.
+   *
+   * Answers with what is *actually* still unread rather than what the caller
+   * expects, because marking is a latch and two tabs race constantly.
+   */
+  markNotificationsRead(
+    ids?: string[],
+    company?: string | null,
+  ): Promise<MarkNotificationsReadResponse> {
+    return this.request<MarkNotificationsReadResponse>(
+      "PUT",
+      `${this.scope(company)}/notifications`,
+      ids ? { ids } : {},
+    );
+  }
+
+  /**
+   * Everything an `@` can name: teammates, people, desks, and the broadcast
+   * token's spellings.
+   *
+   * A host that predates this route answers 404; the caller treats that as
+   * "no picker" and typing an `@` stays plain text, which the host still
+   * extracts what it can from. So an older host degrades to the previous
+   * behaviour rather than throwing on load.
    */
   mentionables(company?: string | null): Promise<MentionablesResponse> {
     return this.request<MentionablesResponse>(
@@ -802,6 +894,66 @@ export class OpenCompanyClient {
     return isResolveReceipt(answer) ? answer : (answer as ChatResponse);
   }
 
+  /**
+   * The parked budget-pause marker for an agent (issue #1846), or `null` when
+   * nothing is paused. Read-only — does not consume the marker.
+   */
+  getBudgetPause(
+    agentId: string,
+    company?: string | null,
+  ): Promise<BudgetPauseMarker | null> {
+    return this.request<BudgetPauseMarker | null>(
+      "GET",
+      `${this.scope(company)}/agents/${encodeURIComponent(agentId)}/budget-pause`,
+    );
+  }
+
+  /**
+   * The Add-Credits CTA (issue #1846): redeems the parked marker and
+   * re-dispatches the original message. Not true resume (#561) — a fresh
+   * turn runs from the top on the same chat thread the pause happened on.
+   *
+   * `expectedId` is the marker id the caller last read via
+   * {@link getBudgetPause} (issue #1846 review, Codex #3866418876 /
+   * #3866802268) — sent as `?id=` so the server can refuse with a `409` when
+   * a background turn (a workflow node, an unstreamed task) has since
+   * overwritten the SAME agent's marker with one that has no chat
+   * destination, rather than silently re-dispatching whatever is parked NOW
+   * under the assumption it is still what the operator clicked. Omitted only
+   * for a caller with no prior read to compare against, in which case the
+   * server falls back to its pre-fix unconditional redeem.
+   */
+  redeemBudgetPause(
+    agentId: string,
+    company?: string | null,
+    expectedId?: string | null,
+  ): Promise<BudgetPauseMarker> {
+    const qs = expectedId ? `?id=${encodeURIComponent(expectedId)}` : "";
+    return this.request<BudgetPauseMarker>(
+      "POST",
+      `${this.scope(company)}/agents/${encodeURIComponent(agentId)}/budget-pause/redeem${qs}`,
+    );
+  }
+
+  /**
+   * Push a parked approval's deadline out to a fresh full TTL window (#1805),
+   * so a stalled run does not default-deny before someone can decide it.
+   *
+   * Returns the approval's **new** default-deny instant (epoch-millis) — the
+   * number the card's countdown will now project — so the caller can redraw the
+   * deadline without re-fetching the whole approvals list. A 404 means there was
+   * nothing to extend: an unknown id, or one that has since resolved or expired,
+   * which the caller should treat by refreshing the list rather than as a
+   * failure to report.
+   */
+  async extendApproval(approvalId: string, company?: string | null): Promise<number> {
+    const answer = await this.request<{ expiresAtMillis: number }>(
+      "POST",
+      `${this.scope(company)}/approvals/${encodeURIComponent(approvalId)}/extend`,
+    );
+    return answer.expiresAtMillis;
+  }
+
   /** The live standing permissions, newest first (#374). */
   listGrants(company?: string | null): Promise<StandingGrant[]> {
     return this.request<StandingGrant[]>("GET", `${this.scope(company)}/grants`);
@@ -912,6 +1064,14 @@ export class OpenCompanyClient {
        * collect instructions changes nothing.
        */
       instructions?: string;
+      /**
+       * The job shape that decides this teammate's tool belt (issue #1674),
+       * carried by the first-run setup build-out. Sent as the validated wire
+       * spelling the roster proposal returned (`research`, `writing`, …); the
+       * host derives the belt from it, so the console never chooses a
+       * permission boundary. Omitted on every other add path.
+       */
+      focus?: string;
     },
     company?: string | null,
   ): Promise<TeamMemberDto> {
@@ -1132,6 +1292,43 @@ export class OpenCompanyClient {
   // were never checked against the wire and the view built on them crashed on
   // open (issue #414). Add MCP calls to `api/mcp.ts`, next to the ones the host
   // answers.
+
+  /**
+   * Provision a company from a manifest (issue #1807).
+   *
+   * Platform-scoped on the host (`PlatformScope`): only a client that carries a
+   * platform bearer ({@link carriesPlatformBearer}) can reach it — a person
+   * signed in with a session cookie is refused by construction, the same wall
+   * `suspend`/`archive` sit behind. The console gates the New-company control on
+   * that flag rather than letting the call 401 after the operator has typed a
+   * name (the #1401 dishonest-button lesson).
+   *
+   * `manifest_toml` is the company manifest as TOML; the host fills in
+   * `[policy].mode = "auto"` and `[users].mode = "email"` when the text omits
+   * them, so `[company].name` alone is a valid body. `id` overrides the id the
+   * host would otherwise derive from the company name.
+   *
+   * Returns the fresh company's status (the host answers `201`), which the
+   * caller switches the console into.
+   */
+  provisionCompany(body: { manifest_toml: string; id?: string }): Promise<CompanyStatus> {
+    return this.request<CompanyStatus>("POST", "/api/v1/companies", body);
+  }
+
+  /**
+   * The auth-mode preflight: the sign-in mode a company
+   * provisioned on this host right now would land in, and whether wallet
+   * addresses are required.
+   *
+   * Platform-scoped like {@link provisionCompany}, so a client that carries a
+   * platform bearer ({@link carriesPlatformBearer}) can read it. The create /
+   * reset dialog calls this on open so it can render the mode's identity field
+   * — an email admin or a wallet address — before it builds a manifest, rather
+   * than provisioning an `admins`-only manifest a `wallet`-mode host refuses.
+   */
+  provisioningInfo(): Promise<ProvisioningInfo> {
+    return this.request<ProvisioningInfo>("GET", "/api/v1/companies/provisioning");
+  }
 
   /** Platform lifecycle control (requires a scoped company id). */
   lifecycle(action: LifecycleAction, company?: string | null): Promise<CompanyStatus> {

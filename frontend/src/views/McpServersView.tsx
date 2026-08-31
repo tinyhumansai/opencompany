@@ -3,6 +3,7 @@ import { FileJson, Info, Server } from "lucide-react";
 
 import { me as fetchMe } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { McpServersSection } from "@/views/connections/McpServersSection";
@@ -60,16 +61,18 @@ export function McpServersView({ client, company }: Props) {
   }, [client, company]);
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-5xl space-y-6 px-4 py-6">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">MCP Servers</h1>
-          <p className="text-sm text-muted-foreground">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader
+        title="MCP Servers"
+        width="5xl"
+        description={
+          <>
             The tool servers this company&apos;s teammates can call, from its manifest and the
             ones you add here.
-          </p>
-        </div>
-
+          </>
+        }
+      />
+      <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
         {!canManage && (
           <Alert data-testid="mcp-read-only">
             <Info className="size-4" />

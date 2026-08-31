@@ -58,10 +58,15 @@ impl CompanyRegistry {
         // same lock, and the drain snapshots the map only afterwards. A company
         // is therefore either in that snapshot or born quiesced — never neither.
         let mut map = self.inner.write().expect("registry poisoned");
-        if self.shutting_down.load(Ordering::SeqCst) {
+        let shutting_down = self.shutting_down.load(Ordering::SeqCst);
+        if shutting_down {
             runtime.mark_quiesced();
         }
-        map.insert(id, runtime);
+        map.insert(id, runtime.clone());
+        drop(map);
+        if !shutting_down {
+            runtime.schedule_replayed_continuations();
+        }
     }
 
     /// Marks the host as shutting down, so every subsequent
@@ -88,6 +93,35 @@ impl CompanyRegistry {
     /// the company is no longer addressable and chatting it returns a 404.
     pub fn remove(&self, id: &CompanyId) -> Option<Arc<CompanyRuntime>> {
         self.inner.write().expect("registry poisoned").remove(id)
+    }
+
+    /// Removes `id` only if the runtime currently registered under it is the
+    /// same allocation as `expected` (`Arc::ptr_eq`, not equal contents).
+    ///
+    /// The conditional counterpart to [`remove`](Self::remove), for a caller
+    /// that observed one specific runtime instance — e.g. read its `status()`
+    /// as `"archived"` a moment ago — and must not evict whatever now sits at
+    /// `id` if something has since replaced it there. [`insert`](Self::insert)
+    /// is the only writer of an already-occupied slot (a rebuild swap is the
+    /// production case), and it replaces unconditionally; this is what lets a
+    /// caller downstream of an unconditional `insert` still remove safely
+    /// (codex review on #1943, PR comment 3894439351 — maintenance eviction
+    /// used to remove "whatever is at `id`" and could deregister a live
+    /// replacement instead of the archived runtime it actually confirmed).
+    ///
+    /// Returns the removed runtime on a match. `None` both when `id` is
+    /// unregistered and when it now points to a different runtime — a caller
+    /// that needs to tell those apart checks [`get`](Self::get) first.
+    pub fn remove_if(
+        &self,
+        id: &CompanyId,
+        expected: &Arc<CompanyRuntime>,
+    ) -> Option<Arc<CompanyRuntime>> {
+        let mut map = self.inner.write().expect("registry poisoned");
+        match map.get(id) {
+            Some(current) if Arc::ptr_eq(current, expected) => map.remove(id),
+            _ => None,
+        }
     }
 
     /// The ids of every registered company, sorted.
@@ -193,5 +227,69 @@ mod test {
         assert!(removed.is_some());
         assert!(registry.get(&CompanyId::new("acme")).is_none());
         assert!(registry.remove(&CompanyId::new("acme")).is_none());
+    }
+
+    /// `remove_if` removes on a match, the same as an unconditional `remove`.
+    #[tokio::test]
+    async fn remove_if_removes_on_a_matching_runtime() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let registry = CompanyRegistry::new();
+        let rt = runtime(&home, "acme").await;
+        registry.insert(CompanyId::new("acme"), rt.clone());
+
+        let removed = registry.remove_if(&CompanyId::new("acme"), &rt);
+        assert!(removed.is_some());
+        assert!(registry.get(&CompanyId::new("acme")).is_none());
+    }
+
+    /// Codex review on #1943, PR comment 3894439351: a caller that observed
+    /// one runtime instance and later asks to remove it by id must not evict
+    /// whatever has since replaced it there — `insert` (the only writer of an
+    /// already-occupied slot; a rebuild swap is the production case) replaces
+    /// unconditionally, so a plain `remove(id)` would delete the replacement
+    /// instead of doing nothing.
+    #[tokio::test]
+    async fn remove_if_leaves_a_replacement_untouched() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let registry = CompanyRegistry::new();
+        let original = runtime(&home, "acme").await;
+        let replacement = runtime(&home, "acme").await;
+        assert!(
+            !Arc::ptr_eq(&original, &replacement),
+            "sanity: distinct instances"
+        );
+
+        // The replacement is what's actually registered now.
+        registry.insert(CompanyId::new("acme"), replacement.clone());
+
+        let removed = registry.remove_if(&CompanyId::new("acme"), &original);
+        assert!(
+            removed.is_none(),
+            "the registered runtime is not the one `remove_if` was asked to remove"
+        );
+        let still_there = registry.get(&CompanyId::new("acme"));
+        assert!(still_there.is_some(), "the id must still be registered");
+        assert!(
+            Arc::ptr_eq(still_there.as_ref().unwrap(), &replacement),
+            "the replacement must be exactly what remains registered — untouched"
+        );
+    }
+
+    /// `remove_if` on an id that was never registered is a no-op, the same
+    /// shape as "replaced" from the caller's point of view (`None` either
+    /// way) — nothing to assert differently, just that it doesn't panic and
+    /// genuinely removes nothing.
+    #[tokio::test]
+    async fn remove_if_on_an_unregistered_id_is_a_no_op() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let registry = CompanyRegistry::new();
+        let rt = runtime(&home, "acme").await;
+
+        let removed = registry.remove_if(&CompanyId::new("acme"), &rt);
+        assert!(removed.is_none());
+        assert!(registry.is_empty());
     }
 }

@@ -26,6 +26,13 @@ pub struct Cognition {
     pub path: &'static str,
     /// Provider slug the path's cycle usage is metered under.
     pub provider: &'static str,
+    /// Which model the path's cycle usage is metered against, folded onto the
+    /// closed `ModelSlug` vocabulary (issue #1749). `None` when the path cannot
+    /// name one: an injected brain, `echo` (runs no model), `sidecar` (the
+    /// host's `InferenceClient` picks it), and `hosted` (Medulla picks it
+    /// upstream and the `orch:usage` frame does not carry it). The `harness`
+    /// path names its model **per turn** instead, off the live provider.
+    pub model: Option<ModelSlug>,
     pub metering: UsageMetering,
 }
 
@@ -45,6 +52,102 @@ pub enum UsageMetering {
 `CycleRunner` **enforces** both non-`PerCycle` arms: a path that declares
 `PerTurn` or `None` and then reports non-zero cycle usage is warned about and
 dropped, never metered. Only `PerCycle` reaches the meter.
+
+### What the console is told: `cognition` (issue #1735)
+
+`Cognition` is a *metering and diagnosis* descriptor with an open set of path
+labels, and it is deliberately not `Serialize`. What a console surface actually
+asks is narrower and closed — **can a teammate answer me, and if not, is that
+mine to fix?** — so the host derives that answer and reports it, rather than
+publishing the path vocabulary and letting every view restate the rule.
+
+```rust
+// src/server/cognition.rs
+pub enum CognitionState {
+    Configured, Unconfigured, RestartRequired, Unavailable, Undetermined,
+}
+
+pub enum InferenceResolution { Resolved, Nothing, Unreadable }
+
+pub fn cognition_state(
+    path: &str,
+    harness_reachable: bool,
+    resolution: InferenceResolution,
+) -> CognitionState;
+```
+
+| state | what is true | remedy |
+|---|---|---|
+| `configured` | a path that runs a real model is live | — |
+| `unconfigured` | a harness is attached, the config reads clean, nothing is set | Settings → Inference, **in-app** |
+| `restart-required` | a provider resolves, but the runtime predates it | the restart, **not** another provider choice |
+| `unavailable` | no agent harness is reachable on this host | a different build or host wiring — say so plainly |
+| `undetermined` | a harness is reachable, but the host could not *read* the config | **none that can be named** |
+
+Not a fifth `*_in_build` boolean. Cognition is two facts at once — a harness is
+reachable, *and* a model resolved at runtime — and only the second is actionable
+without a new binary. One flag collapses them and sends the operator who needs a
+settings page off looking for a build.
+
+**The states are named for their remedy, not their mechanism.** Two mechanisms
+land on `unavailable`: the `openhuman` feature is not compiled in, or it is and
+the embedder built its runtimes without `app::harness::attach` — the shipped
+desktop-shell bug that module exists to end. The operator can act on neither, so
+splitting them would offer a distinction they cannot use; folding either into
+`unconfigured` would offer a settings page that cannot help.
+
+`restart-required` and `undetermined` exist for the same reason, and both were
+added because collapsing them into `unconfigured` produced a false sentence.
+Brain selection happens once, in `RuntimeBuilder::build`, so a company
+configured *after* boot keeps the echo brain until its runtime is rebuilt —
+telling that operator "this company has no model configured" sends them back to
+the page they have just come from to redo work they did correctly. The remedy is
+the restart `ops::inference` already reports as `restartRequired` (issue #266).
+The banner links to the card that owns it and stops there: whether a restart can
+be *performed* in place is that card's fact (`can_rebuild_in_place`, issue
+#1736), and promising the button from chat would be the switch that does nothing
+all over again.
+
+`undetermined` is the state whose remedy **cannot be named**. A config the host could not read is no
+evidence that saving one would help — the #266 doctrine — which is why
+`ops::inference`'s `runner_gap_for` degrades a resolve error to
+`RunnerGap::NotWired` rather than `InferenceRequired`, and why its
+`unreadable_inference_config_is_not_restartable` regression exists. Cognition
+must not make, on the same runtime, the promise that route declines to make. The
+banner for it therefore carries no settings link and does not borrow the harness
+wording either, since a harness *is* attached.
+
+All three outcomes of the config read are carried, because all three mean
+something different to the operator. It is consulted only on the degraded path —
+a company whose brain is not the echo brain, or that has no harness at all, pays
+neither the manifest load nor the secret-store resolve, because neither can
+change the answer.
+
+That is why the second input is **harness reachability, not the Cargo feature**.
+`cfg!(feature = "openhuman")` says the harness was compiled in; it does not say
+this company's runtime was ever handed a pool. `cognition_state` therefore takes
+`ops::inference::harness_reachable`, and alongside it
+`ops::inference::inference_resolution` — the same predicates
+`restart_pending` and `runner_gap_for` gate their restart and
+configure-inference advice on (issues #266, #514) — so the chat banner and the
+Inference card cannot disagree about whether Settings → Inference is a remedy or
+a dead end for one company.
+
+Derived on every read from the brain the runtime is holding
+(`runtime.cognition().path`) plus that reachability check, so it cannot
+drift from reality. Reported on `GET …/capabilities` beside `mediaInBuild`,
+`searchInBuild`, `publishInBuild` and `mcpInBuild` — the per-company answer to
+"what can this company actually do" — as `cognition`.
+
+The console consumes it in chat (issue #1734): on anything but `configured` the
+transcript carries a banner naming the cause and, where one exists, the remedy,
+and every company-side row is marked as a placeholder rather than presented as
+the teammate's own words. `ChatMessage` carries no provenance, so a company-level
+state is the only shape that answer has — see `MessageRow`'s `cognition` prop for
+why marking beats suppressing. The same state reaches `ThreadPanel`, because a
+reply read inside a thread is the same false attribution as one read in the
+channel, and the marker's tooltip names the cause it was given rather than
+restating `unconfigured`'s remedy for both.
 
 ```rust
 /// Callbacks the brain makes into the host mid-cycle.

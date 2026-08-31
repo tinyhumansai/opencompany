@@ -3,6 +3,7 @@
 // the wire) and runs one via `…/workflows/{wid}/run`. Replaces the client-side
 // `workflow-sample` illustrative data.
 
+import type { ArtifactKind } from "./artifacts";
 import type { OpenCompanyClient } from "./client";
 
 /** A one-line workflow entry, as the picker lists it. */
@@ -88,6 +89,23 @@ export interface WorkflowNode {
    * classifies its call as reaching outside the company.
    */
   repeatable?: boolean;
+  /**
+   * A deterministic postcondition (issue #1866): a mechanical predicate
+   * checked against the node's output before it is allowed to flow
+   * downstream — `require` is `"non_empty"` | `"field_present"` |
+   * `"non_empty_list"`, `field` a dotted path into the output (required for
+   * `field_present`, optional for `non_empty_list`).
+   *
+   * Only ever set through the write route, on `agent` nodes today. This
+   * console has no control for it, so every read/write path here must carry
+   * it through verbatim like `onError`/`retry`/`requiresApproval`/
+   * `repeatable` — dropping it on an unrelated edit silently removes a
+   * run-safety gate the operator declared (issue #1937 review).
+   */
+  postcondition?: {
+    require: string;
+    field?: string;
+  };
   /** Where an `output` node's report goes when the run finishes. */
   destination?: WorkflowDestination;
 }
@@ -156,6 +174,20 @@ export interface WorkflowGraph {
   id: string;
   name: string;
   description?: string;
+  /**
+   * The owning desk (issue #1862 prerequisite) — a desk id or name, resolved
+   * against the company's wired desks host-side. `undefined` for a graph with
+   * no owner (every graph saved before this field existed, or one an author
+   * chose not to assign).
+   *
+   * **No control in this dialog edits it yet** — the create/edit form has no
+   * field for it. It is carried on {@link GraphDraft} and round-tripped
+   * verbatim by {@link assembleGraph} purely so a Save never clears it: a
+   * `PUT` replaces the whole graph, so an edit that omitted this field here
+   * would silently wipe whatever desk an operator (or the workflow-proposal
+   * defaulting) had set (issue #1882 review).
+   */
+  ownerDesk?: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   /** See {@link WorkflowSummary.editable}. Same "only `false` means no" rule. */
@@ -250,6 +282,13 @@ export interface DeliveryReport {
  * `blocked` and `awaiting-approval` because it contradicts them — both tell an
  * operator to go and decide something, and this is the state in which there is
  * nothing there.
+ *
+ * `degraded` is the newest addition (issue #1865): a node under
+ * `on_error: continue|route` errored and the graph kept going past it, or an
+ * agent node's turn truncated at the iteration cap. Checked LAST, immediately
+ * above `ok` — every reading above it describes something more actionable, so
+ * a run that is also failed, stopped, stranded, blocked, undelivered or
+ * awaiting approval reports that instead.
  */
 export type WorkflowRunVerdict =
   | "running"
@@ -259,6 +298,7 @@ export type WorkflowRunVerdict =
   | "blocked"
   | "undelivered"
   | "awaiting-approval"
+  | "degraded"
   | "ok";
 
 /** The result of a run: the engine's final state and any pending approvals. */
@@ -734,10 +774,11 @@ interface WiredChannelsResponse {
  * output node's `channel` destination may name (issue #813): its desk chats and
  * its enabled OpenHuman-provider manifest channels.
  *
- * **`operator` is not one of them** (issue #981). It is an in-memory response
- * surface with no durable reader, so workflow delivery refuses it by name; the
- * host used to include it here anyway, which offered authors the one target
- * guaranteed to fail.
+ * **`operator` is always one of them** (issue #1757). It was excluded per
+ * issue #981, back when the in-memory `operator` adapter had no durable reader
+ * and workflow delivery refused it by name; the built-in Operator channel is
+ * now a durable, journal-backed delivery target present on every running
+ * company, so the host serves it here like any other real channel.
  *
  * The console reads this to offer a picker instead of a free-text box that only
  * fails at delivery with `ChannelNotWired`. An empty list has two causes and the
@@ -944,6 +985,83 @@ export function workflowRunOutput(
 ): Promise<WorkflowRunOutputRecord> {
   return client.get<WorkflowRunOutputRecord>(
     `${client.scopeFor(company)}/workflows/runs/${encodeURIComponent(runId)}/output`,
+  );
+}
+
+/**
+ * One file a workflow run produced (issue #1684) — a row of the run inspector's
+ * "Files associated" section.
+ *
+ * The host resolves these through the run's provenance chain (`run_id → cards
+ * opened by the run → each card's artifacts`), so a row carries exactly what the
+ * console needs to deep-link the file and nothing more: it is **metadata only**,
+ * never the artifact body. {@link artifactHref} turns `taskId` + `artifactId` +
+ * `latestVersion` into the Artifacts-tab address, and `workspaceNodeId` — when
+ * the file was mirrored into the shared tree — into the second `#/workspace/<id>`
+ * link.
+ */
+export interface RunArtifactRow {
+  /** The card that produced the file — scopes the Artifacts tab the link opens. */
+  taskId: string;
+  /** The artifact's stable id → the tab's open artifact. */
+  artifactId: string;
+  /** The artifact's display title. */
+  title: string;
+  /** What the file holds — `text` | `markdown` | `image` | `file`. */
+  kind: ArtifactKind;
+  /**
+   * The workspace-relative path the agent published (e.g. `specs/launch.md`).
+   * Absent on a legacy record captured before the source path existed (issue
+   * #244); the console labels those rather than hiding them.
+   */
+  source?: string;
+  /** The newest revision number → the version the deep-link pins. */
+  latestVersion: number;
+  /** Epoch-millis of the newest revision — the host's sort key and the row's time. */
+  updatedAtMillis: number;
+  /**
+   * The workspace node the newest revision was mirrored into (issue #552), when
+   * one was → an optional `#/workspace/<id>` link. Absent when nothing mirrored it.
+   */
+  workspaceNodeId?: string;
+  /** The producing card's title, for grouping rows by card. */
+  taskTitle?: string;
+}
+
+/** The `GET …/workflows/runs/{rid}/artifacts` response. A wrapper rather than a
+ * bare array so a run whose file count exceeds the host's defensive cap can say
+ * so instead of the console presenting an incomplete list as exhaustive. */
+export interface RunArtifactsResponse {
+  /** The run's files, newest first (the host's sort). */
+  files: RunArtifactRow[];
+  /**
+   * Whether older rows were cut by the host's cap. `false` for every run in
+   * practice — the cap is a ceiling, not a page size — but when `true` the
+   * console labels the list rather than silently showing a subset.
+   */
+  truncated: boolean;
+}
+
+/**
+ * Fetches the files one past run produced (issue #1684), for the run inspector's
+ * lazy "Files associated" disclosure.
+ *
+ * Lazy per-run by design, exactly like {@link workflowRunOutput}: the history
+ * list stays structural, and only the run an operator expands is fetched.
+ *
+ * **Answers `200 { files: [] }` — never `404` — for a run that produced no
+ * files**, which is the common case (a run that opened no cards, or cards that
+ * published nothing). That is the one contract difference from
+ * `workflowRunOutput`: a fileless run is normal, so callers render the empty
+ * state off an empty array rather than off a caught 404.
+ */
+export function fetchRunArtifacts(
+  client: OpenCompanyClient,
+  company: string | null,
+  runId: string,
+): Promise<RunArtifactsResponse> {
+  return client.get<RunArtifactsResponse>(
+    `${client.scopeFor(company)}/workflows/runs/${encodeURIComponent(runId)}/artifacts`,
   );
 }
 

@@ -252,7 +252,7 @@ type SimLink = { source: SimNode | string; target: SimNode | string; kind: strin
  */
 export function KnowledgeGraph({
   graph, agents = [], departments = [], people = [], tasks = [], memory, runsByAgent = {}, toolLabels = {},
-  statusSlot, covered = false, emptyState = false,
+  statusSlot, covered = false, emptyState = false, noDesks = false,
   repelDefault = 150, linkDistDefault = 60, centerDefault = 0.32,
 }: {
   graph: KGData; agents?: Agent[]; departments?: Department[]; people?: Person[]; tasks?: SopTask[];
@@ -273,8 +273,22 @@ export function KnowledgeGraph({
   /** an outage overlay covers the graph; it must not answer the keyboard at
       all — `inert` cannot suppress a `window` listener (issue #1314) */
   covered?: boolean;
-  /** A settled company with no desks gets an explanation and desk-management link. */
+  /**
+   * The graph has nothing beyond its core node: the field is bare, so an
+   * explanation is drawn over it rather than an empty canvas being left to
+   * read as a rendering fault.
+   *
+   * Not the same as {@link noDesks}, and it used to be. A company with no
+   * desks but with teammates, tools or saved workflows has a graph — the
+   * model hangs all of them off the core when there is no pillar to hang them
+   * off — and it is drawn.
+   */
   emptyState?: boolean;
+  /**
+   * A settled company that declares no desks. The graph still draws; this only
+   * adds the corner note and the one control that changes the fact.
+   */
+  noDesks?: boolean;
   /** latest run per agent id, for the harness card */
   runsByAgent?: Record<string, AgentRun>;
   /** Tool slug → display name, so a card can name a tool as its source does. */
@@ -2594,6 +2608,7 @@ export function KnowledgeGraph({
         statusSlot={statusSlot}
         covered={covered}
         emptyState={emptyState}
+        noDesks={noDesks}
         onNavDept={navDept}
         onBack={clearDetail}
       >

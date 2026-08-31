@@ -189,7 +189,8 @@ export function teamIsUnstaffed(roster: TeamMemberDto[]): boolean {
  * agents of its own — which is every company under `companies/` except
  * `companies/e2e_setup` — never sees the offer, because it was never unstaffed.
  * Those companies came with a team, so there is nothing for setup to do. The
- * Team page's in-place prompt is how someone who skipped comes back.
+ * Team page's in-place prompt, Settings, and `#/setup` are ways back after a
+ * skip or when an operator wants to run it manually.
  *
  * `skipped` suppresses only the *unprompted* open. It is browser-local and that
  * is safe precisely because it can only ever hide an offer, never cause a

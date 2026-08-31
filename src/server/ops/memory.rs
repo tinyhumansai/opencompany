@@ -1,5 +1,6 @@
-//! Memory-fact reads + writes: `GET /memory`, `GET /memory/stats`,
-//! `POST /memory`, `DELETE /memory/{fact_id}` under both scope forms.
+//! Memory-fact reads + writes: `GET /memory`, `GET /memory/traces`,
+//! `GET /memory/stats`, `GET /memory/archives`, `POST /memory`,
+//! `DELETE /memory/{fact_id}` under both scope forms.
 //!
 //! Bodies mirror the console's `MemoryEntry` (`frontend/src/api/memory.ts`).
 //! Facts land in the [`FactStore`](crate::ports::FactStore) — the console's
@@ -30,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::error::OpenCompanyError;
 use crate::ports::facts::{FactKind, FactRecord};
-use crate::ports::types::{ChunkAddr, ChunkMeta, CompanyEvent, ContextChunk};
+use crate::ports::types::{ChunkAddr, ChunkMeta, CompanyEvent, CompressedTrace, ContextChunk};
 use crate::ports::{generate_id, now_millis};
+use crate::runtime::maintenance::TRACE_RETENTION_LIMIT;
 use crate::server::error::ApiError;
 use crate::server::ops::{ScopedCompany, scoped};
 
@@ -77,7 +79,9 @@ const OUTCOME_LABEL_PREFIX: &str = "task-outcome";
 /// Builds the memory route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/memory", post(create_fact).get(list_facts))
+        .merge(scoped("/memory/traces", get(list_traces)))
         .merge(scoped("/memory/stats", get(memory_stats)))
+        .merge(scoped("/memory/archives", get(archived_traces)))
         .merge(scoped("/memory/{fact_id}", delete(delete_fact)))
 }
 
@@ -87,8 +91,78 @@ pub fn router() -> Router<AppState> {
 /// (no per-chunk read), so it stays unbounded; the list caps its reads here.
 const MAX_CONTEXT_ENTRIES: usize = 500;
 
+/// Upper bound on archived traces materialised by `GET /memory/archives`.
+///
+/// The facade's `evict` bounds the archive tier itself on every eviction path
+/// (keep-recent to its `n`, older-than to [`TRACE_RETENTION_LIMIT`]; see
+/// `prune_archive`), so the route's cap is defense-in-depth for archive rows
+/// written before that bound applied, not the primary bound. Mirrors
+/// `recent_traces`' newest-window semantics: same total order, tail of the cap.
+const MAX_ARCHIVED_TRACES: usize = TRACE_RETENTION_LIMIT;
+
+/// `GET /memory/archives` — traces preserved by a provider-backed engine when
+/// it evicts its active trace window. The base and embedded engines have no
+/// archive tier, so they answer a clear refusal instead of an empty list that
+/// would falsely imply there are no archived traces.
+///
+/// Responses map through the same camelCase [`TraceEntry`] DTO as
+/// [`list_traces`], so a client that reads `cycleId`/`atMillis` from one gets
+/// them from the other.
+async fn archived_traces(company: ScopedCompany) -> Result<Json<Vec<TraceEntry>>, ApiError> {
+    let mut traces = company.runtime.archived_traces().await?.ok_or_else(|| {
+        // The route is registered for every company, but only a provider-backed
+        // engine has an archive tier. A 500 would read as a server fault (and
+        // prompt retries) for a permanent capability refusal; 404 is the same
+        // "missing surface" answer the feedback board gives without a
+        // credential — the console can treat it as "this engine keeps no
+        // archives" without special-casing an error status.
+        OpenCompanyError::NotFound(
+            "the selected memory engine does not provide archived traces; use a provider-backed memory engine to retain evicted traces".into(),
+        )
+    })?;
+    // Newest-first, capped at the same window the archive tier itself keeps.
+    // The provider read has no limit argument, so the sort-and-tail happens
+    // here as well as in the facade.
+    traces.sort_by(|a, b| {
+        a.at_millis
+            .cmp(&b.at_millis)
+            .then_with(|| a.cycle_id.cmp(&b.cycle_id))
+    });
+    let skip = traces.len().saturating_sub(MAX_ARCHIVED_TRACES);
+    Ok(Json(
+        traces
+            .into_iter()
+            .skip(skip)
+            .map(TraceEntry::from)
+            .collect(),
+    ))
+}
+
 /// Max characters kept for a context entry's synthesised title (its first line).
 const CONTEXT_TITLE_MAX: usize = 120;
+
+/// A persisted cycle trace as exposed to an operator.
+///
+/// The route returns the full live retention window: maintenance retains at
+/// most [`TRACE_RETENTION_LIMIT`] traces, so this materialises no unbounded
+/// store read.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceEntry {
+    cycle_id: String,
+    summary: String,
+    at_millis: u64,
+}
+
+impl From<CompressedTrace> for TraceEntry {
+    fn from(trace: CompressedTrace) -> Self {
+        Self {
+            cycle_id: trace.cycle_id,
+            summary: trace.summary,
+            at_millis: trace.at_millis,
+        }
+    }
+}
 
 /// Where a rendered [`MemoryEntry`] came from. The console keys "editable vs
 /// read-only" and the source label off this: only [`Fact`](MemoryOrigin::Fact)
@@ -483,6 +557,21 @@ async fn list_facts(
         total_context,
         context_truncated: total_context > MAX_CONTEXT_ENTRIES,
     }))
+}
+
+/// `GET /memory/traces` — the retained, newest-last cycle trace window.
+///
+/// Trace summaries are intentionally not injected into a cycle: current
+/// producers emit placeholders, and real compression/consumption needs its
+/// own design. This inspection surface makes the durable record visible while
+/// retention keeps the read bounded.
+async fn list_traces(company: ScopedCompany) -> Result<Json<Vec<TraceEntry>>, ApiError> {
+    let traces = company
+        .runtime
+        .memory
+        .recent_traces(company.id(), TRACE_RETENTION_LIMIT)
+        .await?;
+    Ok(Json(traces.into_iter().map(TraceEntry::from).collect()))
 }
 
 /// Drops the operator-fact mirrors, then keeps the newest `cap` chunks.
@@ -1058,7 +1147,7 @@ mod route_tests {
     use crate::company::CompanyManifest;
     use crate::ports::context::ContextStore;
     use crate::ports::types::{
-        ChunkAddr, ChunkHit, ChunkMeta, CompanyId, CompanyRecord, ContextChunk,
+        ChunkAddr, ChunkHit, ChunkMeta, CompanyId, CompanyRecord, CompressedTrace, ContextChunk,
     };
     use crate::runtime::RuntimeBuilder;
     use crate::server::router;
@@ -1197,9 +1286,43 @@ mod route_tests {
         }
     }
 
+    /// A scripted [`crate::store::MemoryScopes`] whose archive tier answers a
+    /// fixed trace list — the provider-only surface the fs default refuses.
+    struct ScriptedScopes {
+        archived: Vec<CompressedTrace>,
+    }
+
+    #[async_trait]
+    impl crate::store::MemoryScopes for ScriptedScopes {
+        fn agent_context(&self, _agent_id: &str) -> Arc<dyn ContextStore> {
+            panic!("the archives route never touches agent context")
+        }
+
+        fn desk_context(&self, _desk_id: &str) -> Arc<dyn ContextStore> {
+            panic!("the archives route never touches desk context")
+        }
+
+        async fn archived_traces(
+            &self,
+            _company: &CompanyId,
+        ) -> crate::Result<Vec<CompressedTrace>> {
+            Ok(self.archived.clone())
+        }
+    }
+
     /// An [`AppState`] whose company runtime reads context from `context`,
     /// with everything else on fresh fs stores under `home`.
     async fn state_over(home: &std::path::Path, context: Arc<ScriptedContext>) -> AppState {
+        state_over_with_scopes(home, context, None).await
+    }
+
+    /// [`state_over`] with an injected [`crate::store::MemoryScopes`], so a
+    /// test can exercise the provider-only archive surface.
+    async fn state_over_with_scopes(
+        home: &std::path::Path,
+        context: Arc<ScriptedContext>,
+        scopes: Option<Arc<dyn crate::store::MemoryScopes>>,
+    ) -> AppState {
         use crate::ports::CompanyStore;
         let manifest: CompanyManifest =
             toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n").unwrap();
@@ -1220,19 +1343,24 @@ mod route_tests {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
-        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
+        let mut builder = RuntimeBuilder::new(home.to_path_buf(), manifest)
             .with_id(id.clone())
-            .with_context(context)
-            .build()
-            .await
-            .unwrap();
+            .with_context(context);
+        if let Some(scopes) = scopes {
+            builder = builder.with_memory_scopes(scopes);
+        }
+        let runtime = builder.build().await.unwrap();
         let state = AppState::new(AppConfig::default());
         state.registry().insert(id, Arc::new(runtime));
         crate::server::test_support::seed_fixed_admin(&state, "acme").await;
@@ -1457,6 +1585,72 @@ mod route_tests {
             context.single_peeks.load(Ordering::SeqCst),
             0,
             "the per-chunk peek loop is gone"
+        );
+    }
+
+    /// The route is registered for every company, but only a provider-backed
+    /// engine has an archive tier. The store/embedded default must answer a
+    /// 404 that names the condition — never a 500 that reads as a server
+    /// fault — and an empty list would falsely imply there are no archived
+    /// traces.
+    #[tokio::test]
+    async fn the_archives_route_refuses_a_store_backend_with_404() {
+        let home = tempfile::tempdir().unwrap();
+        let state = state_over(home.path(), ScriptedContext::with_labels(&[])).await;
+
+        let (status, body) = get_json(&state, "/api/v1/company/memory/archives").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not provide archived traces"),
+            "the refusal must name the condition: {body}"
+        );
+    }
+
+    /// The archive surface speaks the same camelCase [`TraceEntry`] contract
+    /// as `/memory/traces` — `cycleId`/`atMillis`, never the storage type's
+    /// snake_case — and orders newest-last, the same total order as the
+    /// retained window.
+    #[tokio::test]
+    async fn the_archives_route_serializes_camelcase_newest_last() {
+        let home = tempfile::tempdir().unwrap();
+        let scopes: Arc<dyn crate::store::MemoryScopes> = Arc::new(ScriptedScopes {
+            archived: vec![
+                CompressedTrace {
+                    cycle_id: "c-old".into(),
+                    summary: "older".into(),
+                    at_millis: 100,
+                },
+                CompressedTrace {
+                    cycle_id: "c-new".into(),
+                    summary: "newer".into(),
+                    at_millis: 300,
+                },
+            ],
+        });
+        let state =
+            state_over_with_scopes(home.path(), ScriptedContext::with_labels(&[]), Some(scopes))
+                .await;
+
+        let (status, body) = get_json(&state, "/api/v1/company/memory/archives").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("a JSON array of traces");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["cycleId"], "c-old");
+        assert_eq!(
+            rows[1]["cycleId"], "c-new",
+            "newest last, like /memory/traces"
+        );
+        assert_eq!(rows[1]["atMillis"], 300);
+        assert_eq!(rows[1]["summary"], "newer");
+        assert!(
+            rows[0].get("cycle_id").is_none() && rows[0].get("at_millis").is_none(),
+            "the storage type's snake_case must not leak onto the wire"
         );
     }
 }

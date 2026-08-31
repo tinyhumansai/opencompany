@@ -71,12 +71,10 @@ struct ProviderConfig {
 /// Resolves the app credentials needed to revoke a historical provider grant.
 ///
 /// They no longer make this host a provider connection endpoint: `start` always
-/// refuses, regardless of whether these values are present.
-fn provider_config(provider: &str) -> Option<ProviderConfig> {
-    provider_config_from(provider, &crate::app::config::ProcessEnv)
-}
-
-/// [`provider_config`] over an environment seam for revocation tests.
+/// refuses, regardless of whether these values are present. The seam is an
+/// injected [`crate::app::config::EnvSource`] so revocation tests can point it
+/// at a [`crate::app::config::MapEnv`]; production goes through
+/// [`best_effort_revoke`]'s `ProcessEnv` pin.
 fn provider_config_from(
     provider: &str,
     env: &dyn crate::app::config::EnvSource,
@@ -155,12 +153,13 @@ fn native_oauth_callback_retired() -> Response {
 /// `OPENCOMPANY_OAUTH_<P>_REVOKE_URL` (tests point this at a local mock).
 /// `None` means "no known revoke flow" — disconnect still blanks the local
 /// secret; there is simply no remote call to make.
-fn revoke_url(provider: &str, config: &ProviderConfig) -> Option<String> {
+fn revoke_url_from(
+    provider: &str,
+    config: &ProviderConfig,
+    env: &dyn crate::app::config::EnvSource,
+) -> Option<String> {
     let key = provider.to_ascii_uppercase();
-    if let Some(url) = std::env::var(format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"))
-        .ok()
-        .filter(|u| !u.is_empty())
-    {
+    if let Some(url) = env.get(&format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL")) {
         return Some(url);
     }
     match provider {
@@ -199,13 +198,24 @@ async fn stored_access_token(runtime: &CompanyRuntime, provider: &str) -> Option
 /// network error, or a non-success status — is logged and swallowed so the
 /// disconnect always proceeds. Token material is never logged or returned.
 async fn best_effort_revoke(runtime: &CompanyRuntime, provider: &str) {
+    best_effort_revoke_from(runtime, provider, &crate::app::config::ProcessEnv).await;
+}
+
+async fn best_effort_revoke_from(
+    runtime: &CompanyRuntime,
+    provider: &str,
+    // `+ Sync` so the returned future is `Send`, which axum requires of a
+    // handler: a `&T` is `Send` only when `T` is `Sync`, and the bare trait
+    // object is not. Same rule as `server/setup.rs`'s `apply_inner`.
+    env: &(dyn crate::app::config::EnvSource + Sync),
+) {
     let Some(access_token) = stored_access_token(runtime, provider).await else {
         return;
     };
-    let Some(config) = provider_config(provider) else {
+    let Some(config) = provider_config_from(provider, env) else {
         return;
     };
-    let Some(url) = revoke_url(provider, &config) else {
+    let Some(url) = revoke_url_from(provider, &config, env) else {
         return;
     };
     // Bound the best-effort revoke: a provider that accepts the connection but
@@ -254,6 +264,28 @@ async fn do_disconnect(
     best_effort_revoke(&runtime, provider).await;
     // Overwrite with an empty marker: the secret store has no delete; an empty
     // value reads back as "not connected" on the read side.
+    runtime
+        .secrets()
+        .set(
+            runtime.id(),
+            &oauth_key(provider),
+            SecretValue(String::new()),
+        )
+        .await?;
+    Ok(Json(json!({ "connected": false, "provider": provider })))
+}
+
+/// [`do_disconnect`] over an injected environment seam, for revocation tests.
+/// Test-only: production `disconnect` goes through [`do_disconnect`]'s
+/// `ProcessEnv` pin, so this is compiled only under `cfg(test)` rather than
+/// carrying an `allow(dead_code)` that would hide a real orphan.
+#[cfg(test)]
+async fn do_disconnect_from(
+    runtime: Arc<CompanyRuntime>,
+    provider: &str,
+    env: &(dyn crate::app::config::EnvSource + Sync),
+) -> Result<Json<serde_json::Value>, ApiError> {
+    best_effort_revoke_from(&runtime, provider, env).await;
     runtime
         .secrets()
         .set(
@@ -420,6 +452,26 @@ mod test {
             .unwrap_or(true)
     }
 
+    fn revoke_env(provider: &str, url: String) -> crate::app::config::MapEnv {
+        let key = provider.to_ascii_uppercase();
+        crate::app::config::MapEnv::new([
+            (format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid".to_string()),
+            (
+                format!("OPENCOMPANY_OAUTH_{key}_SECRET"),
+                "csec".to_string(),
+            ),
+            (
+                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
+                "http://x/a".to_string(),
+            ),
+            (
+                format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"),
+                "http://x/t".to_string(),
+            ),
+            (format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"), url),
+        ])
+    }
+
     /// No app credentials configured → provider_config is `None`, so there is no
     /// remote to revoke, but the disconnect must still blank the local secret.
     #[tokio::test]
@@ -458,24 +510,12 @@ mod test {
 
         let (runtime, _home) = test_runtime().await;
         let provider = unique_provider();
-        let key = provider.to_ascii_uppercase();
-        // SAFETY: unique per-test provider name → no cross-test env collision.
-        unsafe {
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid");
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_SECRET"), "csec");
-            std::env::set_var(
-                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
-                "http://x/a",
-            );
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"), "http://x/t");
-            std::env::set_var(
-                format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"),
-                format!("http://{addr}/revoke"),
-            );
-        }
+        let env = revoke_env(&provider, format!("http://{addr}/revoke"));
 
         store_token(&runtime, &provider, "CANARY-revoke-me").await;
-        let _ = do_disconnect(runtime.clone(), &provider).await.unwrap();
+        let _ = do_disconnect_from(runtime.clone(), &provider, &env)
+            .await
+            .unwrap();
 
         let received = hits.lock().await;
         assert_eq!(received.len(), 1, "revoke endpoint was not called");
@@ -485,12 +525,6 @@ mod test {
         );
         drop(received);
         assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
-
-        unsafe {
-            for suffix in ["ID", "SECRET", "AUTHORIZE_URL", "TOKEN_URL", "REVOKE_URL"] {
-                std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
-            }
-        }
     }
 
     /// A revoke endpoint that refuses the connection must not fail the
@@ -504,31 +538,13 @@ mod test {
 
         let (runtime, _home) = test_runtime().await;
         let provider = unique_provider();
-        let key = provider.to_ascii_uppercase();
-        // SAFETY: unique per-test provider name → no cross-test env collision.
-        unsafe {
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_ID"), "cid");
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_SECRET"), "csec");
-            std::env::set_var(
-                format!("OPENCOMPANY_OAUTH_{key}_AUTHORIZE_URL"),
-                "http://x/a",
-            );
-            std::env::set_var(format!("OPENCOMPANY_OAUTH_{key}_TOKEN_URL"), "http://x/t");
-            std::env::set_var(
-                format!("OPENCOMPANY_OAUTH_{key}_REVOKE_URL"),
-                format!("http://{dead_addr}/revoke"),
-            );
-        }
+        let env = revoke_env(&provider, format!("http://{dead_addr}/revoke"));
 
         store_token(&runtime, &provider, "CANARY-unreachable").await;
         // Must still succeed even though the revoke POST cannot connect.
-        let _ = do_disconnect(runtime.clone(), &provider).await.unwrap();
+        let _ = do_disconnect_from(runtime.clone(), &provider, &env)
+            .await
+            .unwrap();
         assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
-
-        unsafe {
-            for suffix in ["ID", "SECRET", "AUTHORIZE_URL", "TOKEN_URL", "REVOKE_URL"] {
-                std::env::remove_var(format!("OPENCOMPANY_OAUTH_{key}_{suffix}"));
-            }
-        }
     }
 }

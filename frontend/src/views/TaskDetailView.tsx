@@ -66,6 +66,8 @@ import {
 import {
   ApiError,
   type ApprovalSummary,
+  type GrantScope,
+  type Verdict,
 } from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
 import {
@@ -74,7 +76,15 @@ import {
   type TaskFocus,
   type TaskTab,
 } from "@/lib/task-output";
-import { pendingApprovalWait } from "@/lib/task-approvals";
+import { useAskerNames } from "@/components/approval-card";
+import { ApprovalRow } from "@/views/chat/ApprovalRow";
+import type { DecidedApproval } from "@/views/chat/model";
+import {
+  blockingTaskApprovals,
+  decidingForTask,
+  pendingApprovalWait,
+  taskApprovalRows,
+} from "@/lib/task-approvals";
 import { formatDuration, timeOf } from "@/lib/timeline-format";
 import { TimelineList, runStatusTone } from "@/views/runs/RunTimeline";
 import { startVisiblePolling } from "@/lib/visible-poll";
@@ -91,6 +101,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -106,7 +117,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { formatUsdCost } from "@/lib/cost";
-import { approvalAction, effectDone } from "@/lib/language";
+import { effectDone } from "@/lib/language";
 
 import { labelFor, PRIORITY_STYLES, type TaskColumn } from "@/lib/board-columns";
 import { useBoardColumns } from "@/hooks/use-board-columns";
@@ -208,6 +219,12 @@ export { waitingBandHeight } from "@/lib/timeline-format";
  * that reads it on a screen with a 1s clock.
  */
 const EMPTY_PARKED: readonly ApprovalSummary[] = [];
+/** Stable defaults, so a screen rendered without the decide bundle does not
+ *  churn the row's props on every poll (#1891). */
+const EMPTY_DECIDING: ReadonlyMap<string, Verdict> = new Map();
+const EMPTY_VERDICTS: Record<string, Verdict> = {};
+const EMPTY_DECIDED: Readonly<Record<string, DecidedApproval>> = {};
+const EMPTY_FAILED: Record<string, string> = {};
 
 /**
  * The count that rides the Plan tab's trigger, and the colour it wears (#337).
@@ -240,6 +257,10 @@ export function TaskDetailView({
   focus,
   onTabChange,
   parked = EMPTY_PARKED,
+  deciding = EMPTY_DECIDING,
+  decided = EMPTY_DECIDED,
+  failed = EMPTY_FAILED,
+  onDecide,
   onBack,
   onNavigate,
   onOpenThread,
@@ -260,6 +281,18 @@ export function TaskDetailView({
    * row — this screen's own read is what decides *whether* it is waiting.
    */
   parked?: readonly ApprovalSummary[];
+  /**
+   * The console-wide decision state this screen decides through (#1891).
+   *
+   * The same bundle the board and the run drawer receive, so a verdict given on
+   * any of them settles on the others without a reload. `onDecide` absent means
+   * a read-only screen: it renders what the card is waiting on and no controls,
+   * on `RunResultPanel`'s precedent.
+   */
+  deciding?: ReadonlyMap<string, Verdict>;
+  decided?: Readonly<Record<string, DecidedApproval>>;
+  failed?: Record<string, string>;
+  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
   /**
    * What the address asked this screen to open (issue #339): a pinned artifact
    * or an attempt's trace. Empty — the ordinary "open the card" navigation —
@@ -282,6 +315,12 @@ export function TaskDetailView({
   // The board's columns, so this screen and the board label a status the same
   // way without either keeping a list. See `lib/board-columns`.
   const columns = useBoardColumns(client, company);
+  /**
+   * Who asked for each parked approval (#1891). Over the whole company queue,
+   * not this card's slice: `useAskerNames` keys on the set of asker ids, so the
+   * roster read is shared with every other surface asking the same question.
+   */
+  const askerNames = useAskerNames(client, company, [...parked]);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [inflight, setInflight] = useState<InflightRun | null>(null);
   const [loading, setLoading] = useState(true);
@@ -435,6 +474,12 @@ export function TaskDetailView({
   if (notFound) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+        {/*
+          `#/tasks/<deleted-id>` had no `h1` at all (codex review, #1785): this
+          pane's only heading is the card's own title, and a deleted card has
+          none. `hidden`, because the recovery message *is* the pane.
+        */}
+        <PageHeader title="Task not found" hidden />
         <p className="text-sm font-medium">This task no longer exists.</p>
         <p className="max-w-sm text-xs text-muted-foreground">
           It may have been deleted. Head back to the board to pick another card.
@@ -449,6 +494,19 @@ export function TaskDetailView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {/*
+        This pane's heading is the card's own title, inside `DetailHeader`,
+        which needs a loaded `detail`. So a cold `#/tasks/<id>` was unnamed
+        while the read was in flight, and stayed unnamed if it failed with
+        anything other than a 404 — `detail` is left null and nothing retries
+        (codex review, #1785).
+
+        "Task", not the id: an id is a string the operator did not choose and
+        cannot read out, and announcing one would be worse than announcing the
+        kind of page. It disappears the moment the real title exists, so the
+        two are never both on screen.
+      */}
+      {!detail && <PageHeader title="Task" hidden />}
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <Button
           variant="ghost"
@@ -504,6 +562,11 @@ export function TaskDetailView({
                 parked={parked}
                 taskId={detail.task.id}
                 now={now}
+                askerNames={askerNames}
+                deciding={deciding}
+                decided={decided}
+                failed={failed}
+                onDecide={onDecide}
               />
             </section>
 
@@ -586,8 +649,6 @@ export function TaskDetailView({
                     />
                   }
                   entries={detail.timeline}
-                  waitingSince={detail.waitingSince}
-                  now={now}
                 />
               </TabsContent>
 
@@ -1542,7 +1603,7 @@ function RunDrawer({
                      case is handled by the guard above, so no `empty` copy is
                      needed here — the task-card dispatch sentence would be
                      wrong for a run's trace anyway. */
-                  <TimelineList entries={detail.steps} now={now} />
+                  <TimelineList entries={detail.steps} />
                 ) : null}
               </div>
             </ScrollArea>
@@ -1554,88 +1615,185 @@ function RunDrawer({
 }
 
 /**
- * The card's one line about approvals (#468).
+ * What this card is waiting on, decided here (#468, #1891).
  *
- * This replaces an Approvals tab that listed every sign-off this task ever
+ * This replaced an Approvals tab that listed every sign-off this task ever
  * asked for. The tab was removed because it could not do the one thing an
- * operator wanted from it — decide. Approvals are resolved in exactly one
- * place, and a second surface beside that one was a maintenance cost that only
- * ever ended in a link.
+ * operator wanted from it — decide — and a second surface beside the real one
+ * was a maintenance cost that only ever ended in a link. The row that took its
+ * place kept the *signal*: a card stalled behind a sign-off has to say so, or
+ * the screen that exists to answer "why is this stuck" silently stops
+ * answering it.
  *
- * What could not be removed with it is the *signal*. A card stalled behind a
- * sign-off has to say so, or the screen that exists to answer "why is this
- * stuck" silently stops answering it — trading a bad surface for a worse
- * silence. So: one row, only when something is actually pending, saying what is
- * being waited on and for how long, and linking to where it gets decided.
+ * #1891 closes the loop the tab could not: the sign-off is decided **here**,
+ * through the same `ApprovalRow` the Approvals page, the chat transcript and
+ * the workflow run drawer resolve with. That is not the tab coming back. The
+ * tab was a *list of history* that ended in a link; this is the live queue for
+ * one card, and it disappears the moment nothing is pending.
  *
- * Deliberately says nothing about *decided* approvals. Those are resolutions,
- * they are already on the timeline as `approval` entries with their own waited
- * span, and repeating them here would rebuild the tab one row at a time.
+ * Still says nothing about *decided* approvals. Those are resolutions, already
+ * on the timeline as `approval` entries with their own waited span, and
+ * repeating them here would rebuild the tab one row at a time.
  *
- * Renders nothing when nothing is pending — an always-present "no approvals"
- * line is the clutter the tab was removed for.
+ * ## Two sources, and only one of them is the truth about waiting
+ *
+ * `approvals` is this screen's own read, and it decides **whether** the card is
+ * waiting — the host computed it with an ownership rule (`approval_owner`)
+ * carrying an attempt-level key this side cannot see. `parked` is the company
+ * queue, and it is what makes a pending approval *decidable*: it is where the
+ * payload, the deadline and the id live.
+ *
+ * They can disagree for a poll, and the honest rendering of that is the point.
+ * An approval the host counts and the feed has not delivered yet is still
+ * counted — it is named in the residual line rather than dropped, because a
+ * decide surface that quietly showed three of four rows would tell an operator
+ * they had cleared a card that is still stopped.
+ *
+ * Exported for `test/unit/task-detail-approvals.test.ts` (#1891), on the same
+ * grounds `TaskItem` and the chat card are: the claims that matter here — that
+ * a decidable row appears, that deciding one does not freeze its siblings, and
+ * above all that an undelivered approval is *said* rather than swallowed — only
+ * exist at the rendered row.
  */
-function AwaitingApprovalRow({
+export function AwaitingApprovalRow({
   approvals,
   parked,
   taskId,
   now,
+  askerNames,
+  deciding,
+  decided,
+  failed,
+  onDecide,
 }: {
   approvals: TaskApproval[];
   /**
-   * The company's parked queue, for naming (issue #883). Deliberately **not**
-   * the source of truth for whether the card is waiting: `approvals` is, because
-   * the host computed it with an ownership rule (`approval_owner`) that has an
-   * attempt-level key this side cannot see. These rows are matched into it by
-   * id, so an approval the host counts and the feed has not caught up on is
-   * still counted — it just goes unnamed for one poll rather than disappearing.
+   * The company's parked queue (issue #883). Deliberately **not** the source of
+   * truth for whether the card is waiting: `approvals` is, because the host
+   * computed it with an ownership rule (`approval_owner`) that has an
+   * attempt-level key this side cannot see. Rows are matched into it by id, so
+   * an approval the host counts and the feed has not caught up on is still
+   * counted — it goes undecidable for one poll rather than disappearing.
    */
   parked: readonly ApprovalSummary[];
   taskId: string;
   now: number;
+  askerNames: Map<string, string>;
+  deciding: ReadonlyMap<string, Verdict>;
+  decided: Readonly<Record<string, DecidedApproval>>;
+  failed: Record<string, string>;
+  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
 }) {
   const pending = pendingApprovalWait(approvals, now);
-  const named = useMemo(() => {
-    if (!pending) return null;
-    const ids = new Set(approvals.filter((a) => a.status === "pending").map((a) => a.id));
-    const hits = parked.filter((p) => ids.has(p.id));
-    // Only when *every* pending row is named, and there is exactly one. Naming
-    // "the" blocked call while a second one the feed has not delivered sits
-    // beside it would tell the operator one decision clears the card when two
-    // do — the precise mistake issue #883 is about.
-    return hits.length === 1 && pending.count === 1 ? hits[0] : null;
-  }, [approvals, parked, pending]);
+  /**
+   * This card's rows, as the queue has them.
+   *
+   * One row per approval, unlike the board card's single consolidated batch,
+   * and for the same reason the Approvals page itemises: this screen is where
+   * an operator studies a request. There is room for each payload and each
+   * grant-scope choice, and a card whose turn parked a fetch *and* a payment
+   * should be able to take the first and refuse the second here.
+   */
+  const rows = useMemo(() => {
+    // Intersected with the host's own answer, never taken from the queue alone
+    // (#1895 review). `approvalsForTask` can only match on the park's task
+    // link, while `approval_owner` decides ownership with an attempt-level
+    // `run_id` this side cannot see — so an approval linked to this card but
+    // belonging to another attempt is excluded from `approvals` by the host and
+    // would still have been pulled in here, giving this screen a row to resolve
+    // that the host does not consider part of this card. The header already
+    // says `approvals` is the authority on what this card is waiting on; this
+    // is that rule applied to the rows and not only to the count.
+    const owned = new Set(
+      approvals.filter((a) => a.status === "pending").map((a) => a.id),
+    );
+    return taskApprovalRows(parked, decided, taskId).filter((r) =>
+      owned.has(r.approval.id),
+    );
+  }, [approvals, parked, decided, taskId]);
+  const blocking = useMemo(() => blockingTaskApprovals(rows), [rows]);
+  /**
+   * Pending approvals the host counts that this screen can neither show nor
+   * account for.
+   *
+   * The honest residual, and the reason it is stated rather than swallowed: the
+   * two reads land separately, so for a poll this screen can hold four pending
+   * approvals and three decidable rows. Deciding those three would leave the
+   * card stopped, and a surface that said nothing would have just told the
+   * operator they were finished.
+   *
+   * **A set difference, not a subtraction** (#1895 review). Counting
+   * `pending.count - blocking.length` mixes two clocks: `pending` refreshes on
+   * this screen's own 4s poll while `blocking` drops a row the instant a
+   * verdict is witnessed, so for up to a poll after the operator decides the
+   * last approval the arithmetic said one was undelivered and the screen
+   * announced "still loading it" about a request that had just been settled by
+   * the person reading it. Naming the ids instead cannot drift: an approval is
+   * unaccounted for only if the host still calls it pending, this screen has no
+   * row for it, **and** this console has not decided it.
+   */
+  const undelivered = useMemo(() => {
+    const shown = new Set(rows.map((r) => r.approval.id));
+    return approvals.filter(
+      (a) => a.status === "pending" && !shown.has(a.id) && !decided[a.id],
+    ).length;
+  }, [approvals, rows, decided]);
   if (!pending) return null;
   const { waited } = pending;
   const href = `#/approvals/${encodeURIComponent(taskId)}`;
 
   return (
-    <div className="flex items-center gap-2 border-t border-status-blocked/30 bg-status-blocked-soft px-4 py-3 text-xs">
-      <Hourglass className="size-3.5 shrink-0 text-status-blocked-text" />
-      <span className="min-w-0 flex-1 text-status-blocked-text">
-        {/* Issue #883: name the call, not the mechanism. "Waiting on an
-            approval" is true of every one of these rows and therefore answers
-            nothing — the same complaint #372 made of the chat card and #846 of
-            the workflow one. `approvalAction` is the function both of those were
-            fixed with, so all three surfaces say one thing about one approval. */}
-        {named
-          ? `Waiting on your approval — ${approvalAction(named).toLowerCase()}`
-          : pending.count === 1
-            ? "Waiting on an approval"
+    <div className="border-t border-status-blocked/30 bg-status-blocked-soft px-4 py-3">
+      <div className="flex items-center gap-2 text-xs">
+        <Hourglass className="size-3.5 shrink-0 text-status-blocked-text" />
+        <span className="min-w-0 flex-1 text-status-blocked-text">
+          {pending.count === 1
+            ? "Waiting on your approval"
             : `Waiting on ${pending.count} approvals`}{" "}
-        <span className="tabular-nums">for {formatDuration(waited)}</span>
-      </span>
-      <a
-        href={href}
-        className="shrink-0 font-medium text-status-blocked-text underline-offset-2 hover:underline"
-        aria-label={
-          pending.count === 1
-            ? "Review this task's pending approval on the Approvals page"
-            : `Review this task's ${pending.count} pending approvals on the Approvals page`
-        }
-      >
-        Review
-      </a>
+          <span className="tabular-nums">for {formatDuration(waited)}</span>
+        </span>
+        {/* Kept even now that the rows are decidable here. The page is where an
+            operator cleans up across cards, and it is also the whole answer when
+            the feed has delivered none of this card's rows yet. */}
+        <a
+          href={href}
+          className="shrink-0 font-medium text-status-blocked-text underline-offset-2 hover:underline"
+          aria-label={
+            pending.count === 1
+              ? "Review this task's pending approval on the Approvals page"
+              : `Review this task's ${pending.count} pending approvals on the Approvals page`
+          }
+        >
+          Review
+        </a>
+      </div>
+      {onDecide && blocking.length > 0 && (
+        <div className="-mx-4 mt-1" data-testid="task-approvals">
+          {blocking.map((row) => (
+            <ApprovalRow
+              key={row.approval.id}
+              approvals={[row.approval]}
+              now={now}
+              askerNames={askerNames}
+              // Narrowed to this row: a decision in flight on a sibling
+              // approval of the same card is not this row's business, and
+              // `ApprovalRow` reads a non-empty map as "I am busy" (#373).
+              deciding={decidingForTask([row], deciding)}
+              decided={EMPTY_VERDICTS}
+              failed={failed}
+              onDecide={onDecide}
+            />
+          ))}
+        </div>
+      )}
+      {undelivered > 0 && (
+        <p className="mt-1 text-2xs text-muted-foreground">
+          {/* Never "and that is all of them". See `undelivered` above. */}
+          {blocking.length === 0
+            ? `Still loading ${undelivered === 1 ? "it" : "them"} — decide on the Approvals page in the meantime.`
+            : `${undelivered} more not loaded yet — this card stays stopped until ${undelivered === 1 ? "it is" : "they are"} decided too.`}
+        </p>
+      )}
     </div>
   );
 }

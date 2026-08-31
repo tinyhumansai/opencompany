@@ -285,10 +285,14 @@ fn record(budget: Option<f64>) -> CompanyRecord {
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
@@ -303,6 +307,7 @@ fn record(budget: Option<f64>) -> CompanyRecord {
 fn deps_for(base_url: String, dir: &std::path::Path) -> (HarnessDeps, Arc<FsOps>) {
     let ops = Arc::new(FsOps::new(dir));
     let deps = HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: Arc::new(HostedProvider::new(HostedProviderConfig {
@@ -361,6 +366,8 @@ fn deps_for(base_url: String, dir: &std::path::Path) -> (HarnessDeps, Arc<FsOps>
         workspace: None,
         search: None,
         tenant_search: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
     (deps, ops)
 }
@@ -377,8 +384,10 @@ fn chat(text: &str) -> CycleRequest {
             chat: None,
             parent: None,
             deliverable: None,
+            attachments: Vec::new(),
         }],
         event_seqs: Vec::new(),
+        policy: None,
     }
 }
 
@@ -425,7 +434,13 @@ async fn a_turn_halted_for_spend_reports_the_halt_and_its_figures() {
     pool.ensure(&rec, &deps).await.expect("pool ensures");
 
     let outcome = pool
-        .run(&rec.id, AGENT, "Write a short feature spec.", &deps, None)
+        .run(
+            &rec.id,
+            AGENT,
+            "Write a short feature spec.",
+            &deps,
+            crate::runtime::delegation::ChatTarget::default(),
+        )
         .await
         .expect("a spend halt is a stop, not an error — the turn must return Ok");
 
@@ -476,7 +491,13 @@ async fn a_turn_that_finishes_inside_its_budget_reports_no_halt() {
     pool.ensure(&rec, &deps).await.expect("pool ensures");
 
     let outcome = pool
-        .run(&rec.id, AGENT, "Write a short feature spec.", &deps, None)
+        .run(
+            &rec.id,
+            AGENT,
+            "Write a short feature spec.",
+            &deps,
+            crate::runtime::delegation::ChatTarget::default(),
+        )
         .await
         .expect("turn runs");
 
@@ -513,7 +534,13 @@ async fn a_teammate_with_no_declared_budget_can_never_report_a_halt() {
     pool.ensure(&rec, &deps).await.expect("pool ensures");
 
     let outcome = pool
-        .run(&rec.id, AGENT, "Write a short feature spec.", &deps, None)
+        .run(
+            &rec.id,
+            AGENT,
+            "Write a short feature spec.",
+            &deps,
+            crate::runtime::delegation::ChatTarget::default(),
+        )
         .await
         .expect("turn runs");
 

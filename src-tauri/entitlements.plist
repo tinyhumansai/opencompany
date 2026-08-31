@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      OpenCompany desktop shell entitlements — hardened runtime, NON-sandboxed.
+
+      Deliberately minimal. OpenCompany uses the system WebKit via Wry: there is
+      no bundled Chromium/CEF and no external sidecar process, so none of the
+      CEF-only relaxations (allow-jit / allow-unsigned-executable-memory /
+      disable-library-validation) nor the sidecar/device/apple-events keys that
+      openhuman carries apply here. Add a key only when a concrete feature needs
+      it under the Hardened Runtime.
+    -->
+
+    <!-- Outbound HTTPS to the platform/tenant APIs and SSH endpoints. Without
+         this, reqwest connections are silently blocked under the Hardened
+         Runtime in signed builds. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- The embedded host binds a loopback listener (127.0.0.1:0). Accepting
+         connections requires the server entitlement under the Hardened Runtime. -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>

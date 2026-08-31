@@ -179,6 +179,10 @@ CREATE TABLE IF NOT EXISTS runs (
     -- does, and `task_id = ?` never matches it — which is what a per-card
     -- filter wants.
     task_id    TEXT,
+    -- The index mirror of `run_json`'s `workflowRunId`, on the same terms as
+    -- `task_id` above: NULL reads as "belongs to no workflow", and
+    -- `workflow_run_id = ?` never matches it.
+    workflow_run_id TEXT,
     -- Issue #1573: the desk the attempt was dispatched to, mirrored out of
     -- `run_json` so the console's per-teammate history is an indexed read
     -- rather than a scan. Nullable only so the additive `ALTER` on an existing
@@ -193,6 +197,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_by_task ON runs (company_id, task_id);
 CREATE INDEX IF NOT EXISTS runs_by_status ON runs (company_id, status);
+-- NOTE: `runs_by_workflow_run` is deliberately NOT here. `CREATE TABLE IF NOT
+-- EXISTS` is a no-op on a database that predates `workflow_run_id`, so an index
+-- over that column would fail outright on exactly the legacy databases the
+-- additive step below exists for. It is created in `from_conn`, after
+-- `add_column_if_missing` has guaranteed the column.
 -- `runs_by_agent` is deliberately NOT here; see `heal_runs_agent_id`.
 CREATE TABLE IF NOT EXISTS run_steps (
     company_id TEXT NOT NULL,
@@ -202,6 +211,16 @@ CREATE TABLE IF NOT EXISTS run_steps (
     step_json  TEXT NOT NULL,
     PRIMARY KEY (company_id, run_id, step_seq)
 );
+CREATE TABLE IF NOT EXISTS run_step_details (
+    company_id  TEXT NOT NULL,
+    run_id      TEXT NOT NULL,
+    step_seq    INTEGER NOT NULL,
+    at_ms       INTEGER NOT NULL,
+    detail_json TEXT NOT NULL,
+    PRIMARY KEY (company_id, run_id, step_seq)
+);
+CREATE INDEX IF NOT EXISTS run_step_details_by_recency
+    ON run_step_details (company_id, at_ms);
 CREATE TABLE IF NOT EXISTS workflow_revisions (
     company_id    TEXT NOT NULL,
     id            TEXT NOT NULL,
@@ -250,6 +269,12 @@ CREATE TABLE IF NOT EXISTS notifications (
     subject_id   TEXT NOT NULL,
     title        TEXT NOT NULL,
     created_ms   INTEGER NOT NULL,
+    -- Who the row is for, as a JSON array of user ids. NULL means the whole
+    -- company, which is what every row written before this column meant.
+    audience     TEXT,
+    -- The console channel id the subject lives in, for placing a badge without
+    -- the browser having loaded that transcript.
+    context      TEXT,
     PRIMARY KEY (company_id, id)
 );
 -- Backs the documented newest-first feed (`NotificationStore::list`):
@@ -355,6 +380,41 @@ fn sql_err(e: rusqlite::Error) -> OpenCompanyError {
 /// land on an existing file. `PRAGMA table_info` is the check rather than
 /// swallowing the `ALTER`'s "duplicate column name" error, so a genuine `ALTER`
 /// failure still surfaces.
+/// Decodes a stored audience and applies the shared visibility predicate.
+///
+/// Invalid JSON preserves the fail-open migration behavior used by the read
+/// path: the notification remains company-wide rather than disappearing.
+fn audience_admits(audience: Option<&str>, user: &str) -> bool {
+    let decoded: Option<Vec<String>> = audience.and_then(|raw| serde_json::from_str(raw).ok());
+    // Decode once, then defer to the one shared rule on `Notification` so this
+    // cannot drift from `list()` in this file or the other two backends.
+    crate::ports::notifications::audience_admits(decoded.as_deref(), user)
+}
+
+/// Notification ids in this company that `user` is allowed to see.
+fn notification_ids_visible_to(
+    conn: &Connection,
+    company: &CompanyId,
+    user: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id, audience FROM notifications WHERE company_id = ?1")
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params![company.as_ref()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(sql_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, audience) = row.map_err(sql_err)?;
+        if audience_admits(audience.as_deref(), user) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
     let present = {
         let mut stmt = conn
@@ -578,12 +638,31 @@ impl SqliteStore {
         // exactly the "this node is not binary" test the reads use, and needs no
         // backfill.
         add_column_if_missing(&conn, "workspace_nodes", "blob", "BLOB")?;
+        // Targeted notifications. Both nullable with no default, so every row
+        // written before them keeps `audience IS NULL` — which is exactly the
+        // "for the whole company" test the read uses, and needs no backfill.
+        add_column_if_missing(&conn, "notifications", "audience", "TEXT")?;
+        add_column_if_missing(&conn, "notifications", "context", "TEXT")?;
         // Issue #983: `runs.task_id` was `NOT NULL`, and SQLite has no way to
         // drop a column constraint — so a database created before this needs the
         // twelve-step table rebuild, or the first card-less chat turn fails its
         // insert on a constraint the record no longer has. Idempotent: it reads
         // the live schema and does nothing once the constraint is gone.
         relax_runs_task_id_nullability(&conn)?;
+        // The workflow-run join. Nullable with no default, so every existing row
+        // keeps `workflow_run_id IS NULL` — which is TRUE for them, not a
+        // placeholder: a run minted before workflow nodes recorded anything
+        // genuinely belongs to no workflow. No backfill.
+        //
+        // ORDER IS LOAD-BEARING: it runs AFTER the rebuild above, which recreates
+        // `runs` from a fixed column list and would drop this column (and its
+        // index) on any database old enough to need that rebuild.
+        add_column_if_missing(&conn, "runs", "workflow_run_id", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS runs_by_workflow_run \
+             ON runs (company_id, workflow_run_id);",
+        )
+        .map_err(sql_err)?;
         // Issue #1573: the `agent_id` mirror column, its backfill and its index.
         // After the rebuild above, which owns the table's shape on the one path
         // that replaces it wholesale.
@@ -645,6 +724,40 @@ impl SqliteStore {
             .or_insert_with(|| broadcast::channel(256).0)
             .clone()
     }
+
+    /// The shared body of `save` and `save_importing`: upserts the company
+    /// row, stamping `overlay_json`'s `activation_gate_seen` with whatever
+    /// the caller passes rather than always `true`. See
+    /// `CompanyStore::save_importing`'s doc comment for why the two callers
+    /// need different values.
+    async fn save_gated(&self, record: &CompanyRecord, activation_gate_seen: bool) -> Result<()> {
+        let manifest_toml = toml::to_string(&record.manifest)
+            .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
+        let overlay_json = serde_json::to_string(&OverlayBlob::from_record_gated(
+            record,
+            activation_gate_seen,
+        ))?;
+        let conn = self.conn();
+        // Append-only: `save` upserts the company row and never touches ledger.
+        conn.execute(
+            "INSERT INTO company (company_id, manifest_toml, lifecycle, overlay_json, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(company_id) DO UPDATE SET \
+               manifest_toml = excluded.manifest_toml, \
+               lifecycle = excluded.lifecycle, \
+               overlay_json = excluded.overlay_json, \
+               updated_ms = excluded.updated_ms",
+            params![
+                record.id.as_ref(),
+                manifest_toml,
+                record.lifecycle,
+                overlay_json,
+                now_millis() as i64
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,37 +811,67 @@ impl CompanyStore for SqliteStore {
             overlay_agent_edits: overlay.agent_edits,
             overlay_retired_agents: overlay.retired_agents,
             overlay_policy: overlay.policy,
+            overlay_tool_grants: overlay.tool_grants,
             overlay_desk_tools: overlay.desk_tools,
             disabled_workflows: overlay.disabled_workflows,
             template_provenance: overlay.provenance,
             setup: overlay.setup,
+            name_confirmed: overlay.name_confirmed,
+            activation_completed_at: overlay.activation_completed_at,
+            created_at_millis: overlay.created_at_millis,
         }))
     }
 
     async fn save(&self, record: &CompanyRecord) -> Result<()> {
-        let manifest_toml = toml::to_string(&record.manifest)
-            .map_err(|e| OpenCompanyError::Store(format!("cannot serialize manifest: {e}")))?;
-        let overlay_json = serde_json::to_string(&OverlayBlob::from_record(record))?;
+        // Every ordinary `save` call against a `running` company is, by
+        // definition, made by code that understands the activation funnel —
+        // see `CompanyStore::activation_gate_seen`'s doc comment. That
+        // reasoning does NOT extend to a `paused`/`archived` record still
+        // waiting on its own first `running` boot to decide the marker (PR
+        // #1875 review finding, second round): `RuntimeBuilder::build`'s
+        // "existing but not running" arm carries the marker forward
+        // untouched for exactly this reason, but a write that reaches this
+        // method directly — bypassing `build` entirely, e.g.
+        // `company_logo::put_logo`'s plain load-modify-save, which never
+        // checks lifecycle — would stamp `true` regardless and poison the
+        // grandfather arm's `!gate_already_seen` guard before the record's
+        // own migration boot ever runs. So: stamp `true` only once the
+        // record itself says `running`; otherwise preserve whatever is
+        // already on file, same as `build`'s own "not running" arm does.
+        if record.lifecycle == "running" {
+            self.save_gated(record, true).await
+        } else {
+            let gate_seen = self.activation_gate_seen(&record.id).await?;
+            self.save_gated(record, gate_seen).await
+        }
+    }
+
+    async fn save_importing(&self, record: &CompanyRecord, gate_seen: bool) -> Result<()> {
+        self.save_gated(record, gate_seen).await
+    }
+
+    /// PR #1875 review finding: `overlay_json` is the same blob `save` above
+    /// always stamps `activation_gate_seen: true` into (via
+    /// `OverlayBlob::from_record`), so reading it back here — rather than
+    /// inheriting the trait's always-`false` default — is what lets a
+    /// sqlite-backed company's second boot tell itself apart from a genuine
+    /// pre-#1843 legacy record. A row that has never been saved at all reads
+    /// `false`, matching `FsCompanyStore::activation_gate_seen`'s own "no
+    /// bundle written yet" case.
+    async fn activation_gate_seen(&self, id: &CompanyId) -> Result<bool> {
         let conn = self.conn();
-        // Append-only: `save` upserts the company row and never touches ledger.
-        conn.execute(
-            "INSERT INTO company (company_id, manifest_toml, lifecycle, overlay_json, updated_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(company_id) DO UPDATE SET \
-               manifest_toml = excluded.manifest_toml, \
-               lifecycle = excluded.lifecycle, \
-               overlay_json = excluded.overlay_json, \
-               updated_ms = excluded.updated_ms",
-            params![
-                record.id.as_ref(),
-                manifest_toml,
-                record.lifecycle,
-                overlay_json,
-                now_millis() as i64
-            ],
-        )
-        .map_err(sql_err)?;
-        Ok(())
+        let overlay_json: Option<String> = conn
+            .query_row(
+                "SELECT overlay_json FROM company WHERE company_id = ?1",
+                params![id.as_ref()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(overlay_json) = overlay_json else {
+            return Ok(false);
+        };
+        Ok(OverlayBlob::parse(&overlay_json)?.activation_gate_seen)
     }
 
     async fn list(&self) -> Result<Vec<CompanySummary>> {
@@ -1241,7 +1384,14 @@ impl ContextStore for SqliteStore {
         Ok(removed > 0)
     }
 
+    /// Weighted token overlap rather than `body.find(query)` — see
+    /// [`crate::store::lexical`]. The same ranker as fs and mongo, so the
+    /// conformance suite can demand one search semantics from all three.
     async fn search(&self, id: &CompanyId, query: &str, limit: usize) -> Result<Vec<ChunkHit>> {
+        let mut ranker = crate::store::lexical::Ranker::new(query);
+        if ranker.matches_nothing() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT addr, body FROM context_chunks WHERE company_id = ?1 ORDER BY rowid")
@@ -1251,26 +1401,11 @@ impl ContextStore for SqliteStore {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(sql_err)?;
-        let mut hits = Vec::new();
         for row in rows {
-            if hits.len() >= limit {
-                break;
-            }
             let (addr, body) = row.map_err(sql_err)?;
-            if let Some(pos) = body.find(query) {
-                // The ±24-byte window can land mid-codepoint on a multibyte
-                // body; widen to the boundary rather than panic the slice.
-                hits.push(ChunkHit {
-                    addr: ChunkAddr::new(addr),
-                    snippet: slice_on_char_boundaries(
-                        &body,
-                        pos.saturating_sub(24)..pos + query.len() + 24,
-                    ),
-                    score: 1.0,
-                });
-            }
+            ranker.offer(&addr, &body);
         }
-        Ok(hits)
+        Ok(ranker.best(limit))
     }
 }
 
@@ -2398,6 +2533,102 @@ impl crate::ports::run_output::WorkflowRunOutputStore for SqliteStore {
     }
 }
 
+#[async_trait]
+impl crate::ports::deep_trace::DeepTraceStore for SqliteStore {
+    async fn append_step_detail(
+        &self,
+        company: &CompanyId,
+        record: &crate::ports::deep_trace::RunStepDetailRecord,
+    ) -> Result<()> {
+        use crate::ports::deep_trace::MAX_DEEP_RUNS_PER_COMPANY;
+        let json = serde_json::to_string(&record.detail)?;
+        let mut guard = self.conn();
+        // Upsert + prune in ONE transaction, so a reader never observes an
+        // over-cap set. The prune keeps whole RUNS, not the newest rows: ranking
+        // rows would leave a surviving run holding a torn half of its own trace,
+        // which reads as the agent stopping mid-thought rather than as a prune.
+        // A run's recency is the newest `at_ms` any of its rows carries.
+        let tx = guard.transaction().map_err(sql_err)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO run_step_details \
+             (company_id, run_id, step_seq, at_ms, detail_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                company.as_ref(),
+                record.run_id,
+                record.step_seq as i64,
+                record.at_millis as i64,
+                json,
+            ],
+        )
+        .map_err(sql_err)?;
+        tx.execute(
+            "DELETE FROM run_step_details \
+             WHERE company_id = ?1 AND run_id NOT IN (\
+                 SELECT run_id FROM run_step_details \
+                 WHERE company_id = ?1 \
+                 GROUP BY run_id \
+                 ORDER BY MAX(at_ms) DESC, run_id DESC LIMIT ?2)",
+            params![company.as_ref(), MAX_DEEP_RUNS_PER_COMPANY as i64],
+        )
+        .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(())
+    }
+
+    async fn list_step_details(
+        &self,
+        company: &CompanyId,
+        run_id: &str,
+    ) -> Result<Vec<crate::ports::deep_trace::RunStepDetailRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT step_seq, at_ms, detail_json FROM run_step_details \
+                 WHERE company_id = ?1 AND run_id = ?2 ORDER BY step_seq ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![company.as_ref(), run_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (step_seq, at_ms, json) = row.map_err(sql_err)?;
+            out.push(crate::ports::deep_trace::RunStepDetailRecord {
+                run_id: run_id.to_string(),
+                step_seq: step_seq as u32,
+                at_millis: at_ms as u64,
+                detail: serde_json::from_str(&json)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn purge_deep_trace(&self, company: &CompanyId, run_id: Option<&str>) -> Result<u64> {
+        let conn = self.conn();
+        let removed = match run_id {
+            Some(id) => conn
+                .execute(
+                    "DELETE FROM run_step_details WHERE company_id = ?1 AND run_id = ?2",
+                    params![company.as_ref(), id],
+                )
+                .map_err(sql_err)?,
+            None => conn
+                .execute(
+                    "DELETE FROM run_step_details WHERE company_id = ?1",
+                    params![company.as_ref()],
+                )
+                .map_err(sql_err)?,
+        };
+        Ok(removed as u64)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunStore
 // ---------------------------------------------------------------------------
@@ -2451,6 +2682,8 @@ impl crate::ports::runs::RunStore for SqliteStore {
             task_id: spec.task_id,
             agent_id: spec.agent_id,
             chat_id: spec.chat_id,
+            workflow_run_id: spec.workflow_run_id,
+            node_id: spec.node_id,
             attempt: attempt as u32,
             status: RunStatus::Pending,
             trigger_event_seq: None,
@@ -2463,12 +2696,13 @@ impl crate::ports::runs::RunStore for SqliteStore {
         };
         tx.execute(
             "INSERT INTO runs \
-             (company_id, id, task_id, agent_id, status, attempt, created_ms, run_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (company_id, id, task_id, workflow_run_id, agent_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 company.as_ref(),
                 run.id,
                 run.task_id,
+                run.workflow_run_id,
                 run.agent_id,
                 run.status.as_str(),
                 run.attempt as i64,
@@ -2508,13 +2742,15 @@ impl crate::ports::runs::RunStore for SqliteStore {
     ) -> Result<()> {
         let json = serde_json::to_string(run)?;
         let conn = self.conn();
-        // `status` and `task_id` are mirrored out of the blob so the indexes
-        // can answer a filtered list without deserializing every row.
+        // `status`, `task_id` and `workflow_run_id` are mirrored out of the blob
+        // so the indexes can answer a filtered list without deserializing every
+        // row.
         conn.execute(
             "INSERT INTO runs \
-             (company_id, id, task_id, agent_id, status, attempt, created_ms, run_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             (company_id, id, task_id, workflow_run_id, agent_id, status, attempt, created_ms, run_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(company_id, id) DO UPDATE SET task_id = excluded.task_id, \
+             workflow_run_id = excluded.workflow_run_id, \
              agent_id = excluded.agent_id, \
              status = excluded.status, attempt = excluded.attempt, \
              created_ms = excluded.created_ms, run_json = excluded.run_json",
@@ -2522,6 +2758,7 @@ impl crate::ports::runs::RunStore for SqliteStore {
                 company.as_ref(),
                 run.id,
                 run.task_id,
+                run.workflow_run_id,
                 run.agent_id,
                 run.status.as_str(),
                 run.attempt as i64,
@@ -2546,6 +2783,10 @@ impl crate::ports::runs::RunStore for SqliteStore {
         if let Some(task_id) = &filter.task_id {
             args.push(task_id.clone());
             sql.push_str(&format!(" AND task_id = ?{}", args.len()));
+        }
+        if let Some(workflow_run_id) = &filter.workflow_run_id {
+            args.push(workflow_run_id.clone());
+            sql.push_str(&format!(" AND workflow_run_id = ?{}", args.len()));
         }
         if let Some(agent_id) = &filter.agent_id {
             args.push(agent_id.clone());
@@ -3037,8 +3278,9 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
         // error, matching the fs and mongo backends.
         conn.execute(
             "INSERT OR IGNORE INTO notifications \
-                 (company_id, id, kind, subject_kind, subject_id, title, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (company_id, id, kind, subject_kind, subject_id, title, created_ms, \
+                  audience, context) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 company.as_ref(),
                 notification.id.as_str(),
@@ -3047,6 +3289,15 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
                 notification.subject.id.as_str(),
                 notification.title.as_str(),
                 notification.created_at as i64,
+                notification
+                    .audience
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| crate::error::OpenCompanyError::Store(format!(
+                        "notification audience is not serializable: {e}"
+                    )))?,
+                notification.context.as_deref(),
             ],
         )
         .map_err(sql_err)?;
@@ -3064,7 +3315,7 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT n.id, n.kind, n.subject_kind, n.subject_id, n.title, n.created_ms, \
-                        r.read_ms \
+                        r.read_ms, n.audience, n.context \
                  FROM notifications n \
                  LEFT JOIN notification_reads r \
                      ON r.company_id = n.company_id \
@@ -3084,12 +3335,14 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
                     r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(sql_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, kind, subject_kind, subject_id, title, created_ms, read_ms) =
+            let (id, kind, subject_kind, subject_id, title, created_ms, read_ms, audience, context) =
                 row.map_err(sql_err)?;
             let subject_kind = crate::ports::notifications::SubjectKind::from_token(&subject_kind)
                 .ok_or_else(|| {
@@ -3107,10 +3360,25 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
                     },
                     created_at: created_ms as u64,
                     title,
+                    // A row whose audience will not parse is treated as
+                    // company-wide rather than dropped: losing a notification
+                    // is worse than showing one person one extra line, and a
+                    // corrupt column is a bug to see, not to hide.
+                    audience: audience
+                        .as_deref()
+                        .and_then(|a| serde_json::from_str(a).ok()),
+                    context,
                 },
                 read_at: read_ms.map(|v| v as u64),
             });
         }
+        // Filtered here rather than in SQL: SQLite's JSON support is a
+        // compile-time option this crate does not require, and a company's feed
+        // is small enough that the index-ordered scan plus a predicate is
+        // cheaper than depending on it. The rule itself lives on
+        // `Notification::visible_to`, so all three backends read it from one
+        // place.
+        out.retain(|view| view.notification.visible_to(user));
         Ok(out)
     }
 
@@ -3140,29 +3408,54 @@ impl crate::ports::notifications::NotificationStore for SqliteStore {
                 }
             }
             None => {
-                conn.execute(
-                    "INSERT OR IGNORE INTO notification_reads \
-                         (company_id, user_id, notification_id, read_ms) \
-                     SELECT ?1, ?2, id, ?3 FROM notifications WHERE company_id = ?1",
-                    params![company.as_ref(), user, now],
-                )
-                .map_err(sql_err)?;
+                // Only what this person can actually see. Marking a colleague's
+                // targeted row read is inert, but writing markers for rows they
+                // will never be shown makes "mark all read" mean something
+                // different per backend, which is exactly what the conformance
+                // suite exists to prevent.
+                for id in notification_ids_visible_to(&conn, company, user)? {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO notification_reads \
+                             (company_id, user_id, notification_id, read_ms) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![company.as_ref(), user, id.as_str(), now],
+                    )
+                    .map_err(sql_err)?;
+                }
             }
         }
-        let unread: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM notifications n \
+        // Counted in Rust rather than in SQL: the audience is a JSON array, and
+        // reading it in SQLite needs the `json1` extension, which this crate
+        // does not require of its host. A company's feed is small, and the
+        // predicate lives on `Notification::visible_to` so all three backends
+        // agree by construction rather than by three careful queries.
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.audience FROM notifications n \
                  WHERE n.company_id = ?1 \
                    AND NOT EXISTS \
                        (SELECT 1 FROM notification_reads r \
                         WHERE r.company_id = n.company_id \
                           AND r.notification_id = n.id \
                           AND r.user_id = ?2)",
-                params![company.as_ref(), user],
-                |r| r.get(0),
             )
             .map_err(sql_err)?;
-        Ok(unread as u64)
+        let rows = stmt
+            .query_map(params![company.as_ref(), user], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .map_err(sql_err)?;
+        let mut unread = 0u64;
+        for row in rows {
+            let audience = row.map_err(sql_err)?;
+            let decoded: Option<Vec<String>> = audience
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok());
+            if crate::ports::notifications::audience_admits(decoded.as_deref(), user) {
+                unread += 1;
+            }
+        }
+        Ok(unread)
     }
 }
 
@@ -3400,9 +3693,26 @@ impl crate::ports::workspace::WorkspaceStore for SqliteStore {
                 }
             }
         }
-        // Adoption commits nothing: the transaction is dropped, which rolls back
-        // a reservation that never wrote.
-        if let Some(existing) = existing_folder_claim(nodes.values(), parent, name)? {
+        // Adoption stamps the lease flag (issue #1839) and commits it. The write
+        // rides `node_json` via serde, inside the immediate transaction this
+        // method already holds, so the flag lands atomically against a
+        // concurrent `delete_if_empty` and Race 1 is closed on this backend.
+        // Authorship is untouched — only `adopted` changes.
+        if let Some(mut existing) = existing_folder_claim(nodes.values(), parent, name)? {
+            if !existing.adopted {
+                existing.adopted = true;
+                tx.execute(
+                    "UPDATE workspace_nodes SET node_json = ?3 \
+                     WHERE company_id = ?1 AND id = ?2",
+                    params![
+                        company.as_ref(),
+                        existing.id,
+                        serde_json::to_string(&existing)?
+                    ],
+                )
+                .map_err(sql_err)?;
+                tx.commit().map_err(sql_err)?;
+            }
             return Ok(FolderClaim::Adopted(existing));
         }
         let node = new_folder(name, parent, origin);
@@ -3719,6 +4029,46 @@ impl crate::ports::workspace::WorkspaceStore for SqliteStore {
         Ok(true)
     }
 
+    async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        // `parent_id` and `adopted` live inside `node_json`, not as their own
+        // columns (see the `workspace_nodes` table def), so both the existence
+        // check and the has-child check go through the same deserializing
+        // helper the rest of this backend's workspace methods use — a raw SQL
+        // `WHERE parent_id = ?` against this table is a "no such column" error,
+        // not a narrowing filter.
+        let nodes = self.workspace_nodes(&tx, company)?;
+        let Some(node) = nodes.get(id) else {
+            return Ok(false);
+        };
+        // An adopted folder has a second writer whose create has not landed yet
+        // (issue #1839). The flag-read here and the flag-write in
+        // `adopt_or_create_folder` both happen under an IMMEDIATE transaction on
+        // this same table, so they serialize: once an adoption has stamped
+        // `adopted`, this refuses — closing the race on this backend rather than
+        // narrowing it, matching `FsOps`'s guard.
+        if node.adopted {
+            return Ok(false);
+        }
+        if nodes.values().any(|n| n.parent_id.as_deref() == Some(id)) {
+            return Ok(false);
+        }
+        // Single document, non-recursive — the reads above, taken under this
+        // same IMMEDIATE transaction, already proved `id` exists, is unadopted
+        // and is childless, so a plain delete-by-key is enough.
+        let removed = tx
+            .execute(
+                "DELETE FROM workspace_nodes WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id],
+            )
+            .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(removed > 0)
+    }
+
     async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
         let conn = self.conn();
         let count: i64 = conn
@@ -3797,6 +4147,12 @@ mod test {
     async fn conformance_isolation_by_company() {
         let s = store();
         conformance::assert_isolation_by_company(s.clone(), s.clone(), s.clone(), s).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_paused_ordinary_save_preserves_activation_gate() {
+        let s = store();
+        conformance::assert_paused_ordinary_save_preserves_activation_gate(s).await;
     }
 
     #[tokio::test]
@@ -3912,6 +4268,12 @@ mod test {
     #[tokio::test]
     async fn conformance_context_delete_label_survives_a_concurrent_identical_put() {
         conformance::assert_delete_label_survives_a_concurrent_identical_put(store()).await;
+    }
+
+    /// The same search semantics as every other backend.
+    #[tokio::test]
+    async fn conformance_context_search_ranking() {
+        conformance::assert_context_search_ranking(store()).await;
     }
 
     /// The migration path a fresh database never exercises.
@@ -4319,6 +4681,16 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conformance_deep_trace_store() {
+        conformance::assert_deep_trace_store(store()).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_run_store_workflow_join() {
+        conformance::assert_run_store_workflow_join(store()).await;
+    }
+
+    #[tokio::test]
     async fn conformance_schedule_fire_store() {
         conformance::assert_schedule_fire_store(store()).await;
     }
@@ -4395,6 +4767,16 @@ mod test {
         conformance::assert_workspace_sibling_names(store()).await;
     }
 
+    /// Issue #1839: the adoption lease — a second claim marks the folder, and
+    /// `delete_if_empty` refuses it while a minted-unadopted twin still deletes.
+    /// SQLite inherits the trait-default `delete_if_empty`, so this pins that the
+    /// flag it persists in `node_json` under the adopt transaction is the flag
+    /// the default reads back.
+    #[tokio::test]
+    async fn conformance_workspace_adoption_lease() {
+        conformance::assert_workspace_adoption_lease(store()).await;
+    }
+
     /// **The race issue #894 is actually about**, and the reason the guard is an
     /// `IMMEDIATE` transaction rather than a check in `create`'s caller.
     ///
@@ -4435,6 +4817,7 @@ mod test {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         };
 
         let gate = Arc::new(tokio::sync::Barrier::new(2));
@@ -4529,6 +4912,7 @@ mod test {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         };
 
         WorkspaceStore::create(
@@ -4618,10 +5002,14 @@ mod test {
                 overlay_budgets: Vec::new(),
                 overlay_agent_edits: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -4635,6 +5023,7 @@ mod test {
                     by: None,
                     chat: None,
                     deliverable: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -4689,6 +5078,7 @@ mod test {
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             },
         )
         .await
@@ -4706,6 +5096,7 @@ mod test {
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             }
         );
     }
@@ -4794,6 +5185,7 @@ mod test {
                     by: None,
                     chat: None,
                     deliverable: None,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -4812,6 +5204,7 @@ mod test {
                 by: None,
                 chat: None,
                 deliverable: None,
+                attachments: Vec::new(),
             }
         );
     }

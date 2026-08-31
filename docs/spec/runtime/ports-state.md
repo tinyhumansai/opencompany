@@ -249,6 +249,36 @@ them apart — collapsing `""` into `None` would fall back to whatever the
 manifest or the environment supplies and silently undo the operator's
 revocation.
 
+`SecretValue` is **opaque by construction** (issue #1741): it hand-writes both
+`Debug` and `Serialize` to emit `[redacted]`, so a struct that embeds one and
+derives either cannot leak the credential — the guard is on the type, not on
+each enclosing struct. Before this, five separate hand-written `Debug` impls
+guarded the containers and nothing at all guarded serialization, so
+`serde_json::to_value` over a config holding a secret emitted plaintext.
+
+`Deserialize` stays derived — reading a secret *in* never leaks one — so a
+serde round-trip is deliberately asymmetric and yields `SecretValue("[redacted]")`,
+which fails closed at the point of use. Persistence is unaffected because it
+never used serde: every backend writes `value.expose()` and reads back through
+the `SecretValue` constructor.
+
+`expose()` is the *named* door out, not the only one: the field is `pub`, so
+`let SecretValue(raw) = value` reads the plaintext without it, and about ten
+production call sites already do. Audit with
+`grep -E 'expose\(|SecretValue\('`, not `grep 'expose()'` — the shorter search
+reads clean while missing them. Privatizing the field behind a constructor
+would close the gap and is deliberately left as separate work: it touches
+roughly 110 construction sites and is unrelated to the serialization guard.
+
+Credential-bearing fields hold a `SecretValue` rather than a `String` for the
+same reason (issue #1770): `SmtpCredentials::password`, `ImapCredentials::password`
+and the legacy `StoredConfig::password` were each guarded on one rendering
+surface and not the other — three structs, three hand-written or documented
+`Debug` decisions, and a derived `Serialize` nobody considered. Holding the
+credential in the guarded type is what makes `#[derive(Debug, Serialize)]` on
+`MailCredentials`, `TenantMailboxConfig` or the next mail struct safe without
+anyone remembering.
+
 `assert_secret_store` in `src/store/conformance.rs` is the contract every
 backend is checked against (issue #1505): read-back, absence, per-key
 independence, overwrite, the empty-value distinction above, and isolation in

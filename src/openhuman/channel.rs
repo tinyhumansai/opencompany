@@ -74,6 +74,7 @@ mod test {
                 text: "hello".into(),
                 steps: Vec::new(),
                 reply_to: None,
+                mentions: Vec::new(),
             })
             .await
             .unwrap();
@@ -105,6 +106,7 @@ mod test {
                 text: "hi".into(),
                 steps: Vec::new(),
                 reply_to: None,
+                mentions: Vec::new(),
             })
             .await
             .unwrap_err();

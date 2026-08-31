@@ -11,9 +11,11 @@ mod ids;
 pub mod acp;
 pub mod approvals;
 pub mod artifacts;
+pub mod blockers;
 pub mod brain;
 pub mod channel;
 pub mod context;
+pub mod deep_trace;
 pub mod economy;
 pub mod events;
 pub mod facts;
@@ -47,9 +49,17 @@ pub use artifacts::{
     ArtifactAuthor, ArtifactDiff, ArtifactKind, ArtifactRecord, ArtifactStore, ArtifactVersion,
     DiffLine, DiffOp,
 };
+pub use blockers::{
+    BLOCKER_EFFECT_PREFIX, BlockerKind, BlockerPayload, BlockerSource, BlockerStep,
+};
 pub use brain::{Brain, Cognition, CycleHost, UsageMetering};
 pub use channel::ChannelAdapter;
 pub use context::ContextStore;
+pub use deep_trace::{
+    DEEP_ARGUMENTS_CHAR_CAP, DEEP_OUTPUT_CHAR_CAP, DEEP_REASONING_CHAR_CAP, DeepTraceStore,
+    MAX_DEEP_RUNS_PER_COMPANY, MAX_DEEP_STEPS_PER_RUN, RunStepDetailRecord, TurnStepDetail,
+    bound_detail,
+};
 pub use economy::AgentEconomy;
 pub use events::{EventLog, PruneReport, RetentionClass, RetentionPolicy, plan_prune};
 pub use facts::{FactKind, FactRecord, FactStore};
@@ -81,7 +91,7 @@ pub use types::*;
 pub use usage::{SampleKind, UsageMeter, UsageSample};
 pub use users::{
     InviteRecord, LoginIdentity, UserRecord, UserRole, UserStatus, UserStore,
-    decode_wallet_address, normalize_email, normalize_wallet,
+    decode_wallet_address, derive_display_name, normalize_email, normalize_wallet,
 };
 pub use workflow_revisions::{
     MAX_WORKFLOW_REVISIONS, WorkflowRevisionRecord, WorkflowRevisionStore,

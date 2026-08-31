@@ -52,6 +52,7 @@
 //! sessions and flags the account so the user is asked to replace it.
 
 pub mod admin;
+pub mod bootstrap;
 pub mod cookie;
 pub mod password;
 pub mod routes;
@@ -61,6 +62,27 @@ pub mod wallet;
 pub(crate) mod scope;
 
 pub use routes::router;
+
+use crate::error::OpenCompanyError;
+
+/// The longest a display name may be, in characters.
+///
+/// A name renders on every surface that shows a person — chat gutters,
+/// facepiles, the org chart, approvals — and rides in every roster payload,
+/// so the bound is the difference between a name and a place to park a page of
+/// text. Eighty is far above any real name and far below anything a UI should
+/// be asked to lay out.
+pub(crate) const MAX_DISPLAY_NAME_CHARS: usize = 80;
+
+/// Rejects a display name longer than [`MAX_DISPLAY_NAME_CHARS`], as `400`.
+pub(crate) fn validate_display_name(name: &str) -> Result<(), OpenCompanyError> {
+    if name.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(OpenCompanyError::InvalidRequest(format!(
+            "a display name may be at most {MAX_DISPLAY_NAME_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod auth_test;

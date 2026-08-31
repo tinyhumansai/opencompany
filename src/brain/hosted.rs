@@ -227,7 +227,6 @@ impl Brain for HostedMedullaBrain {
         // `orch:usage` frames; stays zero when the upstream reports none, which
         // the runtime then meters as nothing rather than as a fake charge.
         let mut token_usage = TokenUsage::default();
-
         for (index, event) in req.events.iter().enumerate() {
             // Prefer the durable EventLog seq; fall back to the position when a
             // caller did not thread seqs (idempotency then holds within a cycle).
@@ -247,12 +246,31 @@ impl Brain for HostedMedullaBrain {
 
             // Drain the cycle's frames, deduping on callId (at-least-once).
             let mut seen: HashSet<String> = HashSet::new();
+            // Provider adapters reject a model response that co-batches
+            // request_approval with another call. This guard is the transport
+            // backstop for any later frames in the same orchestration cycle;
+            // answers remain streaming because the peer may await each one.
+            let mut approval_requested = false;
             let mut frames = self.transport.cycle_frames(&cycle_id);
             while let Some(frame) = frames.next().await {
                 match frame? {
                     InboundFrame::CycleComplete => break,
                     InboundFrame::Effect(effect_frame) => {
                         if !seen.insert(effect_frame.call_id.clone()) {
+                            continue;
+                        }
+                        if approval_requested {
+                            self.transport
+                                .ack_effect(EffectResult {
+                                    call_id: effect_frame.call_id,
+                                    ok: false,
+                                    error: Some(
+                                        "effect cannot execute after a request_approval boundary"
+                                            .to_string(),
+                                    ),
+                                    result: None,
+                                })
+                                .await?;
                             continue;
                         }
                         let outcome = self.service_effect(host, &effect_frame).await?;
@@ -274,8 +292,29 @@ impl Brain for HostedMedullaBrain {
                         if !seen.insert(call.call_id.clone()) {
                             continue;
                         }
+                        if approval_requested
+                            && context_op_from_call(&call.name, &call.args).is_none()
+                        {
+                            self.transport
+                                .answer_tool_call(ToolResultFrame {
+                                    call_id: call.call_id,
+                                    ok: false,
+                                    result: None,
+                                    error: Some(
+                                        "tool cannot execute after a request_approval boundary"
+                                            .to_string(),
+                                    ),
+                                })
+                                .await?;
+                            continue;
+                        }
+                        let requests_approval =
+                            call.name == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND;
                         let answer = self.service_tool_call(host, &call).await?;
+                        approval_requested |= requests_approval && answer.ok;
                         self.transport.answer_tool_call(answer).await?;
+                        // Keep draining: every later sibling frame must receive
+                        // its explicit refusal instead of being abandoned.
                     }
                     InboundFrame::Usage(usage) => {
                         // Deduped like every other frame: delivery is
@@ -331,6 +370,9 @@ impl Brain for HostedMedullaBrain {
         Cognition {
             path: "hosted",
             provider: MEDULLA_PROVIDER,
+            // The model is chosen upstream and never named on the `orch:usage`
+            // frame, so this process cannot honestly report one (issue #1749).
+            model: None,
             metering: UsageMetering::PerCycle,
         }
     }

@@ -97,13 +97,16 @@
 //! one that already fired or one the operator took back.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::ports::generate_id;
-use crate::ports::types::{Actor, ApprovalId, EventSeq};
+use crate::ports::types::{
+    Actor, ApprovalId, Attachment, CompanyEvent, CompanyId, EventSeq, Mention, MessageIntent,
+    Verdict,
+};
 
 /// How long an unredeemed grant stays live: 15 minutes.
 ///
@@ -181,6 +184,21 @@ pub struct GrantedCall {
     /// mean there is no task checkout to resume, which is the pre-#796 behaviour.
     #[serde(default)]
     pub origin_task: Option<String>,
+}
+
+/// A durable follow-up owed after an agent explicitly asked the operator a
+/// question. This is deliberately not a grant: either verdict resumes the
+/// conversation, and a denial must never appear in the audit log as authority
+/// to execute a tool call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalContinuation {
+    /// Routing and agent context for the follow-up turn.
+    pub call: GrantedCall,
+    /// The operator decision the follow-up must report.
+    pub verdict: Verdict,
+    /// Who made the decision, retained so restart recovery can recreate the
+    /// exact `ApprovalResolved` event without inventing an actor.
+    pub by: Actor,
 }
 
 /// The hard ceiling on a standing grant's life: 7 days.
@@ -534,6 +552,9 @@ pub struct GrantSet {
 #[derive(Default)]
 struct GrantState {
     live: HashMap<ApprovalId, GrantedCall>,
+    /// Explicit request continuations, kept separate from executable grants so
+    /// a denied request can never be mistaken for admitted authority.
+    continuations: HashMap<ApprovalId, ApprovalContinuation>,
     /// Grants consumed since the last [`GrantSet::drain_consumed`].
     ///
     /// Consumption happens deep inside a `ToolPolicy::check`, which is sync and
@@ -554,6 +575,8 @@ struct GrantState {
     /// it means recording the redemption where it happens, which needs a journal
     /// handle at the `ToolPolicy::check` seam.
     consumed: Vec<ApprovalId>,
+    /// Explicit continuations completed since the last journal drain.
+    consumed_continuations: Vec<ApprovalId>,
     /// Standing grants (issue #374), keyed by their own id.
     ///
     /// A second map rather than a second variant in `live`: the two are matched
@@ -602,6 +625,15 @@ impl GrantSet {
             .insert(call.approval_id.clone(), call);
     }
 
+    /// Arms a verdict-bearing conversation continuation.
+    pub fn continue_approval(&self, continuation: ApprovalContinuation) {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .continuations
+            .insert(continuation.call.approval_id.clone(), continuation);
+    }
+
     /// Redeems a grant for `(agent, tool, args)`, removing it.
     ///
     /// The match and the removal happen under one lock, so two concurrent turns
@@ -639,6 +671,24 @@ impl GrantSet {
             .cloned()
     }
 
+    /// Reads an explicit approval continuation without consuming it.
+    pub fn peek_continuation(&self, id: &ApprovalId) -> Option<ApprovalContinuation> {
+        self.inner
+            .lock()
+            .expect("grant set poisoned")
+            .continuations
+            .get(id)
+            .cloned()
+    }
+
+    /// Consumes a completed explicit approval continuation.
+    pub fn consume_continuation(&self, id: &ApprovalId) -> Option<ApprovalContinuation> {
+        let mut state = self.inner.lock().expect("grant set poisoned");
+        let continuation = state.continuations.remove(id)?;
+        state.consumed_continuations.push(id.clone());
+        Some(continuation)
+    }
+
     /// Removes every grant minted more than `ttl_millis` before `now_millis`,
     /// returning them so the caller can journal and announce each expiry.
     pub fn sweep(&self, now_millis: u64, ttl_millis: u64) -> Vec<GrantedCall> {
@@ -655,6 +705,26 @@ impl GrantSet {
             .collect()
     }
 
+    /// Removes explicit continuations that were never delivered before their
+    /// short consent window elapsed.
+    pub fn sweep_continuations(
+        &self,
+        now_millis: u64,
+        ttl_millis: u64,
+    ) -> Vec<ApprovalContinuation> {
+        let mut state = self.inner.lock().expect("grant set poisoned");
+        let expired: Vec<ApprovalId> = state
+            .continuations
+            .iter()
+            .filter(|(_, c)| now_millis.saturating_sub(c.call.at_millis) >= ttl_millis)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| state.continuations.remove(&id))
+            .collect()
+    }
+
     /// Seeds the live set from a journal replay (boot recovery).
     pub fn rehydrate(&self, calls: impl IntoIterator<Item = GrantedCall>) {
         let mut state = self.inner.lock().expect("grant set poisoned");
@@ -663,9 +733,33 @@ impl GrantSet {
         }
     }
 
+    /// Seeds explicit continuations from journal replay.
+    pub fn rehydrate_continuations(
+        &self,
+        continuations: impl IntoIterator<Item = ApprovalContinuation>,
+    ) {
+        let mut state = self.inner.lock().expect("grant set poisoned");
+        for continuation in continuations {
+            state
+                .continuations
+                .insert(continuation.call.approval_id.clone(), continuation);
+        }
+    }
+
     /// Takes the ids consumed since the last drain, so they can be journaled.
     pub fn drain_consumed(&self) -> Vec<ApprovalId> {
         std::mem::take(&mut self.inner.lock().expect("grant set poisoned").consumed)
+    }
+
+    /// Takes explicit continuation ids completed since the last journal drain.
+    pub fn drain_consumed_continuations(&self) -> Vec<ApprovalId> {
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .expect("grant set poisoned")
+                .consumed_continuations,
+        )
     }
 
     /// How many grants are live (tests / observability).
@@ -950,6 +1044,539 @@ impl std::fmt::Debug for GrantSet {
             .field("standing", &self.standing_count())
             .finish_non_exhaustive()
     }
+}
+
+/// A parked "budget paused" turn (issue #1846), waiting for the operator to
+/// add credits and trigger a re-issue.
+///
+/// Modelled on the same "mint on park, consume on redeem" shape a
+/// [`GrantedCall`] uses, but simpler on two axes that follow from what a
+/// budget pause actually is:
+///
+/// * **Matches on `(company, agent)` alone.** A grant matches a specific tool
+///   call with specific arguments because approving one call must not open the
+///   door to a different one; a budget pause has no call to be specific
+///   about — the operator is not re-approving an action, they are re-sending
+///   the message that stalled.
+/// * **In-memory only, not journaled.** [`GrantSet`] is replayed on boot
+///   because losing an approved-but-unredeemed grant silently drops consent
+///   the operator already gave. Losing a budget-pause marker on a restart
+///   costs strictly less: the operator re-sends the same message, which is
+///   already the whole redemption story (issue #561: this was never going to
+///   be a resume). The durability this issue asks for is "outlives the
+///   request", not "survives a process restart".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BudgetPauseMarker {
+    /// Mint-order id, so a client reading the marker back can tell a fresh
+    /// park from the one it already saw.
+    pub id: String,
+    /// The teammate whose turn paused — carried for display only; redemption
+    /// re-enters the SAME cycle path an ordinary operator message takes
+    /// ([`crate::ports::types::CompanyEvent::OperatorMessage`]), which routes
+    /// on `chat_id` exactly as the original message did. A nested delegate's
+    /// pause therefore re-issues from the top, not as a targeted re-call of
+    /// that one delegate's own turn — consistent with "not true resume".
+    pub agent: String,
+    /// The chat/desk thread to re-dispatch on. `None` re-issues on the
+    /// default (unaddressed → orchestrator) thread, matching how the original
+    /// message routed.
+    pub chat_id: Option<String>,
+    /// The ORIGINAL message text the turn was answering — what gets re-sent,
+    /// from the top, on redeem.
+    pub message: String,
+    /// The actionable halt copy the pause reported, carried along so a
+    /// console reading the marker back — rather than the chat bubble — can
+    /// still show why it exists and what it will do.
+    pub summary: String,
+    /// Epoch-millis the marker was parked.
+    pub at_millis: u64,
+    /// The ORIGINAL message's thread parent, replayed as-is on redeem (issue
+    /// #1846 review, Codex #3865812423). Forcing this to `None` — the
+    /// pre-fix `redeem_budget_pause` behaviour — turned a redeemed thread
+    /// reply into a channel-root message: `cycle_conversation` derives both
+    /// the response thread and the continuation context from this field, so
+    /// the rerun and its answer landed outside the thread the pause card
+    /// represented.
+    pub parent: Option<EventSeq>,
+    /// What the operator's composer said the ORIGINAL message was for,
+    /// replayed as-is on redeem (issue #1846 review, Codex #3865812432).
+    /// Forcing this to `None` — the pre-fix behaviour — changed the
+    /// redeemed turn's semantics: `HarnessBrain` passes this field into
+    /// `DelegationRunner::requested`, where it suppresses task creation for
+    /// chat intent and enables workflow-specific behaviour, so a redeemed
+    /// "Just chatting" message could unexpectedly open a card and a redeemed
+    /// workflow request could be treated as an ordinary one-off.
+    pub deliverable: Option<MessageIntent>,
+    /// Who the ORIGINAL message named, already resolved, replayed as-is on
+    /// redeem (issue #1846 review, Codex #3865812419). This event re-enters
+    /// `run_cycle` directly, bypassing the REST handler's own
+    /// `resolve_mentions` — forcing this to `Vec::new()` (the pre-fix
+    /// behaviour) meant `HarnessBrain` read an empty vector and fell back
+    /// from `mention_responder` to the desk lead/orchestrator, so adding
+    /// credits could resend the task to a different agent with different
+    /// tools and permissions than the operator's `@mention` had actually
+    /// asked for.
+    pub mentions: Vec<Mention>,
+    /// The ORIGINAL message's structured attachments, replayed alongside
+    /// `message` on redeem (issue #1846 review, Codex #3866418891) instead of
+    /// being flattened into it a second time. Forcing this to `Vec::new()` —
+    /// the pre-fix behaviour — meant the rerun journaled the
+    /// `with_attachment_refs` marker text already baked into `message` as
+    /// though the operator had typed it themselves: the structured attachment
+    /// metadata (name/mime/size) and whatever preview the console renders
+    /// from it were gone, and for a large extracted document the baked block
+    /// could carry up to the wire-body limit of plain-looking transcript
+    /// text. Empty for a marker with no ambient [`RedeemContext`] to draw
+    /// from (a workflow node's own background turn) or whose original
+    /// message carried none.
+    pub attachments: Vec<Attachment>,
+    /// Whether this marker's ORIGINAL turn had no chat thread an operator
+    /// was addressing — a dispatched task card or a workflow agent node,
+    /// rather than an interactive `/chat` message (issue #1846 review, Codex
+    /// #3869193112).
+    ///
+    /// **Not the same question as `chat_id.is_none()`.** An ordinary
+    /// interactive message sent to no specific desk ALSO parks with
+    /// `chat_id: None` (see that field's doc — "unaddressed → orchestrator"
+    /// is a normal, redeemable destination) and must redeem exactly as it
+    /// does today. This field is the thing `chat_id` alone cannot say:
+    /// whether an operator was ever in the loop for the ORIGINAL turn at
+    /// all. `redeem_budget_pause` refuses when this is `true` — replaying a
+    /// dispatched card's or workflow node's own turn as a generic
+    /// `OperatorMessage` routes it to the orchestrator instead of the
+    /// original task/node, leaving the original stuck forever while opening
+    /// unrelated, possibly duplicate work.
+    ///
+    /// Set at the ONE call site (`run_inner` in `mod.rs`) that has the
+    /// `LiveStream` value to answer this from directly; the delegation
+    /// re-park call sites in `runtime/delegation.rs` do not have that
+    /// context available and default to `false` — a delegated sub-turn's own
+    /// background-ness is not yet distinguished by this field, which is a
+    /// known gap, not a claim this covers every background origin.
+    pub background: bool,
+}
+
+/// The parent / deliverable / mentions the operator's ORIGINAL message set,
+/// carried ambient through a cycle so a budget-pause
+/// [`park`](BudgetPauseSet::park) anywhere inside it — the top-level turn, a
+/// CEO-relay call, a delegate's own turn — can stamp the marker with the
+/// request the operator actually sent (issue #1846 review, Codex
+/// #3865812419 / #3865812423 / #3865812432).
+///
+/// Set once, around the WHOLE cycle
+/// ([`CycleRunner::run_bracketed`](crate::runtime::cycle::CycleRunner)),
+/// from whichever event in the batch is the triggering `OperatorMessage` —
+/// the same "same task, propagates through the seam" shape
+/// `delegation::CHAT_ONLY_TURN` already uses for its own ambient hint, and
+/// for the same reason: nothing on `run_locked`'s call chain down to a
+/// `park()` site spawns onto a new task, so a `tokio::task_local!` reaches
+/// every one of them without a parameter added to any function in between.
+///
+/// [`Default`] — no parent, no deliverable, no mentions — is the correct
+/// reading for every cycle that did not start from an `OperatorMessage`: a
+/// scheduler tick, a webhook, an approval follow-up. None of those has an
+/// original message to replay, and a pause during one of them redeems with
+/// exactly the defaults `redeem_budget_pause` used everywhere before this
+/// fix.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RedeemContext {
+    pub parent: Option<EventSeq>,
+    pub deliverable: Option<MessageIntent>,
+    pub mentions: Vec<Mention>,
+    /// The ORIGINAL `OperatorMessage`'s raw text, before
+    /// [`with_attachment_refs`](crate::brain::medulla::effects::with_attachment_refs)
+    /// composed it with any attachment markers (issue #1846 review, Codex
+    /// #3866418891) — distinct from whatever COMPOSED text a delegate's or
+    /// the orchestrator's own dispatch actually ran the turn with. A
+    /// `park()` call site reads this in preference to its own local message
+    /// whenever it is `Some`, so a redeem re-composes fresh from raw text +
+    /// [`attachments`](Self::attachments) instead of replaying a stale,
+    /// already-baked block. `None` — the same "not applicable" reading
+    /// [`parent`](Self::parent) already uses — for every cycle that carries
+    /// no `OperatorMessage` at all (a workflow node's own background turn),
+    /// where the caller's own local message is the correct thing to park.
+    pub text: Option<String>,
+    /// The SAME message's structured attachments, carried alongside `text`
+    /// so a `park()` call site can stamp [`BudgetPauseMarker::attachments`]
+    /// (issue #1846 review, Codex #3866418891). Empty whenever `text` is
+    /// `None`, and also whenever the original message itself carried none.
+    pub attachments: Vec<Attachment>,
+}
+
+impl RedeemContext {
+    /// The context to carry for one cycle's batch — the first
+    /// `OperatorMessage` in it, or [`Default`] when none is present.
+    ///
+    /// "First", not "every": `single_agent` already restricts an addressed
+    /// batch to one agent, and every caller into `run_bracketed` (the chat
+    /// route, the redeem route itself) sends exactly one `OperatorMessage`
+    /// per cycle in practice. A future caller that ever batches more than
+    /// one still gets a coherent, if approximate, answer rather than a
+    /// panic.
+    pub fn from_events(events: &[(Option<EventSeq>, CompanyEvent)]) -> Self {
+        events
+            .iter()
+            .find_map(|(_, event)| match event {
+                CompanyEvent::OperatorMessage {
+                    parent,
+                    deliverable,
+                    mentions,
+                    text,
+                    attachments,
+                    ..
+                } => Some(Self {
+                    parent: *parent,
+                    deliverable: *deliverable,
+                    mentions: mentions.clone(),
+                    text: Some(text.clone()),
+                    attachments: attachments.clone(),
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+tokio::task_local! {
+    static REDEEM_CONTEXT: RedeemContext;
+}
+
+/// Runs `fut` with [`current_redeem_context`] reading `ctx` for its
+/// duration — set once around a whole cycle by
+/// [`CycleRunner::run_bracketed`](crate::runtime::cycle::CycleRunner).
+pub async fn with_redeem_context<F: std::future::Future>(ctx: RedeemContext, fut: F) -> F::Output {
+    REDEEM_CONTEXT.scope(ctx, fut).await
+}
+
+/// The ambient [`RedeemContext`] for the cycle the caller is running inside,
+/// or [`Default`] when none was set — every path that does not run through
+/// [`with_redeem_context`] (every test, and any hypothetical future caller
+/// of [`BudgetPauseSet::park`] outside a cycle).
+pub fn current_redeem_context() -> RedeemContext {
+    REDEEM_CONTEXT.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Outcome of a [`BudgetPauseSet::redeem_matching`] attempt. See that
+/// method's doc comment for why an id-matched redeem exists alongside plain
+/// [`BudgetPauseSet::redeem`].
+#[derive(Debug, PartialEq)]
+pub enum RedeemMatch {
+    /// The expected marker was still parked and is now reserved.
+    Reserved(BudgetPauseMarker),
+    /// Nothing is parked for this agent at all.
+    Absent,
+    /// Something IS parked for this agent, but it is not the marker the
+    /// caller expected — left untouched.
+    Stale,
+}
+
+/// One company's parked budget pauses, at most one per agent (issue #1846).
+///
+/// Parking a new marker for an agent that already has one overwrites it: a
+/// second pause on the same teammate means the first one is stale, and the
+/// operator's next "add credits" should re-issue the LATEST stuck message,
+/// not a queue of every message that ever stalled.
+#[derive(Default)]
+pub struct BudgetPauseSet {
+    by_agent: Mutex<HashMap<String, BudgetPauseMarker>>,
+}
+
+impl BudgetPauseSet {
+    /// Parks a fresh marker for `agent`, replacing whatever was parked
+    /// before, and returns it.
+    ///
+    /// `redeem` is the ambient [`RedeemContext`] — pass
+    /// [`current_redeem_context`] at every real call site; a bare
+    /// [`RedeemContext::default`] is only correct for a test that is not
+    /// itself running inside [`with_redeem_context`].
+    pub fn park(
+        &self,
+        agent: impl Into<String>,
+        chat_id: Option<String>,
+        message: impl Into<String>,
+        summary: impl Into<String>,
+        at_millis: u64,
+        redeem: RedeemContext,
+    ) -> BudgetPauseMarker {
+        self.park_marked(agent, chat_id, message, summary, at_millis, redeem, false)
+    }
+
+    /// [`park`](Self::park), for the ONE call site (`run_inner` in
+    /// `mod.rs`) that knows — from its own `LiveStream` value — that this
+    /// turn had no chat thread an operator was addressing at all: a
+    /// dispatched task card or a workflow agent node (issue #1846 review,
+    /// Codex #3869193112). See [`BudgetPauseMarker::background`]'s doc for
+    /// why this is a different question from `chat_id.is_none()`.
+    ///
+    /// A SEPARATE method rather than a new parameter on [`park`](Self::park)
+    /// itself: that method has ~30 call sites across this crate's own tests
+    /// and the delegation re-park sites in `runtime/delegation.rs`, none of
+    /// which have (or need) an opinion on this — a positional bool added
+    /// there would be silent, easy-to-mis-order surface area on every one of
+    /// them for a distinction only one caller actually has the information
+    /// to make. Every other caller keeps calling `park`, which defaults to
+    /// `background: false` — the correct answer for an interactive message
+    /// (addressed or not) and the status-quo answer (no worse than before
+    /// this field existed) for a delegation re-park, which does not yet
+    /// have this context threaded to it either.
+    pub fn park_background(
+        &self,
+        agent: impl Into<String>,
+        chat_id: Option<String>,
+        message: impl Into<String>,
+        summary: impl Into<String>,
+        at_millis: u64,
+        redeem: RedeemContext,
+    ) -> BudgetPauseMarker {
+        self.park_marked(agent, chat_id, message, summary, at_millis, redeem, true)
+    }
+
+    /// Re-parks a marker for `agent` with corrected text/context — same
+    /// shape as [`park`](Self::park), but carries forward whatever
+    /// `background` bit is CURRENTLY set on `agent`'s marker, rather than
+    /// resetting it to `false` (issue #1846 review, Codex #3870400579).
+    ///
+    /// For the delegation re-park sites in `runtime/delegation.rs`, which
+    /// don't have their own `LiveStream` context to answer `background`
+    /// from directly (see [`BudgetPauseMarker::background`]'s own doc for
+    /// why plain [`park`](Self::park) there defaults to `false`): those
+    /// sites run AFTER the delegate's own turn has already gone through
+    /// `run_inner`, which DOES have that context and already parked (or
+    /// not) a `background` marker for the SAME agent under the SAME turn,
+    /// moments earlier. Reading that bit back before overwriting is what
+    /// keeps a genuinely background-originated delegate turn's marker from
+    /// silently losing the flag — and the redemption refusal it drives — on
+    /// every delegation re-park.
+    pub fn park_preserving_background(
+        &self,
+        agent: impl Into<String>,
+        chat_id: Option<String>,
+        message: impl Into<String>,
+        summary: impl Into<String>,
+        at_millis: u64,
+        redeem: RedeemContext,
+    ) -> BudgetPauseMarker {
+        let agent = agent.into();
+        let background = self.peek(&agent).is_some_and(|m| m.background);
+        self.park_marked(
+            agent, chat_id, message, summary, at_millis, redeem, background,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn park_marked(
+        &self,
+        agent: impl Into<String>,
+        chat_id: Option<String>,
+        message: impl Into<String>,
+        summary: impl Into<String>,
+        at_millis: u64,
+        redeem: RedeemContext,
+        background: bool,
+    ) -> BudgetPauseMarker {
+        let agent = agent.into();
+        let marker = BudgetPauseMarker {
+            id: generate_id(),
+            agent: agent.clone(),
+            chat_id,
+            message: message.into(),
+            summary: summary.into(),
+            at_millis,
+            parent: redeem.parent,
+            deliverable: redeem.deliverable,
+            mentions: redeem.mentions,
+            attachments: redeem.attachments,
+            background,
+        };
+        self.by_agent
+            .lock()
+            .expect("budget-pause set poisoned")
+            .insert(agent, marker.clone());
+        marker
+    }
+
+    /// Reads the parked marker for `agent` without consuming it, for a
+    /// read-only console status check.
+    pub fn peek(&self, agent: &str) -> Option<BudgetPauseMarker> {
+        self.by_agent
+            .lock()
+            .expect("budget-pause set poisoned")
+            .get(agent)
+            .cloned()
+    }
+
+    /// Takes the parked marker for `agent`, if one exists — single-use, like
+    /// a [`GrantedCall`] redemption.
+    ///
+    /// Also the redeem route's RESERVATION step (issue #1846 review, Codex
+    /// #3865395849): taking the marker atomically, before re-dispatching,
+    /// is what closes the race two concurrent redeem requests could hit —
+    /// both `peek`ing the same marker before either finished, then both
+    /// re-dispatching it, with only one of two later consume calls actually
+    /// winning while the loser still reported success. The second caller's
+    /// `redeem` here finds nothing (the first already took it) and 404s
+    /// before it ever re-dispatches. [`restore_if_absent`](Self::restore_if_absent)
+    /// is the undo half, for a re-dispatch that fails after reserving.
+    pub fn redeem(&self, agent: &str) -> Option<BudgetPauseMarker> {
+        self.by_agent
+            .lock()
+            .expect("budget-pause set poisoned")
+            .remove(agent)
+    }
+
+    /// Reserves the parked marker for `agent` only if it is still the SAME
+    /// marker as `expected_id` — otherwise leaves it untouched.
+    ///
+    /// Issue #1846 review (Codex #3866418876): plain [`redeem`](Self::redeem)
+    /// takes WHATEVER is currently parked for the agent, which is correct
+    /// for a caller with nothing to compare against, but wrong for the
+    /// console's "Add credits & resend" CTA — that card is always rendered
+    /// from a specific marker it already read (`GET …/budget-pause`). A
+    /// background turn (a workflow node, an unstreamed task) pausing for the
+    /// SAME agent re-parks with no chat destination and overwrites that
+    /// marker; the console's stale-card check
+    /// ([`isBudgetPauseNoticeSuperseded`] on the frontend) only watches the
+    /// CHAT transcript, which a chat-less park never touches, so it cannot
+    /// see this happened. A plain `redeem` would then silently reserve and
+    /// re-dispatch the WRONG marker's message as though the operator had
+    /// asked for it.
+    ///
+    /// Matching on `id` — the field [`BudgetPauseMarker::id`] documents as
+    /// existing precisely "so a client reading the marker back can tell a
+    /// fresh park from the one it already saw" — closes that without the
+    /// console needing to know anything about chat/desk routing. Atomic
+    /// under the same lock as every other operation here: a background park
+    /// racing this call either lands entirely before or entirely after it,
+    /// never observed half-applied.
+    ///
+    /// [`isBudgetPauseNoticeSuperseded`]: https://github.com/tinyhumansai/opencompany/blob/main/frontend/src/hooks/use-events.ts
+    pub fn redeem_matching(&self, agent: &str, expected_id: &str) -> RedeemMatch {
+        let mut by_agent = self.by_agent.lock().expect("budget-pause set poisoned");
+        match by_agent.get(agent) {
+            None => RedeemMatch::Absent,
+            Some(marker) if marker.id != expected_id => RedeemMatch::Stale,
+            Some(_) => {
+                RedeemMatch::Reserved(by_agent.remove(agent).expect("just confirmed present"))
+            }
+        }
+    }
+
+    /// Retires the parked marker for `agent` only if its saved request
+    /// context — text, chat thread, thread parent, composer intent, mentions
+    /// AND attachments — still matches the candidate turn's own — otherwise
+    /// leaves it untouched and returns `None`.
+    ///
+    /// Issue #1846 review (Codex #3869792503, tightened by #3869968949): the
+    /// sibling of [`redeem_matching`](Self::redeem_matching), for the OTHER
+    /// caller that retires a marker without redeeming it — `run_inner`'s
+    /// "this agent's turn just succeeded without pausing" cleanup. Plain
+    /// [`redeem`](Self::redeem) there retired WHATEVER was parked for the
+    /// agent the moment ANY turn of theirs succeeded, which is correct for
+    /// the manual-resend scenario it was written for (the very request the
+    /// marker names came back and worked) but wrong when a DIFFERENT,
+    /// unrelated turn for the same agent — an automatic background task, a
+    /// second chat message about something else — happens to succeed first:
+    /// that silently drops the marker (and its CTA) for the STILL-unretried
+    /// original request, which reads to the operator as "nothing to
+    /// resend" even though their original ask was never reissued.
+    ///
+    /// The first cut of this fix matched on [`BudgetPauseMarker::message`]
+    /// alone. Text-only matching has its own gap: two DIFFERENT requests can
+    /// share identical text ("review this", posted in two different threads,
+    /// or with two different attachments) — the finding's own example. This
+    /// widens the match to the whole saved [`RedeemContext`] a resend would
+    /// have to reproduce exactly to genuinely BE the same request: `chat_id`,
+    /// `parent`, `deliverable`, `mentions` and `attachments`, alongside
+    /// `message`. There is still no marker id to compare against here (see
+    /// `message`-only note below) — this is the closest a text/context
+    /// comparison can get without one.
+    ///
+    /// Matching on request CONTENT rather than `id`: the caller has no
+    /// marker id to compare against here (nothing was ever read back the way
+    /// the console's redeem click reads one), only the shape of whatever turn
+    /// just ran. A resend, by construction, runs with the SAME content the
+    /// marker parked; an unrelated success does not.
+    pub fn retire_if_message_matches(
+        &self,
+        agent: &str,
+        expected_message: &str,
+        expected_chat_id: Option<&str>,
+        expected_redeem: &RedeemContext,
+    ) -> Option<BudgetPauseMarker> {
+        let mut by_agent = self.by_agent.lock().expect("budget-pause set poisoned");
+        match by_agent.get(agent) {
+            Some(marker)
+                if marker.message == expected_message
+                    && marker.chat_id.as_deref() == expected_chat_id
+                    && marker.parent == expected_redeem.parent
+                    && marker.deliverable == expected_redeem.deliverable
+                    && marker.mentions == expected_redeem.mentions
+                    && marker.attachments == expected_redeem.attachments =>
+            {
+                by_agent.remove(agent)
+            }
+            _ => None,
+        }
+    }
+
+    /// Restores a marker the caller reserved via [`redeem`](Self::redeem) but
+    /// whose redispatch failed to complete — guarded on absence (issue #1846
+    /// review, Codex #3865395849, replacing the peek/redeem_matching shape
+    /// Codex #3864988181 added).
+    ///
+    /// The redeem route reserves the marker with plain [`redeem`](Self::redeem)
+    /// **before** re-dispatching, so a re-dispatch failure (the event store
+    /// hiccups, the request is cancelled) would otherwise lose the marker for
+    /// good — a retry sees nothing parked and 404s, even though no successful
+    /// redispatch ever happened. This is what puts it back for the retry to
+    /// find.
+    ///
+    /// `or_insert` rather than a plain overwrite is what makes that safe
+    /// rather than merely later: the failed re-dispatch re-enters the SAME
+    /// cycle path an ordinary message takes, which can itself pause again on
+    /// the same agent before this call runs. Restoring unconditionally would
+    /// blow away THAT fresh marker — the operator's payload for the pause
+    /// that just happened, never yet shown to them — with the stale one this
+    /// call is putting back. Absence-only insertion means the fresh marker,
+    /// once parked, always wins.
+    pub fn restore_if_absent(&self, marker: BudgetPauseMarker) {
+        self.by_agent
+            .lock()
+            .expect("budget-pause set poisoned")
+            .entry(marker.agent.clone())
+            .or_insert(marker);
+    }
+
+    /// Every currently-parked marker, agent-sorted for a stable listing.
+    pub fn list(&self) -> Vec<BudgetPauseMarker> {
+        let mut out: Vec<_> = self
+            .by_agent
+            .lock()
+            .expect("budget-pause set poisoned")
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.agent.cmp(&b.agent));
+        out
+    }
+}
+
+/// Process-wide registry of [`BudgetPauseSet`]s, one per company (issue
+/// #1846) — mirrors [`crate::turn_stream`]'s per-company `REGISTRY`: created
+/// lazily on first use and kept for the process lifetime, since companies are
+/// few and long-lived.
+static BUDGET_PAUSES: LazyLock<Mutex<HashMap<CompanyId, Arc<BudgetPauseSet>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The parked-budget-pause set for `company`, creating an empty one on first
+/// use.
+pub fn budget_pauses_for(company: &CompanyId) -> Arc<BudgetPauseSet> {
+    BUDGET_PAUSES
+        .lock()
+        .expect("budget-pause registry poisoned")
+        .entry(company.clone())
+        .or_insert_with(|| Arc::new(BudgetPauseSet::default()))
+        .clone()
 }
 
 #[cfg(test)]
@@ -1857,5 +2484,406 @@ mod test {
         let listed = set.standing();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, GrantId::new("g1"));
+    }
+
+    // --- budget-pause markers (issue #1846) ----------------------------------
+
+    #[test]
+    fn parking_then_peeking_a_budget_pause_does_not_consume_it() {
+        let set = BudgetPauseSet::default();
+        set.park(
+            "ceo",
+            Some("desk-1".to_string()),
+            "hi",
+            "paused",
+            1_000,
+            RedeemContext::default(),
+        );
+
+        let first = set.peek("ceo").expect("parked");
+        let second = set.peek("ceo").expect("peek does not consume");
+        assert_eq!(first.id, second.id, "the same marker both times");
+        assert_eq!(first.message, "hi");
+        assert_eq!(first.chat_id.as_deref(), Some("desk-1"));
+    }
+
+    /// Issue #1846 review (Codex #3870400579) — **the regression.** A
+    /// delegation re-park (`runtime/delegation.rs`) has no `LiveStream`
+    /// context of its own to answer `background` from, so it must carry
+    /// forward whatever the delegate's own `run_inner` call already set,
+    /// rather than resetting it to `false` via plain `park`.
+    #[test]
+    fn park_preserving_background_carries_the_flag_forward() {
+        let set = BudgetPauseSet::default();
+        set.park_background(
+            "ceo",
+            None,
+            "the hand-off instruction",
+            "paused",
+            1_000,
+            RedeemContext::default(),
+        );
+        assert!(
+            set.peek("ceo").expect("parked").background,
+            "fixture sanity: the marker `run_inner` would have parked is background"
+        );
+
+        let reparked = set.park_preserving_background(
+            "ceo",
+            None,
+            "the corrected original request",
+            "paused",
+            2_000,
+            RedeemContext::default(),
+        );
+        assert!(
+            reparked.background,
+            "re-parking with corrected text must not silently reset background to false"
+        );
+        assert_eq!(reparked.message, "the corrected original request");
+    }
+
+    /// The other half: an ordinary (non-background) marker's re-park must
+    /// stay non-background — this method is not a way to ACCIDENTALLY turn
+    /// an interactive marker into a background one either.
+    #[test]
+    fn park_preserving_background_leaves_a_non_background_marker_alone() {
+        let set = BudgetPauseSet::default();
+        set.park(
+            "ceo",
+            Some("general".to_string()),
+            "hi",
+            "paused",
+            1_000,
+            RedeemContext::default(),
+        );
+        assert!(!set.peek("ceo").expect("parked").background);
+
+        let reparked = set.park_preserving_background(
+            "ceo",
+            Some("general".to_string()),
+            "hi, corrected",
+            "paused",
+            2_000,
+            RedeemContext::default(),
+        );
+        assert!(!reparked.background);
+    }
+
+    /// No prior marker to read a flag off of — defaults to `false`, the
+    /// same as plain `park`, rather than panicking or guessing `true`.
+    #[test]
+    fn park_preserving_background_defaults_to_false_with_nothing_parked_yet() {
+        let set = BudgetPauseSet::default();
+        let marker = set.park_preserving_background(
+            "ceo",
+            None,
+            "hi",
+            "paused",
+            1_000,
+            RedeemContext::default(),
+        );
+        assert!(!marker.background);
+    }
+
+    #[test]
+    fn redeeming_a_budget_pause_consumes_it_exactly_once() {
+        let set = BudgetPauseSet::default();
+        set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+
+        let redeemed = set.redeem("ceo").expect("a marker was parked");
+        assert_eq!(redeemed.agent, "ceo");
+        assert!(
+            set.redeem("ceo").is_none(),
+            "single-use: a second redeem finds nothing"
+        );
+        assert!(set.peek("ceo").is_none());
+    }
+
+    #[test]
+    fn redeem_reserves_atomically_so_a_second_concurrent_redeem_finds_nothing() {
+        // Issue #1846 review (Codex #3865395849): two redeem requests that
+        // both read the marker before either re-dispatches would both
+        // re-dispatch the same non-idempotent message. Reserving with plain
+        // `redeem` up front — rather than `peek`, then consume after — means
+        // the SECOND caller's own `redeem` finds nothing, closing the race
+        // before it ever gets to re-dispatch.
+        let set = BudgetPauseSet::default();
+        let marker = set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+
+        let first = set.redeem("ceo").expect("the first reservation wins");
+        assert_eq!(first.id, marker.id);
+        assert!(
+            set.redeem("ceo").is_none(),
+            "a second, concurrent reservation finds nothing parked"
+        );
+    }
+
+    #[test]
+    fn restore_if_absent_puts_a_failed_redispatchs_marker_back() {
+        let set = BudgetPauseSet::default();
+        let marker = set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+
+        let reserved = set.redeem("ceo").expect("reserved for redispatch");
+        assert!(set.peek("ceo").is_none(), "reserved out of the set");
+
+        // The redispatch failed — restore it for a retry to find.
+        set.restore_if_absent(reserved);
+        let restored = set.peek("ceo").expect("restored after the failure");
+        assert_eq!(restored.id, marker.id);
+        assert_eq!(restored.message, "hi");
+    }
+
+    #[test]
+    fn restore_if_absent_leaves_a_fresher_marker_untouched() {
+        // The re-dispatch a redeem triggers can itself re-pause the same
+        // agent before the failed-redispatch's restore call runs. The stale
+        // marker being restored must not delete the operator's not-yet-seen
+        // fresh one out from under them.
+        let set = BudgetPauseSet::default();
+        let stale = set.park(
+            "ceo",
+            None,
+            "first stuck message",
+            "paused once",
+            1_000,
+            RedeemContext::default(),
+        );
+        let reserved = set.redeem("ceo").expect("reserved for redispatch");
+        assert_eq!(reserved.id, stale.id);
+
+        // The (failed) redispatch itself re-entered the cycle and paused
+        // again before the restore call below runs.
+        set.park(
+            "ceo",
+            None,
+            "second stuck message",
+            "paused again",
+            2_000,
+            RedeemContext::default(),
+        );
+
+        set.restore_if_absent(reserved);
+        let still_parked = set.peek("ceo").expect("the fresher marker survives");
+        assert_eq!(still_parked.message, "second stuck message");
+    }
+
+    #[test]
+    fn a_second_pause_on_the_same_agent_overwrites_the_first() {
+        let set = BudgetPauseSet::default();
+        set.park(
+            "ceo",
+            None,
+            "first stuck message",
+            "paused once",
+            1_000,
+            RedeemContext::default(),
+        );
+        set.park(
+            "ceo",
+            None,
+            "second stuck message",
+            "paused again",
+            2_000,
+            RedeemContext::default(),
+        );
+
+        let marker = set.redeem("ceo").expect("the latest marker");
+        assert_eq!(
+            marker.message, "second stuck message",
+            "the operator's next redeem re-issues the LATEST stalled message, not a queue"
+        );
+    }
+
+    #[test]
+    fn redeem_matching_reserves_when_the_id_still_matches() {
+        let set = BudgetPauseSet::default();
+        let marker = set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+
+        let outcome = set.redeem_matching("ceo", &marker.id);
+        assert_eq!(outcome, RedeemMatch::Reserved(marker));
+        assert!(set.peek("ceo").is_none(), "reserved out of the set");
+    }
+
+    #[test]
+    fn redeem_matching_reports_absent_when_nothing_is_parked() {
+        let set = BudgetPauseSet::default();
+        assert_eq!(set.redeem_matching("ceo", "some-id"), RedeemMatch::Absent);
+    }
+
+    #[test]
+    fn redeem_matching_leaves_a_background_overwrite_untouched_on_a_stale_id() {
+        // Issue #1846 review (Codex #3866418876): a chat pause parks a
+        // marker with a chat destination; a background turn (workflow node,
+        // unstreamed task) for the SAME agent then pauses too and overwrites
+        // it with a marker that has NONE. The console still shows the OLD
+        // chat card because nothing about a chat-less park touches the
+        // transcript-based staleness check. Redeeming by the OLD id must
+        // not silently take the NEW (unrelated) marker.
+        let set = BudgetPauseSet::default();
+        let chat_marker = set.park(
+            "ceo",
+            Some("general".to_string()),
+            "ship the API",
+            "paused for the chat turn",
+            1_000,
+            RedeemContext::default(),
+        );
+        let background_marker = set.park(
+            "ceo",
+            None,
+            "run the nightly workflow node",
+            "paused for the background turn",
+            2_000,
+            RedeemContext::default(),
+        );
+
+        // The stale chat id must not reserve the background marker.
+        assert_eq!(
+            set.redeem_matching("ceo", &chat_marker.id),
+            RedeemMatch::Stale
+        );
+        // Left completely untouched — still there, still the background one.
+        let still_parked = set.peek("ceo").expect("the background marker survives");
+        assert_eq!(still_parked.id, background_marker.id);
+        assert_eq!(still_parked.message, "run the nightly workflow node");
+
+        // The fresh id reserves correctly.
+        let outcome = set.redeem_matching("ceo", &background_marker.id);
+        assert_eq!(outcome, RedeemMatch::Reserved(background_marker));
+        assert!(set.peek("ceo").is_none());
+    }
+
+    #[test]
+    fn redeem_matching_reserves_atomically_so_a_concurrent_stale_attempt_finds_nothing() {
+        let set = BudgetPauseSet::default();
+        let marker = set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+
+        let first = set.redeem_matching("ceo", &marker.id);
+        assert_eq!(first, RedeemMatch::Reserved(marker.clone()));
+        // A second attempt with the same id now finds nothing parked at all
+        // (not "stale") — the first call already reserved it.
+        assert_eq!(set.redeem_matching("ceo", &marker.id), RedeemMatch::Absent);
+    }
+
+    #[test]
+    fn budget_pauses_are_scoped_per_company() {
+        let acme = CompanyId::new("acme");
+        let globex = CompanyId::new("globex");
+        budget_pauses_for(&acme).park(
+            "ceo",
+            None,
+            "acme's message",
+            "paused",
+            1_000,
+            RedeemContext::default(),
+        );
+
+        assert!(
+            budget_pauses_for(&globex).peek("ceo").is_none(),
+            "a marker parked for one company must not leak into another's set"
+        );
+        assert!(budget_pauses_for(&acme).peek("ceo").is_some());
+    }
+
+    #[test]
+    fn an_unrelated_agent_has_no_parked_marker() {
+        let set = BudgetPauseSet::default();
+        set.park("ceo", None, "hi", "paused", 1_000, RedeemContext::default());
+        assert!(
+            set.peek("engineer").is_none(),
+            "parking for one agent must not be visible under another's key"
+        );
+    }
+
+    /// Issue #1846 review (Codex #3865812419/#3865812423/#3865812432):
+    /// `RedeemContext::from_events` reads the ORIGINAL operator message's
+    /// parent/deliverable/mentions out of a cycle's event batch, skipping
+    /// any non-`OperatorMessage` record ahead of it.
+    #[test]
+    fn redeem_context_reads_the_first_operator_message_in_a_batch() {
+        use crate::ports::types::MentionTarget;
+
+        let mention = Mention {
+            target: MentionTarget::Agent {
+                id: "researcher".to_string(),
+            },
+            text: "@researcher".to_string(),
+            offset: 0,
+            quiet: false,
+        };
+        let events = vec![
+            (
+                None,
+                CompanyEvent::WorkspaceChanged {
+                    node_id: "n-1".into(),
+                    change: "updated".into(),
+                },
+            ),
+            (
+                None,
+                CompanyEvent::OperatorMessage {
+                    text: "ship it".into(),
+                    by: None,
+                    chat: Some("general".into()),
+                    parent: Some(EventSeq::new(9)),
+                    deliverable: Some(MessageIntent::Chat),
+                    mentions: vec![mention.clone()],
+                    attachments: Vec::new(),
+                },
+            ),
+        ];
+
+        let ctx = RedeemContext::from_events(&events);
+        assert_eq!(ctx.parent, Some(EventSeq::new(9)));
+        assert_eq!(ctx.deliverable, Some(MessageIntent::Chat));
+        assert_eq!(ctx.mentions, vec![mention]);
+    }
+
+    #[test]
+    fn redeem_context_defaults_when_no_operator_message_is_in_the_batch() {
+        let events = vec![(
+            None,
+            CompanyEvent::WorkspaceChanged {
+                node_id: "n-1".into(),
+                change: "updated".into(),
+            },
+        )];
+        assert_eq!(
+            RedeemContext::from_events(&events),
+            RedeemContext::default(),
+            "a batch with no OperatorMessage carries nothing to replay"
+        );
+    }
+
+    /// Issue #1846 review: the ambient scope round-trips exactly the shape
+    /// `CHAT_ONLY_TURN` already proves for its own hint — set, read from
+    /// inside, and gone once the scope's future finishes.
+    #[tokio::test]
+    async fn current_redeem_context_reads_the_ambient_scope_and_defaults_outside_it() {
+        assert_eq!(
+            current_redeem_context(),
+            RedeemContext::default(),
+            "outside any scope, the ambient context is the default"
+        );
+
+        let ctx = RedeemContext {
+            parent: Some(EventSeq::new(3)),
+            deliverable: Some(MessageIntent::Workflow),
+            mentions: Vec::new(),
+            text: None,
+            attachments: Vec::new(),
+        };
+        let read_back = with_redeem_context(ctx.clone(), async { current_redeem_context() }).await;
+        assert_eq!(
+            read_back, ctx,
+            "inside the scope, the ambient context is what was set"
+        );
+
+        assert_eq!(
+            current_redeem_context(),
+            RedeemContext::default(),
+            "the scope does not leak past its own future"
+        );
     }
 }

@@ -162,7 +162,7 @@ export function EngineSection({ client, company, onApplied }: Props) {
 
   return (
     <Card data-testid="memory-engine-panel">
-      <CardHeader className="pb-3">
+      <CardHeader>
         <CardTitle className="text-base">Memory engine</CardTitle>
         <CardDescription>
           {state.editable ? (

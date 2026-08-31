@@ -53,14 +53,52 @@ describe("chargebeeHealth", () => {
     expect(health.remedy).toBeNull();
   });
 
-  it("names the manifest, not the form, when the company does not grant chargebee", () => {
+  it("names the grant, not the form, when the company does not grant chargebee", () => {
     // Both credentials stored and still nothing reaches an agent. Saying "not
     // connected" would send the operator back through a form already correct.
     const health = chargebeeHealth({ ...CHARGEBEE_OK, granted: false });
     expect(health.state).toBe("not_granted");
-    expect(health.remedy).toContain("[tools].allow");
-    // And the panel does not offer to fix what it cannot.
+    expect(health.remedy).toContain("chargebee");
+    // Issue #1796: the remedy used to end in "it cannot be fixed from this
+    // page" and stop. It now names the namespace the panel offers to grant, so
+    // the panel can render the control that ends the dead end.
+    expect(health.grantNamespace).toBe("chargebee");
+    // The credential form still is not the fix, so the panel stays collapsed.
     expect(startsExpanded(health)).toBe(false);
+  });
+
+  it("does not claim a connection the company never made (issue #1796)", () => {
+    // The reported bug, exactly: a company with no Chargebee credential at all
+    // fell into the not-granted arm, which asserts "Connected" and interpolates
+    // the site — rendering, on a live tenant, "Connected to null — but no
+    // teammate can use it". Two claims in one line, both false.
+    const health = chargebeeHealth({
+      ...CHARGEBEE_OK,
+      granted: false,
+      apiKeyConfigured: false,
+      site: null,
+    });
+    expect(health.state).toBe("not_configured");
+    expect(health.label).toBe("Not connected");
+    expect(health.label).not.toContain("null");
+    expect(health.label).not.toContain("Connected to");
+    // And the form IS the fix now, so the panel opens itself on arrival.
+    expect(startsExpanded(health)).toBe(true);
+  });
+
+  it("still reports the missing grant once a credential exists", () => {
+    // The half of the precedence that must survive the fix above: a company
+    // that HAS connected and lacks the grant must not be told to re-enter a
+    // credential it already stored.
+    const configuredButUngranted = chargebeeHealth({ ...CHARGEBEE_OK, granted: false });
+    expect(configuredButUngranted.state).toBe("not_granted");
+    // A half credential is not one, so it reports the form, not the grant.
+    expect(
+      chargebeeHealth({ ...CHARGEBEE_OK, granted: false, site: null }).state,
+    ).toBe("not_configured");
+    expect(
+      chargebeeHealth({ ...CHARGEBEE_OK, granted: false, apiKeyConfigured: false }).state,
+    ).toBe("not_configured");
   });
 
   it("puts not-in-build above not-granted", () => {
@@ -68,7 +106,9 @@ describe("chargebeeHealth", () => {
     // without it, so reporting the grant would hand over the wrong remedy.
     const health = chargebeeHealth({ ...CHARGEBEE_OK, granted: false, inBuild: false });
     expect(health.state).toBe("not_in_build");
-    expect(health.remedy).not.toContain("[tools].allow");
+    // And no grant control either: the grant would succeed and change nothing,
+    // because this host has no billing tools to hand out (issue #1796).
+    expect(health.grantNamespace).toBeUndefined();
   });
 
   it("never reports connected without BOTH the key and the site", () => {
@@ -119,5 +159,31 @@ describe("paypalHealth", () => {
     expect(paypalHealth({ ...PAYPAL_OK, granted: false, inBuild: false }).state).toBe(
       "not_in_build",
     );
+  });
+
+  it("offers the grant, and only where it would help", () => {
+    // Issue #1796: the Wallet panel said "Add `paypal` to [tools].allow" and
+    // stopped, which on a hosted tenant named a file the operator cannot edit.
+    expect(paypalHealth({ ...PAYPAL_OK, granted: false }).grantNamespace).toBe("paypal");
+    expect(paypalHealth(PAYPAL_OK).grantNamespace).toBeUndefined();
+    expect(
+      paypalHealth({ ...PAYPAL_OK, granted: false, inBuild: false }).grantNamespace,
+    ).toBeUndefined();
+  });
+
+  it("does not claim a connection the company never made (issue #1796)", () => {
+    // The Wallet half of the reported bug. Chargebee's showed the `null`;
+    // PayPal's said a bare "Connected — but no teammate can use it" over a
+    // company that had never entered a client id, which is the same false claim
+    // with nothing in it to give the falsehood away.
+    const health = paypalHealth({
+      ...PAYPAL_OK,
+      granted: false,
+      clientIdConfigured: false,
+      clientSecretConfigured: false,
+    });
+    expect(health.state).toBe("not_configured");
+    expect(health.label).toBe("Not connected");
+    expect(startsExpanded(health)).toBe(true);
   });
 });

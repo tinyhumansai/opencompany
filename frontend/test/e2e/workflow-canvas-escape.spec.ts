@@ -32,6 +32,19 @@ async function openCanvas(page: Page) {
   });
 }
 
+/**
+ * Issue #1683 opens the Copilot on select. Copilot and the node inspector
+ * share the canvas's right edge and Copilot wins while open (#303), so a spec
+ * driving the inspector has to close it first — same as an operator would.
+ */
+async function closeCopilotIfOpen(page: Page) {
+  const toggle = page.getByTestId("workflow-copilot-toggle");
+  if (await toggle.isVisible().catch(() => false)) {
+    await toggle.click();
+    await expect(page.getByTestId("workflow-copilot")).toBeHidden();
+  }
+}
+
 async function rightmostNode(page: Page) {
   const nodes = page.locator(".react-flow__node");
   const count = await nodes.count();
@@ -51,6 +64,7 @@ async function rightmostNode(page: Page) {
 
 test("Escape closes the node inspector and restores the canvas", async ({ page }) => {
   await openCanvas(page);
+  await closeCopilotIfOpen(page);
   const node = await rightmostNode(page);
   const before = await box(node);
 
@@ -75,7 +89,8 @@ test("Escape closes the copilot and does nothing once canvas overlays are gone",
 }) => {
   await openCanvas(page);
 
-  await page.getByTestId("workflow-copilot-toggle").click();
+  // Issue #1683 opens the Copilot on select — it is already up by the time
+  // the canvas is.
   const copilot = page.getByTestId("workflow-copilot");
   await expect(copilot).toBeVisible();
 
@@ -91,7 +106,8 @@ test("Escape closes the copilot and does nothing once canvas overlays are gone",
 test("the copilot leads with its purpose and mutes the unavailable composer", async ({ page }) => {
   await openCanvas(page);
 
-  await page.getByTestId("workflow-copilot-toggle").click();
+  // Issue #1683 opens the Copilot on select — it is already up by the time
+  // the canvas is.
   const copilot = page.getByTestId("workflow-copilot");
   await expect(copilot).toBeVisible();
   await expect(page.getByTestId("workflow-copilot-introduction")).toContainText(

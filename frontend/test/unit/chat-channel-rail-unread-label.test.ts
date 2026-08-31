@@ -70,6 +70,23 @@ describe("collapsed ChannelRail unread labels", () => {
     ]);
   });
 
+  it("includes mention and unread counts in the compact accessible name", () => {
+    act(() =>
+      root.render(
+        createElement(ChannelRail, {
+          sections: SECTIONS,
+          activeId: null,
+          unread: { "front-desk": 3 },
+          mentions: { "front-desk": 2 },
+          onSelect: () => {},
+          collapsed: true,
+        }),
+      ),
+    );
+
+    expect(channelButtons()[0].getAttribute("aria-label")).toBe("Front desk, 2 mentions, 3 unread");
+    expect(container.querySelectorAll('[data-testid="channel-mentions"]')).toHaveLength(1);
+  });
   it("caps a huge count the way the expanded badge does", () => {
     act(() =>
       root.render(
@@ -198,5 +215,84 @@ describe("section folds survive a rail collapse/expand (P2 review)", () => {
     });
     expect(toggles()[0].getAttribute("aria-expanded")).toBe("false");
     expect(toggles()[1].getAttribute("aria-expanded")).toBe("false");
+  });
+});
+
+/**
+ * The pinned Operator row shows unread the same as any other channel
+ * (PR #1781 review, Codex P2).
+ *
+ * A workflow report can land in the Operator feed while another channel is
+ * open, same as any other channel — the collapsed rail's `CompactChannelRow`
+ * already surfaced that (it flat-maps every section, this one included), but
+ * `PinnedOperatorRow` in the expanded rail never received the `unread` map at
+ * all, so folding the rail changed whether the pinned row could tell you
+ * something was waiting.
+ */
+const OPERATOR_SECTIONS: ChannelSection[] = [
+  {
+    id: "operator",
+    label: "Operator",
+    channels: [
+      {
+        id: "operator",
+        name: "Operator",
+        kind: "channel",
+        purpose: "Workflow reports.",
+        system: true,
+      },
+    ],
+  },
+];
+
+describe("expanded ChannelRail pinned Operator row unread", () => {
+  const pinnedRow = () =>
+    container.querySelector<HTMLButtonElement>('aside button[aria-current], aside button');
+
+  it("shows the unread count on the pinned row when a report lands unseen", () => {
+    act(() =>
+      root.render(
+        createElement(ChannelRail, {
+          sections: OPERATOR_SECTIONS,
+          activeId: null,
+          unread: { operator: 2 },
+          onSelect: () => {},
+        }),
+      ),
+    );
+
+    const badge = container.querySelector('[data-testid="channel-unread"]');
+    expect(badge?.textContent).toBe("2");
+  });
+
+  it("renders no badge when the Operator feed has nothing unread", () => {
+    act(() =>
+      root.render(
+        createElement(ChannelRail, {
+          sections: OPERATOR_SECTIONS,
+          activeId: null,
+          unread: {},
+          onSelect: () => {},
+        }),
+      ),
+    );
+
+    expect(container.querySelector('[data-testid="channel-unread"]')).toBeNull();
+  });
+
+  it("suppresses the badge while the Operator feed is the active channel", () => {
+    act(() =>
+      root.render(
+        createElement(ChannelRail, {
+          sections: OPERATOR_SECTIONS,
+          activeId: "operator",
+          unread: { operator: 5 },
+          onSelect: () => {},
+        }),
+      ),
+    );
+
+    expect(container.querySelector('[data-testid="channel-unread"]')).toBeNull();
+    expect(pinnedRow()?.getAttribute("aria-current")).toBe("page");
   });
 });

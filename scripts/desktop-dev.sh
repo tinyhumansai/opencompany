@@ -39,6 +39,12 @@ Environment:
                          leave your installed application's data alone:
 
     OPENCOMPANY_DATA_DIR=$PWD/target/desktop-dev ./scripts/desktop-dev.sh
+
+  DESKTOP_FEATURES       Cargo features for the shell. Defaults to the set the
+                         release workflow ships, so what you run matches what
+                         we ship. Set it empty to build the leaner default:
+
+    DESKTOP_FEATURES= ./scripts/desktop-dev.sh
 EOF
 }
 
@@ -126,15 +132,73 @@ else
     done
 fi
 
+# The feature set the SHIPPED desktop carries, read from the release workflow
+# that declares it (issue #1823).
+#
+# Without this the desktop you RUN is not the desktop we SHIP, and it differs in
+# exactly the surfaces the desktop exists to provide. `acp` gates
+# `RuntimeBuilder::with_acp_agents`, so a locally-run desktop resolved every
+# `transport = "local"` harness as unavailable — a `claude`-bound teammate could
+# not take a turn, on the one host that has an `AcpAgentFactory` to give.
+# `composio` gates whether the connector tiles are compiled at all, so they read
+# "this build was compiled without", which is not an instruction a desktop user
+# can follow.
+#
+# **Parsed rather than copied.** A second literal here is a third place to
+# forget: the release workflow and `ci.yml` already carry the same string with a
+# comment asking a human to keep them in step, and this script would have made
+# that promise harder to keep at exactly the moment it started to matter. The
+# workflow stays the source of truth; this reads it.
+#
+# Anchored on the key at the start of a line, so a mention of the name inside a
+# comment cannot be picked up instead. A miss is fatal rather than a silent
+# fall-back to no features: that would restore the very divergence this exists
+# to close, and do it quietly.
+RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/release-desktop-macos.yml"
+# An explicitly-set `DESKTOP_FEATURES` wins, even when empty — that is someone
+# deliberately asking for the leaner build. Only an UNSET one is read from the
+# workflow, and a read that finds nothing is fatal: falling back to no features
+# would quietly restore the divergence this exists to close.
+#
+# The `+set` test has to happen BEFORE the assignment, because after it the
+# variable is set either way and the two cases are indistinguishable.
+if [ -z "${DESKTOP_FEATURES+set}" ]; then
+    DESKTOP_FEATURES=$(
+        sed -n 's/^[[:space:]]*DESKTOP_RELEASE_FEATURES:[[:space:]]*//p' \
+            "${RELEASE_WORKFLOW}" | head -n 1
+    )
+    if [ -z "${DESKTOP_FEATURES}" ]; then
+        echo "desktop-dev: could not read DESKTOP_RELEASE_FEATURES from ${RELEASE_WORKFLOW}" >&2
+        echo "desktop-dev: set DESKTOP_FEATURES=... to choose the set yourself" >&2
+        exit 1
+    fi
+fi
+if [ -n "${DESKTOP_FEATURES}" ]; then
+    echo "desktop-dev: building with --features ${DESKTOP_FEATURES}"
+else
+    echo "desktop-dev: building with no extra features (DESKTOP_FEATURES is empty)"
+fi
+
 # The CLI from `frontend/node_modules`, as `ci.yml` uses, falling back to a
 # `cargo install`ed one. Run from `src-tauri` so the CLI finds this project:
 # it searches *subfolders* of the working directory, so from `frontend/` it
 # would pick the console wrapper in `frontend/src-tauri/` instead — a different
 # application that happens to share this one's `productName`.
+#
+# `--features` is the CLI's own flag rather than the `-- --features` the release
+# build uses. Both reach cargo, but they reach it differently: on `dev` a bare
+# `--` means "arguments for the runner", and a reader has to already know the
+# runner is cargo to see that the features land anywhere. `tauri build` has no
+# such flag, which is why the workflow spells it the other way.
 TAURI_CLI="${REPO_ROOT}/frontend/node_modules/.bin/tauri"
 cd "${REPO_ROOT}/src-tauri"
-if [ -x "${TAURI_CLI}" ]; then
-    "${TAURI_CLI}" dev
+if [ -n "${DESKTOP_FEATURES}" ]; then
+    set -- --features "${DESKTOP_FEATURES}"
 else
-    cargo tauri dev
+    set --
+fi
+if [ -x "${TAURI_CLI}" ]; then
+    "${TAURI_CLI}" dev "$@"
+else
+    cargo tauri dev "$@"
 fi

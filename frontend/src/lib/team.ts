@@ -4,6 +4,7 @@
 // are user-definable here.
 
 import type { AgentDeskDto, TeamMemberDto } from "@/api/types";
+import { avatarRef, hashedFlavour } from "@/lib/avatar";
 
 /** A desk a teammate sits on, as the roster read reports it. */
 export type TeamMemberDesk = AgentDeskDto;
@@ -15,7 +16,11 @@ export interface TeamMember {
   description: string;
   /** Avatar tone key; derived from the id so colors stay stable. */
   tone: string;
-  /** Mascot avatar key; derived from the same seed, for the same reason. */
+  /**
+   * The face to draw: the avatar reference this teammate **chose**, or the
+   * mascot hashed from its id when nobody has (`lib/avatar.ts`). Always a
+   * resolvable reference, never absent — every teammate has a face.
+   */
   avatar: string;
   /**
    * Whether this teammate has an inbox on the host. Read from `GET …/team` and
@@ -95,48 +100,15 @@ export function toneFor(seed: string): string {
 }
 
 /**
- * The mascot avatars shipped in `public/avatars/`, one file per colourway.
+ * The face to draw for a teammate nobody has chosen one for — the mascot hashed
+ * from its id, as a full avatar reference.
  *
- * Eleven rather than the eight `TONE_KEYS` holds on purpose: the tones are a
- * hue circle that deliberately avoids amber, green and red, while the mascots
- * have no such constraint. Keeping the lists separate stops one being trimmed
- * to match the other.
- */
-const AVATAR_KEYS = [
-  "amber",
-  "blue",
-  "clay",
-  "cloud",
-  "ember",
-  "graphite",
-  "green",
-  "indigo",
-  "rose",
-  "teal",
-  "violet",
-];
-
-/**
- * Picks a teammate's mascot from the same seed [`toneFor`] uses.
- *
- * A hash rather than a random draw, for the reason that matters to an
- * operator: a teammate keeps the same face across reloads, browsers and
- * machines, with nothing persisted anywhere. Drawing randomly at creation
- * would need a stored field, and drawing randomly at render would give the
- * same teammate a new face every time the page reloaded.
- *
- * Seeded with the id where there is one (`toneFor` is called the same way), so
- * renaming a teammate does not change its face.
+ * A thin wrapper over [`hashedFlavour`] so the many callers that only have a
+ * seed keep one import; the hashing rule, the flavour list and the reference
+ * grammar all live in `lib/avatar.ts` beside the host module they mirror.
  */
 export function avatarFor(seed: string): string {
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) | 0;
-  return AVATAR_KEYS[Math.abs(hash) % AVATAR_KEYS.length];
-}
-
-/** Where [`avatarFor`]'s key lives on disk. */
-export function avatarSrc(key: string): string {
-  return `/avatars/blob-${key}.webp`;
+  return `tiny:${hashedFlavour(seed)}`;
 }
 
 export function initials(name: string): string {
@@ -186,7 +158,11 @@ export function fromDto(dto: TeamMemberDto): TeamMember {
     role: dto.role,
     description: dto.description ?? "",
     tone: toneFor(dto.id || name),
-    avatar: avatarFor(dto.id || name),
+    // What this teammate chose, else the hashed default. Resolved to one
+    // reference here, because a roster row is only ever *drawn* — the picker
+    // needs "chosen" and "default" kept apart and reads the detail DTO, which
+    // carries the raw field.
+    avatar: avatarRef(dto.avatar, dto.id || name),
     inboxEnabled: dto.inboxEnabled ?? false,
     global: dto.global,
     // Carried through as-is: `undefined` means uncapped and must stay
@@ -275,6 +251,7 @@ export function newMember(fields: { name: string; role: string; description: str
     role: fields.role.trim(),
     description: fields.description.trim(),
     tone: toneFor(memberId),
+    // Nobody has chosen a face for a teammate that was created a moment ago.
     avatar: avatarFor(memberId),
     inboxEnabled: false,
     // Nothing on a host has granted this teammate anything or seated it

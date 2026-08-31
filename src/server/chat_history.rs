@@ -10,11 +10,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::{
-    Actor, ActorKind, CompanyEvent, CompanyRecord, EventSeq, Mention, MentionTarget, StoredEvent,
-    TurnStep,
+    Actor, ActorKind, Attachment, CompanyEvent, CompanyRecord, EventSeq, Mention, MentionTarget,
+    StoredEvent, TurnStep,
 };
 use crate::server::ops::language::DEFAULT_DESK;
 
@@ -168,6 +170,41 @@ pub struct MessageView {
     pub at_millis: f64,
     /// Whether it is the operator's own message.
     pub mine: bool,
+    /// Whether a **person** wrote this line, as opposed to the runtime.
+    ///
+    /// Not derivable downstream, which is why it is projected here (issue
+    /// #1734). [`Self::mine`] answers "did *you* write it" and is per-viewer, so
+    /// a colleague's message reads `mine: false` and reaches the console on the
+    /// company side of the transcript — indistinguishable there from an agent
+    /// reply. [`Self::channel`] cannot separate them either: the offline echo
+    /// brain names its own outbound channel `operator`, exactly as the
+    /// `OperatorMessage` arm does, so a journaled echo reply and a human's
+    /// message carry the same label.
+    ///
+    /// The host is the only layer that still knows the difference — it is
+    /// reading the event variant. Anything downstream is guessing, and the guess
+    /// this exists to stop is chat marking a colleague's own words as the echo
+    /// brain's, which fabricates an attribution rather than merely missing one.
+    ///
+    /// `true` for [`CompanyEvent::OperatorMessage`] and nothing else. A
+    /// dispatch marker and an agent reply are both `false`: neither was typed by
+    /// a person.
+    pub by_person: bool,
+    /// Whether this row may reach only administrators (issue #1781 review,
+    /// Codex P1).
+    ///
+    /// `true` for exactly one shape today: an `owner`-destination workflow
+    /// report that fell back to the operator channel because the company has
+    /// no mailbox, or no active admin has an address. The ordinary email
+    /// branch of that same destination reaches active admins only
+    /// (`workflows::delivery::owner_recipients`); this field is what lets the
+    /// channel fallback honour the same restriction rather than silently
+    /// widening the audience to every signed-in company user. The caller
+    /// (`server::operator::chat_history_response`) drops any row with this set
+    /// before returning to a non-admin viewer — see
+    /// [`OWNER_FALLBACK_REPORT_AUTHOR`](crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+    /// for how the underlying event is marked.
+    pub admin_only: bool,
     /// The scrubbed processing steps behind a company reply, so a rehydrated
     /// transcript renders the same tool-call timeline the live turn showed.
     /// Empty for operator messages and tool-less replies.
@@ -213,10 +250,24 @@ pub struct MessageView {
     /// Empty for a message that mentions nobody, which is every message
     /// journaled before mentions existed.
     pub mentions: Vec<MentionView>,
+    /// Files attached to this message (issue #1682), each a durable reference
+    /// into the company workspace with the store-computed name / mime / size.
+    ///
+    /// Projected straight from the stored [`Attachment`] rows — the name and
+    /// mime are already the store's, resolved server-side at send time, so this
+    /// surface adds no viewer-scoping the way [`MentionView`] does: an
+    /// attachment names a file the operator themself put in this company's own
+    /// workspace, reachable by the same person through the blob route.
+    ///
+    /// Empty on an [`AgentReply`](CompanyEvent::AgentReply), a system pill, and
+    /// every operator message journaled before this field existed — the shared
+    /// [`MessageView`], so REST and GraphQL carry the same rows (issue #65).
+    pub attachments: Vec<Attachment>,
 }
 
 /// One mention inside one message, as a reader sees it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MentionView {
     /// The literal span the author typed, so the renderer highlights what is
     /// actually in the text rather than what the target is called now.
@@ -380,21 +431,28 @@ impl MessageView {
             } => MessageView {
                 id,
                 channel: agent_id.clone(),
+                admin_only: agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR,
                 author: agent_id,
                 text,
                 at_millis,
                 mine: false,
+                // The runtime wrote this, whichever brain produced it.
+                by_person: false,
                 steps,
                 task_id,
                 parent_id: parent.map(|seq| seq.value().to_string()),
                 reactions: Vec::new(),
                 mentions: project_mentions(&mentions, authors, viewer),
+                // A reply is the company's own voice and carries no operator
+                // upload (issue #1682).
+                attachments: Vec::new(),
             },
             CompanyEvent::OperatorMessage {
                 text,
                 by,
                 parent,
                 mentions,
+                attachments,
                 ..
             } => {
                 let (author, mine) = match &by {
@@ -414,15 +472,22 @@ impl MessageView {
                 MessageView {
                     id,
                     channel: "operator".to_string(),
+                    admin_only: false,
                     author,
                     text,
                     at_millis,
                     mine,
+                    // A person typed this — the one arm where that is true.
+                    by_person: true,
                     steps: Vec::new(),
                     task_id: None,
                     parent_id: parent.map(|seq| seq.value().to_string()),
                     reactions: Vec::new(),
                     mentions: project_mentions(&mentions, authors, viewer),
+                    // Issue #1682: the operator's attached files, carried
+                    // through so a reload renders the same chips the live send
+                    // showed.
+                    attachments,
                 }
             }
             // The dispatch terminal (issue #377), as the channel marker a
@@ -450,29 +515,35 @@ impl MessageView {
             } => MessageView {
                 id,
                 channel: crate::ports::SYSTEM_AUTHOR.to_string(),
+                admin_only: false,
                 author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 text: dispatch_marker_text(&column),
                 at_millis,
                 mine: false,
+                by_person: false,
                 steps: Vec::new(),
                 task_id: Some(task_id),
                 parent_id: None,
                 reactions: Vec::new(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
             },
             // `owns` never admits other variants into a history.
             other => MessageView {
                 id,
                 channel: crate::ports::SYSTEM_AUTHOR.to_string(),
+                admin_only: false,
                 author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 text: format!("{other:?}"),
                 at_millis,
                 mine: false,
+                by_person: false,
                 steps: Vec::new(),
                 task_id: None,
                 parent_id: None,
                 reactions: Vec::new(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
             },
         }
     }
@@ -490,7 +561,7 @@ impl MessageView {
 ///   its `@` — which is exactly what a reader would have seen anyway.
 /// * **`mine` is decided.** Per viewer, and `true` for `@everyone` as well as
 ///   for a direct mention, because a broadcast is addressed to this reader too.
-fn project_mentions(
+pub(crate) fn project_mentions(
     mentions: &[Mention],
     authors: &HashMap<String, String>,
     viewer: &Viewer,
@@ -614,7 +685,7 @@ impl AttributionAudit {
 /// bound; in practice that notice is rare enough not to move it.
 /// Whether a stored `agent_id` names an author we can actually resolve.
 ///
-/// The roster, **plus two ids that are truthful authors without being teammates**.
+/// The roster, **plus three ids that are truthful authors without being teammates**.
 ///
 /// [`SYSTEM_AUTHOR`](crate::ports::SYSTEM_AUTHOR) (issue #966) is the runtime
 /// speaking for itself — an approval-overflow notice, the `"Acknowledged."`
@@ -630,18 +701,43 @@ impl AttributionAudit {
 /// false positive, and would make the audit's number drift upward on a company
 /// doing nothing wrong.
 ///
+/// [`WORKFLOW_REPLY_AUTHOR`](crate::runtime::WORKFLOW_REPLY_AUTHOR) is the same
+/// case as `SYSTEM_AUTHOR`: a delivered workflow report is journaled under it
+/// on purpose, not a destination that leaked into the author field, so it must
+/// not inflate the count either — and unlike `SYSTEM_AUTHOR`, no roster entry
+/// can *ever* shadow it, on this company or any other: the id is hyphenated,
+/// so neither a minted slug nor a manifest-declared one can equal it (see the
+/// constant's doc).
+///
+/// [`OWNER_FALLBACK_REPORT_AUTHOR`](crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+/// is the same case again, one level narrower: it is `WORKFLOW_REPLY_AUTHOR`'s
+/// own admin-only sibling, journaled when an `owner` report has no mailbox to
+/// reach (issue #1781 review, Codex P2) — a legitimate report, deliberately
+/// unmintable for the same reason, and it must not inflate the count either.
+///
 /// This is the single predicate the audit and any presentation of its result
 /// must share; two copies would let the count and the rendering disagree about
 /// which rows are unknown.
 pub fn is_known_author(agent_id: &str, record: &CompanyRecord) -> bool {
     agent_id == crate::ports::CONFINED_AGENT_ID
         || agent_id == crate::ports::SYSTEM_AUTHOR
+        || agent_id == crate::runtime::WORKFLOW_REPLY_AUTHOR
+        || agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR
         || record.resolve_roster_agent_id(agent_id).is_some()
 }
 
+/// `is_admin` gates the same admin-only rows [`history_for_desk`] and
+/// [`history_total_for_desk`] already exclude for a non-admin viewer (issue
+/// #1781 review, Codex P2): an owner-fallback report is invisible on the
+/// transcript and over SSE, but the raw `replies` count previously included
+/// it regardless of caller, so a Member watching the count tick up around an
+/// owner-fallback delivery could infer a hidden admin-only message exists.
+/// Excluded here — before `fold` — so a non-admin's count can never expose
+/// that inference.
 pub async fn channel_attributed_replies(
     runtime: &CompanyRuntime,
     record: &CompanyRecord,
+    is_admin: bool,
 ) -> Result<AttributionAudit, OpenCompanyError> {
     const PAGE: usize = 512;
     let mut audit = AttributionAudit::default();
@@ -655,7 +751,15 @@ pub async fn channel_attributed_replies(
             break;
         }
         let last = page[page.len() - 1].seq;
-        audit.fold(&page, |agent_id| is_known_author(agent_id, record));
+        if is_admin {
+            audit.fold(&page, |agent_id| is_known_author(agent_id, record));
+        } else {
+            let visible: Vec<StoredEvent> = page
+                .into_iter()
+                .filter(|stored| !is_admin_only_event(&stored.event))
+                .collect();
+            audit.fold(&visible, |agent_id| is_known_author(agent_id, record));
+        }
         cursor = EventSeq::new(last.value() + 1);
     }
     Ok(audit)
@@ -663,9 +767,11 @@ pub async fn channel_attributed_replies(
 
 /// Loads roster display labels for a company: user id → label.
 ///
-/// Prefers a display name, and falls back to the email's *local part* rather
-/// than the whole address: a desk history is read by every member, and it
-/// should not hand each of them everyone else's email.
+/// Prefers a display name, and falls back to one derived from the email's
+/// local part rather than the whole address: a desk history is read by every
+/// member, and it should not hand each of them everyone else's email. The
+/// ladder is [`UserRecord::display_label`] — the same one the profile pane and
+/// the mention picker use, so the same person reads the same way everywhere.
 pub async fn author_labels(
     runtime: &CompanyRuntime,
 ) -> Result<HashMap<String, String>, OpenCompanyError> {
@@ -673,13 +779,9 @@ pub async fn author_labels(
     Ok(users
         .into_iter()
         .map(|user| {
-            let label = user.display_name.unwrap_or_else(|| {
-                user.email
-                    .split('@')
-                    .next()
-                    .unwrap_or("someone")
-                    .to_string()
-            });
+            let label = user
+                .display_label()
+                .unwrap_or_else(|| "someone".to_string());
             (user.id, label)
         })
         .collect())
@@ -691,6 +793,13 @@ pub async fn author_labels(
 /// messages before it are considered. `first` caps how many of the remaining,
 /// most-recent messages come back.
 ///
+/// `is_admin` gates [`MessageView::admin_only`] rows (issue #1781 review,
+/// Codex P1): a non-admin viewer never sees one, and the exclusion happens
+/// **inside** the paging loop, before a row counts toward `first` — filtering
+/// the returned `Vec` afterward would silently short a non-admin's page by
+/// however many admin-only rows it held, which is a pagination bug, not
+/// merely a display one.
+///
 /// Shared by the GraphQL `Chat.history` resolver and the REST
 /// `GET .../chat/history` route so the two can never disagree about what a
 /// desk's history contains (issue #65).
@@ -701,6 +810,7 @@ pub async fn history_for_desk(
     viewer: &Viewer,
     before_seq: Option<u64>,
     first: usize,
+    is_admin: bool,
 ) -> Result<Vec<MessageView>, OpenCompanyError> {
     // A page is events rather than messages: a busy company can put unrelated
     // events between two chat turns. Walking backward keeps the newest `first`
@@ -730,7 +840,14 @@ pub async fn history_for_desk(
         cursor = page.last().map(|event| event.seq);
         for event in page {
             if owns(desk_id, desk_name, &event.event) {
-                messages.push(MessageView::project(event, viewer, &authors));
+                let message = MessageView::project(event, viewer, &authors);
+                // Excluded before it counts toward `first` — see this fn's
+                // doc. A non-admin viewer's page fills with the next visible
+                // row instead of coming back short.
+                if message.admin_only && !is_admin {
+                    continue;
+                }
+                messages.push(message);
                 if messages.len() == first {
                     break;
                 }
@@ -855,11 +972,20 @@ async fn drop_dead_cards(
 /// not. Keep that potentially full journal walk out of [`history_for_desk`],
 /// so bounded transcript readers stop as soon as their requested window is
 /// complete.
+///
+/// `is_admin` excludes an owner-fallback report the same way
+/// [`history_for_desk`]'s `is_admin` param excludes it from `items` (issue
+/// #1781 review, Codex P2): without this, a non-admin querying a GraphQL desk
+/// that holds one — notably a grandfathered real desk at the literal
+/// `operator` id — got a `total` counting a row `items` had already hidden,
+/// which both breaks `Page.total`'s item-count contract and reveals that a
+/// hidden admin report exists.
 pub async fn history_total_for_desk(
     runtime: &CompanyRuntime,
     desk_id: &str,
     desk_name: &str,
     before_seq: Option<u64>,
+    is_admin: bool,
 ) -> Result<i32, OpenCompanyError> {
     const EVENT_PAGE: usize = 512;
 
@@ -877,9 +1003,15 @@ pub async fn history_total_for_desk(
             if before_seq.is_some_and(|before| event.seq.value() >= before) {
                 return Ok(total);
             }
-            if owns(desk_id, desk_name, &event.event) {
-                total = total.saturating_add(1);
+            if !owns(desk_id, desk_name, &event.event) {
+                continue;
             }
+            // Same admin-only exclusion `MessageView::project` applies to
+            // `history_for_desk`'s rows (see `is_admin_only_event`'s doc).
+            if !is_admin && is_admin_only_event(&event.event) {
+                continue;
+            }
+            total = total.saturating_add(1);
         }
         let Some(last) = page.last() else {
             break;
@@ -890,6 +1022,20 @@ pub async fn history_total_for_desk(
         }
     }
     Ok(total)
+}
+
+/// Whether `event` is the owner-fallback report — admin-only on both
+/// [`history_for_desk`] (via [`MessageView::project`]'s `admin_only` field,
+/// which applies the identical `agent_id == OWNER_FALLBACK_REPORT_AUTHOR`
+/// check inline) and [`history_total_for_desk`]'s count (issue #1781 review,
+/// Codex P2), so the two projections of the same journal cannot disagree
+/// about which rows a non-admin is shown.
+fn is_admin_only_event(event: &CompanyEvent) -> bool {
+    matches!(
+        event,
+        CompanyEvent::AgentReply { agent_id, .. }
+            if agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR
+    )
 }
 
 #[cfg(test)]
@@ -923,6 +1069,7 @@ mod test {
             by: None,
             chat: chat.map(str::to_string),
             deliverable: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -1011,6 +1158,7 @@ mod test {
             }),
             chat: Some(MAIN_THREAD_ID.to_string()),
             deliverable: None,
+            attachments: Vec::new(),
         };
         assert!(owns(GENERAL_DESK, GENERAL_DESK, &event));
         assert!(!owns("strategy", "Strategy desk", &event));
@@ -1027,6 +1175,7 @@ mod test {
             by: None,
             chat: Some(MAIN_THREAD_ID.to_string()),
             deliverable: None,
+            attachments: Vec::new(),
         };
         // The console queries the main thread with desk = ("main", "main").
         assert!(owns(MAIN_THREAD_ID, MAIN_THREAD_ID, &event));
@@ -1045,6 +1194,7 @@ mod test {
             by: None,
             chat: Some("strategy".to_string()),
             deliverable: None,
+            attachments: Vec::new(),
         };
         assert!(owns("strategy", "Strategy desk", &event));
         assert!(!owns(MAIN_THREAD_ID, MAIN_THREAD_ID, &event));
@@ -1168,7 +1318,78 @@ mod test {
             by: None,
             chat: Some("studio".to_string()),
             deliverable: None,
+            attachments: Vec::new(),
         }
+    }
+
+    /// Who *typed* a line is a fact only the host still holds (issue #1734).
+    ///
+    /// Every downstream shortcut for it is wrong, and the two obvious ones are
+    /// wrong in ways that look right:
+    ///
+    /// * `mine` is per-viewer, so a colleague's own message is `mine: false`
+    ///   and lands on the company side of their reader's transcript, beside the
+    ///   agent replies.
+    /// * `channel == "operator"` collides head-on. The offline echo brain names
+    ///   its own outbound channel `operator` (`brain::echo`), exactly as this
+    ///   arm does, so a journaled echo reply and a human's message carry the
+    ///   same label. A console that split on it marked neither, which suppressed
+    ///   the marker on precisely the replies it exists for — caught in a browser
+    ///   against a live host, not by a unit test.
+    ///
+    /// So the projection says it, and this test pins both directions with the
+    /// echo brain's own channel label in play, because that is the collision.
+    #[test]
+    fn only_a_persons_message_is_projected_as_by_person() {
+        let typed = MessageView::project(
+            at(
+                1,
+                CompanyEvent::OperatorMessage {
+                    mentions: Vec::new(),
+                    parent: None,
+                    text: "on it".to_string(),
+                    by: Some(Actor {
+                        kind: ActorKind::User,
+                        id: "u1".to_string(),
+                    }),
+                    chat: Some("studio".to_string()),
+                    deliverable: None,
+                    attachments: Vec::new(),
+                },
+            ),
+            // Projected for *another* reader, which is the case that matters:
+            // for them this is `mine: false` and nothing else distinguishes it.
+            &Viewer::User("u2".to_string()),
+            &labels(),
+        );
+        assert!(typed.by_person, "a person typed this");
+        assert!(!typed.mine, "and it is not this reader's own line");
+
+        // The echo brain's reply as the runtime journals it: an `AgentReply`
+        // whose agent id is the outbound channel the brain named — `operator`,
+        // the very label the arm above hardcodes.
+        let echoed = MessageView::project(
+            at(
+                2,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: "studio".to_string(),
+                    agent_id: "operator".to_string(),
+                    text: "You said: on it".to_string(),
+                    steps: Vec::new(),
+                },
+            ),
+            &Viewer::User("u2".to_string()),
+            &labels(),
+        );
+        assert!(!echoed.by_person, "no person typed the echo brain's reply");
+        assert_eq!(
+            echoed.channel, typed.channel,
+            "the collision is real: the channel label cannot tell these apart",
+        );
     }
 
     /// A person's mention reaches a reader as a **label**, never as the user id
@@ -1340,6 +1561,7 @@ mod test {
                     by: None,
                     chat: Some("studio".to_string()),
                     deliverable: None,
+                    attachments: Vec::new(),
                 },
             ),
             &Viewer::Operator,
@@ -1382,6 +1604,7 @@ mod test {
             by: None,
             chat: None,
             deliverable: None,
+            attachments: Vec::new(),
         };
         assert!(owns(GENERAL_DESK, GENERAL_DESK, &event));
         assert!(!owns("strategy", "Strategy desk", &event));
@@ -1600,10 +1823,14 @@ mod test {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             }
         }
 
@@ -1697,6 +1924,121 @@ mod test {
             assert!(!is_known_author("operator", &record));
         }
 
+        /// A delivered workflow report is journaled under
+        /// [`crate::runtime::WORKFLOW_REPLY_AUTHOR`] on purpose — it is the
+        /// workflow speaking, not a teammate's own reply. Counting it would
+        /// flag every delivered report on a company with no roster match for
+        /// "workflow" as damaged, and — worse — a teammate who *did* mint that
+        /// id would have every report silently misattributed to them by
+        /// `senderOf` before this reservation existed.
+        #[test]
+        fn a_workflow_report_is_a_known_author_not_an_affected_row() {
+            let record = record();
+            assert!(
+                record
+                    .resolve_roster_agent_id(crate::runtime::WORKFLOW_REPLY_AUTHOR)
+                    .is_none(),
+                "workflow reports resolve through the extra arm, not the roster"
+            );
+            let mut audit = AttributionAudit::default();
+            audit.fold(
+                &[
+                    reply(1, crate::runtime::WORKFLOW_REPLY_AUTHOR),
+                    reply(2, "engineer"),
+                ],
+                |agent_id| is_known_author(agent_id, &record),
+            );
+            assert_eq!(audit.replies, 2);
+            assert_eq!(audit.affected, 0);
+        }
+
+        /// Issue #1781 review, Codex P2: an owner-fallback report is journaled
+        /// under [`crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR`] on purpose —
+        /// same reservation as `WORKFLOW_REPLY_AUTHOR`, one arm narrower — so it
+        /// must not inflate the audit either. Before this arm existed, every
+        /// legitimate no-mailbox fallback counted as damaged attribution.
+        #[test]
+        fn an_owner_fallback_report_is_a_known_author_not_an_affected_row() {
+            let record = record();
+            assert!(
+                record
+                    .resolve_roster_agent_id(crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR)
+                    .is_none(),
+                "owner-fallback reports resolve through the extra arm, not the roster"
+            );
+            let mut audit = AttributionAudit::default();
+            audit.fold(
+                &[
+                    reply(1, crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR),
+                    reply(2, "engineer"),
+                ],
+                |agent_id| is_known_author(agent_id, &record),
+            );
+            assert_eq!(audit.replies, 2);
+            assert_eq!(audit.affected, 0);
+        }
+
+        /// Review on PR #1781 (Codex P2): a company that named an overlay
+        /// teammate "Workflow" before this reservation existed would have
+        /// minted the bare id `workflow` — the id `WORKFLOW_REPLY_AUTHOR`
+        /// itself used to be, until it was reshaped to the unmintable,
+        /// hyphenated `workflow-report`. That persisted teammate is not
+        /// migrated or renamed by this fix — there is nothing to migrate: the
+        /// pseudo-author a workflow report is now journaled under is a
+        /// **different, disjoint id** from the one that teammate holds, so
+        /// the collision this reservation exists to prevent cannot occur for
+        /// it, retroactively as well as going forward. Proven here rather than
+        /// asserted, since the whole point is that the two ids must never
+        /// again be able to resolve to the same author.
+        #[test]
+        fn a_persisted_teammate_named_workflow_does_not_shadow_the_reply_author() {
+            let mut record = record();
+            record
+                .overlay_agents
+                .push(crate::ports::types::OverlayAgent {
+                    id: "workflow".to_string(),
+                    name: "Workflow".to_string(),
+                    role: "Worker".to_string(),
+                    description: None,
+                    tools: Some(Vec::new()),
+                    model: None,
+                    harness: None,
+                });
+
+            assert_ne!(
+                "workflow",
+                crate::runtime::WORKFLOW_REPLY_AUTHOR,
+                "the two ids must be disjoint for the rest of this test to mean anything"
+            );
+            assert!(
+                record.resolve_roster_agent_id("workflow").is_some(),
+                "the pre-existing teammate is still on the roster, unmigrated"
+            );
+            assert!(
+                record
+                    .resolve_roster_agent_id(crate::runtime::WORKFLOW_REPLY_AUTHOR)
+                    .is_none(),
+                "the reply-author id does not resolve to that (or any) teammate"
+            );
+
+            let mut audit = AttributionAudit::default();
+            audit.fold(
+                &[
+                    // The teammate's own reply — attributed to them, as before.
+                    reply(1, "workflow"),
+                    // A new workflow report, delivered after this fix ships —
+                    // journaled under the disjoint id, not theirs.
+                    reply(2, crate::runtime::WORKFLOW_REPLY_AUTHOR),
+                ],
+                |agent_id| is_known_author(agent_id, &record),
+            );
+            assert_eq!(audit.replies, 2);
+            assert_eq!(
+                audit.affected, 0,
+                "both rows resolve, to two different authors"
+            );
+        }
+
         #[test]
         fn a_reply_authored_by_a_real_teammate_is_not_counted() {
             let mut audit = AttributionAudit::default();
@@ -1758,6 +2100,7 @@ mod test {
                             chat: None,
                             parent: None,
                             deliverable: None,
+                            attachments: Vec::new(),
                         },
                     ),
                     reply(2, "operator"),
@@ -1802,6 +2145,7 @@ mod dead_card_test {
             workflow_proposal: None,
             origin_run_id: None,
             origin_workflow_id: None,
+            bounced: None,
         }
     }
 
@@ -1858,6 +2202,7 @@ mod dead_card_test {
             &Viewer::Operator,
             None,
             50,
+            true,
         )
         .await
         .expect("history");
@@ -1909,6 +2254,7 @@ mod dead_card_test {
             &Viewer::Operator,
             None,
             50,
+            true,
         )
         .await
         .expect("history");
@@ -1960,11 +2306,310 @@ mod dead_card_test {
             &Viewer::Operator,
             None,
             50,
+            true,
         )
         .await
         .expect("history");
 
         assert_eq!(history.len(), 1, "{history:?}");
         assert!(history[0].task_id.is_none(), "{history:?}");
+    }
+
+    /// Issue #1781 review (Codex P1): an `owner`-fallback report — marked via
+    /// [`crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR`] — must never reach a
+    /// non-admin viewer, while an ordinary operator-channel report (any other
+    /// author) is unaffected. Pre-fix, `history_for_desk` had no concept of
+    /// `admin_only` at all: every signed-in company user, admin or Member, saw
+    /// every row on a desk they could address, which is exactly the leak this
+    /// test pins shut.
+    #[tokio::test]
+    async fn an_owner_fallback_row_is_hidden_from_a_non_admin_viewer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+                    text: "admin-only owner report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the owner-fallback report");
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
+                    text: "ordinary workflow report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the ordinary report");
+
+        let as_member = history_for_desk(
+            &runtime,
+            crate::runtime::OPERATOR_CHANNEL,
+            crate::runtime::OPERATOR_CHANNEL,
+            &Viewer::Operator,
+            None,
+            50,
+            false,
+        )
+        .await
+        .expect("history");
+        assert_eq!(
+            as_member.len(),
+            1,
+            "a non-admin must not see the owner-fallback row: {as_member:?}"
+        );
+        assert_eq!(as_member[0].text, "ordinary workflow report");
+        assert!(!as_member[0].admin_only, "{as_member:?}");
+
+        let as_admin = history_for_desk(
+            &runtime,
+            crate::runtime::OPERATOR_CHANNEL,
+            crate::runtime::OPERATOR_CHANNEL,
+            &Viewer::Operator,
+            None,
+            50,
+            true,
+        )
+        .await
+        .expect("history");
+        assert_eq!(
+            as_admin.len(),
+            2,
+            "an admin must see both rows: {as_admin:?}"
+        );
+        assert!(as_admin.iter().any(|m| m.admin_only), "{as_admin:?}");
+    }
+
+    /// The exclusion happens inside the paging loop, before a row counts
+    /// toward `first` (see `history_for_desk`'s doc) — proven by requesting
+    /// exactly one row as a non-admin with an admin-only row sorted newest: a
+    /// post-fetch filter would come back empty here, not with the one visible
+    /// row underneath it.
+    #[tokio::test]
+    async fn a_non_admin_page_fills_past_an_admin_only_row_instead_of_coming_back_short() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        // Oldest first: the visible row, then the admin-only row on top of it.
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
+                    text: "visible report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the ordinary report");
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+                    text: "admin-only report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the owner-fallback report");
+
+        let as_member = history_for_desk(
+            &runtime,
+            crate::runtime::OPERATOR_CHANNEL,
+            crate::runtime::OPERATOR_CHANNEL,
+            &Viewer::Operator,
+            None,
+            1,
+            false,
+        )
+        .await
+        .expect("history");
+
+        assert_eq!(
+            as_member.len(),
+            1,
+            "a non-admin's page must fill with the next visible row, not come \
+             back short: {as_member:?}"
+        );
+        assert_eq!(as_member[0].text, "visible report");
+    }
+
+    /// Issue #1781 review (Codex P2): `history_total_for_desk` must agree with
+    /// `history_for_desk` about which rows a non-admin can see. Pre-fix, this
+    /// count had no `is_admin` param at all — a non-admin querying a desk
+    /// holding an owner-fallback row (e.g. a grandfathered real desk at the
+    /// literal `operator` id) got a `total` one higher than `items.len()`
+    /// could ever be, breaking `Page.total`'s item-count contract and
+    /// revealing that a hidden admin report exists.
+    #[tokio::test]
+    async fn total_excludes_the_owner_fallback_row_for_a_non_admin_but_counts_it_for_an_admin() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+                    text: "admin-only owner report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the owner-fallback report");
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
+                    text: "ordinary workflow report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the ordinary report");
+
+        let as_member = history_total_for_desk(
+            &runtime,
+            crate::runtime::OPERATOR_CHANNEL,
+            crate::runtime::OPERATOR_CHANNEL,
+            None,
+            false,
+        )
+        .await
+        .expect("total");
+        assert_eq!(
+            as_member, 1,
+            "a non-admin's total must match what history_for_desk would ever show them"
+        );
+
+        let as_admin = history_total_for_desk(
+            &runtime,
+            crate::runtime::OPERATOR_CHANNEL,
+            crate::runtime::OPERATOR_CHANNEL,
+            None,
+            true,
+        )
+        .await
+        .expect("total");
+        assert_eq!(as_admin, 2, "an admin's total must count both rows");
+    }
+
+    /// Issue #1781 review (Codex P2, follow-up): `channel_attributed_replies`
+    /// must agree with `history_for_desk` / `history_total_for_desk` about
+    /// which rows a non-admin can see. Pre-fix, it had no `is_admin` param at
+    /// all — a Member polling `/chat/attribution-audit` around an
+    /// owner-fallback delivery watched `replies` tick up for a row neither
+    /// the transcript nor SSE ever showed them, confirming a hidden
+    /// admin-only message exists even though its content stayed hidden.
+    #[tokio::test]
+    async fn attribution_audit_excludes_the_owner_fallback_row_for_a_non_admin_but_counts_it_for_an_admin()
+     {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+        let record = runtime
+            .store()
+            .load(&id)
+            .await
+            .expect("load")
+            .expect("record exists");
+
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
+                    text: "admin-only owner report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the owner-fallback report");
+        runtime
+            .events()
+            .append(
+                &id,
+                CompanyEvent::AgentReply {
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                    parent: None,
+                    task_id: None,
+                    chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
+                    agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
+                    text: "ordinary workflow report".to_string(),
+                    steps: Vec::new(),
+                },
+            )
+            .await
+            .expect("journal the ordinary report");
+
+        let as_member = channel_attributed_replies(&runtime, &record, false)
+            .await
+            .expect("audit");
+        assert_eq!(
+            as_member.replies, 1,
+            "a non-admin's replies count must match what history_for_desk would \
+             ever show them: {as_member:?}"
+        );
+
+        let as_admin = channel_attributed_replies(&runtime, &record, true)
+            .await
+            .expect("audit");
+        assert_eq!(as_admin.replies, 2, "an admin's count must count both rows");
     }
 }

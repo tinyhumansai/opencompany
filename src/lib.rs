@@ -4,8 +4,18 @@
 //! TinyHumans Rust modules. The default build stays small; enable the `tiny`
 //! feature to compile against the sibling `tiny*` crates.
 
+pub mod analytics;
 pub mod app;
 pub mod brain;
+/// How `build.rs` picks the value behind [`BUILD_COMMIT`]. Compiled here only
+/// under `cfg(test)`.
+///
+/// The build script pulls the same file in with `include!`, so the code these
+/// tests execute is the code that stamps the binary. The runtime reads the
+/// finished constant and never calls the resolver, so outside a test build
+/// this module would be dead code rather than a surface.
+#[cfg(test)]
+mod build_stamp;
 /// Chargebee billing (issue #788): the REST client and the billing operations
 /// the agent's tools call. The toolbelt bridge lives in `harness::chargebee`.
 #[cfg(feature = "chargebee")]
@@ -89,3 +99,16 @@ pub use store::{FsCompanyStore, FsContextStore, FsEventLog, FsMemoryStore, FsSec
 
 /// Current crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The Git commit this binary was built from.
+///
+/// A short object id (`d31e532f7c8a`), suffixed `-dirty` when tracked files
+/// differed from that commit at build time, or the literal `"unknown"` when
+/// no source could name one. `build.rs` decides; `src/build_stamp.rs` records
+/// why, including what a build with no repository beside it does.
+///
+/// A compile-time constant, like [`VERSION`] beside it, and for the reason
+/// that motivates it: [`VERSION`] has read `0.1.0` for thousands of commits,
+/// so "a user on 0.1.0 hit this" and "a user on 0.1.0 at `d31e532f` hit this"
+/// are the same sentence to everything that reports it today.
+pub const BUILD_COMMIT: &str = env!("OPENCOMPANY_BUILD_COMMIT");

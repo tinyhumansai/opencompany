@@ -20,11 +20,44 @@
 # can override is the version of "global tools" that does not quietly widen
 # anyone's blast radius.
 #
-# `*` covers files/docs/shell/code/web/subagent. `media` and `composio` are
-# listed literally because `*` excludes the real-money and
-# per-tenant-credential namespaces. `search` is deliberately absent: it is
-# opt-in, so a company that never asked for web search never spends on it.
-default_allow = ["*", "media", "composio"]
+# `*` covers files/docs/shell/code/web/subagent. Every other entry is listed
+# literally because `*` deliberately excludes it: `workspace.*` plus the
+# explicit `workspace.write` grant for workspace reads and writes, `media` and
+# `composio` because they are the real-money and per-tenant-credential
+# namespaces, `search` because it bills per call, and `mcp:*` because MCP grants
+# are named per server.
+#
+# Also not here: `chargebee`, `hosting` and `paypal` — the billing, deploy and
+# wallet namespaces, each opt-in by name because it is a company-specific
+# third-party integration (`hosting` publishes the workspace to the public
+# internet and provisions databases the company pays for).
+#
+# `repo` is not an oversight either: a host on filesystem storage
+# (`OPENCOMPANY_STORAGE=fs`, the default and the desktop's) **refuses to boot a
+# company whose allow-list names `repo`** — a repository credential would sit on
+# that filesystem in plaintext, readable by the uid an agent shell runs as.
+# Defaulting it on would turn every fs deployment into a boot failure. A company
+# on MongoDB storage that wants it adds `repo.*` to its own `[tools].allow`.
+#
+# `workspace.write` is explicit because the host recognizes `workspace.*` as
+# read/sub-grant coverage but only the bare `workspace` or exact
+# `workspace.write` token as write authority.
+#
+# The previous default withheld `search`, `repo.*`, `mcp:*` and workspace
+# writes. What that bought was a first-run company whose teammates reported
+# their own tools as "not enabled" — the ask showed up on the Team screen under
+# "asked for but not granted" — for capabilities the operator had already
+# installed. Withholding by default only works when somebody is there to grant
+# it; on a company minted from three sentences in a wizard, nobody is.
+default_allow = [
+    "*",
+    "workspace.*",
+    "workspace.write",
+    "media",
+    "composio",
+    "search",
+    "mcp:*",
+]
 
 [skills]
 # Shared-library skills installed in every company, by slug.

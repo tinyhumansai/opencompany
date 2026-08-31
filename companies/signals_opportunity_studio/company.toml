@@ -42,14 +42,9 @@ enabled = true
 
 [policy]
 mode = "supervised"
-# `always_approve` names the thing to gate the way the runtime names it: a tool
-# name, or a dotted effect kind a brain emits. This template used to list
-# `payment.send` / `filing.submit` / `external.publish`, none of which is a tool
-# this company can run — so the fence it advertised gated nothing on the harness
-# path (issue #684). `publish_artifact` is a real one, and it is the entry worth
-# demonstrating: under `supervised` the gate already parks every publish, so
-# this changes nothing today and keeps holding if the studio is ever moved to
-# `auto` or `full`.
+# Retained for manifest compatibility while policy HITL is disabled. Agents use
+# `request_approval` when they explicitly want operator sign-off; this list does
+# not currently create cards.
 always_approve = ["publish_artifact"]
 auto_approve_under_usd = 1.0
 

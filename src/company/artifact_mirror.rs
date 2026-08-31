@@ -72,6 +72,8 @@
 //! only under the `openhuman` feature). The shared half therefore cannot live
 //! in the harness, or the default build could not reach it.
 
+use sha2::{Digest, Sha256};
+
 use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::artifacts::{ArtifactAuthor, ArtifactRecord, ArtifactStore};
@@ -79,8 +81,8 @@ use crate::ports::now_millis;
 use crate::ports::types::CompanyId;
 use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceOrigin, WorkspaceStore};
 
-use super::workspace_names::{kebab_name, kebab_name_or};
-use super::workspace_scaffold::ensure_artifact_folder;
+use super::workspace_names::{MAX_NAME_BYTES, kebab_name, kebab_name_or};
+use super::workspace_scaffold::{ensure_artifact_folder_tracked, rollback_empty_minted_folders};
 
 /// One publish, as [`materialize`] needs it.
 ///
@@ -93,9 +95,17 @@ pub struct PublishTarget<'a> {
     /// folder it lands under, and the authorship stamped on every node created
     /// or written along the way.
     pub agent_id: &'a str,
-    /// The card the publish belongs to. Names the folder beneath the agent's,
-    /// so two tasks by one agent cannot collide on a common filename.
+    /// The card the publish belongs to. Its id is the immutable half of the
+    /// folder name beneath the agent's, so two tasks by one agent cannot
+    /// collide on a common filename — and so the folder stays findable by the
+    /// id an operator holds.
     pub task_id: &'a str,
+    /// The card's human title, when the caller has one (issue #1687).
+    ///
+    /// The readable half of that folder's name. `None` — a caller with no
+    /// board record to hand — names the folder by the id alone, which is what
+    /// every folder was called before this.
+    pub task_title: Option<&'a str>,
     /// The normalized workspace-relative path the agent published, e.g.
     /// `specs/launch.md`. Interior segments become folders.
     pub source: &'a str,
@@ -106,6 +116,26 @@ pub struct PublishTarget<'a> {
     /// The node the previous version of this artifact was mirrored into, when
     /// there was one. Reused if it still resolves; see [`materialize`].
     pub existing_node_id: Option<&'a str>,
+}
+
+/// One card-less workflow-run artifact.
+///
+/// Runs cannot use [`PublishTarget`] directly because its second path segment
+/// is a task id and a workflow agent node has no card. This target preserves
+/// the same author/source/payload contract while giving the mirror the two ids
+/// that make the destination unique within a run.
+#[derive(Debug, Clone, Copy)]
+pub struct RunTarget<'a> {
+    /// The roster agent whose sandbox produced the file.
+    pub agent_id: &'a str,
+    /// The workflow run that owns the capture.
+    pub run_id: &'a str,
+    /// The graph node whose turn wrote it.
+    pub node_id: &'a str,
+    /// The normalized path relative to that agent's workspace.
+    pub source: &'a str,
+    /// The captured file body.
+    pub payload: MirrorPayload<'a>,
 }
 
 /// What [`materialize`] is being asked to put in the tree.
@@ -145,7 +175,10 @@ pub struct Mirrored {
 
 /// Put `target`'s body into the shared tree and return what it left there.
 ///
-/// The layout is `artifacts/<agent-id>/<task-id>/<source…>`. The agent's folder
+/// The layout is `artifacts/<agent-id>/<task-title>.<task-id>/<source…>`, the
+/// task folder named by [`task_folder_name`] — readable half first, id last so
+/// the folder is still findable by the id an operator holds (issue #1687). The
+/// agent's folder
 /// beneath that root is minted on demand by
 /// [`ensure_artifact_folder`](super::workspace_scaffold::ensure_artifact_folder)
 /// — member folders appear the first time somebody publishes something, so this
@@ -211,13 +244,49 @@ pub async fn materialize(
         });
     }
 
+    // From here a publish may mint folders before the write that justifies
+    // them exists. Track the ones this call freshly created so that a write
+    // which then fails does not leave an empty `artifacts/<agent>/…` skeleton
+    // standing (issue #1801) — the residual, non-race half of the empty folders
+    // the Tidy(#700)/Repair(#759) buttons otherwise have to sweep. The cleanup
+    // runs only on error, and removes only a folder that is still empty, so a
+    // concurrent publisher that adopted one of these is never disturbed.
+    let mut minted: Vec<String> = Vec::new();
+    match materialize_fresh(workspace, company, target, &mut minted).await {
+        Ok(mirrored) => Ok(mirrored),
+        Err(err) => {
+            rollback_empty_minted_folders(workspace, company, &minted).await;
+            Err(err)
+        }
+    }
+}
+
+/// The path-resolving, folder-minting half of [`materialize`], for a deliverable
+/// with no reusable node.
+///
+/// Split out so [`materialize`] can undo the folders it minted when the write
+/// that would have filled them fails (issue #1801). Every freshly created folder
+/// id is pushed onto `minted`: the agent folder here, plus each task or interior
+/// folder [`resolve_task_folder`] and [`resolve_folder`] mint. The caller cleans
+/// them up only on error and only while still empty — see
+/// [`rollback_empty_minted_folders`].
+async fn materialize_fresh(
+    workspace: &dyn WorkspaceStore,
+    company: &CompanyId,
+    target: PublishTarget<'_>,
+    minted: &mut Vec<String>,
+) -> Result<Mirrored> {
     let segments = split_source(target.source)?;
     let (dirs, filename) = segments
         .split_last()
         .map(|(last, rest)| (rest, last.as_str()))
         .expect("split_source rejects an empty path");
 
-    let agent_folder = ensure_artifact_folder(workspace, company, target.agent_id).await?;
+    let (agent_folder, created) =
+        ensure_artifact_folder_tracked(workspace, company, target.agent_id).await?;
+    if created {
+        minted.push(agent_folder.clone());
+    }
 
     // One tree read, then a walk that keeps its own view current: each folder
     // this creates is pushed onto `nodes`, so a `specs/deep/note.md` resolves
@@ -225,12 +294,23 @@ pub async fn materialize(
     // against a snapshot that predates it.
     let mut nodes = workspace.tree(company).await?;
     let mut parent = agent_folder;
-    let task_folder = kebab_name_or(target.task_id, target.task_id);
-    for name in std::iter::once(task_folder.as_str()).chain(dirs.iter().map(String::as_str)) {
+    parent = resolve_task_folder(
+        workspace,
+        company,
+        &mut nodes,
+        minted,
+        &parent,
+        target.task_id,
+        target.task_title,
+        target.agent_id,
+    )
+    .await?;
+    for name in dirs.iter().map(String::as_str) {
         parent = resolve_folder(
             workspace,
             company,
             &mut nodes,
+            minted,
             &parent,
             name,
             target.agent_id,
@@ -274,6 +354,56 @@ pub async fn materialize(
         // edits the tree by hand.
         None => create_first(workspace, company, &parent, filename, target).await,
     }
+}
+
+/// A workflow node id's path segment within a run's artifact folder.
+///
+/// `kebab_name_or` is not injective — `write_up` and `write-up` both normalize
+/// to `write-up` — but workflow validation only requires raw node ids to be
+/// unique, not their kebab form. Two nodes that collide there would otherwise
+/// resolve to the same `materialize_run` destination, and the later capture
+/// would silently overwrite the earlier node's output. Appending a short
+/// stable hash of the RAW id (computed before normalization) makes the
+/// segment collision-resistant while keeping the kebab prefix for
+/// readability in the workspace tree.
+fn run_node_segment(node_id: &str) -> String {
+    let kebab = kebab_name_or(node_id, node_id);
+    let digest = Sha256::digest(node_id.as_bytes());
+    let mut suffix = String::with_capacity(8);
+    for byte in digest.iter().take(4) {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    format!("{kebab}-{suffix}")
+}
+
+/// Files a card-less workflow-node output into the shared workspace tree.
+///
+/// The layout is `artifacts/<agent>/runs/<run>/<node>-<hash>/<source…>`.
+/// Reusing [`materialize`] keeps the same path validation, conflict handling,
+/// binary storage, and atomic create semantics as task artifacts while the
+/// `runs` segment prevents a run id from being mistaken for a task id.
+pub async fn materialize_run(
+    workspace: &dyn WorkspaceStore,
+    company: &CompanyId,
+    target: RunTarget<'_>,
+) -> Result<Mirrored> {
+    let run = kebab_name_or(target.run_id, target.run_id);
+    let node = run_node_segment(target.node_id);
+    let source = format!("{run}/{node}/{}", target.source);
+    materialize(
+        workspace,
+        company,
+        PublishTarget {
+            agent_id: target.agent_id,
+            task_id: "runs",
+            task_title: None,
+            source: &source,
+            payload: target.payload,
+            existing_node_id: None,
+        },
+    )
+    .await
 }
 
 /// Publishes a deliverable to a path that nothing occupies yet, and loses
@@ -497,6 +627,7 @@ async fn create_payload(
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     match target.payload {
         MirrorPayload::Text(body) => {
@@ -704,6 +835,7 @@ async fn resolve_folder(
     workspace: &dyn WorkspaceStore,
     company: &CompanyId,
     nodes: &mut Vec<WorkspaceNode>,
+    minted: &mut Vec<String>,
     parent: &str,
     name: &str,
     agent_id: &str,
@@ -716,11 +848,18 @@ async fn resolve_folder(
              beneath it"
         ))),
         [] => {
-            let node = workspace
+            // Only a genuine mint is a rollback candidate (issue #1801): a
+            // publisher that adopted somebody else's folder must not have it
+            // swept if this publish then fails.
+            let claim = workspace
                 .adopt_or_create_folder(company, Some(parent), name, origin(agent_id))
-                .await?
-                .into_node();
+                .await?;
+            let created = claim.was_created();
+            let node = claim.into_node();
             let id = node.id.clone();
+            if created {
+                minted.push(id.clone());
+            }
             nodes.push(node);
             Ok(id)
         }
@@ -729,6 +868,199 @@ async fn resolve_folder(
             count = many.len()
         ))),
     }
+}
+
+/// The name a task's deliverable folder is minted under: the card's title,
+/// then its id (issue #1687).
+///
+/// # Why the title, and why the id is still in it
+///
+/// The folder used to be named by the card ULID alone. That is a perfectly
+/// good *key* and a useless *label*: an operator opening `artifacts/<agent>/`
+/// saw a column of `01hq8zm4x…` and could not tell what any of them held
+/// without opening each one. The card's title is the one string that already
+/// says what the work was.
+///
+/// The id stays because it is the only thing in the name that is unique and
+/// immutable. Dropping it would mean two cards a teammate titled "Weekly
+/// update" share one folder and overwrite each other's deliverables, and it
+/// would leave an operator holding a card id with nothing in the tree to match
+/// it against. Title-then-id also puts the readable half first, which is what
+/// survives the explorer's `truncate`.
+///
+/// # The title half is budgeted, the id half is not
+///
+/// [`kebab_name`] bounds a whole name at [`MAX_NAME_BYTES`]; here two names are
+/// being joined, so the title is trimmed to whatever the id leaves and any
+/// separator the cut exposed is trimmed with it. The id is never truncated — a
+/// partial ULID is not the id, and matching one is the whole point of
+/// [`task_folder_task_id`]. A card whose title normalizes to nothing (an emoji,
+/// punctuation) is named by the id alone rather than by `untitled`, which is
+/// what [`kebab_name`] would otherwise hand back for every one of them at once.
+///
+/// # The two halves are joined by a dot, not by a dash
+///
+/// [`TASK_ID_BOUNDARY`] is the only separator that makes the id half
+/// *findable*, which is the whole job of [`resolve_task_folder`]. A dash cannot:
+/// a seed card's id is `[a-z0-9-]` (`task_file::normalize_task_id`), so cards
+/// `login` and `fix-login` are both legal, and `password-reset-fix-login` ends
+/// with `-login` as surely as `password-reset-login` does. Matching on that
+/// suffix files one card's deliverables in the other's folder, and once both
+/// have published it makes the shorter id ambiguous forever.
+///
+/// A dot has no such twin. Neither id grammar can produce one — a board card's
+/// id is a ULID, a seed card's is `[a-z0-9-]` — so the name's *last* dot is
+/// always the join, and the text after it is the whole id and nothing else. It
+/// is also still one lawful workspace name: [`kebab_name`] keeps a dot that
+/// something precedes, and collapses a dash run, so `--` would fail
+/// [`is_kebab_name`](super::workspace_names::is_kebab_name) where this passes.
+fn task_folder_name(task_id: &str, task_title: Option<&str>) -> String {
+    let id = kebab_name(task_id);
+    // An id carrying the boundary itself would put the join in the wrong place,
+    // so such a card is named by its id alone — which is what every folder was
+    // called before this, and what the `name == id` arm of the lookup still
+    // matches. Guarding an input neither id grammar can produce keeps this a
+    // total function rather than one with an unstated precondition.
+    let Some(title) = task_title.filter(|_| !id.contains(TASK_ID_BOUNDARY)) else {
+        return id;
+    };
+    // `kebab_name_or` falls back **only** when the title normalized to nothing,
+    // which is the distinction `kebab_name` flattens: it answers `untitled` both
+    // for a card actually titled "Untitled" — which has a perfectly good name —
+    // and for one titled "🎉", which has none. Falling back to the id keeps the
+    // second off `untitled.<id>` without taking the first's title away.
+    let mut slug = kebab_name_or(title, task_id);
+    if slug == id {
+        return id;
+    }
+    // `+ 1` for the boundary joining the two halves. Both halves are ASCII by
+    // construction (`kebab_name` emits only `[a-z0-9.-]`), so a byte cut is
+    // always a character cut.
+    let room = MAX_NAME_BYTES.saturating_sub(id.len() + 1);
+    if slug.len() > room {
+        slug.truncate(room);
+    }
+    while slug.ends_with('-') || slug.ends_with('.') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        return id;
+    }
+    format!("{slug}{TASK_ID_BOUNDARY}{id}")
+}
+
+/// The character [`task_folder_name`] joins the readable half to the id half
+/// with, and therefore the boundary [`task_folder_task_id`] reads back.
+const TASK_ID_BOUNDARY: char = '.';
+
+/// The task id `name` was composed around, when it was composed by
+/// [`task_folder_name`] at all.
+///
+/// The **last** boundary rather than the first, because the readable half can
+/// hold dots of its own (`v1.2 plan` normalizes to `v1.2-plan`) while the id
+/// half can hold none. So the tail is the whole id, exactly, and a lookup on it
+/// is an equality test rather than the unbounded suffix match a dash join would
+/// force — see [`task_folder_name`] for the card pair that breaks.
+fn task_folder_task_id(name: &str) -> Option<&str> {
+    name.rsplit_once(TASK_ID_BOUNDARY).map(|(_, id)| id)
+}
+
+/// Adopt-or-create the folder holding `task_id`'s deliverables, **matched by
+/// id rather than by name** (issue #1687).
+///
+/// # Why this is not [`resolve_folder`] with a different name
+///
+/// [`resolve_folder`] matches a name exactly, and a task folder's name is no
+/// longer a function of the task alone: it carries the card's title, and a
+/// title is editable. An exact-name lookup would therefore stop finding the
+/// folder the moment somebody renamed the card, and the next publish would
+/// mint a rival beside it — one task, two folders, deliverables split across
+/// both. Matching on the id suffix makes the lookup depend only on the half
+/// that cannot change.
+///
+/// The same match is what **adopts** a folder minted before this change, whose
+/// name is the bare id: a company that has published already keeps its existing
+/// folders and its console deep links, and only a task publishing for the first
+/// time gets a titled name. Nothing is renamed, for the reason
+/// [`workspace_names`](super::workspace_names) gives at length — an operator
+/// must not find their tree rearranged by an upgrade they did not ask for, and
+/// a rename breaks every reference anyone kept to the old name.
+///
+/// # A note wearing the id is refused, even when a folder also matches
+///
+/// A deliverable cannot be published beneath a note, so a match of the wrong
+/// kind is a [`Conflict`](OpenCompanyError::Conflict) rather than a guess —
+/// the same fail-closed rule [`resolve_folder`] applies to a name. It is
+/// checked **before** any folder is chosen, not only when no folder matched:
+/// no backend enforces unique sibling names, so a legacy or imported tree can
+/// carry a note and a folder under one name, and publishing into the folder
+/// would leave the deliverable at a path `PathIndex` reads as ambiguous — a
+/// note the agent that just wrote it could not then open.
+///
+/// # Two folders for one task: the oldest wins, deterministically
+///
+/// [`resolve_folder`]'s create is atomic, but it is keyed by the folder's
+/// **name**, and two *first* publishes of one task can now compute two
+/// different names — one caller holding the card's title and one holding
+/// `None` ([`PublishTarget::task_title`]), or a retitle landing between them.
+/// Both then see no match, both create, and the tree carries two folders for
+/// one task.
+///
+/// Answering that with `Conflict` would be the worst of the options available:
+/// the state does not decay, so a race lasting microseconds would refuse every
+/// later publish for that task permanently — the exact failure
+/// [`resolve_folder`] documents at length and the store's atomic
+/// adopt-or-create exists to prevent. And there is no identity here to guess
+/// at, which is what makes this unlike [`resolve_folder`]'s duplicate *name*:
+/// both folders were matched on this task's own immutable id, so both are
+/// provably its own. The lowest node id therefore wins — node ids are ULIDs, so
+/// that is the older of the two, and it is the same answer on every later
+/// publish, in every process, on every backend. The deliverables that landed in
+/// the loser stay where they are and stay readable; nothing is moved or
+/// renamed.
+///
+/// Closing the window instead of converging after it would need an
+/// adopt-or-create keyed by something other than the name — a new
+/// [`WorkspaceStore`] method across all three backends, which is a change to
+/// the port rather than to this naming rule.
+// The `minted` accumulator (issue #1801) pushes this over clippy's threshold;
+// the args are the cohesive publish context plus the two walk accumulators, so
+// bundling them would trade one honest signature for a struct that exists only
+// to satisfy the lint — the same call the repo's other sites make.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_task_folder(
+    workspace: &dyn WorkspaceStore,
+    company: &CompanyId,
+    nodes: &mut Vec<WorkspaceNode>,
+    minted: &mut Vec<String>,
+    parent: &str,
+    task_id: &str,
+    task_title: Option<&str>,
+    agent_id: &str,
+) -> Result<String> {
+    let id = kebab_name(task_id);
+    let mut folders: Vec<&str> = Vec::new();
+    let mut other_kind = false;
+    for node in nodes.iter().filter(|node| {
+        node.parent_id.as_deref() == Some(parent)
+            && (node.name == id || task_folder_task_id(&node.name) == Some(id.as_str()))
+    }) {
+        match node.kind {
+            NodeKind::Folder => folders.push(&node.id),
+            _ => other_kind = true,
+        }
+    }
+    if other_kind {
+        return Err(OpenCompanyError::Conflict(format!(
+            "`{id}` already exists as a note, not a folder, so a deliverable cannot be \
+             published beneath it"
+        )));
+    }
+    if let Some(oldest) = folders.iter().min() {
+        return Ok((*oldest).to_string());
+    }
+    let name = task_folder_name(task_id, task_title);
+    resolve_folder(workspace, company, nodes, minted, parent, &name, agent_id).await
 }
 
 /// The existing file `name` under `parent`, or `None` when the name is free.
@@ -885,6 +1217,132 @@ mod test {
         }
     }
 
+    /// [`RefusingCreate`] with a twist: on the note create, a rival publisher
+    /// **adopts the just-minted parent folder** before the create is refused
+    /// (issue #1839) — the exact mid-write race the adoption lease exists for.
+    ///
+    /// This is what `RefusingCreate` alone cannot model: there, the folders this
+    /// publish minted are swept because nobody else laid a claim on them. Here a
+    /// second writer has, so `materialize`'s rollback must find the lease and
+    /// leave the folder standing rather than delete the one the rival is about to
+    /// write into.
+    struct AdoptParentThenRefuse(Arc<FsOps>);
+
+    #[async_trait::async_trait]
+    impl WorkspaceStore for AdoptParentThenRefuse {
+        async fn tree(&self, company: &CompanyId) -> Result<Vec<WorkspaceNode>> {
+            WorkspaceStore::tree(&*self.0, company).await
+        }
+        async fn read(
+            &self,
+            company: &CompanyId,
+            id: &str,
+        ) -> Result<Option<(WorkspaceNode, String)>> {
+            WorkspaceStore::read(&*self.0, company, id).await
+        }
+        async fn write(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            content: &str,
+            author: WorkspaceOrigin,
+        ) -> Result<WorkspaceNode> {
+            WorkspaceStore::write(&*self.0, company, id, content, author).await
+        }
+        async fn create(
+            &self,
+            company: &CompanyId,
+            node: &WorkspaceNode,
+            content: Option<&str>,
+        ) -> Result<()> {
+            if node.kind == NodeKind::Folder {
+                return WorkspaceStore::create(&*self.0, company, node, content).await;
+            }
+            // The note create is about to be refused — but first a rival adopts
+            // the folder this publish just minted for it, taking the lease. The
+            // rival is a real `adopt_or_create_folder` against the inner store,
+            // so the flag lands exactly as it would in production.
+            if let Some(parent_id) = node.parent_id.as_deref() {
+                let nodes = WorkspaceStore::tree(&*self.0, company).await?;
+                if let Some(parent) = nodes.iter().find(|n| n.id == parent_id) {
+                    WorkspaceStore::adopt_or_create_folder(
+                        &*self.0,
+                        company,
+                        parent.parent_id.as_deref(),
+                        &parent.name,
+                        WorkspaceOrigin::Operator,
+                    )
+                    .await?;
+                }
+            }
+            Err(OpenCompanyError::InvalidRequest("over quota".to_string()))
+        }
+        async fn adopt_or_create_folder(
+            &self,
+            company: &CompanyId,
+            parent: Option<&str>,
+            name: &str,
+            origin: WorkspaceOrigin,
+        ) -> Result<crate::ports::workspace::FolderClaim> {
+            WorkspaceStore::adopt_or_create_folder(&*self.0, company, parent, name, origin).await
+        }
+        async fn create_binary(
+            &self,
+            _company: &CompanyId,
+            _node: &WorkspaceNode,
+            _bytes: &[u8],
+        ) -> Result<WorkspaceNode> {
+            Err(OpenCompanyError::InvalidRequest("over quota".to_string()))
+        }
+        async fn write_binary(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            bytes: &[u8],
+            mime: Option<&str>,
+            author: WorkspaceOrigin,
+        ) -> Result<WorkspaceNode> {
+            WorkspaceStore::write_binary(&*self.0, company, id, bytes, mime, author).await
+        }
+        async fn read_bytes(
+            &self,
+            company: &CompanyId,
+            id: &str,
+        ) -> Result<Option<(WorkspaceNode, crate::ports::workspace::BlobStream)>> {
+            WorkspaceStore::read_bytes(&*self.0, company, id).await
+        }
+        async fn rename_move(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            name: Option<&str>,
+            parent: Option<Option<&str>>,
+        ) -> Result<WorkspaceNode> {
+            WorkspaceStore::rename_move(&*self.0, company, id, name, parent).await
+        }
+        async fn swap_files(
+            &self,
+            company: &CompanyId,
+            expected_id: Option<&str>,
+            replacement_id: &str,
+            name: &str,
+        ) -> Result<Option<WorkspaceNode>> {
+            WorkspaceStore::swap_files(&*self.0, company, expected_id, replacement_id, name).await
+        }
+        async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
+            WorkspaceStore::delete(&*self.0, company, id).await
+        }
+        async fn delete_if_empty(&self, company: &CompanyId, id: &str) -> Result<bool> {
+            // Forward to the inner backend's override, per the port contract, so
+            // the rollback exercises the real fs guard rather than the decorator
+            // default.
+            WorkspaceStore::delete_if_empty(&*self.0, company, id).await
+        }
+        async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
+            WorkspaceStore::is_empty(&*self.0, company).await
+        }
+    }
+
     /// Every node id in the workspace, sorted — the set, which is what `tree`
     /// actually promises.
     async fn sorted_ids(ws: &dyn WorkspaceStore, company: &CompanyId) -> Vec<String> {
@@ -920,6 +1378,7 @@ mod test {
         PublishTarget {
             agent_id: "cmo",
             task_id: "t-1",
+            task_title: None,
             source,
             payload: MirrorPayload::Text(body),
             existing_node_id: None,
@@ -1606,6 +2065,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-seed",
+                task_title: None,
                 ..target("seed.md", "# Seed")
             },
         )
@@ -1634,6 +2094,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-9",
+                task_title: None,
                 ..target("left.md", "# From the left")
             },
         );
@@ -1642,6 +2103,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-9",
+                task_title: None,
                 ..target("right.md", "# From the right")
             },
         );
@@ -1677,6 +2139,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-9",
+                task_title: None,
                 ..target("later.md", "# A later publish")
             },
         )
@@ -1714,6 +2177,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-left",
+                task_title: None,
                 ..target("left.md", "# From the left")
             },
         );
@@ -1722,6 +2186,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-right",
+                task_title: None,
                 ..target("right.md", "# From the right")
             },
         );
@@ -1751,6 +2216,7 @@ mod test {
             &co,
             PublishTarget {
                 task_id: "t-later",
+                task_title: None,
                 ..target("later.md", "# A later publish")
             },
         )
@@ -2328,6 +2794,530 @@ mod test {
             .await
             .is_err(),
             "a known deliverable whose version cannot be recorded must refuse the save"
+        );
+    }
+
+    /// Issue #1687: the task folder is named for the *work*, and still carries
+    /// the id.
+    ///
+    /// The whole complaint is legibility. `artifacts/cmo/01hq8zm4x…/` is a
+    /// perfectly good key and tells an operator scanning the tree nothing
+    /// whatsoever — every sibling looks identical, and finding the most recent
+    /// one means opening each. The title goes first because the explorer pane
+    /// truncates from the right; the id stays because it is the only unique,
+    /// immutable half and it is what an operator holding a card id matches
+    /// against.
+    #[tokio::test]
+    async fn a_task_folder_is_named_for_the_card_and_keeps_its_id() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let id = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Q3 Launch Brief"),
+                ..target("launch.md", "# Launch")
+            },
+        )
+        .await
+        .expect("materialize")
+        .node_id;
+
+        assert_eq!(
+            path_of(ws, &co, &id).await,
+            format!("{ARTIFACTS_ROOT}/cmo/q3-launch-brief.t-1/launch.md"),
+            "the folder must read as the work and still end in the card id"
+        );
+    }
+
+    /// Renaming a card must not split its deliverables across two folders.
+    ///
+    /// The folder name is now a function of an **editable** string, so an
+    /// exact-name lookup would miss the folder the moment somebody retitled
+    /// the card and the next publish would mint a rival beside it. The lookup
+    /// therefore matches the id suffix, which is the half that cannot change —
+    /// and the existing folder keeps the name it was minted under, because
+    /// nothing in this runtime renames a node an operator may have linked to.
+    #[tokio::test]
+    async fn a_publish_after_the_card_was_retitled_stays_in_the_same_folder() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let first = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Q3 Launch Brief"),
+                ..target("launch.md", "# Launch")
+            },
+        )
+        .await
+        .expect("first publish")
+        .node_id;
+        let second = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Q3 Launch Brief (revised scope)"),
+                ..target("timeline.md", "# Timeline")
+            },
+        )
+        .await
+        .expect("second publish")
+        .node_id;
+
+        assert_eq!(
+            path_of(ws, &co, &first).await,
+            format!("{ARTIFACTS_ROOT}/cmo/q3-launch-brief.t-1/launch.md")
+        );
+        assert_eq!(
+            path_of(ws, &co, &second).await,
+            format!("{ARTIFACTS_ROOT}/cmo/q3-launch-brief.t-1/timeline.md"),
+            "a retitled card must publish into the folder it already has, not a second one"
+        );
+    }
+
+    /// A company that published before this change keeps the folders it has.
+    ///
+    /// Its task folders are named by the bare id, and the id-suffix lookup
+    /// matches those too — so the next publish *adopts* the existing folder
+    /// rather than opening a titled twin beside it and splitting one task's
+    /// deliverables in half. Nothing is renamed: an operator must not find
+    /// their tree rearranged, and a rename breaks every link kept to the old
+    /// name.
+    #[tokio::test]
+    async fn a_folder_minted_before_titles_is_adopted_rather_than_twinned() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let legacy = materialize(ws, &co, target("launch.md", "# Launch"))
+            .await
+            .expect("legacy publish")
+            .node_id;
+        assert_eq!(
+            path_of(ws, &co, &legacy).await,
+            format!("{ARTIFACTS_ROOT}/cmo/t-1/launch.md"),
+            "a caller with no title still names the folder by the id alone"
+        );
+
+        let titled = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Q3 Launch Brief"),
+                ..target("timeline.md", "# Timeline")
+            },
+        )
+        .await
+        .expect("titled publish")
+        .node_id;
+
+        assert_eq!(
+            path_of(ws, &co, &titled).await,
+            format!("{ARTIFACTS_ROOT}/cmo/t-1/timeline.md"),
+            "the pre-existing id-named folder must be adopted, not joined by a titled twin"
+        );
+    }
+
+    /// The name is composed under the same rule every other minted name obeys,
+    /// and the id half survives every input the title half can throw at it.
+    #[test]
+    fn a_task_folder_name_is_readable_first_and_addressable_last() {
+        use super::super::workspace_names::is_kebab_name;
+
+        let ulid = "01hq8zm4xk3n7y2p9v1w5c8t4b";
+
+        // No title at all — a caller with no board record — is exactly what
+        // every folder was called before this.
+        assert_eq!(task_folder_name(ulid, None), ulid);
+
+        // The ordinary case: readable half first, id last, one workspace name.
+        let named = task_folder_name(ulid, Some("Q3 Launch Brief"));
+        assert_eq!(named, format!("q3-launch-brief.{ulid}"));
+        assert!(is_kebab_name(&named), "{named}");
+
+        // A title that normalizes to nothing must not collapse every such card
+        // onto `untitled.<id>`; the id alone is both shorter and truer.
+        assert_eq!(task_folder_name(ulid, Some("🎉 ✨")), ulid);
+        assert_eq!(task_folder_name(ulid, Some("   ")), ulid);
+
+        // But a card an operator actually titled "Untitled" has a real name,
+        // and it must keep it: `kebab_name` answers `untitled` for that title
+        // and for `🎉` alike, and only the second of those has nothing to say.
+        assert_eq!(
+            task_folder_name(ulid, Some("Untitled")),
+            format!("untitled.{ulid}"),
+            "a real title must not be mistaken for the fallback it collides with"
+        );
+
+        // The id half is read back whole, whatever the title half held — the
+        // one property the lookup depends on.
+        assert_eq!(
+            task_folder_task_id(&task_folder_name("fix-login", Some("v1.2 Plan"))),
+            Some("fix-login")
+        );
+
+        // A long title is trimmed to whatever the id leaves — never the id, a
+        // partial ULID being no id at all — and leaves no dangling separator.
+        let long = task_folder_name(ulid, Some(&"Very Long Card Title ".repeat(20)));
+        assert!(long.len() <= MAX_NAME_BYTES, "{} bytes", long.len());
+        assert!(long.ends_with(ulid), "{long}");
+        assert!(is_kebab_name(&long), "{long}");
+    }
+
+    /// One card's id being the tail of another's must not file one card's
+    /// deliverables in the other's folder.
+    ///
+    /// A seed card's id is `[a-z0-9-]` (`task_file::normalize_task_id`), so
+    /// `login` and `fix-login` are both legal ids on one board, and a dash
+    /// join would leave `password-reset-fix-login` ending in `-login` exactly
+    /// as `login`'s own folder does. The shorter card would then adopt the
+    /// longer card's folder — silently, and overwriting its deliverables
+    /// wherever the two publish the same source path — and once both had
+    /// published, every later lookup for `login` would match two folders. The
+    /// dot boundary makes the id half an equality test rather than a suffix
+    /// search, so neither can reach the other.
+    #[tokio::test]
+    async fn a_card_whose_id_ends_in_another_cards_id_keeps_its_own_folder() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let longer = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_id: "fix-login",
+                task_title: Some("Password reset"),
+                ..target("notes.md", "# Notes")
+            },
+        )
+        .await
+        .expect("publish for `fix-login`")
+        .node_id;
+        assert_eq!(
+            path_of(ws, &co, &longer).await,
+            format!("{ARTIFACTS_ROOT}/cmo/password-reset.fix-login/notes.md")
+        );
+
+        let shorter = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_id: "login",
+                task_title: Some("Login page"),
+                ..target("spec.md", "# Spec")
+            },
+        )
+        .await
+        .expect("publish for `login`")
+        .node_id;
+        assert_eq!(
+            path_of(ws, &co, &shorter).await,
+            format!("{ARTIFACTS_ROOT}/cmo/login-page.login/spec.md"),
+            "`login` must mint its own folder, not adopt the one `fix-login` already has"
+        );
+    }
+
+    /// A note wearing the task's id is refused even when a folder matches too.
+    ///
+    /// No backend enforces unique sibling names, so a legacy or imported tree
+    /// can carry a note and a folder under one name. Publishing into the folder
+    /// would land the deliverable at a path the agents' `PathIndex` reads as
+    /// ambiguous — a note the agent that just wrote it could not open again —
+    /// so the wrong kind is checked before any folder is chosen, not only when
+    /// no folder matched.
+    #[tokio::test]
+    async fn a_note_wearing_the_task_id_is_refused_even_beside_a_matching_folder() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let first = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Launch brief"),
+                ..target("launch.md", "# Launch")
+            },
+        )
+        .await
+        .expect("first publish")
+        .node_id;
+        let tree = ws.tree(&co).await.expect("tree");
+        let published = tree.iter().find(|n| n.id == first).expect("published node");
+        let task_folder = tree
+            .iter()
+            .find(|n| Some(&n.id) == published.parent_id.as_ref())
+            .expect("task folder");
+        let agent_folder = task_folder.parent_id.clone().expect("agent folder");
+
+        // The shape an import can leave behind: a note carrying the bare task
+        // id, beside the folder that actually holds the deliverables.
+        let note = WorkspaceNode {
+            id: "imported-note".to_string(),
+            name: "t-1".to_string(),
+            kind: NodeKind::File,
+            parent_id: Some(agent_folder),
+            updated_at_millis: 1,
+            created_by: origin("cmo"),
+            updated_by: origin("cmo"),
+            mime: None,
+            size: None,
+            sha256: None,
+            adopted: false,
+        };
+        ws.create(&co, &note, Some("imported"))
+            .await
+            .expect("imported note");
+
+        let refused = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Launch brief"),
+                ..target("timeline.md", "# Timeline")
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(OpenCompanyError::Conflict(_))),
+            "a matching note must fail the publish closed rather than be stepped over: {refused:?}"
+        );
+    }
+
+    /// Two folders for one task converge on one of them, rather than refusing
+    /// every publish that follows.
+    ///
+    /// The create is atomic under the store's lock but keyed by *name*, and two
+    /// first publishes of one card can compute two names — one caller holding
+    /// the title and one holding `None`. Answering the result with `Conflict`
+    /// would make a race lasting microseconds refuse that task's publishes
+    /// permanently, which is the failure `resolve_folder` exists to prevent.
+    /// Both folders were matched on the card's own immutable id, so there is no
+    /// identity to guess at: the older wins, on every later publish and in
+    /// every process.
+    #[tokio::test]
+    async fn two_folders_for_one_task_resolve_to_the_oldest_rather_than_refusing() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let first = materialize(ws, &co, target("launch.md", "# Launch"))
+            .await
+            .expect("untitled first publish")
+            .node_id;
+        let tree = ws.tree(&co).await.expect("tree");
+        let published = tree.iter().find(|n| n.id == first).expect("published node");
+        let task_folder = tree
+            .iter()
+            .find(|n| Some(&n.id) == published.parent_id.as_ref())
+            .expect("task folder");
+        assert_eq!(task_folder.name, "t-1");
+        let agent_folder = task_folder.parent_id.clone().expect("agent folder");
+
+        // What a concurrent first publish holding the card's title would have
+        // left behind: the same task, under a second name.
+        let twin = ws
+            .adopt_or_create_folder(&co, Some(&agent_folder), "launch-brief.t-1", origin("cmo"))
+            .await
+            .expect("twin folder")
+            .into_node();
+        assert!(
+            twin.id > task_folder.id,
+            "the twin must be the younger of the two for this to prove anything"
+        );
+
+        let second = materialize(
+            ws,
+            &co,
+            PublishTarget {
+                task_title: Some("Launch brief"),
+                ..target("timeline.md", "# Timeline")
+            },
+        )
+        .await
+        .expect("a task with two folders must still be publishable")
+        .node_id;
+        assert_eq!(
+            path_of(ws, &co, &second).await,
+            format!("{ARTIFACTS_ROOT}/cmo/t-1/timeline.md"),
+            "the older of the two folders must win, and win the same way every time"
+        );
+    }
+
+    // -- no empty / duplicate folders (#1801) -------------------------------
+
+    /// Publishing one deliverable twice lands exactly one `artifacts/<agent>/`
+    /// and one task folder beneath it, and leaves no empty folder anywhere —
+    /// the compensating rollback added for the failure path must not fire on a
+    /// publish that succeeds.
+    #[tokio::test]
+    async fn republishing_one_deliverable_leaves_one_folder_chain_and_no_empties() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let first = materialize(ws, &co, target("launch.md", "v1"))
+            .await
+            .unwrap()
+            .node_id;
+        let second = materialize(ws, &co, target("launch.md", "v2"))
+            .await
+            .unwrap()
+            .node_id;
+        assert_eq!(first, second, "one deliverable, one node");
+
+        let nodes = ws.tree(&co).await.unwrap();
+        assert_eq!(
+            nodes.iter().filter(|n| n.name == "cmo").count(),
+            1,
+            "exactly one agent folder: {nodes:?}"
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|n| n.name == "t-1" || task_folder_task_id(&n.name) == Some("t-1"))
+                .count(),
+            1,
+            "exactly one task folder: {nodes:?}"
+        );
+        for folder in nodes.iter().filter(|n| n.kind == NodeKind::Folder) {
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| n.parent_id.as_deref() == Some(folder.id.as_str())),
+                "`{}` is an empty folder a successful publish must not leave: {nodes:?}",
+                folder.name
+            );
+        }
+
+        let (_, body) = ws.read(&co, &second).await.unwrap().unwrap();
+        assert_eq!(body, "v2");
+    }
+
+    /// A first publish whose note create is refused **after** its folders were
+    /// minted must leave no empty `artifacts/<agent>/…` skeleton behind — the
+    /// residual, non-race seam this issue is about. `RefusingCreate` mints
+    /// folders but refuses the note, the exact shape a quota refusal takes on a
+    /// first publish.
+    #[tokio::test]
+    async fn a_refused_first_publish_leaves_no_empty_folders() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+        let refusing = RefusingCreate(ops.clone());
+
+        let err = materialize(&refusing, &co, target("launch.md", "# Launch"))
+            .await
+            .expect_err("the refused note create must fail the publish");
+        assert!(
+            err.to_string().contains("over quota"),
+            "the store's refusal must reach the caller: {err}"
+        );
+
+        let nodes = ws.tree(&co).await.unwrap();
+        assert!(
+            !nodes.iter().any(|n| n.name == "cmo"),
+            "the empty agent folder minted for the refused publish must be swept: {nodes:?}"
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.name == "t-1" || task_folder_task_id(&n.name) == Some("t-1")),
+            "and so must the empty task folder: {nodes:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.kind != NodeKind::Folder || n.name == ARTIFACTS_ROOT),
+            "no folder beneath the root should survive a fully-refused publish: {nodes:?}"
+        );
+    }
+
+    /// Issue #1839, the other side of the same refused publish: when a rival
+    /// **adopts** the folder this publish minted in the write window, the
+    /// rollback must leave it standing rather than sweep the folder the rival is
+    /// about to write into. `AdoptParentThenRefuse` takes the lease on the task
+    /// folder the instant before the note create is refused — the exact race —
+    /// so the agent and task folders survive despite the failed publish.
+    #[tokio::test]
+    async fn a_folder_a_rival_adopted_survives_the_refused_publish() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+        let racing = AdoptParentThenRefuse(ops.clone());
+
+        let err = materialize(&racing, &co, target("launch.md", "# Launch"))
+            .await
+            .expect_err("the refused note create must still fail the publish");
+        assert!(
+            err.to_string().contains("over quota"),
+            "the store's refusal must reach the caller: {err}"
+        );
+
+        let nodes = ws.tree(&co).await.unwrap();
+        assert!(
+            nodes.iter().any(|n| n.name == "cmo"),
+            "the agent folder a rival adopted must survive the minter's rollback: {nodes:?}"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.name == "t-1" || task_folder_task_id(&n.name) == Some("t-1")),
+            "and the adopted task folder it parents must survive too: {nodes:?}"
+        );
+    }
+
+    /// Two workflow nodes whose raw ids differ only by underscore vs dash
+    /// still capture to distinct folders.
+    ///
+    /// `write_up` and `write-up` both kebab-normalize to `write-up`. Workflow
+    /// validation only requires the RAW ids to be unique, so both are legal
+    /// node ids in one graph. Without a raw-id-derived suffix on the path
+    /// segment, the second node's capture would resolve to the same
+    /// destination as the first and silently overwrite its output.
+    #[tokio::test]
+    async fn run_nodes_with_colliding_kebab_ids_capture_to_distinct_folders() {
+        let (_dir, ops, co) = stores();
+        let ws: &dyn WorkspaceStore = ops.as_ref();
+
+        let first = materialize_run(
+            ws,
+            &co,
+            RunTarget {
+                agent_id: "cmo",
+                run_id: "run-1",
+                node_id: "write_up",
+                source: "notes.md",
+                payload: MirrorPayload::Text("first node's body"),
+            },
+        )
+        .await
+        .expect("first node capture");
+
+        let second = materialize_run(
+            ws,
+            &co,
+            RunTarget {
+                agent_id: "cmo",
+                run_id: "run-1",
+                node_id: "write-up",
+                source: "notes.md",
+                payload: MirrorPayload::Text("second node's body"),
+            },
+        )
+        .await
+        .expect("second node capture");
+
+        assert_ne!(
+            first.node_id, second.node_id,
+            "colliding kebab node ids must not resolve to the same workspace node"
+        );
+
+        let (_, first_body) = ws
+            .read(&co, &first.node_id)
+            .await
+            .expect("read")
+            .expect("first node still present");
+        assert_eq!(
+            first_body, "first node's body",
+            "the second node's capture must not overwrite the first node's output"
         );
     }
 }

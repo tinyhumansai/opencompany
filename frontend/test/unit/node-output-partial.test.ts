@@ -67,4 +67,30 @@ describe("OutputSection partial badge (issue #1008)", () => {
     expect(empty?.textContent).toContain("predates output capture");
     expect(container.querySelector('[data-testid="node-output-partial"]')).toBeNull();
   });
+
+  it("surfaces a partial node's run artifacts even when it returned no text", () => {
+    render({
+      state: "present",
+      value: {
+        items: [],
+        artifacts: [
+          {
+            source: "reports/partial.md",
+            title: "partial.md",
+            kind: "markdown",
+            workspaceNodeId: "node-42",
+          },
+        ],
+      },
+      truncated: false,
+      partial: true,
+    });
+
+    const artifact = container.querySelector<HTMLAnchorElement>(
+      '[data-testid="node-output-artifact"]',
+    );
+    expect(artifact?.textContent).toContain("partial.md");
+    expect(artifact?.getAttribute("href")).toBe("#/workspace/node-42");
+    expect(container.querySelector('[data-testid="node-output-none"]')).toBeNull();
+  });
 });

@@ -158,7 +158,7 @@ export function CompanyCredentialCard({ client, company, canManage, onChanged }:
         // Say the host could not answer. Rendering the card's "Not set" state
         // here would be a confident claim built on no data.
         <Card>
-          <CardContent className="py-4">
+          <CardContent>
             <p className="text-xs text-muted-foreground">
               {error ?? "Couldn't read the company credential."}{" "}
               This is not the same as having none set — the host could not answer, so the current
@@ -168,7 +168,7 @@ export function CompanyCredentialCard({ client, company, canManage, onChanged }:
         </Card>
       ) : (
         <Card>
-          <CardContent className="space-y-4 py-4">
+          <CardContent className="space-y-4">
             <div className="flex flex-wrap items-center gap-2">
               {configured ? (
                 <span className="inline-flex items-center gap-1 text-xs text-status-done-text">

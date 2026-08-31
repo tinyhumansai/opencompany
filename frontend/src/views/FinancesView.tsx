@@ -22,6 +22,7 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/page-header";
 
 function usd(n: number, maxFrac = 2): string {
   return (n === 0 ? 0 : n).toLocaleString(undefined, {
@@ -76,25 +77,46 @@ export function FinancesView({ client, company }: Props) {
       alive = false;
     };
   }, [client, company]);
-  if (load === "loading") {
-    return <FinanceNotice title="Loading finances…" description="Reading the company ledger." />;
-  }
+  /*
+    Hoisted above the three load-state returns (codex review, #1785). Two of
+    them are terminal — `unavailable` on a host with no finances route, `error`
+    on a read that nothing retries — so the page permanently offered a screen
+    reader nothing but `FinanceNotice`'s `h2`, with no page-level name at all.
 
-  if (load === "unavailable") {
-    return (
-      <FinanceNotice
-        title="Finances unavailable"
-        description="This host doesn't expose finances, so there is no ledger data to show."
-      />
-    );
-  }
+    The notice keeps its own `h2`: it names the *state*, not the page, and the
+    two are different sentences ("Finances" / "Could not load finances").
+  */
+  const header = (
+    <PageHeader
+      title="Finances"
+      width="6xl"
+      description={
+        <>
+          What your company is earning and spending this month.
+        </>
+      }
+    />
+  );
 
-  if (load === "error" || !data) {
+  if (load !== "ready" || !data) {
+    const notice =
+      load === "loading"
+        ? { title: "Loading finances…", description: "Reading the company ledger." }
+        : load === "unavailable"
+          ? {
+              title: "Finances unavailable",
+              description:
+                "This host doesn't expose finances, so there is no ledger data to show.",
+            }
+          : {
+              title: "Could not load finances",
+              description: "The company ledger could not be read. Try refreshing the page.",
+            };
     return (
-      <FinanceNotice
-        title="Could not load finances"
-        description="The company ledger could not be read. Try refreshing the page."
-      />
+      <div className="flex min-h-0 flex-1 flex-col">
+        {header}
+        <FinanceNotice title={notice.title} description={notice.description} />
+      </div>
     );
   }
 
@@ -104,15 +126,9 @@ export function FinancesView({ client, company }: Props) {
   const netSign = data.netUsd > 0 ? "+" : data.netUsd < 0 ? "−" : "";
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-6xl space-y-6 px-4 py-6">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Finances</h1>
-          <p className="text-sm text-muted-foreground">
-            What your company is earning and spending this month.
-          </p>
-        </div>
-
+    <div className="flex min-h-0 flex-1 flex-col">
+      {header}
+      <div className="mx-auto min-h-0 w-full max-w-6xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
         {/* KPIs */}
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Kpi icon={Wallet} label="Wallet balance" value={usd(data.balanceUsd)} hint="Ledger balance" />
@@ -259,7 +275,7 @@ function Kpi({
 }) {
   return (
     <Card>
-      <CardContent className="space-y-2 py-5">
+      <CardContent className="space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-muted-foreground">{label}</span>
           <Icon className="size-4 text-muted-foreground" />

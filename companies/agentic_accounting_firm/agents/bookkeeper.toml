@@ -12,3 +12,16 @@ tier = "orchestrator"
 # A missing path here is a manifest error rather than a skipped entry — a role
 # whose prompt was written around a briefing it never received fails silently.
 prompt_files = ["prompts/bookkeeper.md"]
+
+# Billing (#788). The one teammate in this company that holds `chargebee`.
+# Recording transactions and reconciling accounts is the job invoicing belongs
+# to, so the grant sits here rather than on the company at large.
+#
+# The company belt restated verbatim, then extended — the same rule
+# `[tools].allow` follows, and for the same reason: a short list here REPLACES
+# the belt rather than adding to it.
+#
+# Holding the Chargebee tools is not the same as invoicing unattended. Before
+# `chargebee_send_invoice` or `chargebee_create_customer`, call
+# `request_approval` with the exact action and wait for the operator.
+tools = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*", "chargebee"]

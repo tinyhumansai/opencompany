@@ -370,8 +370,12 @@ function titleFrom(text, needle) {
 function findDirective(messages) {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const text = textOf(messages[i]);
-    const at = text.indexOf(TOOL_CALL_DIRECTIVE);
-    if (at >= 0) {
+    // Context augmentation can quote a prior directive in a truncated task
+    // summary before the current complete directive. Search from the end so
+    // the newest valid instruction wins; a malformed historical quote must not
+    // prevent the fixture from serving the operator's actual message.
+    let at = text.lastIndexOf(TOOL_CALL_DIRECTIVE);
+    while (at >= 0) {
       const payload = readJsonObject(text, at + TOOL_CALL_DIRECTIVE.length);
       if (payload && typeof payload.name === "string") {
         return {
@@ -381,12 +385,7 @@ function findDirective(messages) {
           arguments: payload.arguments ?? {},
         };
       }
-      // A malformed payload is a broken spec, not a plain turn. Say so loudly
-      // rather than answering with text the spec will fail on obscurely.
-      process.stderr.write(
-        `[mock brain] ${TOOL_CALL_DIRECTIVE} found but its JSON payload did not parse\n`,
-      );
-      return null;
+      at = text.lastIndexOf(TOOL_CALL_DIRECTIVE, at - 1);
     }
     const spawnAt = text.indexOf(SPAWN_DIRECTIVE);
     if (spawnAt >= 0) {

@@ -29,12 +29,17 @@ describe("Settings navigation (issue #1468)", () => {
     expect(SETTINGS_PAGES.find((page) => page.id === "general")?.hint).toContain("Approvals");
   });
 
-  it("puts the memory browser in the capability section", () => {
-    expect(SETTINGS_PAGES.find((page) => page.id === "brain")).toMatchObject({
-      label: "Brain",
-      hint: "What your company remembers",
-      group: "capability",
-    });
+  it("does not carry the memory browser, which is a nav row now", () => {
+    // Brain left this rail for `#/brain`. Settings is where an operator
+    // *changes* how the company is configured; what the company remembers is
+    // something they read, and reading it should not cost three clicks. The old
+    // address still resolves — `console-routes.test.ts` pins that
+    // `#/settings/brain` rewrites onto the row.
+    // Widened to `string` deliberately: once `brain` is gone from the table its
+    // id is not in the union, so a narrow comparison is a type error rather
+    // than the assertion this test is making — which is about the DATA, and has
+    // to keep holding if someone puts the page back.
+    expect(SETTINGS_PAGES.map((page) => page.id as string)).not.toContain("brain");
   });
 
   it("distinguishes Settings page ids from unknown sub-hashes", () => {
@@ -63,14 +68,24 @@ describe("Settings navigation (issue #1468)", () => {
     expect(section.match(/href=\{`#\/settings\/\$\{item\.id\}`\}/g)).toHaveLength(2);
     expect(section).toContain("title={item.hint}");
     expect(section).toContain("{activePage.hint}");
-    expect(section).toContain('{page === "brain" && <MemoryView client={client} company={company} />}');
+    // And no longer renders the memory browser: that page is routed by the
+    // shell now, not by this rail.
+    expect(section).not.toContain("MemoryView");
+    // Every settings page draws a visible title, and draws it the one way the
+    // console has (issue #1763). It used to be a hand-rolled
+    // `text-2xl font-semibold tracking-tight` on each of them; the type scale
+    // lives in `PageHeader` now, so what is worth pinning here is that each
+    // page still *has* a header rather than what size it sets.
     for (const page of settingsPages) {
-      expect(page).toContain("text-2xl font-semibold tracking-tight");
+      expect(page).toContain("<PageHeader");
+      expect(page).not.toContain('hidden title=');
     }
-    // The General page draws no visible title of its own — the rail already
-    // says "Settings" (issue #1221) — so its heading is screen-reader-only.
+    // General included. It used to hide its own title above `lg` on the
+    // reasoning that the rail beside it already says "Settings" (issue #1221);
+    // #1763 makes it visible at every width, because every one of its siblings
+    // above sits beside that same rail and shows one.
     expect(read("views/SettingsView.tsx")).toContain(
-      'className="text-2xl font-semibold tracking-tight lg:sr-only"',
+      '<PageHeader title="General settings" width="3xl" />',
     );
   });
 });

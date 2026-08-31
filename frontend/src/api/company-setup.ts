@@ -33,6 +33,31 @@ export interface ProposedAgent {
   focus?: string | null;
 }
 
+/**
+ * Why the curated team shipped instead of a designed one
+ * (`FallbackReason` in `src/company/setup.rs`).
+ *
+ * The distinction exists because **the action differs**, and a single sentence
+ * covering both can only be vague enough to be useless.
+ */
+export type RosterFallback =
+  /** Nothing was reachable, so no design pass ran. The action is to wire a key. */
+  | "no_model"
+  /**
+   * A builder exists and its call was attempted but never landed — a timeout,
+   * or a provider that could not be reached. A model is wired, so the action is
+   * to retry or check the provider, not to add a key.
+   */
+  | "model_unreachable"
+  /**
+   * A model answered and its answer could not be used — unreadable, too thin to
+   * be a company, or the reference team handed back unchanged. Almost always
+   * means the answers were too sparse to design from, so the action is to say
+   * more about the business. Pointing this operator at a credential would send
+   * them to fix something that already worked.
+   */
+  | "not_designable";
+
 export interface RosterProposal {
   agents: ProposedAgent[];
   /** Which reference team framed the proposal, e.g. `ecommerce`. */
@@ -69,6 +94,13 @@ export interface RosterProposal {
    * chosen by keyword and never read the list, so it claims nothing about it.
    */
   uncovered?: string[];
+  /**
+   * Why the curated team shipped. Present only when `source` is `"fallback"`.
+   *
+   * Absent on the `"model"` path, and absent from a host too old to send it —
+   * see the dialog's `Fallback` type for why that is not read as `"no_model"`.
+   */
+  reason?: RosterFallback;
 }
 
 /**

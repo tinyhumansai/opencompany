@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::artifact_mirror::{MirrorOutcome, mirror_node_edit};
 use crate::company::workspace_links::file_with_backlinks;
-use crate::company::workspace_names::kebab_name_or;
+use crate::company::workspace_names::{MAX_NAME_BYTES, kebab_name_or};
 use crate::company::workspace_repair::{
     MergedFolder, RepairPlan, Residual, merge_duplicate_folders as merge_workspace_duplicates,
 };
@@ -147,6 +147,17 @@ pub fn router() -> Router<AppState> {
             "/workspace/{node_id}",
             patch(rename_move).delete(delete_node),
         ))
+        // Chat attachments (issue #1682) enter on their own route but land in
+        // the same blob store as a workspace upload, so the handler lives here
+        // beside `upload` to share `resolve_mime`, the filename sanitizer,
+        // `admit_upload` and `create_binary` verbatim. It carries the identical
+        // body-limit layer, for the identical reason — an unbounded multipart
+        // body must not be buffered, and the store speaks first on policy.
+        .merge(
+            scoped("/chat/upload", post(chat_upload)).layer(DefaultBodyLimit::max(
+                crate::runtime::UPLOAD_BODY_LIMIT_BYTES as usize,
+            )),
+        )
 }
 
 /// A workspace node as the console renders it.
@@ -822,6 +833,7 @@ async fn upload(
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
 
     match text_body(&mime, &bytes) {
@@ -855,6 +867,209 @@ async fn upload(
             Ok(Json(FsNode::from_node(stored, None)))
         }
     }
+}
+
+/// A stored chat attachment, as the composer needs it back (issue #1682).
+///
+/// The compact counterpart of [`FsNode`]: a chat attachment is not a tree node
+/// the console edits, so the send path needs only the id to reference it and
+/// the name / mime / size to draw a pending chip. Every field is the **store's**
+/// — the id it generated, the name it stored under, the mime it resolved, the
+/// length it measured — never the client's claim, which is the same discipline
+/// the send route re-applies when it re-resolves the id.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentRef {
+    node_id: String,
+    name: String,
+    mime: String,
+    size: u64,
+}
+
+/// `POST …/chat/upload` — multipart upload of one file to attach to a chat
+/// message (issue #1682).
+///
+/// The byte-transfer half of a two-step send: the client uploads here, gets a
+/// stable [`AttachmentRef`] back, and then posts the ordinary JSON `/chat`
+/// message carrying that node id. Decoupling the two keeps the synchronous,
+/// turn-running `/chat` POST off the bytes.
+///
+/// # Binary-only, unlike [`upload`]
+///
+/// The workspace `upload` stores a UTF-8 text file as an editable prose note,
+/// because a Markdown file in the tree earns a diffable, backlinkable editor. A
+/// chat attachment earns none of that — it is a file hung on a message, not a
+/// document someone maintains — so this always stores bytes, whatever the
+/// encoding. The download path is then 100% shared: the file is served by the
+/// existing hardened `GET …/workspace/blob/{node_id}` (issue #667), so no new
+/// serve is added and the `nosniff` + closed inline allow-list already cover it.
+///
+/// Everything that can refuse still refuses first, and in the same words:
+/// `admit_upload` gates size and quota, the body-limit layer backstops an
+/// unbounded body, and the last-segment filename sanitizer keeps a browser's
+/// full path from reaching the store.
+async fn chat_upload(
+    company: ScopedCompany,
+    mut multipart: Multipart,
+) -> Result<Json<AttachmentRef>, ApiError> {
+    let mut file: Option<(String, Option<String>, Vec<u8>)> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| multipart_error(e, "malformed multipart upload"))?
+    {
+        // Only the `file` part is read; a browser's `FormData` may carry other
+        // fields this route has no use for, and ignoring them keeps an upload
+        // from failing over a stray part.
+        if field.name() == Some("file") {
+            let name = field
+                .file_name()
+                .map(str::to_string)
+                .filter(|n| !n.trim().is_empty())
+                .ok_or_else(|| {
+                    ApiError(OpenCompanyError::InvalidRequest(
+                        "the uploaded file has no filename".to_string(),
+                    ))
+                })?;
+            let declared = field.content_type().map(str::to_string);
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| multipart_error(e, "unreadable file part"))?;
+            file = Some((name, declared, bytes.to_vec()));
+        }
+    }
+
+    let Some((name, declared, bytes)) = file else {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "the upload carried no `file` part".to_string(),
+        )));
+    };
+    // The last path segment only, then named under the workspace rule — the
+    // same sanitizer `upload` applies, so a browser's full path never reaches
+    // the store and a client string never reaches a filesystem path.
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&name)
+        .trim()
+        .to_string();
+    let name = kebab_name_or(&name, &name);
+    let mime = resolve_mime(&name, declared.as_deref());
+
+    // Size + quota, decided by the store so a company's configured cap is
+    // honoured rather than the global default — identical to `upload`.
+    company
+        .runtime
+        .workspace()
+        .admit_upload(company.id(), &name, bytes.len() as u64)
+        .await?;
+
+    let id = generate_id();
+    let mut node = WorkspaceNode {
+        id: id.clone(),
+        name: name.clone(),
+        kind: NodeKind::File,
+        parent_id: None,
+        updated_at_millis: crate::ports::now_millis(),
+        created_by: WorkspaceOrigin::Operator,
+        updated_by: WorkspaceOrigin::Operator,
+        // A chat attachment is bytes, never a note — so it is a binary node
+        // whatever its encoding, and the text branch `upload` owns is skipped.
+        mime: Some(mime.clone()),
+        size: None,
+        sha256: None,
+        adopted: false,
+    };
+    // Chat uploads all land at the workspace root (`parent_id: None`), so a
+    // second attachment reusing an earlier one's exact filename — the same
+    // `image.png` picked in two different messages — collides on the sibling
+    // uniqueness `create_binary` enforces. That used to surface as a 409 on
+    // the second attach, silently losing it, since deleting the first (the
+    // only way to free the name) would break its download too. On exactly
+    // that conflict, retry once under a disambiguated name derived from this
+    // upload's own freshly-minted id — guaranteed free — rather than fail the
+    // attach. The stored name is what `resolve_attachments` later reads back
+    // as the display name, so a repeat filename is honestly shown suffixed
+    // rather than silently dropped.
+    //
+    // Matched in full — codex review finding — rather than `if let
+    // Err(Conflict(_)) = ...`, which let every OTHER failure (a filesystem,
+    // SQLite, or MongoDB write error) fall through as if the first attempt
+    // had succeeded: the composer would show a node that was never stored,
+    // and the later `/chat` POST would 400 resolving a reference that names
+    // nothing.
+    match company
+        .runtime
+        .workspace()
+        .create_binary(company.id(), &node, &bytes)
+        .await
+    {
+        Ok(_) => {}
+        Err(OpenCompanyError::Conflict(_)) => {
+            // On MongoDB the failed attempt is not a dry run: `create_binary`
+            // uploads the blob before the node-document insert, so a
+            // name-collision conflict has already written bytes under this id
+            // (blob-first ordering, issue #894). The store's conflict path
+            // reclaims that payload before returning, so only the name remains
+            // contested. Retrying under the *same* id would upload a second
+            // blob that matches a live node, which the orphan sweep can never
+            // reclaim — so mint a fresh id (and a disambiguated name derived
+            // from it) for the retry.
+            node.id = generate_id();
+            node.name = disambiguate_name(&name, &node.id);
+            company
+                .runtime
+                .workspace()
+                .create_binary(company.id(), &node, &bytes)
+                .await?;
+        }
+        Err(other) => return Err(ApiError(other)),
+    }
+
+    Ok(Json(AttachmentRef {
+        node_id: node.id,
+        name: node.name,
+        mime,
+        // The stored length is exactly what was written — `create_binary`
+        // measures the same bytes — so it needs no re-read to report.
+        size: bytes.len() as u64,
+    }))
+}
+
+/// Inserts a short disambiguator before `name`'s extension (or at its end,
+/// with none), from the tail of `id` — already a fresh, collision-free ULID,
+/// so no extra uniqueness check is needed against it.
+///
+/// `image.png` + id `...01j8` → `image-01j8.png`.
+///
+/// The result stays within the workspace-name budget ([`MAX_NAME_BYTES`]).
+/// `name` arrives already canonical, so it may already fill the whole budget;
+/// appending the tag would then exceed the cap, and the next normalization
+/// would truncate the tag back off — mapping the disambiguated name onto the
+/// very collision it exists to escape. The stem is trimmed to make room for
+/// the tag and the extension; an extension that would alone eat the budget is
+/// dropped (the same rule the sanitizer applies).
+fn disambiguate_name(name: &str, id: &str) -> String {
+    let tag = &id[id.len().saturating_sub(6)..];
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (name, None),
+    };
+    let with_extension = extension.is_some_and(|ext| 8 + ext.len() <= MAX_NAME_BYTES); // `-<tag>.<ext>`
+    let suffix = if with_extension {
+        format!("-{tag}.{}", extension.unwrap())
+    } else {
+        format!("-{tag}")
+    };
+    let mut trimmed = &stem[..stem.len().min(MAX_NAME_BYTES.saturating_sub(suffix.len()))];
+    // A cut that lands mid-run leaves a separator abutting the tag; trim it so
+    // the result is still canonical kebab-case and `is_kebab_name` fixes it.
+    while trimmed.ends_with('-') || trimmed.ends_with('.') {
+        trimmed = &trimmed[..trimmed.len() - 1];
+    }
+    format!("{trimmed}{suffix}")
 }
 
 /// The media type to store a upload under.
@@ -913,6 +1128,7 @@ async fn create_node(
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     company
         .runtime
@@ -1214,5 +1430,56 @@ mod serving_test {
         let serving = serving_for(Some("application/x-invented-2031"));
         assert_eq!(serving.content_type, "application/octet-stream");
         assert_eq!(serving.disposition, "attachment");
+    }
+}
+
+#[cfg(test)]
+mod disambiguate_name_test {
+    use super::disambiguate_name;
+    use crate::company::workspace_names::{MAX_NAME_BYTES, is_kebab_name, kebab_name_or};
+
+    /// The tag always lands between stem and extension, whatever the name
+    /// carried.
+    #[test]
+    fn inserts_the_tag_before_the_extension() {
+        assert_eq!(disambiguate_name("image.png", "01j8ab"), "image-01j8ab.png");
+        assert_eq!(disambiguate_name("notes", "01j8ab"), "notes-01j8ab");
+        assert_eq!(
+            disambiguate_name("page.compiled.mjs", "01j8ab"),
+            "page.compiled-01j8ab.mjs"
+        );
+    }
+
+    /// The regression the budget guard exists for: a name that already fills
+    /// the whole workspace-name budget must stay within it once the tag lands,
+    /// or the next normalization truncates the tag back off and the name maps
+    /// onto the very collision the retry exists to escape.
+    #[test]
+    fn a_full_budget_name_stays_within_the_budget_and_keeps_the_tag() {
+        let stem = "a".repeat(92); // `a…a.png` fills the 96-byte budget exactly.
+        let name = format!("{stem}.png");
+        assert_eq!(name.len(), MAX_NAME_BYTES);
+        assert_eq!(kebab_name_or(&name, &name), name);
+
+        let disambiguated = disambiguate_name(&name, "ab12cd");
+        assert!(
+            disambiguated.len() <= MAX_NAME_BYTES,
+            "disambiguated name is {} bytes, over the {MAX_NAME_BYTES} budget",
+            disambiguated.len()
+        );
+        // The whole tag survives — truncation must never cut it off.
+        assert!(disambiguated.contains("-ab12cd"), "{disambiguated}");
+        // And the result is canonical, so the repair pass leaves it alone.
+        assert!(is_kebab_name(&disambiguated), "{disambiguated}");
+
+        // Re-running the sanitizer is a fixed point: the tag is not a casualty
+        // of the budget, which is what would re-collide with the original name.
+        assert_eq!(kebab_name_or(&disambiguated, &disambiguated), disambiguated);
+    }
+
+    /// A near-full name with a short stem survives whole; the tag still fits.
+    #[test]
+    fn a_short_stem_is_never_truncated() {
+        assert_eq!(disambiguate_name("image.png", "01j8ab"), "image-01j8ab.png");
     }
 }

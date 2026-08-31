@@ -4,6 +4,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { staticAvatarSrc } from "@/lib/avatar";
 import { avatarFor, type TeamMember } from "@/lib/team";
 import { MessageTimeline } from "@/views/chat/MessageTimeline";
 import type { Channel } from "@/views/chat/model";
@@ -105,7 +106,7 @@ describe("the channel intro's mark", () => {
     expect(img).not.toBeNull();
     // Seeded through `dmFace`, so the intro cannot disagree with the rail row
     // or the header about who this DM is with.
-    expect(img!.getAttribute("src")).toContain(avatarFor("agent_ada"));
+    expect(img!.getAttribute("src")).toBe(staticAvatarSrc(avatarFor("agent_ada")));
   });
 
   it("draws no face for a channel — there is no one person behind it", () => {

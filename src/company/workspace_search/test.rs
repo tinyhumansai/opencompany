@@ -30,6 +30,7 @@ fn node(id: &str, name: &str, parent: Option<&str>, kind: NodeKind, rev: u64) ->
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     }
 }
 

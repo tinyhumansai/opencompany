@@ -99,9 +99,17 @@ export function hashWithHost(id: ConnectionId | null): string {
  * `replaceState` callers need this most: replacing fires no `hashchange`, so a
  * scope dropped there has no event for {@link useHostAddress} to repair it on.
  */
-export function withHostParam(path: string): string {
+export function withHostParam(
+  path: string,
+  query: Readonly<Record<string, string | null>> = {},
+): string {
   const host = readHostParam();
-  return `#/${path}${host ? `?${HOST_PARAM}=${host}` : ""}`;
+  const params = new URLSearchParams(host ? `${HOST_PARAM}=${host}` : "");
+  for (const [key, value] of Object.entries(query)) {
+    if (value === null) params.delete(key);
+    else params.set(key, value);
+  }
+  return formatHash(`/${path}`, params);
 }
 
 export interface HostRoute {

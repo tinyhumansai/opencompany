@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::metering::ModelSlug;
 use crate::ports::types::{
     ApprovalId, ContextOp, ContextOpResult, CycleRequest, CycleResult, Effect, EffectDisposition,
     ToolCall, ToolResult,
@@ -43,6 +44,17 @@ pub enum UsageMetering {
 /// one side silently turn the test into a permanent `false`.
 pub const HARNESS_PATH: &str = "harness";
 
+/// The [`Cognition::path`] label of the offline [`EchoBrain`](crate::brain::EchoBrain)
+/// — the degraded fallback that runs no model at all and answers every operator
+/// message with `"You said: …"`.
+///
+/// A named constant for the same reason [`HARNESS_PATH`] is one: the brain that
+/// *reports* it (`crate::brain::echo`) and the inference-status route that
+/// *tests* it to decide whether this company can think (issue #1735) must agree,
+/// and a literal in both would let a wording change on one side turn the test
+/// into a permanent "configured".
+pub const ECHO_PATH: &str = "echo";
+
 /// How a [`Brain`] does cognition, for metering and operator diagnosis.
 ///
 /// The runtime reads [`Self::provider`] when it meters a cycle's usage, and the
@@ -60,6 +72,22 @@ pub struct Cognition {
     pub path: &'static str,
     /// The provider slug this path's cycle usage is metered under.
     pub provider: &'static str,
+    /// Which model this path's cycle usage is metered against, folded onto the
+    /// closed [`ModelSlug`] vocabulary (issue #1749).
+    ///
+    /// `None` when the path cannot name one — an injected brain, the offline
+    /// echo brain (which runs no model), the sidecar (whose model is the host
+    /// [`InferenceClient`](crate::ports::InferenceClient)'s business), and the
+    /// hosted Medulla path (where the model is chosen upstream and never
+    /// reaches this process). Reporting a guess would be worse than reporting
+    /// nothing: an operator reading a model name off the Usage view would have
+    /// no way to tell one that was observed from one that was assumed.
+    ///
+    /// The `openhuman` harness names its model per **turn** rather than here —
+    /// it meters [`UsageMetering::PerTurn`] and reports zero cycle usage, so
+    /// this field would never reach a sample on that path. See
+    /// `harness::built_in::provider::HarnessModel::telemetry_model`.
+    pub model: Option<ModelSlug>,
     /// Where this path's usage is metered.
     pub metering: UsageMetering,
 }
@@ -72,6 +100,7 @@ impl Default for Cognition {
             // name the provider that served it.
             path: "custom",
             provider: crate::metering::UNKNOWN_PROVIDER,
+            model: None,
             metering: UsageMetering::PerCycle,
         }
     }

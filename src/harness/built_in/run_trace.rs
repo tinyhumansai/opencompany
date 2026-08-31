@@ -43,9 +43,10 @@ use oh::agent::progress::AgentProgress;
 use crate::harness::cost::TurnUsage;
 use crate::harness::steps::StepTrace;
 use crate::ports::RunStore;
+use crate::ports::deep_trace::TurnStepDetail;
 use crate::ports::now_millis;
 use crate::ports::runs::RunStepRecord;
-use crate::ports::types::{CompanyId, TokenUsage};
+use crate::ports::types::{CompanyId, TokenUsage, TurnStep};
 
 /// The most steps one attempt persists.
 ///
@@ -74,6 +75,19 @@ pub struct RunTraceSink {
     usage: StdMutex<TokenUsage>,
     /// How many step rows were actually written.
     persisted: StdMutex<u32>,
+    /// Accumulated reasoning by step ordinal. `StepTrace` emits only the newly
+    /// accumulated chunk after each threshold flush; the store record must still
+    /// contain the complete prefix because each write replaces the prior row.
+    deep_reasoning: StdMutex<std::collections::HashMap<u32, String>>,
+    /// Where the unredacted companion of each step goes, when this host keeps
+    /// one.
+    ///
+    /// **Presence of the `Arc` IS the enablement.** There is deliberately no
+    /// boolean beside it: a host that does not retain deep traces constructs no
+    /// store, so there is nothing to write to and nothing to get wrong. A future
+    /// refactor replacing this with a flag would turn "cannot leak" into
+    /// "must remember not to".
+    deep: Option<Arc<dyn crate::ports::deep_trace::DeepTraceStore>>,
 }
 
 impl RunTraceSink {
@@ -86,7 +100,25 @@ impl RunTraceSink {
             trace: StdMutex::new(StepTrace::default()),
             usage: StdMutex::new(TokenUsage::default()),
             persisted: StdMutex::new(0),
+            deep_reasoning: StdMutex::new(std::collections::HashMap::new()),
+            deep: None,
         }
+    }
+
+    /// Also retain the unredacted companion of every step.
+    ///
+    /// Switches the trace itself into deep mode, so the two projections come
+    /// from one state machine and their ordinals cannot drift.
+    #[must_use]
+    pub fn with_deep(
+        mut self,
+        deep: Option<Arc<dyn crate::ports::deep_trace::DeepTraceStore>>,
+    ) -> Self {
+        if deep.is_some() {
+            self.trace = StdMutex::new(StepTrace::deep());
+        }
+        self.deep = deep;
+        self
     }
 
     /// The attempt this sink is tracing.
@@ -100,39 +132,112 @@ impl RunTraceSink {
     /// ordinal finalized, because `append_run_step` replaces on a matching
     /// `step_seq`. An event that maps to no step is a no-op.
     pub async fn record(&self, event: &AgentProgress) {
-        let Some((step_seq, step)) = self
+        let emitted = self
             .trace
             .lock()
             .expect("run trace")
-            // The lock is released before the await below — a store write must
+            // The lock is released before the awaits below — a store write must
             // never be held across the mutex the collector re-enters per event.
-            .push(event)
-        else {
-            return;
-        };
-        if step_seq >= MAX_RUN_STEPS {
-            return;
-        }
-        let record = RunStepRecord {
-            run_id: self.run_id.clone(),
-            step_seq,
-            at_millis: now_millis(),
-            step,
-        };
-        match self.runs.append_run_step(&self.company, &record).await {
-            Ok(()) => {
-                let mut persisted = self.persisted.lock().expect("run trace count");
-                // A finalized start rewrites its own row rather than adding one,
-                // so the count is the high-water ordinal, not the write count.
-                *persisted = (*persisted).max(step_seq + 1);
+            .push(event);
+        self.persist(emitted).await;
+    }
+
+    /// Flushes a thinking run the stream never got to close.
+    ///
+    /// [`record`](Self::record) closes an open thought only when the next event
+    /// gives it a reason to — visible text or a tool call. A turn that *ends*
+    /// mid-thought — a reply, an abort, an error — has neither, so the tail of
+    /// reasoning below the interim flush threshold would sit in the trace
+    /// unpersisted. The collector calls this after the stream drains, so a
+    /// failed or interrupted turn still keeps the reasoning that led to its end.
+    /// No-op when nothing is open.
+    pub async fn flush(&self) {
+        let emitted = self.trace.lock().expect("run trace").finish();
+        self.persist(emitted).await;
+    }
+
+    /// Writes one batch of emitted steps to the run store and — when this host
+    /// retains deep traces — their unredacted companions.
+    async fn persist(&self, emitted: Vec<(u32, TurnStep, Option<TurnStepDetail>)>) {
+        for (step_seq, step, detail) in emitted {
+            if step_seq >= MAX_RUN_STEPS {
+                continue;
             }
-            Err(err) => tracing::warn!(
-                company = %self.company,
-                run = %self.run_id,
+            let at_millis = now_millis();
+            let record = RunStepRecord {
+                run_id: self.run_id.clone(),
                 step_seq,
-                error = %err,
-                "[runs] could not persist a step of an attempt's trace; the turn continues"
-            ),
+                at_millis,
+                step,
+            };
+            let skeleton_written = match self.runs.append_run_step(&self.company, &record).await {
+                Ok(()) => {
+                    let mut persisted = self.persisted.lock().expect("run trace count");
+                    // A finalized start rewrites its own row rather than adding
+                    // one, so the count is the high-water ordinal, not the write
+                    // count.
+                    *persisted = (*persisted).max(step_seq + 1);
+                    true
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        company = %self.company,
+                        run = %self.run_id,
+                        step_seq,
+                        error = %err,
+                        "[runs] could not persist a step of an attempt's trace; the turn continues"
+                    );
+                    false
+                }
+            };
+            if !skeleton_written {
+                continue;
+            }
+            // never meet a detail whose step does not exist. Best-effort like
+            // the step above: a full disk must degrade the record, never fail
+            // the turn.
+            let (Some(deep), Some(mut detail)) = (self.deep.as_ref(), detail) else {
+                continue;
+            };
+            if detail.is_empty() {
+                continue;
+            }
+            if let Some(reasoning) = detail.reasoning.take() {
+                let mut buffers = self.deep_reasoning.lock().expect("deep reasoning");
+                let buffer = buffers.entry(step_seq).or_default();
+                buffer.push_str(&reasoning);
+                // Each emitted chunk already passed through `bound_detail`, but
+                // the concatenation can still exceed DEEP_REASONING_CHAR_CAP,
+                // and every store trusts the caller's bound. Re-bind the
+                // aggregate so a long reasoning stream cannot grow a row past
+                // the documented 64 KiB bound with `clipped == false`.
+                let mut bounded = crate::ports::deep_trace::bound_detail(TurnStepDetail {
+                    reasoning: Some(buffer.clone()),
+                    ..TurnStepDetail::default()
+                });
+                detail.reasoning = bounded.reasoning.take();
+                detail.clipped |= bounded.clipped;
+                // Cap the accumulator itself: only the first CAP bytes are ever
+                // written, so keeping more in memory serves nothing.
+                if let Some(bounded) = &detail.reasoning {
+                    *buffer = bounded.clone();
+                }
+            }
+            let record = crate::ports::deep_trace::RunStepDetailRecord {
+                run_id: self.run_id.clone(),
+                step_seq,
+                at_millis,
+                detail,
+            };
+            if let Err(err) = deep.append_step_detail(&self.company, &record).await {
+                tracing::warn!(
+                    company = %self.company,
+                    run = %self.run_id,
+                    step_seq,
+                    error = %err,
+                    "[runs] could not persist a step's deep detail; the turn continues"
+                );
+            }
         }
     }
 
@@ -180,6 +285,13 @@ mod tests {
             iteration: 1,
             display_label: label.map(str::to_string),
             display_detail: None,
+        }
+    }
+
+    fn thinking(delta: &str) -> AgentProgress {
+        AgentProgress::ThinkingDelta {
+            delta: delta.to_string(),
+            iteration: 1,
         }
     }
 
@@ -247,6 +359,46 @@ mod tests {
         assert_eq!(sink.step_count(), 1);
     }
 
+    /// The EOF path end-to-end: a thought whose stream closes without a
+    /// `TextDelta` or tool call still lands in the deep store when the sink is
+    /// flushed. The tail below the interim flush threshold is exactly what an
+    /// aborted turn leaves behind, and it must not vanish.
+    #[tokio::test]
+    async fn flush_persists_an_aborted_thoughts_tail() {
+        let home = tempfile::Builder::new()
+            .prefix("opencompany-run-trace-deep-")
+            .tempdir()
+            .expect("tempdir");
+        let company = CompanyId::new("acme");
+        let runs: Arc<dyn RunStore> = Arc::new(FsOps::new(home.path().to_path_buf()));
+        let run = runs
+            .create_run(&company, NewRun::for_task("run-1", "t-1", "ceo"))
+            .await
+            .expect("mint");
+        let deep: Arc<dyn crate::ports::deep_trace::DeepTraceStore> =
+            Arc::new(FsOps::new(home.path().to_path_buf()));
+        let sink = RunTraceSink::new(company.clone(), run.id, Arc::clone(&runs))
+            .with_deep(Some(Arc::clone(&deep)));
+
+        sink.record(&thinking("first ")).await;
+        sink.record(&thinking("second")).await; // under DEEP_THINK_FLUSH_BYTES
+        // No text, no tool call — the turn just ends.
+        sink.flush().await;
+
+        let details = deep
+            .list_step_details(&company, "run-1")
+            .await
+            .expect("list step details");
+        let reasoning: String = details
+            .iter()
+            .filter_map(|d| d.detail.reasoning.clone())
+            .collect();
+        assert_eq!(
+            reasoning, "first second",
+            "the tail of an aborted thought was dropped: {reasoning:?}"
+        );
+    }
+
     /// Cost folds across every turn of the attempt, and tokens are recorded even
     /// at zero USD (the managed passthrough bills off the wire).
     #[test]
@@ -309,6 +461,8 @@ mod tests {
                     error: None,
                     usage: TokenUsage::default(),
                     step_count: 0,
+                    workflow_run_id: None,
+                    node_id: None,
                 })
             }
             async fn get_run(

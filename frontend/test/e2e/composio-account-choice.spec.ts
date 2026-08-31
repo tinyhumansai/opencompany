@@ -259,44 +259,6 @@ test.describe("the agent acts as the chosen account", () => {
   test.skip(!LIVE_BRAIN, LIVE_BRAIN_REASON);
 
   /**
-   * Approve the parked `composio_execute`, which is the only way one ever
-   * reaches a provider.
-   *
-   * Not incidental plumbing: `composio_execute` is an `Execute`-level tool and
-   * the harness parks it — "sends to a counterparty, which cannot be taken
-   * back". So the send an operator authorises is the send that carries their
-   * choice of account, and this spec would be describing a path that does not
-   * exist if it bypassed the gate.
-   */
-  async function approvePendingSend(page: Page): Promise<void> {
-    await expect
-      .poll(
-        async () => {
-          const pending = await page.request.get("/api/v1/company/approvals");
-          if (!pending.ok()) return 0;
-          return ((await pending.json()) as unknown[]).length;
-        },
-        { timeout: 30_000 },
-      )
-      .toBeGreaterThan(0);
-
-    const pending = (await (await page.request.get("/api/v1/company/approvals")).json()) as {
-      id: string;
-      tool?: string;
-    }[];
-    for (const approval of pending) {
-      const decided = await page.request.post(
-        `/api/v1/company/approvals/${encodeURIComponent(approval.id)}`,
-        { data: { verdict: "approve" } },
-      );
-      expect(
-        decided.ok(),
-        `approving ${approval.id} failed: ${decided.status()} ${await decided.text()}`,
-      ).toBeTruthy();
-    }
-  }
-
-  /**
    * Make the agent run one `composio_execute` and hand back what the fixture
    * received for it.
    *
@@ -320,12 +282,10 @@ test.describe("the agent acts as the chosen account", () => {
       .first()
       .click();
 
-    // A SEND, deliberately. `composio_execute` is parked for approval on the
-    // strength of the slug — a fetch runs straight through — and the send is
-    // both the case #820 is written around ("send from billing@, not ops@")
-    // and the one that exercises the gate: park → operator approves → the
-    // agent re-issues → the pinned account reaches the wire. A fetch here
-    // would pass while quietly covering none of that.
+    // A SEND, deliberately: it is the case #820 is written around ("send from
+    // billing@, not ops@") and proves the selected account reaches an effectful
+    // provider call. Policy HITL is disabled, so this mock directive executes
+    // directly; explicit approval behavior is covered by the approval suites.
     const directive = `__MOCK_TOOL_CALL__ ${JSON.stringify({
       name: "composio_execute",
       arguments: {
@@ -344,8 +304,6 @@ test.describe("the agent acts as the chosen account", () => {
     // loose match resolves to both as soon as any message mentions sending.
     await page.getByRole("button", { name: "Send", exact: true }).click();
     expect((await posted).ok(), "the chat POST did not succeed").toBeTruthy();
-
-    await approvePendingSend(page);
 
     await expect
       .poll(async () => (await executes(page)).length, { timeout: 30_000 })
@@ -369,8 +327,6 @@ test.describe("the agent acts as the chosen account", () => {
 
     // Now choose, through the page, exactly as an operator would.
     await openConnections(page);
-    // The approval just decided above leaves a toast in the bottom-right
-    // corner, and this button can sit under it once the pane is scrolled.
     await clickClearOfToasts(
       page
         .getByTestId("accounts-gmail")

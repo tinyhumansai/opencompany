@@ -30,8 +30,9 @@ function node(over: {
   name: string;
   kind: "folder" | "file";
   parentId?: string;
+  updatedAt?: number;
 }) {
-  return { ...over, updatedAt: 1 };
+  return { updatedAt: 1, ...over };
 }
 
 function member(id: string, name: string): TeamMemberDto {
@@ -113,6 +114,24 @@ describe("the workspace tree", () => {
     const text = container.textContent ?? "";
     expect(text.indexOf("Alex")).toBeGreaterThanOrEqual(0);
     expect(text.indexOf("Zoe")).toBeGreaterThan(text.indexOf("Alex"));
+  });
+
+  it("sorts agents/ folders by modified time first, display name only as a tie-breaker (issue #1687)", async () => {
+    // Display-name order (Alex, Zoe) and modified-time order disagree: Zoe's
+    // folder is the more recently touched one, so it must lead despite
+    // sorting after Alex alphabetically.
+    const tree = [
+      node({ id: "agents-root", name: "Agents", kind: "folder" }),
+      node({ id: "n-alpha", name: "alpha-id", kind: "folder", parentId: "agents-root", updatedAt: 10 }),
+      node({ id: "n-zeta", name: "zeta-id", kind: "folder", parentId: "agents-root", updatedAt: 20 }),
+    ];
+    const team = [member("alpha-id", "Alex"), member("zeta-id", "Zoe")];
+
+    await render(client(tree, team));
+
+    const text = container.textContent ?? "";
+    expect(text.indexOf("Zoe")).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf("Alex")).toBeGreaterThan(text.indexOf("Zoe"));
   });
 
   it("names an artifacts/ folder by its teammate too", async () => {

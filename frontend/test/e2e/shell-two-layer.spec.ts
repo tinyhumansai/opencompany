@@ -205,6 +205,16 @@ test("the workflow canvas fills the card and keeps its minimap inside it", async
   await open(page, "light", "/#/workflows");
   await openFirstWorkflow(page);
 
+  // Issue #1683 opens the History rail on select. That rail is real,
+  // in-flow layout — it is what this spec's crop-bug class (#1259/#1261) is
+  // NOT about — so close it and measure the canvas against the bare card it
+  // was written against.
+  const historyToggle = page.getByTestId("workflow-history-toggle");
+  if (await historyToggle.isVisible().catch(() => false)) {
+    await historyToggle.click();
+    await expect(page.getByTestId("workflow-run-history")).toBeHidden();
+  }
+
   const canvas = await page.evaluate(() => {
     const card = document.querySelector('[data-testid="content-surface"]')!;
     const flow = document.querySelector(".react-flow");

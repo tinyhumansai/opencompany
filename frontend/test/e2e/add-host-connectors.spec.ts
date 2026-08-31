@@ -165,9 +165,18 @@ async function installDesktopShell(
 
 /** Opens "Add a host" and waits for the chooser. */
 async function openTheChooser(page: Page): Promise<void> {
-  await openHostMenu(page);
-  await page.getByTestId("host-switcher-add").click();
-  await expect(page.getByTestId("add-host-remote")).toBeVisible();
+  const chooser = page.getByTestId("add-host-remote");
+  // Choosing "Add a host" closes the menu the item lives in, so the click can
+  // observe its own target detaching and then retry against a menu that is
+  // already gone. The chooser's arrival is the assertion — drive the
+  // open-and-choose pair until it lands, same shape as `clickClearOfToasts`.
+  await expect(async () => {
+    await openHostMenu(page);
+    await page.getByTestId("host-switcher-add").click({ timeout: 2_000 }).catch(() => {
+      // The menu closed under the click; the chooser check below is the verdict.
+    });
+    await expect(chooser).toBeVisible({ timeout: 2_000 });
+  }).toPass({ timeout: 15_000, intervals: [250] });
 }
 
 /** Every connector this console is offering right now. */

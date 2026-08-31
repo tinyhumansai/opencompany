@@ -27,7 +27,7 @@ function overlay(over: Partial<AgentDetailDto> = {}): AgentDetailDto {
     source: "overlay",
     editable: ["name", "role", "description", "tools", "instructions"],
     isOrchestrator: false,
-    tools: { requested: [], companyAllow: [], effective: [] },
+    tools: { requested: [], companyAllow: [], deskAllow: [], deskCeilingActive: false, effective: [] },
     desks: [],
     inboxEnabled: false,
     description: "Runs paid acquisition.",

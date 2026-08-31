@@ -35,8 +35,10 @@
 //!   comes back, so scratch cannot appear in a durable result even if a driver
 //!   ignores the filter.
 //! - **Archive on evict.** The contract has no archive tier, so eviction is a
-//!   move between namespaces rather than a delete. See
-//!   [`facades::ProviderMemoryStore::evict`].
+//!   move between namespaces rather than a delete — and every eviction bounds
+//!   the archive by the eviction policy's own `n` or, for a policy without
+//!   one, by the retention limit, so the move cannot grow storage without
+//!   bound either. See [`facades::ProviderMemoryStore::evict`].
 //! - **Taint.** Inbound-channel writes are stamped
 //!   [`MemoryTaint::ExternalSync`] via [`BoundMemory::inbound_context`].
 //!   Note the contract's `MemoryCore::store` requires taint on every call and
@@ -71,7 +73,8 @@ pub mod facades;
 pub mod migrate;
 mod namespace;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use tinymemory::registry::DriverClass;
 use tinymemory_api::capabilities::Capabilities;
@@ -85,9 +88,57 @@ use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::ports::{CompanyId, ContextStore, FactStore, MemoryStore};
 
+#[async_trait::async_trait]
+impl crate::store::select::MemoryScopes for BoundMemory {
+    fn agent_context(&self, agent_id: &str) -> Arc<dyn ContextStore> {
+        Self::agent_context(self, agent_id)
+    }
+
+    fn desk_context(&self, desk_id: &str) -> Arc<dyn ContextStore> {
+        Self::desk_context(self, desk_id)
+    }
+
+    async fn archived_traces(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::CompressedTrace>> {
+        Self::archived_traces(self, company).await
+    }
+
+    async fn restore_archived_traces(
+        &self,
+        company: &CompanyId,
+        traces: &[crate::ports::CompressedTrace],
+    ) -> Result<()> {
+        Self::restore_archived_traces(self, company, traces).await
+    }
+}
+
 pub use driver::{
     MemoryDriverConfig, MemoryDriverError, MemoryMode, RemoteDeployment, open_driver,
 };
+
+/// Process-wide cache of per-scope context stores, keyed by the scope label.
+///
+/// Populated lazily on first use of a scope ([`BoundMemory::scoped_context`]),
+/// so one bound engine serves every company and every scope it is asked for
+/// without rebuilding stores. Factored out of the struct field so
+/// `clippy::type-complexity` stays satisfied — the shape is deliberately the
+/// once-init + lock + map + arc composition.
+type ContextStoreCache =
+    Arc<OnceLock<std::sync::Mutex<HashMap<String, Arc<ProviderContextStore>>>>>;
+
+/// Upper bound on distinct scope labels the per-scope context cache holds.
+///
+/// The labels are agent/desk ids — internal identifiers, so a legitimate
+/// company has a handful — but nothing else stops an unbounded number of them
+/// from accumulating for the life of the process: every distinct id ever used
+/// inserts an entry that is never removed. The cache exists to make repeated
+/// access to the *same* scope cheap, not to remember every scope forever, so
+/// the bound is a plain capacity cap with arbitrary eviction. Eviction is safe
+/// because entries are `Arc`-backed: an in-flight holder keeps its store, and
+/// the next access to an evicted scope rebuilds it.
+const SCOPED_CONTEXT_CACHE_CAPACITY: usize = 4096;
 
 /// A bound memory engine, and the only way to get a memory port out of one.
 ///
@@ -104,6 +155,7 @@ pub struct BoundMemory {
     class: DriverClass,
     driver_id: String,
     capabilities: Capabilities,
+    context_stores: ContextStoreCache,
 }
 
 impl std::fmt::Debug for BoundMemory {
@@ -143,6 +195,7 @@ impl BoundMemory {
             capabilities: provider.capabilities(),
             provider,
             class,
+            context_stores: Arc::new(OnceLock::new()),
         })
     }
 
@@ -203,19 +256,67 @@ impl BoundMemory {
         ))
     }
 
-    /// One agent's private partition.
     pub fn agent_context(&self, agent_id: &str) -> Arc<dyn ContextStore> {
-        Arc::new(ProviderContextStore::new(self.bound(
-            Scope::Agent(agent_id.to_string()),
-            MemoryTaint::Internal,
-        )))
+        self.scoped_context(format!("agent:{agent_id}"), || {
+            ProviderContextStore::new(
+                self.bound(Scope::Agent(agent_id.to_string()), MemoryTaint::Internal),
+            )
+        })
     }
 
     /// One desk's shared partition.
     pub fn desk_context(&self, desk_id: &str) -> Arc<dyn ContextStore> {
-        Arc::new(ProviderContextStore::new(
-            self.bound(Scope::Desk(desk_id.to_string()), MemoryTaint::Internal),
-        ))
+        self.scoped_context(format!("desk:{desk_id}"), || {
+            ProviderContextStore::new(
+                self.bound(Scope::Desk(desk_id.to_string()), MemoryTaint::Internal),
+            )
+        })
+    }
+
+    fn scoped_context(
+        &self,
+        key: String,
+        make: impl FnOnce() -> ProviderContextStore,
+    ) -> Arc<dyn ContextStore> {
+        let mut cache = self
+            .context_stores
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("context store cache lock poisoned");
+        // Bound the cache at [`SCOPED_CONTEXT_CACHE_CAPACITY`]: an unbounded
+        // scope set must not grow the map without limit. Evict only entries
+        // no caller still holds — `Arc::strong_count == 1` means the cache is
+        // the sole holder, so dropping one cannot leave a second facade for a
+        // scope beside the one a running agent already has. Two facades for a
+        // scope would each carry their own `label_lock`, and two concurrent
+        // `put`/`delete_label` read-merge-writes through the pair could
+        // interleave and lose a label claim (#1300). If every entry is still
+        // held, accept the temporary over-capacity: those `Arc`s drain as
+        // their callers drop them, and the next access to an unheld scope
+        // evicts again.
+        //
+        // When over capacity, drain the whole surplus down to the cap rather
+        // than evict a single entry. A burst of live agent/desk scopes can
+        // push the map past its capacity while every entry has an external
+        // holder; once those holders drop, one-per-miss eviction would leave
+        // the surplus in place forever — each miss removes one entry and
+        // reinserts its replacement, so the process-lifetime cache stays
+        // permanently oversized. Removing every unheld entry down to the cap
+        // (plus one for the key being inserted) walks it back in a single
+        // miss once the burst's callers are gone.
+        if !cache.contains_key(&key) && cache.len() >= SCOPED_CONTEXT_CACHE_CAPACITY {
+            let surplus = cache.len() - SCOPED_CONTEXT_CACHE_CAPACITY + 1;
+            let victims: Vec<String> = cache
+                .iter()
+                .filter(|(_, facade)| Arc::strong_count(facade) == 1)
+                .take(surplus)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for victim in victims {
+                cache.remove(&victim);
+            }
+        }
+        cache.entry(key).or_insert_with(|| Arc::new(make())).clone()
     }
 
     /// Provisional working-out, unreachable from durable recall.
@@ -259,6 +360,17 @@ impl BoundMemory {
         company: &CompanyId,
     ) -> Result<Vec<crate::ports::CompressedTrace>> {
         self.trace_store().archived_traces(company).await
+    }
+
+    /// Restores traces directly into the archive namespace for bundle import.
+    pub async fn restore_archived_traces(
+        &self,
+        company: &CompanyId,
+        traces: &[crate::ports::CompressedTrace],
+    ) -> Result<()> {
+        self.trace_store()
+            .restore_archived_traces(company, traces)
+            .await
     }
 }
 

@@ -14,9 +14,13 @@ human_role = "Product direction"
 # `http_request` only read one the agent already has.
 #
 # Every entry below is load-bearing. `allow` REPLACES the default
-# (`["*", "media", "composio"]`); it never extends it. `*` covers
-# files/docs/shell/code/web/subagent but deliberately excludes the opt-in
-# namespaces, so `media`, `composio` and `search` are each listed literally.
+# (`globals/globals.toml`'s `default_allow`); it never extends it. `*` covers
+# files/docs/shell/code/web/subagent but deliberately excludes the rest, so
+# `workspace.*` and `workspace.write` (the latter is explicit because the host
+# recognizes only the exact write grant), `media`, `composio`,
+# `search` and `mcp:*` are each listed literally. This line is the default belt
+# restated verbatim; keeping it written out is what makes a narrowing here a
+# visible edit rather than an inherited surprise.
 # media/composio/mcp also require their Cargo features compiled into the tenant
 # image, and each is fail-closed at runtime until its credential/config is
 # present (Composio bearer, media backend, per-server MCP config). Reducing this
@@ -25,7 +29,22 @@ human_role = "Product direction"
 #
 # Search spend is bounded by `[tools].search_daily_calls` (200/day by default);
 # setting it to `0` pauses search without editing this list.
-allow = ["*", "media", "composio", "search"]
+#
+# `chargebee` (#788) is a CEILING, not a grant: every agent in `agents/` states
+# a `tools` line that omits it, so nobody this template ships holds billing
+# tools. A software business that invoices its customers names the teammate who
+# does from the console — `PATCH {scope}/team/{agent_id}` with `chargebee`
+# added — and that edit is an overlay this manifest never sees.
+#
+# It is here at all because the alternative is that the capability is
+# unreachable: `[tools].allow` has no runtime write path, so a company booted
+# from this bundle could store a Chargebee key and still have it reach no
+# teammate, with nothing in the console able to fix it (#1854).
+#
+# `*` does not cover it. These tools mail invoices to a real business's real
+# customers, so the grant is opted into by name rather than ridden in on a
+# wildcard set for files and shell.
+allow = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*", "chargebee"]
 
 # There is deliberately no `[tools.composio].toolkits` here. Absent means "open
 # mode": defer to the backend's own server-enforced allowlist, which is every
@@ -73,7 +92,7 @@ enabled = ["feature_pipeline", "incident_response"]
 # from its own manifest instead of inferred from an absent block.
 #
 # `auto` runs the agent's own sandbox writes and outward reads unattended and
-# still parks everything that leaves the company or spends money. `always_approve`
+# policy HITL is disabled; agents use `request_approval` when they want sign-off. `always_approve`
 # is omitted, so it keeps its default.
 [policy]
 mode = "auto"

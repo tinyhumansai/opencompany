@@ -8,7 +8,9 @@ import {
   arrivedViaSetupHandoff,
   clearSetupHandoff,
   SETUP_HANDOFF_FRAGMENT,
+  setupHandoffHasScope,
 } from "@/setup/state";
+import type { SetupHandoffScope } from "@/setup/state";
 
 /**
  * The one-shot marker a setup hand-off link carries, and how the landing
@@ -60,6 +62,34 @@ describe("the setup hand-off marker", () => {
     window.location.hash = "#/overview";
     clearSetupHandoff();
     expect(hash()).toBe("#/overview");
+  });
+
+  it("tells a scoped marker from the plain unscoped one", () => {
+    window.location.hash = SETUP_HANDOFF_FRAGMENT;
+    expect(setupHandoffHasScope()).toBe(false);
+
+    window.location.hash = "#/company?from=setup&connection=conn-a&company=acme";
+    expect(setupHandoffHasScope()).toBe(true);
+  });
+
+  // The shell's consume decision: a scoped marker is accepted only for the
+  // connection and company it names; the plain form is accepted on whatever
+  // company it lands on, because the wizard and magic-link flows may not know
+  // their scope yet.
+  const accept = (scope: SetupHandoffScope): boolean =>
+    arrivedViaSetupHandoff(scope) ||
+    (!setupHandoffHasScope() && arrivedViaSetupHandoff());
+
+  it("accepts the plain marker on whatever company it lands on", () => {
+    window.location.hash = SETUP_HANDOFF_FRAGMENT;
+    expect(accept({ connection: "conn-b", company: "beta" })).toBe(true);
+  });
+
+  it("accepts a scoped marker only for the connection and company it names", () => {
+    window.location.hash = "#/company?from=setup&connection=conn-a&company=acme";
+    expect(accept({ connection: "conn-a", company: "acme" })).toBe(true);
+    expect(accept({ connection: "conn-b", company: "acme" })).toBe(false);
+    expect(accept({ connection: "conn-a", company: "other" })).toBe(false);
   });
 });
 

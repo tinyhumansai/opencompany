@@ -94,6 +94,7 @@ describe("foldLiveRun scheduled", () => {
       workflowId: "wf1",
       runId: "run-1",
       scheduled,
+      startedBy: scheduled ? "schedule" : "operator",
     };
   }
 

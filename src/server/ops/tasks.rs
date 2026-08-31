@@ -182,6 +182,12 @@ pub(crate) struct TaskCard {
     /// lockstep with `originRunId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) origin_workflow_id: Option<String>,
+    /// Why a failed or cancelled run returned this card to `todo` (issue
+    /// #1865) — the chip that tells a bounced card apart from a fresh one
+    /// without opening it. Omitted for every card that has never bounced,
+    /// which is every card the board rendered before this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bounced: Option<String>,
 }
 
 impl From<TaskRecord> for TaskCard {
@@ -204,6 +210,7 @@ impl From<TaskRecord> for TaskCard {
             workflow_proposal: t.workflow_proposal,
             origin_run_id: t.origin_run_id,
             origin_workflow_id: t.origin_workflow_id,
+            bounced: t.bounced,
         }
     }
 }
@@ -495,6 +502,7 @@ async fn create_task(
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     };
     company.runtime.upsert_task(&record).await?;
     Ok(Json(record.into()))
@@ -550,8 +558,15 @@ async fn patch_task(
         record.deliverable = deliverable;
     }
     record.updated_at_millis = now_millis();
-    company.runtime.upsert_task(&record).await?;
-    Ok(Json(record.into()))
+    // `upsert_task` can persist a record that differs from `record`: leaving
+    // `todo` for any other column clears a stale `bounced` chip (issue #1865),
+    // and that clear happens on the clone it writes, not on this local
+    // `record`. Serializing its return value rather than `record` itself is
+    // what keeps this response in sync with the row that was actually stored
+    // (Codex review, PR #1883) — a client such as `TaskEditDialog` reconciles
+    // its board state straight from this body.
+    let stored = company.runtime.upsert_task(&record).await?;
+    Ok(Json(stored.into()))
 }
 
 /// `DELETE …/tasks/{task_id}` — remove a card from the board.
@@ -666,7 +681,43 @@ async fn apply_workflow_proposal(
             "the stored workflow proposal could not be read as a graph: {err}"
         ))
     })?;
-    let draft = raw_workflow_from_spec(&spec)?;
+    let mut draft = raw_workflow_from_spec(&spec)?;
+
+    // Issue #1862 prerequisite: a proposal that names no owning desk defaults
+    // to the proposing card's assignee's desk — the same "somebody is
+    // responsible for this" fallback the sender-resolution chain leans on
+    // when a run has no triggering agent. Best-effort: an assignee with no
+    // desk (or a company record that fails to load) leaves `owner_desk`
+    // `None` rather than blocking the apply — the same permissive stance
+    // `resolve_assignee` above takes toward an unloadable record.
+    if draft
+        .owner_desk
+        .as_deref()
+        .is_none_or(|desk| desk.trim().is_empty())
+        && let Ok(Some(company_record)) = company.runtime.store().load(company.id()).await
+    {
+        // Issue #1882 review: a card assigned directly to a desk stores the
+        // canonical desk id as its `assignee` (`runtime::assignee`,
+        // `AssigneeResolution::canonical` — including an `EmptyDesk` with no
+        // roster member yet), not a teammate id. `desk_of_member` searches
+        // desk MEMBERSHIP, so a desk-id assignee — nobody's member — resolved
+        // to nothing even though the card already names its owning desk.
+        // Resolve as a desk first; only fall back to the teammate's desk when
+        // the assignee is not itself a desk.
+        //
+        // Issue #1882 review: the teammate fallback uses `sole_desk_of_member`,
+        // not `desk_of_member` — a teammate who sits on two or more desks gives
+        // no basis for picking either one, and `desk_of_member` would silently
+        // persist whichever desk happens to be declared first in the manifest.
+        draft.owner_desk = company_record
+            .resolve_desk_id(&record.assignee)
+            .or_else(|| {
+                crate::runtime::delegation_tools::sole_desk_of_member(
+                    &company_record,
+                    &record.assignee,
+                )
+            });
+    }
 
     // Issue #1191: the deliverable channel set, read off the SAME runtime the
     // console's destination picker is served from. Apply is a save, and it used
@@ -681,6 +732,9 @@ async fn apply_workflow_proposal(
         Some(company.runtime.events()),
         draft,
         Some(&company.runtime.deliverable_channel_ids()),
+        // Issue #1843: the operator applying the proposal, when there is
+        // one — same attribution rule as the direct REST create path.
+        company.actor.clone(),
     )
     .await
     {
@@ -1332,7 +1386,6 @@ pub(crate) struct TaskDetail {
     pub(crate) waiting_since: Option<u64>,
 }
 
-/// `GET …/tasks/{task_id}` — the Task Detail screen's single read (issue #185).
 ///
 /// Assembles six things the console would otherwise have to stitch client-side
 /// (and could not, for the journal-derived halves):
@@ -2683,10 +2736,14 @@ mod steer_redirect_test {
                 overlay_workflows: Vec::new(),
                 overlay_budgets: Vec::new(),
                 overlay_policy: None,
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .unwrap();
@@ -2759,6 +2816,7 @@ mod steer_redirect_test {
                     workflow_proposal: None,
                     origin_run_id: None,
                     origin_workflow_id: None,
+                    bounced: None,
                 },
             )
             .await
@@ -2916,6 +2974,158 @@ mod steer_redirect_test {
             journaled_redirect(&state).await.as_deref(),
             Some(exact.as_str()),
             "an at-limit instruction reaches the run whole — no cut, no marker"
+        );
+    }
+}
+
+/// `PATCH …/tasks/{task_id}` must hand back the row it actually persisted.
+///
+/// `upsert_task` clears a stale `bounced` chip on a clone when a card leaves
+/// `todo` any way other than a re-dispatch or a re-plan (issue #1865), and
+/// that clear used to be invisible to `patch_task`'s own response: the
+/// handler serialized its local `record` — built before the upsert — instead
+/// of what `upsert_task` returned. A client such as `TaskEditDialog` that
+/// reconciles its board state straight from the PATCH body would keep
+/// showing a bounce reason for a card whose stored row had already cleared
+/// it (Codex review, PR #1883).
+#[cfg(test)]
+mod patch_clears_bounced_test {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    use crate::company::CompanyManifest;
+    use crate::ports::types::{CompanyId, CompanyRecord};
+    use crate::runtime::RuntimeBuilder;
+    use crate::server::router;
+    use crate::store::FsCompanyStore;
+    use crate::{AppConfig, AppState};
+
+    fn manifest() -> CompanyManifest {
+        toml::from_str(
+            "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+        )
+        .unwrap()
+    }
+
+    async fn state(home: &std::path::Path) -> AppState {
+        use crate::ports::CompanyStore;
+        let id = CompanyId::new("acme");
+        FsCompanyStore::new(home.to_path_buf())
+            .save(&CompanyRecord {
+                overlay_retired_agents: Vec::new(),
+                overlay_agent_edits: Vec::new(),
+                id: id.clone(),
+                manifest: manifest(),
+                ledger: Vec::new(),
+                lifecycle: "running".to_string(),
+                overlay_agents: Vec::new(),
+                overlay_desk_members: Vec::new(),
+                overlay_desk_order: Vec::new(),
+                overlay_desks: Vec::new(),
+                overlay_workflows: Vec::new(),
+                overlay_budgets: Vec::new(),
+                overlay_policy: None,
+                overlay_tool_grants: None,
+                overlay_desk_tools: Default::default(),
+                disabled_workflows: Vec::new(),
+                template_provenance: None,
+                setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
+            })
+            .await
+            .unwrap();
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, std::sync::Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+        state
+    }
+
+    /// Writes a bounced To-do card straight through the store, bypassing
+    /// `upsert_task`'s dispatch/plan edges — the seed only needs the row to
+    /// exist with a `bounced` chip already on it, not to fire either trigger.
+    async fn seed_bounced_card(state: &AppState, id: &str) {
+        let company = CompanyId::new("acme");
+        let runtime = state.registry().get(&company).unwrap();
+        runtime
+            .tasks()
+            .upsert(
+                &company,
+                &crate::ports::tasks::TaskRecord {
+                    id: id.to_string(),
+                    title: "Draft the launch note".to_string(),
+                    note: None,
+                    column: crate::ports::tasks::COLUMN_TODO.to_string(),
+                    priority: "medium".to_string(),
+                    assignee: String::new(),
+                    updated_at_millis: 1,
+                    origin_chat_id: None,
+                    parent_task_id: None,
+                    output: None,
+                    plan: None,
+                    planning_attempts: Vec::new(),
+                    deliverable: crate::ports::tasks::TaskDeliverable::Once,
+                    workflow_proposal: None,
+                    origin_run_id: None,
+                    origin_workflow_id: None,
+                    bounced: Some("a previous run's dispatch failed".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn patch_column(state: &AppState, id: &str, column: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/company/tasks/{id}"))
+            .header("content-type", "application/json")
+            .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+            .body(Body::from(json!({"column": column}).to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn patching_a_bounced_card_straight_to_done_returns_the_cleared_state() {
+        let home = tempfile::tempdir().unwrap();
+        let state = state(home.path()).await;
+        seed_bounced_card(&state, "card-1").await;
+
+        let (status, body) = patch_column(&state, "card-1", "done").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.get("bounced").is_none(),
+            "the PATCH response still carries the stale bounce chip: {body}"
+        );
+
+        // The response is not just accidentally right while the persisted row
+        // stays wrong — the store must agree too.
+        let company = CompanyId::new("acme");
+        let runtime = state.registry().get(&company).unwrap();
+        let stored = runtime
+            .tasks()
+            .list(&company)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == "card-1")
+            .unwrap();
+        assert!(
+            stored.bounced.is_none(),
+            "the stored row should also have cleared the chip"
         );
     }
 }

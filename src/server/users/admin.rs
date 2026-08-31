@@ -129,6 +129,16 @@ struct UserSummary {
     email: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
+    /// The face this person chose (`docs/spec/runtime/avatars.md`), absent when
+    /// they have not chosen one — which the console draws as the mascot it
+    /// hashes from their id.
+    ///
+    /// Readable here, but **not writable**: unlike `displayName`, which an admin
+    /// may set so a roster of raw addresses can be made legible, a person's own
+    /// face is theirs to pick. `PATCH …/auth/me` is where it is written, by the
+    /// person wearing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar: Option<String>,
     role: UserRole,
     status: UserStatus,
     /// Whether they have a password, never what it is.
@@ -145,6 +155,7 @@ impl From<UserRecord> for UserSummary {
             id: u.id,
             email: u.email,
             display_name: u.display_name,
+            avatar: u.avatar,
             role: u.role,
             status: u.status,
             has_password: u.password_hash.is_some(),
@@ -352,7 +363,10 @@ async fn send_invite_mail(
         Err(err) => {
             // The error, never the message: a body echoed into a log or into
             // telemetry carries the recipient's address off this host.
-            tracing::warn!(company = %runtime.id(), "invite mail failed: {err}");
+            // `error!`, not `warn!`: the default `EnvFilter` (no `RUST_LOG`)
+            // shows errors only, and this is the only line that records why an
+            // invite could not be delivered.
+            tracing::error!(company = %runtime.id(), "invite mail failed: {err}");
             InviteDelivery::Failed
         }
     }
@@ -360,23 +374,22 @@ async fn send_invite_mail(
 
 /// How to name the person who sent an invite, in mail the invitee reads.
 ///
-/// A display name if they set one, otherwise the **local part** of their
-/// address — never the full address. Same rule as chat attribution (see
+/// A display name if they set one, otherwise one derived from the **local part**
+/// of their address — never the full address. Same rule as chat attribution (see
 /// `docs/spec/runtime/users.md`): being invited somewhere should not hand you
 /// an admin's mailbox. Falls back to a role noun if the inviter cannot be
-/// resolved, which is what a manifest- or platform-bootstrapped id looks like.
+/// resolved, or has no name to derive — which is what a manifest- or
+/// platform-bootstrapped id, and every wallet identity, looks like.
+///
+/// Through [`UserRecord::display_label`] rather than a local copy of the rule,
+/// so an admin is called the same thing in this mail as on the console surfaces
+/// the invitee will meet them on a minute later.
 async fn inviter_label(runtime: &CompanyRuntime, user_id: &str) -> String {
     let found = runtime.users().get_user(runtime.id(), user_id).await.ok();
-    let Some(user) = found.flatten() else {
-        return "An admin".to_string();
-    };
-    if let Some(name) = user.display_name.filter(|n| !n.trim().is_empty()) {
-        return name;
-    }
-    match user.email.split('@').next() {
-        Some(local) if !local.is_empty() => local.to_string(),
-        _ => "An admin".to_string(),
-    }
+    found
+        .flatten()
+        .and_then(|user| user.display_label())
+        .unwrap_or_else(|| "An admin".to_string())
 }
 
 /// `POST …/users/invites` — invite an address.
@@ -544,7 +557,9 @@ async fn update_user(
         user.status = status;
     }
     if let Some(name) = body.display_name {
-        user.display_name = Some(name);
+        let name = name.trim().to_string();
+        super::validate_display_name(&name)?;
+        user.display_name = (!name.is_empty()).then_some(name);
     }
     user.updated_at_millis = now_millis();
     runtime.users().upsert_user(runtime.id(), &user).await?;

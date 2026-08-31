@@ -133,6 +133,7 @@ const TONE_TO_VERDICT: Record<string, string> = {
   blocked: "blocked",
   "not delivered": "undelivered",
   "awaiting approval": "awaiting-approval",
+  degraded: "degraded",
   ok: "ok",
 };
 
@@ -246,8 +247,12 @@ describe("read() can verify the approval tier", () => {
   const policyDto = {
     mode: "supervised",
     alwaysApprove: [],
+    autoApproveUnderUsd: null,
+    approvalTtlHours: 24,
     manifestMode: "full",
     manifestAlwaysApprove: [],
+    manifestAutoApproveUnderUsd: null,
+    manifestApprovalTtlHours: null,
     overridden: true,
     setBy: "alice@acme",
     setAtMillis: 1_700_000_000_000,
@@ -271,8 +276,12 @@ describe("read() can verify the approval tier", () => {
       "/api/v1/company/policy": {
         mode: "full",
         alwaysApprove: [],
+        autoApproveUnderUsd: null,
+        approvalTtlHours: 24,
         manifestMode: "full",
         manifestAlwaysApprove: [],
+        manifestAutoApproveUnderUsd: null,
+        manifestApprovalTtlHours: null,
         overridden: false,
         tiers: [],
         takesEffect: "on the next turn",
@@ -290,8 +299,12 @@ describe("read() can verify the approval tier", () => {
       "/api/v1/company/policy": {
         mode: "full",
         alwaysApprove: [],
+        autoApproveUnderUsd: null,
+        approvalTtlHours: 24,
         manifestMode: "full",
         manifestAlwaysApprove: [],
+        manifestAutoApproveUnderUsd: null,
+        manifestApprovalTtlHours: null,
         overridden: false,
         tiers: [],
         takesEffect: "on the next turn",
@@ -313,6 +326,31 @@ describe("runVerdict agrees with the console's runTone", () => {
    */
   const cases: Array<{ name: string; run: WorkflowRunOutcome; label: string }> = [
     { name: "still running", run: run({ running: true }), label: "running" },
+    {
+      // #1865: `on_error: continue | route` and the iteration cap leave a node
+      // in error without failing the run, so every reading above this one is
+      // absent — no error, not cancelled, nothing parked, everything
+      // delivered. Before the harness grew this arm it fell through to `ok`
+      // and the release probe reported PASS on a run with a broken step.
+      name: "a node errored while the run carried on",
+      run: run({
+        nodes: [
+          { nodeId: "fetch", status: "ok" },
+          { nodeId: "summarise", status: "error" },
+        ],
+      } as Partial<WorkflowRunOutcome>),
+      label: "degraded",
+    },
+    {
+      // Degraded sits last for a reason: anything the operator can still act
+      // on outranks it.
+      name: "a gate outranks a degraded node",
+      run: run({
+        blockedNodes: [blocked("approve")],
+        nodes: [{ nodeId: "summarise", status: "error" }],
+      } as Partial<WorkflowRunOutcome>),
+      label: "blocked",
+    },
     {
       name: "running outranks a failure it has not hit yet",
       run: run({ running: true, error: "boom" }),

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Result;
+use crate::app::config::{EnvSource, ProcessEnv, data_dir_from_source};
 use crate::error::OpenCompanyError;
 use crate::ports::artifacts::ArtifactStore;
 use crate::ports::context::ContextStore;
@@ -41,6 +42,41 @@ use crate::ports::usage::UsageMeter;
 use crate::ports::users::UserStore;
 use crate::ports::workflow_revisions::WorkflowRevisionStore;
 use crate::ports::workspace::WorkspaceStore;
+
+/// Safe access to the provider-only context partitions.
+///
+/// This is deliberately a facade, not the underlying `MemoryProvider`: every
+/// method still derives the company namespace from a [`CompanyId`], so wiring
+/// it onto a runtime cannot reopen the raw-namespace escape hatch.
+#[async_trait]
+pub trait MemoryScopes: Send + Sync {
+    /// One agent's private context partition.
+    fn agent_context(&self, agent_id: &str) -> Arc<dyn ContextStore>;
+    /// One desk's shared context partition.
+    fn desk_context(&self, desk_id: &str) -> Arc<dyn ContextStore>;
+    /// Traces retained when normal trace eviction archives them.
+    async fn archived_traces(
+        &self,
+        company: &CompanyId,
+    ) -> Result<Vec<crate::ports::CompressedTrace>>;
+    /// Restores traces directly into the archive tier during bundle import.
+    ///
+    /// Implementations that expose only the inspection surface reject this
+    /// operation rather than silently moving retained traces back into the
+    /// live window.
+    async fn restore_archived_traces(
+        &self,
+        _company: &CompanyId,
+        traces: &[crate::ports::CompressedTrace],
+    ) -> Result<()> {
+        if traces.is_empty() {
+            return Ok(());
+        }
+        Err(OpenCompanyError::Store(
+            "the selected memory engine cannot restore archived traces".into(),
+        ))
+    }
+}
 
 /// Which storage backend hosts the durable ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -206,6 +242,9 @@ pub struct MemoryOverlay {
     pub inbound_context: Option<Arc<dyn ContextStore>>,
     /// The scratch firewall: working-out that durable recall can never reach.
     pub scratch: Option<Arc<dyn ContextStore>>,
+    /// Provider-only scoped partitions and archive reads, with no raw
+    /// provider exposed to runtime consumers.
+    pub scopes: Option<Arc<dyn MemoryScopes>>,
     /// What is bound, for status output.
     pub descriptor: MemoryDescriptor,
     /// The bound provider, kept solely so [`Self::refresh_health`] can probe
@@ -237,6 +276,7 @@ impl MemoryOverlay {
             facts: None,
             inbound_context,
             scratch: None,
+            scopes: None,
             descriptor: MemoryDescriptor {
                 backend: MemoryBackend::Store,
                 driver_id: "test".into(),
@@ -367,6 +407,10 @@ pub struct StorageHandles {
     pub schedule_fires: Arc<dyn ScheduleFireStore>,
     /// Durable, console-facing per-node run output snapshots (#596).
     pub run_outputs: Arc<dyn WorkflowRunOutputStore>,
+    /// The unredacted companion of a turn's steps — reasoning text, raw tool
+    /// arguments and raw tool output. Holds secrets by design; see
+    /// [`crate::ports::deep_trace`].
+    pub deep_trace: Arc<dyn crate::ports::deep_trace::DeepTraceStore>,
     pub usage: Arc<dyn UsageMeter>,
     pub skills: Arc<dyn SkillStateStore>,
     /// Per-person, per-channel read markers (#755).
@@ -533,23 +577,25 @@ impl std::fmt::Debug for StorageSettings {
 /// Parses env var `key` into `T`. Absent → `Ok(None)` (the caller applies its
 /// default); a set-but-non-UTF-8 value is a hard [`OpenCompanyError::Config`]
 /// rather than a silent fallback to the default.
-fn parse_env<T>(key: &str) -> Result<Option<T>>
+fn parse_env<T>(env: &dyn EnvSource, key: &str) -> Result<Option<T>>
 where
     T: std::str::FromStr<Err = OpenCompanyError>,
 {
-    match std::env::var(key) {
-        Ok(raw) => Ok(Some(raw.parse()?)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(OpenCompanyError::Config(format!(
-            "{key} is set but is not valid UTF-8"
-        ))),
+    match env.get_os(key) {
+        Some(raw) => match raw.into_string() {
+            Ok(raw) => Ok(Some(raw.parse()?)),
+            Err(_) => Err(OpenCompanyError::Config(format!(
+                "{key} is set but is not valid UTF-8"
+            ))),
+        },
+        None => Ok(None),
     }
 }
 
 /// Reads a boolean opt-in env flag. Truthy values (case-insensitive, trimmed):
 /// `1`, `true`, `yes`, `on`. Anything else — including unset — is `false`.
-fn env_flag(key: &str) -> bool {
-    std::env::var(key)
+fn env_flag(env: &dyn EnvSource, key: &str) -> bool {
+    env.get(key)
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -565,17 +611,23 @@ impl StorageSettings {
     /// `OPENCOMPANY_TENANT_ID`, `OPENCOMPANY_MEMORY`, `OPENCOMPANY_DATA_DIR`,
     /// `OPENCOMPANY_MEMORY_ALLOW_EPHEMERAL`).
     pub fn from_env() -> Result<Self> {
-        let kind: StorageKind = parse_env("OPENCOMPANY_STORAGE")?.unwrap_or_default();
-        let memory_backend: MemoryBackend = parse_env("OPENCOMPANY_MEMORY")?.unwrap_or_default();
-        let non_empty = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+        Self::from_env_source(&ProcessEnv)
+    }
+
+    /// Resolves storage settings from an injected environment source.
+    pub fn from_env_source(env: &dyn EnvSource) -> Result<Self> {
+        let kind: StorageKind = parse_env(env, "OPENCOMPANY_STORAGE")?.unwrap_or_default();
+        let memory_backend: MemoryBackend =
+            parse_env(env, "OPENCOMPANY_MEMORY")?.unwrap_or_default();
+        let non_empty = |key: &str| env.get(key);
         Ok(Self {
             kind,
             mongodb_uri: non_empty("OPENCOMPANY_MONGODB_URI"),
             mongodb_db: non_empty("OPENCOMPANY_MONGODB_DB"),
             tenant_id: non_empty("OPENCOMPANY_TENANT_ID"),
             memory_backend,
-            data_dir: Some(crate::app::config::data_dir_from_env()),
-            allow_ephemeral_memory: env_flag("OPENCOMPANY_MEMORY_ALLOW_EPHEMERAL"),
+            data_dir: Some(data_dir_from_source(env)),
+            allow_ephemeral_memory: env_flag(env, "OPENCOMPANY_MEMORY_ALLOW_EPHEMERAL"),
             memory_driver: non_empty("OPENCOMPANY_MEMORY_DRIVER"),
             memory_url: non_empty("OPENCOMPANY_MEMORY_URL"),
             memory_api_key: non_empty("OPENCOMPANY_MEMORY_API_KEY"),
@@ -593,20 +645,40 @@ impl StorageSettings {
     /// Presence, not value: a control plane that injects `OPENCOMPANY_MEMORY`
     /// owns the choice whichever engine it names, including `store`.
     pub fn memory_is_env_owned() -> bool {
-        std::env::var("OPENCOMPANY_MEMORY").is_ok_and(|value| !value.trim().is_empty())
+        Self::memory_is_env_owned_by(&ProcessEnv)
     }
 
-    /// Layers a `config.toml` `[memory]` section under the environment.
+    /// Whether `env` explicitly owns the memory-engine choice.
+    pub fn memory_is_env_owned_by(env: &dyn EnvSource) -> bool {
+        env.get("OPENCOMPANY_MEMORY")
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    /// Layers a `config.toml` `[memory]` section under the process
+    /// environment.
     ///
     /// A no-op when [`Self::memory_is_env_owned`] — see [`MemorySection`] for
     /// why the env layer wins rather than the more recent write.
     ///
     /// [`MemorySection`]: crate::app::config::MemorySection
-    pub fn with_memory_config(
+    pub fn with_memory_config(self, section: &crate::app::config::MemorySection) -> Result<Self> {
+        self.with_memory_config_from(&ProcessEnv, section)
+    }
+
+    /// Like [`Self::with_memory_config`], but resolves the ownership check from
+    /// the injected `env` source rather than the ambient process environment.
+    ///
+    /// A caller that built the settings with [`Self::from_env_source`] must
+    /// layer through here: the plain variant reads `ProcessEnv`, so a `MapEnv`
+    /// carrying `OPENCOMPANY_MEMORY` would be overridden by the file, and an
+    /// absent injected value would wrongly appear env-owned when the ambient
+    /// process sets it.
+    pub fn with_memory_config_from(
         mut self,
+        env: &dyn EnvSource,
         section: &crate::app::config::MemorySection,
     ) -> Result<Self> {
-        if Self::memory_is_env_owned() {
+        if Self::memory_is_env_owned_by(env) {
             return Ok(self);
         }
         let selection = MemorySelection::from_section(section)?;
@@ -821,6 +893,7 @@ fn open_provider(settings: &StorageSettings) -> Result<Option<MemoryOverlay>> {
         facts: Some(bound.facts()),
         inbound_context: Some(bound.inbound_context()),
         scratch: Some(bound.scratch()),
+        scopes: Some(Arc::new(bound.clone())),
         descriptor: MemoryDescriptor {
             backend: settings.memory_backend,
             driver_id: bound.driver_id().to_string(),
@@ -868,6 +941,7 @@ fn open_sqlite(data_dir: &Path) -> Result<Option<StorageHandles>> {
         workflow_revisions: store.clone(),
         schedule_fires: store.clone(),
         run_outputs: store.clone(),
+        deep_trace: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         read_state: store.clone(),
@@ -912,6 +986,7 @@ async fn open_mongodb(settings: &StorageSettings) -> Result<Option<StorageHandle
         workflow_revisions: store.clone(),
         schedule_fires: store.clone(),
         run_outputs: store.clone(),
+        deep_trace: store.clone(),
         usage: store.clone(),
         skills: store.clone(),
         read_state: store.clone(),
@@ -948,7 +1023,7 @@ impl OwnershipStore for crate::store::MongoStore {
 mod test {
     use super::*;
 
-    use crate::test_support::EnvVarGuard;
+    use crate::app::config::MapEnv;
 
     #[test]
     fn parses_storage_kinds() {
@@ -1273,16 +1348,12 @@ mod test {
             "OPENCOMPANY_MEMORY_URL",
             "OPENCOMPANY_MEMORY_API_KEY",
         ];
-        // Takes the crate-wide env lock for the whole body and restores every
-        // key on drop — including on panic, which the hand-rolled restore this
-        // replaced would have skipped, leaving a driver name set for whatever
-        // `from_env` test libtest scheduled next.
-        let env = EnvVarGuard::capture(&KEYS);
-
-        env.set(KEYS[0], "supermemory");
-        env.set(KEYS[1], "https://memory.example");
-        env.set(KEYS[2], "sk-test");
-        let settings = StorageSettings::from_env().unwrap();
+        let env = MapEnv::new([
+            (KEYS[0], "supermemory"),
+            (KEYS[1], "https://memory.example"),
+            (KEYS[2], "sk-test"),
+        ]);
+        let settings = StorageSettings::from_env_source(&env).unwrap();
         assert_eq!(settings.memory_driver.as_deref(), Some("supermemory"));
         assert_eq!(
             settings.memory_url.as_deref(),
@@ -1292,16 +1363,12 @@ mod test {
 
         // Empty is absent, not an empty credential: `require` would otherwise
         // accept a blank key and defer the failure to the first call.
-        env.set(KEYS[0], "");
-        env.set(KEYS[2], "");
-        let blank = StorageSettings::from_env().unwrap();
+        let blank =
+            StorageSettings::from_env_source(&MapEnv::new([(KEYS[0], ""), (KEYS[2], "")])).unwrap();
         assert_eq!(blank.memory_driver, None);
         assert_eq!(blank.memory_api_key, None);
 
-        for key in KEYS {
-            env.remove(key);
-        }
-        let unset = StorageSettings::from_env().unwrap();
+        let unset = StorageSettings::from_env_source(&MapEnv::default()).unwrap();
         assert_eq!(unset.memory_driver, None);
         assert_eq!(unset.memory_url, None);
         assert_eq!(unset.memory_api_key, None);
@@ -1309,48 +1376,55 @@ mod test {
 
     #[test]
     fn from_env_reads_memory_backend() {
-        let env = EnvVarGuard::capture(&["OPENCOMPANY_MEMORY"]);
-
-        env.set("OPENCOMPANY_MEMORY", "remote");
+        let env = MapEnv::new([("OPENCOMPANY_MEMORY", "remote")]);
         assert_eq!(
-            StorageSettings::from_env().unwrap().memory_backend,
+            StorageSettings::from_env_source(&env)
+                .unwrap()
+                .memory_backend,
             MemoryBackend::Remote
         );
 
-        env.remove("OPENCOMPANY_MEMORY");
         assert_eq!(
-            StorageSettings::from_env().unwrap().memory_backend,
+            StorageSettings::from_env_source(&MapEnv::default())
+                .unwrap()
+                .memory_backend,
             MemoryBackend::Store
         );
     }
 
     #[test]
     fn from_env_reads_tenant_id() {
-        let env = EnvVarGuard::capture(&["OPENCOMPANY_TENANT_ID"]);
-
-        env.set("OPENCOMPANY_TENANT_ID", "acme");
+        let env = MapEnv::new([("OPENCOMPANY_TENANT_ID", "acme")]);
         assert_eq!(
-            StorageSettings::from_env().unwrap().tenant_id.as_deref(),
+            StorageSettings::from_env_source(&env)
+                .unwrap()
+                .tenant_id
+                .as_deref(),
             Some("acme")
         );
 
         // An empty value is filtered out, same as the mongodb vars.
-        env.set("OPENCOMPANY_TENANT_ID", "");
-        assert_eq!(StorageSettings::from_env().unwrap().tenant_id, None);
+        assert_eq!(
+            StorageSettings::from_env_source(&MapEnv::new([("OPENCOMPANY_TENANT_ID", "")]))
+                .unwrap()
+                .tenant_id,
+            None
+        );
 
         // Unset leaves it `None` (the id-namespacing no-op).
-        env.remove("OPENCOMPANY_TENANT_ID");
-        assert_eq!(StorageSettings::from_env().unwrap().tenant_id, None);
+        assert_eq!(
+            StorageSettings::from_env_source(&MapEnv::default())
+                .unwrap()
+                .tenant_id,
+            None
+        );
     }
 
     #[test]
     fn from_env_reads_data_dir() {
-        let env = EnvVarGuard::capture(&["OPENCOMPANY_DATA_DIR"]);
-
-        // An explicit data dir is threaded straight through into settings.
-        env.set("OPENCOMPANY_DATA_DIR", "/srv/oc-data");
+        let env = MapEnv::new([("OPENCOMPANY_DATA_DIR", "/srv/oc-data")]);
         assert_eq!(
-            StorageSettings::from_env().unwrap().data_dir,
+            StorageSettings::from_env_source(&env).unwrap().data_dir,
             Some(PathBuf::from("/srv/oc-data")),
             "OPENCOMPANY_DATA_DIR must be read into StorageSettings::data_dir"
         );
@@ -1359,29 +1433,61 @@ mod test {
     #[test]
     fn from_env_reads_allow_ephemeral_memory() {
         const KEY: &str = "OPENCOMPANY_MEMORY_ALLOW_EPHEMERAL";
-        let env = EnvVarGuard::capture(&[KEY]);
-
-        // Unset → the safe default: refuse (flag false).
-        env.remove(KEY);
-        assert!(!StorageSettings::from_env().unwrap().allow_ephemeral_memory);
+        assert!(
+            !StorageSettings::from_env_source(&MapEnv::default())
+                .unwrap()
+                .allow_ephemeral_memory
+        );
 
         // Truthy values set the durability assertion.
         for truthy in ["1", "true", "YES", "On"] {
-            env.set(KEY, truthy);
             assert!(
-                StorageSettings::from_env().unwrap().allow_ephemeral_memory,
+                StorageSettings::from_env_source(&MapEnv::new([(KEY, truthy)]))
+                    .unwrap()
+                    .allow_ephemeral_memory,
                 "{truthy:?} must read as durability asserted"
             );
         }
 
         // Any non-truthy value stays false (fails safe toward refusal).
         for falsy in ["0", "false", "no", ""] {
-            env.set(KEY, falsy);
             assert!(
-                !StorageSettings::from_env().unwrap().allow_ephemeral_memory,
+                !StorageSettings::from_env_source(&MapEnv::new([(KEY, falsy)]))
+                    .unwrap()
+                    .allow_ephemeral_memory,
                 "{falsy:?} must read as not asserted"
             );
         }
+    }
+
+    #[test]
+    fn with_memory_config_from_resolves_ownership_from_the_injected_source() {
+        let section = crate::app::config::MemorySection {
+            backend: Some("remote".into()),
+            driver: Some("supermemory".into()),
+            url: Some("https://memory.example".into()),
+            ..Default::default()
+        };
+
+        // The injected source owns the choice: the `config.toml` layer is
+        // inert, exactly as it is for a deployment env naming an engine.
+        let env = MapEnv::new([("OPENCOMPANY_MEMORY", "store")]);
+        let settings = StorageSettings::from_env_source(&env)
+            .unwrap()
+            .with_memory_config_from(&env, &section)
+            .unwrap();
+        assert_eq!(settings.memory_backend, MemoryBackend::Store);
+        assert_eq!(settings.memory_driver, None);
+        assert_eq!(settings.memory_url, None);
+
+        // No injected ownership: the file layer is applied.
+        let unset = StorageSettings::from_env_source(&MapEnv::default())
+            .unwrap()
+            .with_memory_config_from(&MapEnv::default(), &section)
+            .unwrap();
+        assert_eq!(unset.memory_backend, MemoryBackend::Remote);
+        assert_eq!(unset.memory_driver.as_deref(), Some("supermemory"));
+        assert_eq!(unset.memory_url.as_deref(), Some("https://memory.example"));
     }
 
     #[cfg(feature = "mongodb")]

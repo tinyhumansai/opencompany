@@ -74,10 +74,14 @@ async fn state_with_public_url(
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         })
         .await
         .unwrap();
@@ -385,6 +389,7 @@ async fn an_address_removed_from_the_roster_is_refused() {
                 id: generate_id(),
                 email: "bob@example.com".to_string(),
                 display_name: None,
+                avatar: None,
                 role: UserRole::Member,
                 status: UserStatus::Suspended,
                 password_hash: None,

@@ -235,6 +235,12 @@ pub const PAYLOAD_WORKFLOW_ID: &str = "workflow_id";
 pub const PAYLOAD_NODE_ID: &str = "node_id";
 /// The payload key holding the trigger input the paused run was started with.
 pub const PAYLOAD_INPUT: &str = "input";
+/// The payload key holding the [`StartedBy`](crate::ports::types::StartedBy)
+/// of the run that paused (issue #1862 prerequisite) — read back by
+/// [`started_by_of`] so a continuation carries the same attribution rather
+/// than resetting to the `scheduled`-derived default every resumed run's
+/// `scheduled` (always `false`, issue #542) would otherwise stamp.
+pub const PAYLOAD_STARTED_BY: &str = "started_by";
 /// The payload key holding this lineage's delivery ledger (issue #438) — the
 /// reports a continuation must NOT send again.
 pub const PAYLOAD_DELIVERED: &str = "delivered";
@@ -521,6 +527,24 @@ pub fn gate_workflow_id(effect: &Effect) -> Option<&str> {
         .get(PAYLOAD_WORKFLOW_ID)
         .and_then(Value::as_str)
         .filter(|workflow| !workflow.trim().is_empty())
+}
+
+/// The [`StartedBy`](crate::ports::types::StartedBy) of the run a parked
+/// [`WORKFLOW_APPROVE_KIND`] effect belongs to (issue #1862 prerequisite).
+///
+/// Falls back to [`StartedBy::from_scheduled(false)`](crate::ports::types::StartedBy::from_scheduled)
+/// — the same coarse default [`WorkflowRunContext::new`](crate::ports::WorkflowRunContext::new)
+/// uses — for a card parked before this field existed, or one whose payload
+/// value fails to parse. Not kind-checked like [`gate_node_id`]/
+/// [`gate_workflow_id`]: every caller that reaches this already knows it is
+/// holding a gate card, so the fallback exists for the payload shape, not the
+/// effect kind.
+pub fn started_by_of(effect: &Effect) -> crate::ports::types::StartedBy {
+    effect
+        .payload
+        .get(PAYLOAD_STARTED_BY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_else(|| crate::ports::types::StartedBy::from_scheduled(false))
 }
 
 /// The call a parked [`WORKFLOW_APPROVE_KIND`] effect is stopping — `(tool,
@@ -1011,6 +1035,10 @@ async fn spawn_continuation(
         })?;
 
     let input = continuation_input(effect, approved, denied)?;
+    // Issue #1862 prerequisite: carry the paused run's attribution into the
+    // continuation instead of letting `spawn`'s `scheduled: false` reset it to
+    // `Operator` — see `started_by_of`.
+    let started_by = started_by_of(effect);
     // The handle is dropped on purpose. The task holds its own guard, journals
     // its own outcome and deregisters itself; awaiting it here would hold the
     // approvals request open for the length of a whole workflow run, which is
@@ -1022,7 +1050,7 @@ async fn spawn_continuation(
     // gets ONE spawn attempt, and every card that would have retried it is
     // already consumed, so a swallowed refusal loses the run with no way back.
     let (run_id, _handle) =
-        WorkflowSpawn::new(runtime, runner).spawn(workflow, input, false, false)?;
+        WorkflowSpawn::new(runtime, runner).spawn_as(workflow, input, false, false, started_by)?;
     tracing::info!(
         company = %runtime.id(),
         workflow = %workflow_id,
@@ -1063,10 +1091,56 @@ async fn spawn_continuation(
 /// Propagated, on [`spawn_continuation`]'s terms: the approval is already
 /// committed, so a graph that has since been deleted or a build with no workflow
 /// execution has to reach the operator at click time, not vanish.
+///
+/// # Marking the dispatch (issue #1825, P1 follow-up)
+///
+/// `turn` is threaded in so the durable
+/// [`BlockedNodeDispatched`](crate::runtime::journal::JournalRecord::BlockedNodeDispatched)
+/// marker can be banked **from inside this function**, between
+/// [`RunSupervisor::begin`](crate::runtime::RunSupervisor::begin) admitting the
+/// run and [`WorkflowSpawn::spawn_admitted`] actually launching its detached
+/// task — not, as the marker's first cut had it, after this whole function
+/// returns to `resume_blocked_agent_node`. That ordering left the marker
+/// racing the *entire* detached run: `spawn`'s own doc is explicit that the
+/// caller does not await the task it launches, so a crash any time between
+/// launch and the write landing — however long the graph took to run — looked
+/// identical to a strand and could re-dispatch a continuation that had
+/// already finished. `begin` and the write it gates are both on this
+/// function's own stack with no detached task between them yet, so the same
+/// crash window now spans only the synchronous handful of instructions
+/// between the write's `.await` returning and `spawn_admitted` being called —
+/// no further `.await` sits in between for anything to preempt.
+///
+/// **A write that outright fails, as opposed to a crash racing it, is a
+/// different case and gets `?`-propagated rather than warned past.** The
+/// first cut of this fix logged the failure and launched anyway, which broke
+/// the invariant every read of this marker depends on — "absent" must mean
+/// "never launched". A crash between that unmarked launch and
+/// [`BlockedNodeReleased`](crate::runtime::journal::JournalRecord::BlockedNodeReleased)
+/// landing left a run genuinely in flight with nothing durable saying so, and
+/// `reconcile_stranded_blocked_nodes` re-dispatched it a second time at the
+/// next boot. Propagating instead means this attempt is abandoned before
+/// `spawn_admitted` ever runs — `begin`'s guard drops, freeing the
+/// concurrency slot it briefly held — and the caller's own retry
+/// classification (`CompanyRuntime::is_retryable_dispatch_failure`) already
+/// treats this write's error type as retryable, so the stash and its
+/// approval stay exactly as durably recoverable as before this attempt.
+///
+/// The crash-race window above this note is **not** closed by that change,
+/// and is not something a caller can retry its way out of: a crash between
+/// the write landing and `spawn_admitted` running leaves a durable marker for
+/// a run that never actually started, which `reconcile_stranded_blocked_nodes`
+/// reads as "already dispatched" and permanently retires without ever
+/// launching. Closing that fully needs a durable record this single boolean
+/// marker cannot express — something that distinguishes "dispatch attempted"
+/// from "dispatch confirmed", written from inside the launched task itself
+/// rather than by its caller — not a heuristic guess at this call site.
 pub async fn spawn_blocked_node_continuation(
     runtime: &CompanyRuntime,
+    turn: &str,
     workflow_id: &str,
     input: Value,
+    started_by: crate::ports::types::StartedBy,
 ) -> Result<()> {
     let Some(runner) = runtime.workflow_runner().cloned() else {
         return Err(OpenCompanyError::InvalidRequest(format!(
@@ -1087,11 +1161,50 @@ pub async fn spawn_blocked_node_continuation(
                  exists)"
             ))
         })?;
-    // Issue #542: a resumed run is always real (`false`). Issue #401: `spawn`
-    // refuses at the concurrency ceiling; propagate it so the caller surfaces
-    // the same refusal rather than losing the run silently.
-    let (run_id, _handle) =
-        WorkflowSpawn::new(runtime, runner).spawn(workflow, input, false, false)?;
+    // Issue #401: `begin` refuses at the concurrency ceiling; propagate it so
+    // the caller surfaces the same refusal rather than losing the run
+    // silently. Deliberately split from `spawn_admitted` below (mirroring the
+    // cron scheduler's own begin/claim ordering, issue #661) rather than
+    // calling the combined `WorkflowSpawn::spawn` — admission has to land
+    // (and can still cleanly fail) *before* the dispatch marker is written,
+    // so a refusal here writes no marker for a run that never started.
+    let ws = WorkflowSpawn::new(runtime, runner);
+    let (ctx, guard) = runtime.run_supervisor().begin(&workflow.id, false)?;
+    // Issue #1862 prerequisite: `started_by` is the blocked run's own
+    // attribution, stashed at block-settle by `BlockedNodeQueue::arm` and
+    // handed back on release — stamped onto the admitted context here so it
+    // overrides `begin`'s `scheduled`-derived `Operator` default, the same as
+    // `spawn_as` does for the gate path in `spawn_continuation`. Done on the
+    // already-admitted `ctx` (rather than via `spawn_as`, which owns its own
+    // `begin` call) so this still gets the split-`begin`/dispatch-marker
+    // ordering below.
+    let ctx = ctx.with_started_by(started_by);
+    // Issue #1825 (P1 follow-up): abort rather than launch unmarked. Warning
+    // and proceeding anyway broke the exact invariant `BlockedNodeDispatched`'s
+    // own doc comment depends on — "no marker" must mean "nothing launched",
+    // or `reconcile_stranded_blocked_nodes` can no longer tell a genuine
+    // strand apart from a run this very call already started, and re-spawns a
+    // continuation that is already under way (repeating token spend or
+    // unprotected upstream work). Propagating drops `guard` here, freeing the
+    // concurrency slot without `spawn_admitted` ever running, and this
+    // function's only caller (`resume_blocked_agent_node`) already classifies
+    // a durable-store failure as retryable — the stash and its approval stay
+    // recorded exactly as they were, for a later boot's
+    // `reconcile_stranded_blocked_nodes` to pick back up, instead of this
+    // call quietly deciding on its own that an unmarked launch was fine.
+    // Specifically a *later boot's*: this journal's in-memory
+    // `blocked_node_dispatched` mirror (like every sibling `record_*` on it)
+    // is written before the durable append it guards even runs and is not
+    // rolled back on failure, so calling `reconcile_stranded_blocked_nodes`
+    // again in *this* process would read a stale "dispatched" for `turn` and
+    // retire the stash without ever having launched it. Safe only from a
+    // fresh boot's replay, which correctly excludes a write that never
+    // durably landed.
+    runtime.journal.record_blocked_node_dispatched(turn).await?;
+    // Issue #542: a resumed run is always real (`false`). Nothing here can
+    // fail — `begin`'s ceiling check already ran — so the task exists the
+    // moment this returns, immediately after the write above.
+    let (run_id, _handle) = ws.spawn_admitted(ctx, guard, workflow, input, false);
     tracing::info!(
         company = %runtime.id(),
         workflow = %workflow_id,
@@ -2097,6 +2210,7 @@ mod decide_tests {
         workflow_id: String,
         input: Value,
         run_id: String,
+        started_by: crate::ports::types::StartedBy,
     }
 
     /// A runner that records every run it is handed and settles immediately.
@@ -2127,6 +2241,7 @@ mod decide_tests {
                     workflow_id: workflow.id.clone(),
                     input,
                     run_id: ctx.run_id.clone(),
+                    started_by: ctx.started_by.clone(),
                 });
             Ok(WorkflowRun {
                 output: json!({ "ok": true }),
@@ -2258,6 +2373,37 @@ mode = "full"
         id
     }
 
+    /// [`park_gate`], stamping the card with `started_by` the way
+    /// `park_pending_gates` does in production (issue #1862 prerequisite) —
+    /// for pinning that a continuation carries it forward.
+    async fn park_gate_started_by(
+        rt: &Arc<crate::company::runtime::CompanyRuntime>,
+        input: Value,
+        started_by: &crate::ports::types::StartedBy,
+    ) -> ApprovalId {
+        let mut effect = gate_effect("gated", "gate", &input, "run-that-paused", &[], &[], None);
+        if let Value::Object(ref mut payload) = effect.payload {
+            payload.insert(PAYLOAD_STARTED_BY.to_string(), json!(started_by));
+        }
+        let id = rt
+            .approvals
+            .park(rt.id(), effect.clone())
+            .await
+            .expect("parks");
+        rt.journal()
+            .record_parked(
+                &id,
+                &effect,
+                crate::ports::now_millis(),
+                TaskLink::Unlinked,
+                ApprovalConversation::default(),
+                None,
+            )
+            .await
+            .expect("journals");
+        id
+    }
+
     /// The resume spawns its run on a detached task, so give it a moment to be
     /// recorded. Bounded so a genuine failure fails rather than hangs.
     async fn wait_for_runs(runner: &Arc<RecordingRunner>, want: usize) -> Vec<StartedRun> {
@@ -2296,6 +2442,68 @@ mode = "full"
         // A new causal root, not the paused run's id.
         assert_ne!(started[0].run_id, "run-that-paused");
         assert!(rt.pending_approvals().is_empty(), "the card is decided");
+    }
+
+    /// Issue #1862 prerequisite (a distinct gap from the trigger-site one
+    /// #1861 owns): approving a gate parked by an agent-triggered run must
+    /// carry that attribution into the continuation, not reset it to
+    /// `Operator`.
+    ///
+    /// `WorkflowSpawn::spawn`'s `scheduled` is always `false` for a resume
+    /// (issue #542), which on its own stamps every continuation
+    /// `StartedBy::Operator` via `WorkflowRunContext::new`'s coarse default —
+    /// regardless of who or what actually started the run that paused. Before
+    /// the fix this assertion reads `Operator` even though the parked card
+    /// says `Agent("ceo")`.
+    #[tokio::test]
+    async fn a_continuation_run_carries_the_paused_runs_attribution() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        let id = park_gate_started_by(
+            &rt,
+            json!({ "request": "quarterly numbers" }),
+            &crate::ports::types::StartedBy::Agent("ceo".into()),
+        )
+        .await;
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].started_by,
+            crate::ports::types::StartedBy::Agent("ceo".into()),
+            "the continuation must credit the same agent the paused run did: {:?}",
+            started[0].started_by
+        );
+    }
+
+    /// The other half of the same gap: a card parked before this field
+    /// existed carries no `PAYLOAD_STARTED_BY` at all, and must not fail the
+    /// resume — it degrades to the same `Operator` default the pre-fix
+    /// behaviour always produced.
+    #[tokio::test]
+    async fn a_pre_fix_gate_with_no_started_by_resumes_as_operator() {
+        let home = seed_home();
+        let (rt, runner) = runtime(home.path(), true).await;
+        // `park_gate` never stamps `PAYLOAD_STARTED_BY` — a stand-in for a card
+        // parked before this field existed.
+        let id = park_gate(&rt, json!({ "request": "legacy" })).await;
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].started_by,
+            crate::ports::types::StartedBy::Operator,
+            "a card with no started_by payload must degrade to the old default, not error: {:?}",
+            started[0].started_by
+        );
     }
 
     /// Issue #438, over the real decide path: the run an approval starts is

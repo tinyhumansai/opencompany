@@ -201,6 +201,7 @@ pub(super) fn deps(base_url: String, dir: &std::path::Path) -> (HarnessDeps, Arc
     let gate = Arc::new(crate::policy::ManifestApprovalGate::new(policy));
     let journal = Arc::new(RuntimeJournal::new(dir.join("journal.jsonl")));
     let deps = HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: Arc::new(HostedProvider::new(HostedProviderConfig {
@@ -272,6 +273,8 @@ pub(super) fn deps(base_url: String, dir: &std::path::Path) -> (HarnessDeps, Arc
         workspace: None,
         search: None,
         tenant_search: None,
+        workflow_runs: None,
+        deep_trace: None,
     };
     (deps, journal)
 }
@@ -291,20 +294,27 @@ pub(super) fn record() -> CompanyRecord {
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
-/// Runs the agent graph once against a script that calls `shell` and then
+/// Runs the agent graph once against a script that explicitly requests approval and then
 /// answers, returning the journal and the run's id.
 async fn run_gated(dir: &std::path::Path) -> (Arc<RuntimeJournal>, HarnessDeps, String) {
     let base_url = spawn_script(vec![
         Turn::Call {
-            tool: "shell",
-            args: json!({ "command": "echo quarterly" }),
+            tool: "request_approval",
+            args: json!({
+                "title": "Publish quarterly numbers",
+                "question": "May I publish the quarterly numbers?"
+            }),
         },
         Turn::Say("I was not allowed to run that."),
     ])
@@ -340,16 +350,16 @@ async fn run_gated(dir: &std::path::Path) -> (Arc<RuntimeJournal>, HarnessDeps, 
 /// card on the Approvals page — which reads the journal, so "on the page" means
 /// "in `journal.pending()`".
 #[tokio::test]
-async fn a_gated_tool_call_inside_a_workflow_node_parks_for_approval() {
+async fn an_explicit_approval_call_inside_a_workflow_node_parks() {
     let dir = tempfile::tempdir().unwrap();
     let (journal, _deps, run_id) = run_gated(dir.path()).await;
 
     let pending = journal.pending();
     let card = pending
         .iter()
-        .find(|p| p.effect.kind == "shell")
+        .find(|p| p.effect.kind == "request_approval")
         .unwrap_or_else(|| {
-            panic!("the gated shell call should be waiting on the operator: {pending:?}")
+            panic!("the explicit request should be waiting on the operator: {pending:?}")
         });
 
     // `agent: Some` is what routes approval to a single-use grant and a
@@ -367,7 +377,7 @@ async fn a_gated_tool_call_inside_a_workflow_node_parks_for_approval() {
         "the card must name the run waiting on it"
     );
     // The tool's own arguments, verbatim — this is the thing being consented to.
-    assert_eq!(card.effect.payload["command"], "echo quarterly");
+    assert_eq!(card.effect.payload["title"], "Publish quarterly numbers");
 }
 
 /// The regression this issue is actually about. Parking is only half the fix:
@@ -381,11 +391,14 @@ async fn a_gated_tool_call_inside_a_workflow_node_parks_for_approval() {
 /// reach the queue. It is that the journal is the durable record and the queue
 /// is not, which is what makes the card survive *any* queue lifecycle.
 #[tokio::test]
-async fn the_parked_request_survives_a_later_chat_cycle() {
+async fn the_explicit_request_survives_a_later_chat_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let (journal, deps, _run_id) = run_gated(dir.path()).await;
     assert!(
-        journal.pending().iter().any(|p| p.effect.kind == "shell"),
+        journal
+            .pending()
+            .iter()
+            .any(|p| p.effect.kind == "request_approval"),
         "precondition: the request parked"
     );
 
@@ -395,7 +408,10 @@ async fn the_parked_request_survives_a_later_chat_cycle() {
     deps.approval_requests.clear();
 
     assert!(
-        journal.pending().iter().any(|p| p.effect.kind == "shell"),
+        journal
+            .pending()
+            .iter()
+            .any(|p| p.effect.kind == "request_approval"),
         "the operator's card must outlive the in-memory queue it came from — this is the \
          disappearance the issue reported"
     );

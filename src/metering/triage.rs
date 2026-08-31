@@ -41,7 +41,14 @@ use super::inference::{UNATTRIBUTED_AGENT, inference_ledger_entry};
 ///
 /// `agent` is not a parameter — attribution to [`UNATTRIBUTED_AGENT`] is the
 /// rule this module holds, so no caller can bill a classification to a desk.
-pub fn triage_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample> {
+///
+/// `model` is the classified [`ModelSlug`](crate::metering::ModelSlug) the pass
+/// ran against, or `None` when the caller cannot name one (issue #1749).
+pub fn triage_sample(
+    usage: &TokenUsage,
+    provider: &str,
+    model: Option<crate::metering::ModelSlug>,
+) -> Option<UsageSample> {
     if usage.is_zero() {
         return None;
     }
@@ -55,6 +62,7 @@ pub fn triage_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample> 
         cost_usd: usage.cost_usd,
         kind: SampleKind::TriageCall,
         run_id: None,
+        model,
     })
 }
 
@@ -71,6 +79,7 @@ pub fn triage_sample(usage: &TokenUsage, provider: &str) -> Option<UsageSample> 
 pub async fn record_triage_usage(
     usage: &TokenUsage,
     provider: &str,
+    model: Option<crate::metering::ModelSlug>,
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: Option<&dyn UsageMeter>,
@@ -96,7 +105,7 @@ pub async fn record_triage_usage(
             "[usage] failed to append the triage spend entry; the classification still stands"
         );
     }
-    if let Some(sample) = triage_sample(usage, provider)
+    if let Some(sample) = triage_sample(usage, provider, model)
         && let Some(meter) = meter
         && let Err(err) = meter.record(company, &sample).await
     {
@@ -175,7 +184,7 @@ mod test {
     async fn meter_none_still_records_the_ledger_row() {
         let store = RecordingStore::default();
         let company = CompanyId::new("acme");
-        record_triage_usage(&usage(), "openrouter", &company, &store, None).await;
+        record_triage_usage(&usage(), "openrouter", None, &company, &store, None).await;
 
         let ledger = store.ledger.lock().unwrap();
         assert_eq!(
@@ -199,7 +208,7 @@ mod test {
         let store = RecordingStore::default();
         let meter = RecordingMeter::default();
         let company = CompanyId::new("acme");
-        record_triage_usage(&usage(), "openrouter", &company, &store, Some(&meter)).await;
+        record_triage_usage(&usage(), "openrouter", None, &company, &store, Some(&meter)).await;
 
         let samples = meter.samples.lock().unwrap();
         assert_eq!(samples.len(), 1);
@@ -220,6 +229,7 @@ mod test {
         record_triage_usage(
             &TokenUsage::default(),
             "managed",
+            None,
             &company,
             &store,
             Some(&meter),
@@ -231,7 +241,7 @@ mod test {
 
     #[test]
     fn a_completed_escalation_is_charged_to_the_company_not_a_teammate() {
-        let sample = triage_sample(&usage(), "managed").expect("a sample for real spend");
+        let sample = triage_sample(&usage(), "managed", None).expect("a sample for real spend");
         assert_eq!(sample.kind, SampleKind::TriageCall);
         assert_eq!(
             sample.agent, UNATTRIBUTED_AGENT,
@@ -247,14 +257,14 @@ mod test {
     /// indistinguishable from a real call that happened to be free.
     #[test]
     fn an_escalation_that_moved_nothing_writes_no_row() {
-        assert!(triage_sample(&TokenUsage::default(), "managed").is_none());
+        assert!(triage_sample(&TokenUsage::default(), "managed", None).is_none());
     }
 
     /// Distinct from planning, on purpose: the two are driven by different
     /// things and tuned separately.
     #[test]
     fn triage_is_not_filed_as_planning() {
-        let sample = triage_sample(&usage(), "managed").expect("a sample");
+        let sample = triage_sample(&usage(), "managed", None).expect("a sample");
         assert_ne!(sample.kind, SampleKind::PlanningCall);
     }
 }

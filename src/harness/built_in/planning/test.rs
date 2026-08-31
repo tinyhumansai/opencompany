@@ -172,10 +172,14 @@ fn record() -> CompanyRecord {
         overlay_workflows: Vec::new(),
         overlay_budgets: Vec::new(),
         overlay_policy: None,
+        overlay_tool_grants: None,
         overlay_desk_tools: Default::default(),
         disabled_workflows: Vec::new(),
         template_provenance: None,
         setup: None,
+        name_confirmed: false,
+        activation_completed_at: None,
+        created_at_millis: None,
     }
 }
 
@@ -192,7 +196,7 @@ fn evidence() -> Evidence {
             id: a.id.clone(),
             role: a.role.clone(),
             description: a.description.clone(),
-            grants: crate::runtime::builder::agent_effective_grants(&allow, &a.tools),
+            grants: crate::runtime::builder::agent_effective_grants(&allow, a.tools.as_deref()),
             global: a.global,
         })
         .collect();
@@ -227,6 +231,7 @@ fn evidence() -> Evidence {
         skills: vec!["writing".to_string()],
         mail_configured: false,
         composio_credential: true,
+        native_capabilities: HashSet::new(),
     }
 }
 
@@ -391,6 +396,7 @@ fn workspace_paths_render_and_terminate() {
         mime: None,
         size: None,
         sha256: None,
+        adopted: false,
     };
     let paths = workspace_paths(vec![
         node("1", "standards", None, NodeKind::Folder),
@@ -574,6 +580,79 @@ fn composio_distinguishes_no_credential_from_no_account() {
         note.contains("no Composio credential"),
         "the operator needs to know which of the two things is missing: {note}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Native-first routing: a built-in tool pre-empts a Composio prerequisite
+// ---------------------------------------------------------------------------
+
+fn teammate_with_grants(id: &str, grants: &[&str]) -> TeammateBrief {
+    TeammateBrief {
+        id: id.to_string(),
+        role: "Role".to_string(),
+        description: None,
+        grants: grants.iter().map(|g| g.to_string()).collect(),
+        global: false,
+    }
+}
+
+/// A capability the company already serves with a built-in tool satisfies BOTH
+/// the `connection` and `composio` prerequisite kinds — with a note that says a
+/// built-in tool serves it and no Composio connection is needed — instead of
+/// parking the card on a connection it never needed.
+#[test]
+fn a_native_capability_pre_empts_both_composio_prerequisite_kinds() {
+    let mut e = evidence();
+    e.native_capabilities = HashSet::from(["search".to_string()]);
+
+    let (status, note) = verify_composio(&e, "search");
+    assert_eq!(status, PrereqStatus::Satisfied);
+    assert!(note.contains("built-in tool"), "{note}");
+    assert!(!note.contains("Connections tab"), "{note}");
+
+    let (status, note) = verify_connection(&e, "search");
+    assert_eq!(status, PrereqStatus::Satisfied);
+    assert!(note.contains("built-in tool"), "{note}");
+    assert!(!note.contains("Connections tab"), "{note}");
+}
+
+/// A prerequisite that is NOT a native capability and has no connection still
+/// parks — native-first widens nothing for a genuine third-party account.
+#[test]
+fn a_non_native_capability_without_a_connection_still_parks() {
+    let mut e = evidence();
+    e.native_capabilities = HashSet::from(["search".to_string()]);
+    assert_eq!(verify_composio(&e, "gmail").0, PrereqStatus::Missing);
+    assert_eq!(verify_connection(&e, "gmail").0, PrereqStatus::Missing);
+}
+
+/// The native branch is checked before the Composio-outage `unknown` guard, so
+/// a built-in capability stays satisfied even when the probe is down — while a
+/// genuine third-party name under the same outage still reads `unknown`.
+#[test]
+fn the_native_branch_wins_even_when_composio_is_unreachable() {
+    let mut e = evidence();
+    e.native_capabilities = HashSet::from(["search".to_string()]);
+    e.composio_reachable = false;
+    assert_eq!(verify_composio(&e, "search").0, PrereqStatus::Satisfied);
+    assert_eq!(verify_connection(&e, "search").0, PrereqStatus::Satisfied);
+    assert_eq!(verify_composio(&e, "gmail").0, PrereqStatus::Unknown);
+}
+
+/// The set is a union over the roster: an explicit `search` grant on any one
+/// teammate marks `search` native, while `*` or `composio` alone never confers
+/// the metered search family (and `composio` is not in the native vocabulary).
+#[test]
+fn native_capabilities_are_a_union_over_the_roster_grants() {
+    let set = native_capabilities_of(&[teammate_with_grants("maya", &["search"])]);
+    assert!(set.contains("search"));
+
+    let set = native_capabilities_of(&[
+        teammate_with_grants("ann", &["*"]),
+        teammate_with_grants("bob", &["composio"]),
+    ]);
+    assert!(!set.contains("search"));
+    assert!(!set.contains("composio"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1087,7 @@ fn card(id: &str, assignee: &str) -> TaskRecord {
         output: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     }
 }
 
@@ -1071,7 +1151,14 @@ async fn a_blocked_plan_returns_the_card_with_the_gap_named() {
     run_planning_pass(Arc::clone(&runtime), "t-2".to_string()).await;
 
     let after = read(&runtime, "t-2").await;
-    assert_eq!(after.column, COLUMN_TODO, "it must not dispatch");
+    // Issue #1861: `paused`, not `todo`. The gap is answerable — somebody
+    // connects Slack — so the card waits with a question on it rather than
+    // dropping back among the cards nobody has started.
+    assert_eq!(
+        after.column,
+        crate::ports::tasks::COLUMN_PAUSED,
+        "it must not dispatch, and it must not read as fresh work either"
+    );
     let plan = after.plan.expect("the brief is kept, not discarded");
     assert!(!plan.is_dispatchable());
     assert_eq!(plan.blockers().len(), 1);
@@ -1081,6 +1168,86 @@ async fn a_blocked_plan_returns_the_card_with_the_gap_named() {
     assert!(
         note.contains("slack"),
         "an operator must be able to read the gap off the board: {note}"
+    );
+}
+
+/// Issue #1861: the gap does not only land on the note, it lands on the
+/// operator's queue — durably, so it survives the pass that raised it and
+/// expires through the approval TTL rather than waiting forever.
+///
+/// A missing `connection` is **infrastructure**: nobody on the roster can see
+/// whether the operator's Slack is connected, so the class has to route past
+/// #1866's ask-around rung rather than into it.
+#[tokio::test]
+async fn a_missing_prerequisite_parks_a_question_for_the_operator() {
+    use crate::ports::blockers::{BlockerKind, BlockerPayload, BlockerSource, BlockerStep};
+
+    let reply = r#"{"description":"Post the announcement","steps":[{"title":"Post it","detail":"in #general"}],
+        "prerequisites":[{"kind":"connection","name":"slack","why":"the announcement goes there"}],
+        "risks":[],"verification":"it is visible in the channel","scope":"the post only"}"#;
+    let (_home, runtime) = runtime_with(ScriptedModel::replying(reply)).await;
+    runtime
+        .tasks()
+        .upsert(runtime.id(), &card("t-prereq", "maya"))
+        .await
+        .unwrap();
+
+    run_planning_pass(Arc::clone(&runtime), "t-prereq".to_string()).await;
+
+    let pending = runtime.pending_approvals();
+    assert_eq!(pending.len(), 1, "the gap reaches the operator's queue");
+
+    let parked = runtime
+        .journal
+        .pending()
+        .into_iter()
+        .find(|p| p.effect.kind.starts_with("blocker."))
+        .expect("a blocker is parked");
+    assert_eq!(parked.effect.kind, "blocker.infrastructure");
+    assert!(
+        parked.effect.agent.is_none(),
+        "a planning blocker is nobody's blocked tool call"
+    );
+
+    let payload: BlockerPayload =
+        serde_json::from_value(parked.effect.payload.clone()).expect("payload round-trips");
+    assert_eq!(payload.kind, BlockerKind::Infrastructure);
+    assert_eq!(payload.source, BlockerSource::Prereq);
+    assert_eq!(
+        payload.step,
+        Some(BlockerStep::Task {
+            task_id: "t-prereq".to_string()
+        }),
+        "the resume tiers need to know which card stopped"
+    );
+    assert!(payload.reason.contains("slack"), "{}", payload.reason);
+    assert!(!payload.needed.trim().is_empty());
+}
+
+/// The ownership cases stay #1106's: a card with no usable owner still returns
+/// to To-do carrying its candidates, and parks nothing. Asking a second time,
+/// on a second surface, for one decision would be worse than the silence.
+#[tokio::test]
+async fn an_unowned_card_still_returns_to_todo_and_parks_nothing() {
+    let reply = r#"{"description":"Post the announcement","steps":[{"title":"Post it","detail":"in #general"}],
+        "prerequisites":[],"risks":[],"verification":"visible","scope":"the post only",
+        "proposedAssignee":""}"#;
+    let (_home, runtime) = runtime_with(ScriptedModel::replying(reply)).await;
+    let mut unowned = card("t-unowned", "maya");
+    unowned.assignee = String::new();
+    runtime
+        .tasks()
+        .upsert(runtime.id(), &unowned)
+        .await
+        .unwrap();
+
+    run_planning_pass(Arc::clone(&runtime), "t-unowned".to_string()).await;
+
+    let after = read(&runtime, "t-unowned").await;
+    assert_eq!(after.column, COLUMN_TODO);
+    assert!(
+        runtime.pending_approvals().is_empty(),
+        "who owns a card is one decision, asked in one place"
     );
 }
 
@@ -1244,6 +1411,7 @@ async fn planning_spend_lands_on_the_company_and_never_on_the_assignee() {
             cost_usd: 0.03,
         },
         "managed",
+        None,
         runtime.id(),
         runtime.store().as_ref(),
         runtime.usage().as_ref(),
@@ -1625,7 +1793,7 @@ async fn add_overlay_agent(runtime: &Arc<CompanyRuntime>, id: &str, role: &str, 
             name: id.to_string(),
             role: role.to_string(),
             description: Some(description.to_string()),
-            tools: Vec::new(),
+            tools: None,
             model: None,
             harness: None,
         });
@@ -1658,6 +1826,7 @@ async fn the_prompt_carries_runtime_teammates_and_desks_not_just_manifest_ones()
         name: "Growth".to_string(),
         description: None,
         members: vec!["social_manager".to_string()],
+        responder: crate::ports::types::ResponderMode::default(),
     });
     runtime.store().save(&record).await.unwrap();
 

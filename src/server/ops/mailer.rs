@@ -48,7 +48,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::app::config::{EnvSource, ProcessEnv};
 use crate::error::OpenCompanyError;
+use crate::ports::types::SecretValue;
 use crate::server::ops::imap::ImapCredentials;
 use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
 
@@ -86,9 +88,13 @@ impl std::str::FromStr for MailProvider {
 /// Credentials for one mail provider — **secret**.
 ///
 /// Tagged by `provider` on the wire so a stored blob is self-describing.
-/// `Debug` is written by hand: a derived one would print the password into
-/// whatever logged it.
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// `Debug` used to be hand-written here because [`SmtpCredentials`] derived one
+/// that printed its password. Since issue #1770 the password is a
+/// [`SecretValue`], so the derive is safe at every level and the container no
+/// longer has to remember — which is the whole point of guarding the field's
+/// type rather than each struct that holds one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum MailCredentials {
     /// An SMTP submission server.
@@ -115,16 +121,6 @@ impl MailCredentials {
         match self {
             MailCredentials::Smtp(c) => &c.from_name,
         }
-    }
-}
-
-impl std::fmt::Debug for MailCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the password. Mirrors AppConfig's hand-written Debug.
-        f.debug_struct("MailCredentials")
-            .field("provider", &self.provider())
-            .field("from_email", &self.from_email())
-            .finish_non_exhaustive()
     }
 }
 
@@ -289,7 +285,12 @@ impl MailConfig {
     /// discovering the typo when the first login link silently fails to arrive
     /// is worse than refusing here.
     pub fn from_env() -> Result<Option<Self>, OpenCompanyError> {
-        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        Self::from_env_source(&ProcessEnv)
+    }
+
+    /// Resolves host-level mail configuration from an injected source.
+    pub fn from_env_source(env: &dyn EnvSource) -> Result<Option<Self>, OpenCompanyError> {
+        let var = |key: &str| env.get(key).filter(|v| !v.trim().is_empty());
 
         let provider: MailProvider = match var("OPENCOMPANY_MAIL_PROVIDER") {
             Some(raw) => raw.parse()?,
@@ -338,7 +339,7 @@ impl MailConfig {
                         port,
                         security,
                         username: var("OPENCOMPANY_MAIL_USERNAME").unwrap_or_default(),
-                        password: var("OPENCOMPANY_MAIL_PASSWORD").unwrap_or_default(),
+                        password: SecretValue(var("OPENCOMPANY_MAIL_PASSWORD").unwrap_or_default()),
                         from_name: var("OPENCOMPANY_MAIL_FROM_NAME").unwrap_or_default(),
                         from_email,
                     }),
@@ -361,8 +362,9 @@ pub struct TenantMailboxConfig {
 
 impl std::fmt::Debug for TenantMailboxConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the SMTP/IMAP passwords: `SmtpCredentials` derives Debug and
-        // would otherwise print its password field through this struct.
+        // Deliberately narrower than a derive, which would be safe on its own
+        // since #1770 made both passwords `SecretValue`s: this renders one line
+        // naming the two hosts rather than two nested credential structs.
         f.debug_struct("TenantMailboxConfig")
             .field("address", &self.address)
             .field("smtp_host", &self.smtp.host)
@@ -375,7 +377,12 @@ impl TenantMailboxConfig {
     /// `Ok(None)` when unconfigured (no `OPENCOMPANY_MAIL_ADDRESS`); a *partial*
     /// injection is a hard error.
     pub fn from_env() -> Result<Option<Self>, OpenCompanyError> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Self::from_env_source(&ProcessEnv)
+    }
+
+    /// Resolves a tenant mailbox from an injected source.
+    pub fn from_env_source(env: &dyn EnvSource) -> Result<Option<Self>, OpenCompanyError> {
+        let var = |k: &str| env.get(k).filter(|v| !v.trim().is_empty());
         let Some(address) = var("OPENCOMPANY_MAIL_ADDRESS") else {
             return Ok(None);
         };
@@ -392,7 +399,7 @@ impl TenantMailboxConfig {
                 .map_err(|_| OpenCompanyError::Config(format!("{k} must be a port number")))
         };
         let user = need("OPENCOMPANY_MAIL_USER")?;
-        let password = need("OPENCOMPANY_MAIL_PASSWORD")?;
+        let password = SecretValue(need("OPENCOMPANY_MAIL_PASSWORD")?);
         let smtp_port = port("OPENCOMPANY_MAIL_SMTP_PORT")?;
         // The injected env carries no SECURITY var, so derive it from the port:
         // 465 = implicit TLS (SMTPS); everything else (587, 25, custom) = STARTTLS.
@@ -483,7 +490,6 @@ mod test {
     // not on one local to this module: all of these tests link into a single
     // test binary, so a module-local lock would leave every *other*
     // env-touching test in it free to race these.
-    use crate::test_support::EnvVarGuard;
 
     fn smtp_creds() -> SmtpCredentials {
         SmtpCredentials {
@@ -491,7 +497,7 @@ mod test {
             port: 587,
             security: SmtpSecurity::Starttls,
             username: "user".into(),
-            password: "hunter2".into(),
+            password: SecretValue("hunter2".into()),
             from_name: "Acme".into(),
             from_email: "hi@acme.test".into(),
         }
@@ -523,18 +529,24 @@ mod test {
         assert!(rendered.contains("hi@acme.test"));
     }
 
+    /// The inverse of the guard-rail this used to be.
+    ///
+    /// Until issue #1770 this test asserted that `SmtpCredentials`' derived
+    /// `Debug` *did* print its password, and said that when it stopped, the
+    /// derive had been fixed and `MailCredentials`' hand-written `Debug` could
+    /// be relaxed. Both of those happened: the password is a `SecretValue`, so
+    /// the derive is safe at every level and `MailCredentials` now derives too.
+    /// The assertion is kept, pointing the other way, so that reverting the
+    /// field to a `String` fails here as well as in `smtp::credential_tests`.
     #[test]
-    fn smtp_credentials_debug_still_leaks_so_never_derive_it_upward() {
-        // A guard-rail, not an endorsement: SmtpCredentials derives Debug and
-        // prints its password. That is tolerable only because the type is
-        // confined to the SecretStore. If this ever starts passing, the derive
-        // was fixed and MailCredentials' hand-written Debug could be relaxed —
-        // until then, nothing may put SmtpCredentials in a Debug-printed struct.
+    fn smtp_credentials_debug_no_longer_leaks_so_containers_may_derive() {
         let rendered = format!("{:?}", smtp_creds());
         assert!(
-            rendered.contains("hunter2"),
-            "SmtpCredentials::Debug no longer leaks; revisit this guard"
+            !rendered.contains("hunter2"),
+            "SmtpCredentials::Debug leaks its password again: {rendered}"
         );
+        // Still useful for diagnosis.
+        assert!(rendered.contains("smtp.example.com"), "{rendered}");
     }
 
     #[test]
@@ -577,7 +589,7 @@ mod test {
             host: "h".into(),
             port: 993,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
         };
         let rx = RecordingMailReceiver::new();
         rx.push_batch(vec![FetchedEmail {
@@ -600,7 +612,7 @@ mod test {
             host: "h".into(),
             port: 993,
             username: "u".into(),
-            password: "p".into(),
+            password: SecretValue("p".into()),
         };
         let rx = RecordingMailReceiver::new();
         rx.mark_seen(&creds, &[3, 4]).await.unwrap();
@@ -610,17 +622,7 @@ mod test {
 
     #[test]
     fn tenant_mailbox_config_parses_injected_env() {
-        // Serialize env access; set the 7 injected vars.
-        let env = EnvVarGuard::capture(&[
-            "OPENCOMPANY_MAIL_ADDRESS",
-            "OPENCOMPANY_MAIL_SMTP_HOST",
-            "OPENCOMPANY_MAIL_SMTP_PORT",
-            "OPENCOMPANY_MAIL_IMAP_HOST",
-            "OPENCOMPANY_MAIL_IMAP_PORT",
-            "OPENCOMPANY_MAIL_USER",
-            "OPENCOMPANY_MAIL_PASSWORD",
-        ]);
-        for (k, v) in [
+        let env = crate::app::config::MapEnv::new([
             ("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work"),
             ("OPENCOMPANY_MAIL_SMTP_HOST", "mail.opencompany.work"),
             ("OPENCOMPANY_MAIL_SMTP_PORT", "465"),
@@ -628,35 +630,31 @@ mod test {
             ("OPENCOMPANY_MAIL_IMAP_PORT", "993"),
             ("OPENCOMPANY_MAIL_USER", "acme@opencompany.work"),
             ("OPENCOMPANY_MAIL_PASSWORD", "secret"),
-        ] {
-            env.set(k, v);
-        }
-
-        let cfg = TenantMailboxConfig::from_env()
+        ]);
+        let cfg = TenantMailboxConfig::from_env_source(&env)
             .unwrap()
             .expect("configured");
         assert_eq!(cfg.address, "acme@opencompany.work");
         assert_eq!(cfg.imap.host, "mail.opencompany.work");
         assert_eq!(cfg.imap.port, 993);
         assert_eq!(cfg.smtp.from_email, "acme@opencompany.work");
-
-        // `env` (dropped here) puts every touched var back to whatever it was
-        // before this test ran, rather than unconditionally removing it, and
-        // releases the crate-wide lock only once that restore has finished.
     }
 
     #[test]
     fn tenant_mailbox_config_absent_is_none() {
-        let env = EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS"]);
-        env.remove("OPENCOMPANY_MAIL_ADDRESS");
-        assert!(TenantMailboxConfig::from_env().unwrap().is_none());
+        assert!(
+            TenantMailboxConfig::from_env_source(&crate::app::config::MapEnv::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn tenant_mailbox_config_partial_is_error() {
-        let env = EnvVarGuard::capture(&["OPENCOMPANY_MAIL_ADDRESS", "OPENCOMPANY_MAIL_PASSWORD"]);
-        env.set("OPENCOMPANY_MAIL_ADDRESS", "acme@opencompany.work");
-        env.remove("OPENCOMPANY_MAIL_PASSWORD");
-        assert!(TenantMailboxConfig::from_env().is_err());
+        let env = crate::app::config::MapEnv::new([(
+            "OPENCOMPANY_MAIL_ADDRESS",
+            "acme@opencompany.work",
+        )]);
+        assert!(TenantMailboxConfig::from_env_source(&env).is_err());
     }
 }

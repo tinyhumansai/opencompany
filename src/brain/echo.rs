@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 
 use crate::Result;
-use crate::ports::brain::{Brain, Cognition, CycleHost, UsageMetering};
+use crate::ports::brain::{Brain, Cognition, CycleHost, ECHO_PATH, UsageMetering};
 use crate::ports::types::{
     CompanyEvent, CompressedTrace, CycleRequest, CycleResult, Effect, EffectGroup, OutboundMessage,
     TokenUsage,
@@ -54,6 +54,7 @@ impl Brain for EchoBrain {
                     text: format!("You said: {text}"),
                     steps: Vec::new(),
                     reply_to: None,
+                    mentions: Vec::new(),
                 });
             }
             if let CompanyEvent::WebhookReceived { channel, .. } = event {
@@ -66,6 +67,7 @@ impl Brain for EchoBrain {
                     text,
                     steps: Vec::new(),
                     reply_to,
+                    mentions: Vec::new(),
                 });
             }
         }
@@ -78,6 +80,7 @@ impl Brain for EchoBrain {
                 text: "Acknowledged.".to_string(),
                 steps: Vec::new(),
                 reply_to: None,
+                mentions: Vec::new(),
             });
         }
 
@@ -104,8 +107,10 @@ impl Brain for EchoBrain {
     /// broken" (issue #174).
     fn cognition(&self) -> Cognition {
         Cognition {
-            path: "echo",
+            path: ECHO_PATH,
             provider: "none",
+            // No model is called on this path, so there is no model to name.
+            model: None,
             metering: UsageMetering::None,
         }
     }
@@ -154,6 +159,7 @@ mod test {
             company_id: CompanyId::new("acme"),
             events,
             event_seqs: Vec::new(),
+            policy: None,
         }
     }
 
@@ -170,6 +176,7 @@ mod test {
                     by: None,
                     chat: None,
                     deliverable: None,
+                    attachments: Vec::new(),
                 }]),
                 &host,
             )

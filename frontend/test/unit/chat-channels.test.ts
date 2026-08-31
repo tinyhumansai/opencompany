@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  channelIdFromSegment,
   channelIdForThread,
   dmChannelId,
   legacyDmChannelId,
@@ -63,6 +64,37 @@ describe("resolveDmChannelId (the legacy-URL shim)", () => {
 
   it("returns null for anything that is not a DM id", () => {
     expect(resolveDmChannelId("engineering", ROSTER)).toBeNull();
+  });
+});
+
+describe("channelIdFromSegment (URL decoding at the hash boundary)", () => {
+  it("leaves an already-literal channel id alone", () => {
+    expect(channelIdFromSegment("dm:agent-ada")).toBe("dm:agent-ada");
+    expect(channelIdFromSegment("engineering")).toBe("engineering");
+  });
+
+  it("decodes an encoded DM id, as an approval-card href mints it", () => {
+    // `#/chat/${encodeURIComponent(channelId)}` writes `dm%3Aagent-ada`, and
+    // the router passes that segment through untouched. Without the decode the
+    // id compares against nothing and the link lands on the fallback channel.
+    expect(channelIdFromSegment("dm%3Aagent-ada")).toBe("dm:agent-ada");
+  });
+
+  it("feeds the decoded id into the legacy shim", () => {
+    const old = legacyDmChannelId(ADA);
+    expect(resolveDmChannelId(channelIdFromSegment(encodeURIComponent(old))!, ROSTER)).toBe(
+      dmChannelId(ADA),
+    );
+  });
+
+  it("returns null for no segment", () => {
+    expect(channelIdFromSegment(null)).toBeNull();
+  });
+
+  it("returns the raw segment on malformed escapes, so it reads as unknown", () => {
+    // `#/chat/%` is a typo, not a channel — the raw value should surface in the
+    // unknown-channel notice rather than collapsing silently onto the fallback.
+    expect(channelIdFromSegment("%")).toBe("%");
   });
 });
 

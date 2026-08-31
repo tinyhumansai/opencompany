@@ -28,6 +28,7 @@ import {
   closeSshTunnel,
   forgetConnection,
   openSshTunnel,
+  adoptSessionIntoCore,
   registerConnection,
 } from "@/api/transport/desktop";
 import {
@@ -693,8 +694,142 @@ export function unpairConnection(id: ConnectionId): void {
  * Replaces the client, through `adoptCredential`, so every request after this
  * carries the new session rather than the one it was constructed with.
  */
-export function adoptSession(id: ConnectionId, session: string): void {
+export async function adoptSession(id: ConnectionId, session: string): Promise<void> {
+  // On the desktop the session goes to the CORE, not into this client
+  // (issue #1855). The webview cannot use it: the proxy strips a caller-
+  // supplied `x-opencompany-session` (`RESERVED_HEADERS`) and the event
+  // stream carries only the core-held credential — both deliberate, so the
+  // page never decides what a request authenticates as. The core stores it in
+  // the keychain under this connection id, which is exactly where a paired
+  // device's session lived and what `oc_connect` reads back on the next
+  // launch — so a sign-in here survives an app restart, which the browser's
+  // never could.
+  //
+  // Awaited by the caller before it probes: a probe that ran first would
+  // authenticate with the pre-sign-in credential and conclude the host still
+  // refuses us.
+  if (isDesktopRuntime()) {
+    await adoptSessionIntoCore(id, session);
+    // `device` rather than a webview-held `session`: the record says where the
+    // credential lives, and every check keyed off it — the insecure-transport
+    // refusal, what a probe may claim — already treats a core-held credential
+    // correctly under this kind. The ref names the pairing for a person; a
+    // sign-in has no device id, so it says what it is.
+    adoptCredential(id, { kind: "device", ref: "signed-in" });
+    return;
+  }
   adoptCredential(id, { kind: "session", value: session });
+}
+
+/**
+ * Points an explicit-company connection at a different company (issue #1807).
+ *
+ * `defaultCompany` is what `ConnectionConsole`'s boot effect reads on every
+ * mount — a `?company=` link or a single-company profile takes the "explicit
+ * company wins" path straight to `client.status(defaultCompany)` rather than
+ * listing. A reset provisions the replacement into the *current* session
+ * directly (`switchCompany`), which leaves this untouched: the next reload
+ * would still ask for the just-archived id, `client.status` would answer
+ * `company_not_found`, and the operator would land on a connection error
+ * instead of back in their own console.
+ *
+ * Re-seats like {@link editConnection}, so the rebuilt client and the
+ * persisted profile agree with the roster immediately, not just after the
+ * next probe.
+ *
+ * A no-op for a connection that was never company-scoped (`defaultCompany`
+ * already `null`) — a multi-company connection has nothing to retarget, and
+ * forcing one narrows it to a single company it was never addressed as.
+ */
+export function retargetDefaultCompany(id: ConnectionId, company: string): void {
+  const existing = getConnection(id);
+  if (!existing || existing.defaultCompany === null || existing.defaultCompany === company) {
+    return;
+  }
+  reseat(id, { ...existing, defaultCompany: company });
+}
+
+/**
+ * Clears an explicit-company connection's persisted default (issue #1807).
+ *
+ * For the abandon path: a reset's archive leg landed, but nothing replaced
+ * it — the operator cancelled, or gave up retrying a failed create. There is
+ * no replacement id to retarget to, so unlike {@link retargetDefaultCompany}
+ * this drops the scoping entirely rather than moving it, sending the next
+ * boot down the multi-company/picker path instead of retrying an id that no
+ * longer exists.
+ *
+ * A no-op for a connection that was never company-scoped, same as
+ * {@link retargetDefaultCompany}.
+ */
+export function clearDefaultCompany(id: ConnectionId): void {
+  const existing = getConnection(id);
+  if (!existing || existing.defaultCompany === null) return;
+  reseat(id, { ...existing, defaultCompany: null });
+}
+
+/**
+ * Rewrites the `?company=` URL param to `newId` in place, or clears it, to
+ * keep the next reload from re-booting a connection into `archivedId`
+ * (issue #1807).
+ *
+ * {@link retargetDefaultCompany} fixes the persisted profile, but
+ * `resolveConfig()` re-derives its `company` fresh on every load from THREE
+ * sources, in ascending priority — `VITE_OC_COMPANY`, `window.OPENCOMPANY
+ * _CONFIG`, then `?company=` (see `config.ts`) — and a reset never touches
+ * any of them. Left stale, the *next* reload's bootstrap `addConnection`
+ * call looks up `findProfile(baseUrl, archivedId)`, which no longer matches
+ * the retargeted profile (its `defaultCompany` has moved), mints a fresh,
+ * duplicate connection scoped to the archived id instead of reusing it, and
+ * that connection's boot effect asks the host for an id that no longer
+ * exists.
+ *
+ * Only the query layer can be rewritten at runtime — `VITE_OC_COMPANY` is
+ * baked in at build time and `window.OPENCOMPANY_CONFIG` is injected once in
+ * `index.html`, so neither this function nor anything else client-side can
+ * touch them directly. But the query layer outranks both in `resolveConfig`'s
+ * merge, so writing an override there works regardless of which of the three
+ * the connection's explicit company actually came from — including the
+ * config/env case the original fix (query-only) missed (codex review on
+ * #1828, PR comment 3864885209).
+ *
+ * `newId: null` clears the override instead of retargeting to a replacement
+ * — the abandon path (a reset that archived but never created), where there
+ * is no replacement id to name. An empty `?company=` still outranks the
+ * env/window layers on the next `resolveConfig()`, and resolves to `""`,
+ * which the boot effect's `if (defaultCompany)` treats as "no explicit
+ * company" (falsy), same as `null` (codex review on #1828, PR comment
+ * 3864885215).
+ *
+ * A no-op when the URL already names some OTHER company — that param was
+ * never going to resolve to `archivedId` on reload regardless of anything
+ * this function does (the query layer already outranks env/window), so
+ * overwriting it would clobber an unrelated link rather than fix this one.
+ *
+ * That guard alone does NOT cover an absent `?company=` param — `current ===
+ * null` also passes it, so this still WRITES one in for a connection that
+ * never sourced its default company from the URL at all. Whether that write
+ * is correct depends on identity, not on what the param currently holds: it
+ * is only correct for the one connection `resolveConfig()` produced for the
+ * page currently loaded (`ConnectionConsole`'s `isBootstrap` prop, App's
+ * `bootstrapId === connectionId`). A restored, non-bootstrap profile can
+ * carry its own non-null `defaultCompany` the same way and hit this
+ * function via the same call sites, and an absent param there means the
+ * *bootstrap* connection's own link (or no link at all) — writing into it
+ * anyway points the address bar at a company the connection whose config it
+ * actually describes never asked for, and the next reload's
+ * `resolveConfig()`/`findProfile` pair mints a duplicate scoped to the wrong
+ * host (issue #1828 comment 3865563560). Callers gate on that identity
+ * before calling; this function's own guard only ever protected the
+ * narrower "URL already names something else" case.
+ */
+export function retargetCompanyUrlParam(archivedId: string, newId: string | null): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const current = url.searchParams.get("company");
+  if (current !== null && current !== archivedId) return;
+  url.searchParams.set("company", newId ?? "");
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
 /** What "modify a host" may change about one. See {@link editConnection}. */
@@ -961,6 +1096,16 @@ async function runProbe(
       patch(id, { status: "live", companies: [], waking: false });
       return null;
     } catch (statusErr) {
+      // A 401 from the companies list outranks whatever the alias said
+      // (issue #1855). The fallback exists for single-company hosts, and on a
+      // platform host it answers 404 for everyone — so letting that 404 win
+      // reported "down" about a host that had answered, precisely, "sign in".
+      // `keepWaking` then retried `down` for the whole cloud wake window,
+      // which is the spinner-over-a-sign-in that `waking.ts` promises never
+      // to show.
+      if (listErr instanceof ApiError && listErr.status === 401) {
+        return statusFromError(listErr);
+      }
       return statusFromError(statusErr ?? listErr);
     }
   }

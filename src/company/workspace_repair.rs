@@ -123,6 +123,19 @@ pub enum ResidualCause {
     /// Nothing was lost and nothing is inconsistent — running it again picks
     /// this up.
     TreeMovedOn,
+    /// The node's `parent_id` resolves to no node in the tree — a true orphan
+    /// (issue #1839). A concurrent child create can commit *after* a
+    /// [`delete_if_empty`](WorkspaceStore::delete_if_empty) read-deletes its
+    /// parent on a backend with no per-company lock, leaving a child whose
+    /// rendered path is unaddressable and which no sweep otherwise reaches.
+    ///
+    /// The repair is the guaranteed net: an orphan **folder** that is provably
+    /// empty is removed (nothing non-empty is ever deleted — the module's
+    /// standing invariant), while an orphan **file**, or a non-empty orphan
+    /// folder, is surfaced here so the operator can re-home it rather than being
+    /// silently swept. A residual with this cause that survives a real run is
+    /// therefore always something a human must settle.
+    DanglingParent,
 }
 
 /// One node the repair deliberately did not touch, and why.
@@ -335,6 +348,27 @@ pub(crate) fn duplicate_folder_plan(nodes: &[WorkspaceNode]) -> RepairPlan {
         }
     }
 
+    // Orphans (issue #1839): a node whose `parent_id` names nothing in the tree.
+    // Independent of the duplicate-folder fold above — appended after it so a
+    // node already reported as a residual is not named twice — this is what
+    // turns a Race-2 orphan from an invisible, unaddressable node into something
+    // the operator is told about and the apply half can act on. Sorted so the
+    // preview and the confirm agree on the order.
+    let already_residual: HashSet<&str> = residuals.iter().map(|r| r.id.as_str()).collect();
+    let mut orphans: Vec<&WorkspaceNode> = nodes
+        .iter()
+        .filter(|node| {
+            node.parent_id
+                .as_deref()
+                .is_some_and(|parent| !by_id.contains_key(parent))
+                && !already_residual.contains(node.id.as_str())
+        })
+        .collect();
+    orphans.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    for node in orphans {
+        residuals.push(Residual::new(node, ResidualCause::DanglingParent));
+    }
+
     RepairPlan {
         folders: folds
             .into_iter()
@@ -528,6 +562,41 @@ pub async fn merge_duplicate_folders(
         }
     }
 
+    // -- phase three: reap provably-empty orphan folders (issue #1839) -------
+    //
+    // A Race-2 orphan is a node whose parent was read-deleted out from under a
+    // concurrent child insert on a lockless backend. The plan named every orphan
+    // as a `DanglingParent` residual; here the guaranteed net acts on them. An
+    // orphan *folder* that is still childless goes — through `delete_if_empty`,
+    // which re-checks emptiness against the store's current state, so a child
+    // that arrived in the meantime keeps its folder exactly as the duplicate
+    // path's second read does. An orphan *file*, or a folder something now sits
+    // under, is left standing and stays a residual for the operator to re-home:
+    // nothing non-empty is ever deleted, and no file is destroyed on a path the
+    // repair could not choose. Removed folders drop out of the residual list;
+    // what remains is what a human still has to settle.
+    let orphan_ids: Vec<String> = residuals
+        .iter()
+        .filter(|r| r.cause == ResidualCause::DanglingParent)
+        .map(|r| r.id.clone())
+        .collect();
+    if !orphan_ids.is_empty() {
+        let current = store.tree(company).await?;
+        let kind_of: HashMap<&str, NodeKind> = current
+            .iter()
+            .map(|node| (node.id.as_str(), node.kind))
+            .collect();
+        let mut removed: HashSet<String> = HashSet::new();
+        for id in &orphan_ids {
+            if kind_of.get(id.as_str()) == Some(&NodeKind::Folder)
+                && store.delete_if_empty(company, id).await?
+            {
+                removed.insert(id.clone());
+            }
+        }
+        residuals.retain(|r| r.cause != ResidualCause::DanglingParent || !removed.contains(&r.id));
+    }
+
     tracing::info!(
         company = %company,
         merged = done.iter().filter(|folder| folder.removed).count(),
@@ -562,6 +631,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 
@@ -752,6 +822,50 @@ mod tests {
             folder("ceo", "reports", Some("agents")),
             folder("cmo", "reports", Some("desks")),
             file("note", "reports.md", Some("agents")),
+        ];
+
+        assert_eq!(duplicate_folder_plan(&nodes), RepairPlan::default());
+    }
+
+    /// Issue #1839: a node whose `parent_id` resolves to nothing is a true
+    /// orphan — the Race-2 shape a lockless backend leaves when a child insert
+    /// commits after its parent was read-deleted. The plan names every orphan,
+    /// both kinds, so the preview can show them and the apply half can act.
+    #[test]
+    fn a_dangling_parent_is_reported_as_a_residual() {
+        let nodes = vec![
+            file("orphan-file", "lost.md", Some("ghost")),
+            folder("orphan-dir", "lost", Some("ghost")),
+        ];
+
+        let plan = duplicate_folder_plan(&nodes);
+
+        assert!(
+            plan.folders.is_empty(),
+            "there is nothing to merge: {plan:?}"
+        );
+        let reported: Vec<(&str, ResidualCause)> = plan
+            .residuals
+            .iter()
+            .map(|r| (r.id.as_str(), r.cause))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                ("orphan-dir", ResidualCause::DanglingParent),
+                ("orphan-file", ResidualCause::DanglingParent),
+            ],
+            "both orphans are named, sorted by id"
+        );
+    }
+
+    /// A node whose parent *does* exist is not an orphan, so a healthy tree — and
+    /// the duplicate shapes above — never gain a spurious dangling residual.
+    #[test]
+    fn a_present_parent_is_never_dangling() {
+        let nodes = vec![
+            folder("root", "agents", None),
+            folder("child", "cmo", Some("root")),
         ];
 
         assert_eq!(duplicate_folder_plan(&nodes), RepairPlan::default());
@@ -964,6 +1078,93 @@ mod tests {
         assert!(
             ws.read(&company, "late").await.unwrap().is_some(),
             "and the deliverable itself must still be there"
+        );
+    }
+
+    /// Issue #1839, the guaranteed net: a real run reaps a provably-empty orphan
+    /// **folder** and surfaces an orphan **file** rather than destroying it.
+    /// Both are injected past the store's parent check, because a lawful create
+    /// refuses a missing parent — the orphan only arises from the Race-2 the
+    /// reaper exists to clean up.
+    #[tokio::test]
+    async fn the_orphan_reaper_reaps_an_empty_folder_and_surfaces_a_file() {
+        let loose = Arc::new(LooseWorkspace::default());
+        let ws: Arc<dyn WorkspaceStore> = loose.clone();
+        let company = CompanyId::new("acme");
+        loose.inject(
+            &company,
+            vec![
+                file("orphan-file", "lost.md", Some("ghost")),
+                folder("orphan-dir", "lost", Some("ghost")),
+            ],
+        );
+
+        let done = merge_duplicate_folders(ws.as_ref(), &company, false)
+            .await
+            .unwrap();
+
+        // The empty orphan folder is gone from the residual list; the file stays.
+        let surfaced: Vec<(&str, ResidualCause)> = done
+            .residuals
+            .iter()
+            .map(|r| (r.id.as_str(), r.cause))
+            .collect();
+        assert_eq!(
+            surfaced,
+            vec![("orphan-file", ResidualCause::DanglingParent)],
+            "the orphan file is surfaced; the empty orphan folder is not: {done:?}"
+        );
+
+        let remaining: Vec<String> = ws
+            .tree(&company)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert!(
+            remaining.contains(&"orphan-file".to_string()),
+            "the orphan file must be surfaced, never destroyed: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"orphan-dir".to_string()),
+            "the empty orphan folder must be reaped: {remaining:?}"
+        );
+    }
+
+    /// The reaper honours the module's standing invariant: a **non-empty** orphan
+    /// folder is not deleted. It stays surfaced, and its child — whose own parent
+    /// now resolves — is left where it is.
+    #[tokio::test]
+    async fn a_non_empty_orphan_folder_is_surfaced_not_reaped() {
+        let loose = Arc::new(LooseWorkspace::default());
+        let ws: Arc<dyn WorkspaceStore> = loose.clone();
+        let company = CompanyId::new("acme");
+        loose.inject(
+            &company,
+            vec![
+                folder("orphan-dir", "lost", Some("ghost")),
+                file("inside", "kept.md", Some("orphan-dir")),
+            ],
+        );
+
+        let done = merge_duplicate_folders(ws.as_ref(), &company, false)
+            .await
+            .unwrap();
+
+        // Only the top orphan is dangling — `inside`'s parent resolves — and it
+        // holds a document, so `delete_if_empty` refuses it and it stays a
+        // residual.
+        assert_eq!(
+            done.residuals
+                .iter()
+                .map(|r| (r.id.as_str(), r.cause))
+                .collect::<Vec<_>>(),
+            vec![("orphan-dir", ResidualCause::DanglingParent)],
+        );
+        assert!(
+            ws.read(&company, "inside").await.unwrap().is_some(),
+            "the child of a non-empty orphan folder is untouched"
         );
     }
 }

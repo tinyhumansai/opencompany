@@ -37,7 +37,7 @@
 //! per-turn metering and the runtime's per-cycle metering (every other cognition
 //! path) from drifting into two different definitions of "usage worth recording".
 
-use crate::metering::inference;
+use crate::metering::{ModelSlug, inference};
 use crate::ports::CompanyStore;
 use crate::ports::types::{CompanyId, LedgerEntry, TokenUsage};
 use crate::ports::usage::{UsageMeter, UsageSample};
@@ -83,6 +83,12 @@ pub fn ledger_entry_for(turn: &TurnUsage, agent_id: &str) -> Option<LedgerEntry>
 /// one served by the offline [`MockProvider`](super::provider::MockProvider),
 /// whose replies carry no usage.
 ///
+/// `model` is the classified [`ModelSlug`] the turn resolved to, read live off
+/// the provider (issue #1749) — a vocabulary member, never the raw model name,
+/// which stays inside
+/// [`HarnessModel`](super::provider::HarnessModel). `None` when the provider
+/// cannot name one.
+///
 /// `run_id` attributes the sample to the task attempt the turn ran under, when
 /// it ran under one (issue #242). Stamped here rather than inside
 /// [`inference::inference_sample`] because that function is the *shared* mapping
@@ -93,9 +99,11 @@ pub fn usage_sample_for(
     turn: &TurnUsage,
     agent_id: &str,
     provider: &str,
+    model: Option<ModelSlug>,
     run_id: Option<&str>,
 ) -> Option<UsageSample> {
-    let mut sample = inference::inference_sample(&turn.to_token_usage(), agent_id, provider)?;
+    let mut sample =
+        inference::inference_sample(&turn.to_token_usage(), agent_id, provider, model)?;
     sample.run_id = run_id.map(str::to_string);
     Some(sample)
 }
@@ -108,6 +116,7 @@ pub async fn record_turn_cost(
     turn: &TurnUsage,
     agent_id: &str,
     provider: &str,
+    model: Option<ModelSlug>,
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: Option<&dyn UsageMeter>,
@@ -116,8 +125,10 @@ pub async fn record_turn_cost(
     if let Some(entry) = ledger_entry_for(turn, agent_id) {
         store.append_ledger(company, entry).await?;
     }
-    if let (Some(meter), Some(sample)) = (meter, usage_sample_for(turn, agent_id, provider, run_id))
-    {
+    if let (Some(meter), Some(sample)) = (
+        meter,
+        usage_sample_for(turn, agent_id, provider, model, run_id),
+    ) {
         // The usage sample is telemetry, not the turn's record of itself: the
         // ledger write above has already happened, so a meter failure must not
         // fail a completed turn. Log it and let the turn stand.
@@ -199,7 +210,7 @@ mod tests {
     fn zero_usage_turn_produces_no_entry_or_sample() {
         let turn = TurnUsage::default();
         assert!(ledger_entry_for(&turn, "ceo").is_none());
-        assert!(usage_sample_for(&turn, "ceo", "managed", None).is_none());
+        assert!(usage_sample_for(&turn, "ceo", "managed", None, None).is_none());
     }
 
     /// The `/openai/v1` passthrough reports tokens but no USD (billing happens
@@ -213,7 +224,7 @@ mod tests {
             cached_input_tokens: 0,
             cost_usd: 0.0,
         };
-        assert!(usage_sample_for(&turn, "ceo", "managed", None).is_some());
+        assert!(usage_sample_for(&turn, "ceo", "managed", None, None).is_some());
         // No USD ⇒ no ledger entry, but the token sample still lands.
         assert!(ledger_entry_for(&turn, "ceo").is_none());
     }
@@ -237,6 +248,7 @@ mod tests {
             &turn,
             "ceo",
             "managed",
+            None,
             &CompanyId::new("acme"),
             &store,
             Some(&meter),
@@ -269,6 +281,7 @@ mod tests {
             &turn,
             "ceo",
             "managed",
+            None,
             &CompanyId::new("acme"),
             &store,
             Some(&meter),
@@ -281,6 +294,7 @@ mod tests {
             &turn,
             "ceo",
             "managed",
+            None,
             &CompanyId::new("acme"),
             &store,
             Some(&meter),
@@ -305,6 +319,67 @@ mod tests {
         assert!(tagged.contains(r#""runId":"run-7""#), "{tagged}");
     }
 
+    /// Issue #1749: the turn's sample names the model it ran on.
+    ///
+    /// This is the seam the issue is about — the richest one in the tree, with
+    /// agent, provider, run id and totals already in scope — so a model that
+    /// does not arrive here arrives nowhere.
+    #[tokio::test]
+    async fn a_turns_sample_names_the_model_it_ran_on() {
+        let store = RecordingStore::default();
+        let meter = RecordingMeter::default();
+        let turn = turn_with(0.25);
+        record_turn_cost(
+            &turn,
+            "ceo",
+            "byok",
+            Some(ModelSlug::classify("anthropic/claude-sonnet-4-6")),
+            &CompanyId::new("acme"),
+            &store,
+            Some(&meter),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let samples = meter.samples.lock().unwrap();
+        assert_eq!(
+            samples[0].model.map(|m| m.as_str()),
+            Some("anthropic-sonnet"),
+            "`provider` says who served the tokens; only `model` says what ran"
+        );
+    }
+
+    /// The BYOK containment, end to end at this seam: an operator-named model
+    /// is folded onto the fallback, and its raw name is nowhere in the sample
+    /// the meter is handed.
+    #[tokio::test]
+    async fn an_operator_named_model_never_reaches_the_meter() {
+        let store = RecordingStore::default();
+        let meter = RecordingMeter::default();
+        let turn = turn_with(0.25);
+        record_turn_cost(
+            &turn,
+            "ceo",
+            "byok",
+            Some(ModelSlug::classify("northwind-legal-review-v2")),
+            &CompanyId::new("acme"),
+            &store,
+            Some(&meter),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let samples = meter.samples.lock().unwrap();
+        assert_eq!(samples[0].model, Some(ModelSlug::OTHER));
+        let persisted = serde_json::to_string(&samples[0]).expect("serialize");
+        assert!(
+            !persisted.to_ascii_lowercase().contains("northwind"),
+            "the operator's model name reached the meter: {persisted}"
+        );
+    }
+
     #[tokio::test]
     async fn record_turn_cost_is_a_noop_for_zero_usage() {
         let store = RecordingStore::default();
@@ -313,6 +388,7 @@ mod tests {
             &TurnUsage::default(),
             "ceo",
             "managed",
+            None,
             &CompanyId::new("acme"),
             &store,
             Some(&meter),

@@ -139,6 +139,19 @@ does, and an agent with no `files` grant is meant to be offered no file tools at
 all, so a floor would silently re-grant authority a company withheld on purpose.
 What is global here is where the starting belt is authored.
 
+The belt is **wide**: `["*", "workspace.*", "workspace.write", "media",
+"composio", "search", "mcp:*"]` — every namespace a company can hold except the
+credential-gated `chargebee`, `hosting` and `paypal` integrations, and `repo`,
+which an fs-storage host refuses to boot with. `workspace.write` is
+listed explicitly because `workspace.*` is a *read* grant and a bare `*` does
+not confer writes; an operator narrowing this list must copy it verbatim or the
+company's teammates silently lose the write tier. Turning one off is a company-level edit
+to `[tools].allow` (which replaces this list rather than extending it), and
+that is the only off switch there is. It used to be narrow, and what that
+bought was first-run companies whose teammates reported their own tools as "not
+enabled" for capabilities the operator had already installed — see
+`docs/spec/runtime/tools.md`.
+
 ## Provenance, and why it is persisted
 
 `Agent::global` and `WorkflowFile::global` mark what came from the baseline.
@@ -159,7 +172,7 @@ companies and no existing one.
 `Agent::global` also travels to the console, on every `GET …/team` row. That is
 not decoration: because the baseline is merged into every company, "is this
 roster empty?" is false everywhere, and the console's first-run gate asked
-exactly that — so [company setup](company-setup.md) could not open on any
+exactly that — so [company setup](company-setup/overview.md) could not open on any
 company, including the fixture built to reach it (issue #1404). The gate now
 asks whether any teammate is *not* from the baseline, which is a question only
 the provenance marker can answer. A console re-deriving it from a copied list of

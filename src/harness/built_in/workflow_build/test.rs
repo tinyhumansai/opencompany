@@ -179,6 +179,12 @@ pub(crate) struct NativeCopilotModel {
     /// assert whether a later turn's first invoke replayed an earlier turn's
     /// transcript (issue #1042).
     seen_messages: StdMutex<Vec<Vec<Message>>>,
+    /// The `request.tools` names seen on each `invoke`, in call order — so a test
+    /// can assert the model actually got offered a given tool (issue #1931
+    /// regression: `propose_company_workflow` was silently withheld by the
+    /// vendored toolpacks registry, and the model dutifully called a tool it was
+    /// never advertised).
+    seen_tool_names: StdMutex<Vec<Vec<String>>>,
 }
 
 impl NativeCopilotModel {
@@ -206,6 +212,7 @@ impl NativeCopilotModel {
                 ..ModelProfile::default()
             },
             seen_messages: StdMutex::new(Vec::new()),
+            seen_tool_names: StdMutex::new(Vec::new()),
         })
     }
 
@@ -232,6 +239,11 @@ impl NativeCopilotModel {
         self.seen_messages.lock().unwrap().clone()
     }
 
+    /// The `request.tools` names recorded for each invoke so far, in call order.
+    fn seen_tool_names(&self) -> Vec<Vec<String>> {
+        self.seen_tool_names.lock().unwrap().clone()
+    }
+
     fn next_step(&self) -> NativeStep {
         let mut steps = self.steps.lock().unwrap();
         if let Some(step) = steps.pop_front() {
@@ -254,6 +266,13 @@ impl ChatModel<()> for NativeCopilotModel {
 
     async fn invoke(&self, _state: &(), request: ModelRequest) -> TaResult<ModelResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen_tool_names.lock().unwrap().push(
+            request
+                .tools
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
+        );
         self.seen_messages.lock().unwrap().push(request.messages);
         let step = self.next_step();
         let tool_calls: Vec<ToolCall> = step
@@ -432,8 +451,8 @@ fn the_outcome_resolves_graph_versus_not_automatable() {
 
     // Issue #873: no workflow, no reason and no refusal decided NOTHING, so it
     // is a non-answer rather than a verdict. The distinction is load-bearing —
-    // a verdict now settles Succeeded and converts the card to a one-off, and an
-    // empty object must do neither.
+    // a verdict now settles Declined (#1809) and converts the card to a one-off,
+    // and an empty object must do neither.
     let empty = parse_draft(r#"{"automatable":true}"#)
         .unwrap()
         .into_outcome();
@@ -780,8 +799,9 @@ async fn runtime_with_desk(model: Arc<ScriptedModel>) -> (tempfile::TempDir, Arc
         .expect("runtime");
     assert_eq!(
         runtime.deliverable_channel_ids(),
-        vec!["engineering".to_string()],
-        "the fixture must have exactly one delivery channel, or these tests prove nothing"
+        vec!["operator".to_string(), "engineering".to_string()],
+        "the fixture must have the operator channel plus exactly one desk channel, or these \
+         tests prove nothing"
     );
     runtime.set_builder(Arc::new(WorkflowBuilder::new(model, "chat-v1")));
     (home, Arc::new(runtime))
@@ -810,6 +830,7 @@ pub(crate) fn agent_deps(
     model: Arc<dyn HarnessModel>,
 ) -> crate::harness::HarnessDeps {
     crate::harness::HarnessDeps {
+        notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
         provider: model,
@@ -859,6 +880,8 @@ pub(crate) fn agent_deps(
         run_supervisor: crate::runtime::RunSupervisor::default(),
         delivery: None,
         workspace: None,
+        workflow_runs: None,
+        deep_trace: None,
     }
 }
 
@@ -909,6 +932,7 @@ fn card(id: &str, plan: Option<crate::ports::tasks::TaskPlan>) -> TaskRecord {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     }
 }
 
@@ -1014,9 +1038,11 @@ async fn a_card_with_no_plan_builds_from_title_and_note() {
 /// A not-automatable answer returns the card to To-do with the reason and no
 /// proposal (decision D2c).
 ///
-/// Issue #873: the attempt settles **Succeeded**, and the card is converted to a
-/// `once` deliverable. It used to settle Failed and keep `workflow`, which is
-/// what trapped the card — see the loop test below.
+/// Issue #873 + #1809: the attempt settles **Declined** — its own terminal
+/// state, neither the failure it used to be (#873) nor the success that #873
+/// first repurposed — and the card is converted to a `once` deliverable. It used
+/// to settle Failed and keep `workflow`, which is what trapped the card — see the
+/// loop test below.
 #[tokio::test]
 async fn a_not_automatable_answer_returns_the_card_to_todo() {
     let reply = r#"{"automatable":false,"reason":"this only ever runs once"}"#;
@@ -1042,7 +1068,10 @@ async fn a_not_automatable_answer_returns_the_card_to_todo() {
         "no proposal on a not-automatable card"
     );
     assert!(after.note.unwrap().contains("done once"));
-    assert_eq!(run_status(&runtime, &run_id).await, RunStatus::Succeeded);
+    // Issue #1809: a by-design decline is its own terminal state, not a failure
+    // and not a plain success — so the external "work that stopped" surface stops
+    // bucketing the compiler's correct refusal as the product breaking.
+    assert_eq!(run_status(&runtime, &run_id).await, RunStatus::Declined);
 }
 
 /// The loop #873 reports, asserted at the seam that closes it.
@@ -1116,7 +1145,7 @@ async fn a_not_automatable_verdict_files_no_error_and_says_what_happened_to_the_
         .await
         .expect("read")
         .expect("the attempt row exists");
-    assert_eq!(row.status, RunStatus::Succeeded);
+    assert_eq!(row.status, RunStatus::Declined);
     assert!(
         row.error.is_none(),
         "a verdict is not an error: {:?}",
@@ -1292,6 +1321,102 @@ async fn an_out_of_vocabulary_kind_settles_to_todo() {
     assert_eq!(run_status(&runtime, &run_id).await, RunStatus::Failed);
 }
 
+/// Issue #1865 (CodeRabbit review, PR #1883): `settle_to_todo` is the builder's
+/// only failure exit, and it must carry the same bounce chip every other
+/// failed-dispatch-back-to-To-do path does — `advance::advance_settled_card`
+/// and `run_task`'s rich settle both compute it. Reuses the out-of-vocabulary
+/// scenario above, which already drives a real `settle_to_todo` call, and
+/// checks the one field that test does not: without the fix, `settle_to_todo`
+/// never touched `bounced`, so a card that had never bounced before (dispatch
+/// already cleared it) came back from a genuine builder failure still reading
+/// `bounced: None` — indistinguishable from a card that had never failed.
+#[tokio::test]
+async fn a_builder_failure_settling_to_todo_sets_the_bounce_chip() {
+    let reply = r#"{"automatable":true,"summary":"call a url","workflow":{"name":"Reach out",
+        "nodes":[{"id":"start","kind":"trigger","name":"Start"},
+                 {"id":"call","kind":"http_request","name":"Call",
+                  "config":{"url":"http://attacker.example/x","method":"GET"}}],
+        "edges":[{"from":"start","to":"call"}]}}"#;
+    let (_home, runtime) = runtime_with(ScriptedModel::replying(reply)).await;
+    runtime
+        .tasks()
+        .upsert(runtime.id(), &card("t-bounce", None))
+        .await
+        .unwrap();
+    let run_id = open_run(&runtime, "t-bounce").await;
+
+    run_workflow_build_pass(
+        Arc::clone(&runtime),
+        "t-bounce".to_string(),
+        Some(run_id.clone()),
+    )
+    .await;
+
+    let after = read(&runtime, "t-bounce").await;
+    assert_eq!(after.column, COLUMN_TODO);
+    assert_eq!(run_status(&runtime, &run_id).await, RunStatus::Failed);
+    let bounced = after
+        .bounced
+        .expect("a builder pass that failed and landed the card on To-do must set the bounce chip");
+    assert!(
+        bounced.contains("http_request"),
+        "the bounce reason carries the same failure text as the card note: {bounced}"
+    );
+}
+
+/// Issue #1865 (CodeRabbit review, PR #1883): a builder failure landing on
+/// To-do must file the same `dispatch_failed` notification every other
+/// bounced-dispatch path does — `CompanyRuntime::abandon_run`, the cycle's
+/// terminality backstop, and the boot reaper's card sweep, all via
+/// `advance::notify_dispatch_failed`. Unlike those crash-recovery paths, and
+/// unlike `brain.rs`'s `refuse_dispatch` (which can relay a reply into the
+/// card's origin chat), `settle_to_todo` has no other operator-facing signal
+/// off the board — before this fix, a builder-pass failure was the one
+/// bounced-dispatch path the notification feed never badged.
+///
+/// Reuses the same out-of-vocabulary-domain scenario as the sibling bounce-chip
+/// test above, which already drives a real `settle_to_todo` call, and checks
+/// the notification store instead of the card.
+#[tokio::test]
+async fn a_builder_failure_settling_to_todo_files_a_dispatch_failed_notification() {
+    let reply = r#"{"automatable":true,"summary":"call a url","workflow":{"name":"Reach out",
+        "nodes":[{"id":"start","kind":"trigger","name":"Start"},
+                 {"id":"call","kind":"http_request","name":"Call",
+                  "config":{"url":"http://attacker.example/x","method":"GET"}}],
+        "edges":[{"from":"start","to":"call"}]}}"#;
+    let (_home, runtime) = runtime_with(ScriptedModel::replying(reply)).await;
+    runtime
+        .tasks()
+        .upsert(runtime.id(), &card("t-notify", None))
+        .await
+        .unwrap();
+    let run_id = open_run(&runtime, "t-notify").await;
+
+    run_workflow_build_pass(
+        Arc::clone(&runtime),
+        "t-notify".to_string(),
+        Some(run_id.clone()),
+    )
+    .await;
+
+    let after = read(&runtime, "t-notify").await;
+    assert_eq!(after.column, COLUMN_TODO);
+
+    let notifications = runtime
+        .notifications()
+        .list(runtime.id(), "owner")
+        .await
+        .unwrap();
+    assert!(
+        notifications
+            .iter()
+            .any(|n| n.notification.kind == "dispatch_failed"
+                && n.notification.subject.id == "t-notify"),
+        "a builder pass that failed and bounced its card must file a \
+         dispatch_failed notification, got {notifications:?}"
+    );
+}
+
 /// **The #1191 regression, at the builder.** The model routes the report to a
 /// channel this runtime cannot deliver to — the shape the QA pass found, where
 /// the builder appended `-desk` to a desk's display name.
@@ -1354,11 +1479,17 @@ async fn the_card_prompt_grounds_the_wired_channels() {
     let evidence = gather_evidence(&runtime, &card("t-ground", None))
         .await
         .expect("evidence");
-    assert_eq!(evidence.wired_channels, vec!["engineering".to_string()]);
+    // Since issue #1757 the always-present Operator channel is a durable delivery
+    // target too, so it grounds alongside the desk channel.
+    assert_eq!(
+        evidence.wired_channels,
+        vec!["operator".to_string(), "engineering".to_string()]
+    );
 
     let prompt = evidence_prompt(&evidence);
     assert!(prompt.contains("## Channels"), "{prompt}");
     assert!(prompt.contains("`engineering`"), "{prompt}");
+    assert!(prompt.contains("`operator`"), "{prompt}");
     assert!(
         prompt.contains("copied exactly"),
         "the section must say the id is copied, not paraphrased: {prompt}"
@@ -1375,22 +1506,34 @@ async fn the_description_prompt_grounds_the_wired_channels() {
     let prompt = description_evidence_prompt(&evidence, &[], &[], "post the weekly digest");
     assert!(prompt.contains("## Channels"), "{prompt}");
     assert!(prompt.contains("`engineering`"), "{prompt}");
+    assert!(prompt.contains("`operator`"), "{prompt}");
 }
 
-/// A company with no desk and no provider channel says so in its own words,
-/// matching how the roster and tool sections state an empty set — a silent
-/// section would read as "anything goes".
+/// A company with no desk and no provider channel still has the always-present
+/// Operator channel (issue #1757), so the Channels section grounds on it rather
+/// than the empty-set fallback — every company can deliver *somewhere* now.
 #[tokio::test]
-async fn an_empty_channel_set_renders_the_honest_fallback() {
+async fn a_company_with_no_desks_still_grounds_on_the_operator_channel() {
     let (_home, runtime) = runtime_with(ScriptedModel::replying(VALID_GRAPH)).await;
     let evidence = gather_evidence(&runtime, &card("t-empty", None))
         .await
         .expect("evidence");
-    assert!(evidence.wired_channels.is_empty());
+    assert_eq!(evidence.wired_channels, vec!["operator".to_string()]);
 
     let prompt = evidence_prompt(&evidence);
     assert!(prompt.contains("## Channels"), "{prompt}");
-    assert!(prompt.contains("no channels are wired"), "{prompt}");
+    assert!(prompt.contains("`operator`"), "{prompt}");
+}
+
+/// The empty-set fallback message still renders for a truly channel-less set —
+/// unreachable from a live runtime now (every company has `operator`), but the
+/// pure section renderer must still speak honestly when handed nothing.
+#[test]
+fn an_empty_channel_slice_renders_the_honest_fallback() {
+    let mut out = String::new();
+    super::render_channel_section(&mut out, &[]);
+    assert!(out.contains("## Channels"), "{out}");
+    assert!(out.contains("no channels are wired"), "{out}");
 }
 
 /// The model does not get a vote on approval gating: whatever `requires_approval`
@@ -1493,6 +1636,7 @@ async fn seed_workflow(runtime: &Arc<CompanyRuntime>, id: &str, name: &str) {
         runtime.store(),
         Some(runtime.events()),
         raw,
+        None,
         None,
     )
     .await
@@ -1645,11 +1789,11 @@ async fn check_workflow_flags_gate_failures_and_passes_a_clean_graph() {
 // (envelope-null bindings, prose-as-expression prompts) prove `check_workflow`
 // runs `gates::failures` and surfaces its findings.
 
-/// `propose_workflow` accepts a good spec — running the SAME host authority the
+/// `propose_company_workflow` accepts a good spec — running the SAME host authority the
 /// old inline path did (a host-minted id, name dedup, stripped approval gating) —
 /// and stashes `(summary, spec, notes)` in the shared cell.
 #[tokio::test]
-async fn propose_workflow_accepts_a_good_spec_under_host_authority() {
+async fn propose_company_workflow_accepts_a_good_spec_under_host_authority() {
     let (_home, runtime) = evidence_runtime().await;
     seed_workflow(&runtime, "weekly-digest", "Weekly digest").await;
     let ctx = copilot_ctx(&runtime, "email the weekly digest every Monday", &[], &[]).await;
@@ -1696,12 +1840,12 @@ async fn propose_workflow_accepts_a_good_spec_under_host_authority() {
     assert!(diag.lock().unwrap().is_empty());
 }
 
-/// `propose_workflow` rejects via each of the three host gates — the node-kind
+/// `propose_company_workflow` rejects via each of the three host gates — the node-kind
 /// refusal, `ground_and_validate` (an unknown agent), and `courtesy_validate_draft`
 /// (an ungranted `tool_call`) — never stashing a proposal, and recording the
 /// sentence for the caller's fallback.
 #[tokio::test]
-async fn propose_workflow_rejects_via_each_host_gate() {
+async fn propose_company_workflow_rejects_via_each_host_gate() {
     let (_home, runtime) = evidence_runtime().await;
 
     async fn propose(runtime: &Arc<CompanyRuntime>, description: &str, workflow: Value) -> String {
@@ -1793,7 +1937,7 @@ async fn propose_workflow_rejects_via_each_host_gate() {
 /// script.
 pub(crate) fn propose_step(summary: &str, workflow: Value) -> NativeStep {
     NativeStep::call(
-        "propose_workflow",
+        "propose_company_workflow",
         json!({ "summary": summary, "workflow": workflow }),
     )
 }
@@ -1837,6 +1981,46 @@ async fn a_description_drafts_a_graph_via_the_agent() {
     assert!(spec.nodes.iter().all(|n| n.requires_approval.is_none()));
     assert_eq!(spec.nodes[0].schedule.as_deref(), Some("0 9 * * 1"));
     assert!(model.calls() >= 1, "the model ran at least once");
+}
+
+/// Issue #1931 regression: the vendored `openhuman` runtime compiles in a
+/// `workflows` toolpack that claims the bare name `propose_workflow`, owned only
+/// by openhuman's OWN `workflow_builder`/`flow_discovery` agents — and withholds
+/// any tool sharing that name from every OTHER agent's advertised belt,
+/// regardless of who actually registered it (`strip_packed_from_visible` matches
+/// by name alone). That silently dropped this copilot's propose tool from the
+/// model's very first request: the model still called it (from the system
+/// prompt), got back `unknown tool`, and gave up narrating prose instead of
+/// drafting a graph — so every downstream assertion about the drafted graph
+/// failed, none of them naming the real cause.
+///
+/// This pins the invariant that would have caught it directly: the FIRST model
+/// request of a turn must advertise all three of the copilot's own tools,
+/// including the propose tool, by name — not a downstream side effect of it
+/// being missing.
+#[tokio::test]
+async fn the_first_model_request_advertises_all_three_copilot_tools() {
+    let model = NativeCopilotModel::scripting(vec![
+        propose_step("email the weekly digest", good_workflow()),
+        NativeStep::done("Proposed the weekly digest workflow for your review."),
+    ]);
+    let (_home, runtime) = runtime_with_agent(model.clone(), None).await;
+    seed_workflow(&runtime, "weekly-digest", "Weekly digest").await;
+
+    let _ = draft_workflow_from_description(&runtime, "email the weekly digest every Monday").await;
+
+    let seen = model.seen_tool_names();
+    let first_request_tools = seen.first().expect("the model was invoked at least once");
+    for tool in [
+        "list_effective_tools",
+        "check_workflow",
+        "propose_company_workflow",
+    ] {
+        assert!(
+            first_request_tools.iter().any(|name| name == tool),
+            "the first model request must advertise `{tool}`; got {first_request_tools:?}"
+        );
+    }
 }
 
 /// Issue #1042 regression: drafting the SAME description twice must draft a graph
@@ -2185,7 +2369,7 @@ async fn the_description_prompt_renders_the_company_state_verbatim() {
     assert!(
         system.contains("list_effective_tools")
             && system.contains("check_workflow")
-            && system.contains("propose_workflow"),
+            && system.contains("propose_company_workflow"),
         "the persona names its three tools: {system}"
     );
     assert!(
@@ -2628,6 +2812,103 @@ async fn a_failure_fix_corrects_the_graph_and_preserves_identity() {
                 "the unwired tool step is gone from the correction"
             );
         }
+        DescriptionDraftOutcome::NotAutomatable(reason) => panic!("expected a graph: {reason}"),
+    }
+}
+
+/// **Regression, issue #1882 review (PR #1882 bot finding, comment 3879878907).**
+/// A workflow whose owning desk has since been deleted is still correctable: the
+/// stale desk rides through the correction as an UNCHANGED value, so the
+/// courtesy pre-flight grandfathers it exactly as the edit route would, instead
+/// of refusing the whole correction over a field the operator never touched.
+///
+/// RED-FIRST: pre-fix `courtesy_validate_draft` always validated the corrected
+/// graph as a fresh create, so the echoed `ghost-desk` was a hard refusal and
+/// the fixer folded to not-automatable — an unrelated stale owner blocked the
+/// repair of the actual run failure.
+#[tokio::test]
+async fn a_failure_fix_survives_an_owning_desk_that_no_longer_exists() {
+    // The model does what the prompt asks and echoes back the fields it did not
+    // change — including the `ownerDesk` it saw on the failing graph.
+    let corrected = json!({
+        "name": "Weekly digest",
+        "ownerDesk": "ghost-desk",
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Every Monday", "schedule": "0 9 * * 1" },
+            { "id": "draft", "kind": "agent", "name": "Draft", "agent": "maya" }
+        ],
+        "edges": [{ "from": "t", "to": "draft" }]
+    });
+    let model = NativeCopilotModel::scripting(vec![
+        propose_step("dropped the unwired search step", corrected),
+        NativeStep::done("Corrected the workflow."),
+    ]);
+    let (_home, runtime) = runtime_with_agent(model, None).await;
+    seed_workflow(&runtime, "weekly-digest", "Weekly digest").await;
+
+    let mut failing = failing_spec();
+    // No such desk on this company — the owning desk was deleted after the
+    // workflow was saved.
+    failing.owner_desk = Some("ghost-desk".to_string());
+
+    let outcome = fix_workflow_from_failure(&runtime, &failing, &failure_ctx())
+        .await
+        .expect("the fixer runs");
+    match outcome {
+        DescriptionDraftOutcome::Graph { spec, .. } => {
+            assert_eq!(
+                spec.owner_desk.as_deref(),
+                Some("ghost-desk"),
+                "the stale owner is carried through the correction, not silently rewritten"
+            );
+            assert!(
+                spec.nodes.iter().all(|n| n.kind != "tool_call"),
+                "and the actual run failure is still corrected"
+            );
+        }
+        DescriptionDraftOutcome::NotAutomatable(reason) => {
+            panic!("a stale owning desk must not block the correction: {reason}")
+        }
+    }
+}
+
+/// The other half of host authority over `ownerDesk` on the fix path (issue
+/// #1882 review): neither copilot tool advertises the field, so a model that
+/// simply omits it from its correction — the common case — must not silently
+/// UNASSIGN the workflow. The host pins the saved desk back on, the same way it
+/// pins the saved id and name.
+///
+/// RED-FIRST: pre-fix `FixTarget` carried no desk and nothing re-applied it, so
+/// the corrected spec came back with `owner_desk: None`.
+#[tokio::test]
+async fn a_failure_fix_keeps_the_saved_owner_desk_when_the_model_drops_it() {
+    let corrected = json!({
+        "name": "Weekly digest",
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Every Monday", "schedule": "0 9 * * 1" },
+            { "id": "draft", "kind": "agent", "name": "Draft", "agent": "maya" }
+        ],
+        "edges": [{ "from": "t", "to": "draft" }]
+    });
+    let model = NativeCopilotModel::scripting(vec![
+        propose_step("dropped the unwired search step", corrected),
+        NativeStep::done("Corrected the workflow."),
+    ]);
+    let (_home, runtime) = runtime_with_agent(model, None).await;
+    seed_workflow(&runtime, "weekly-digest", "Weekly digest").await;
+
+    let mut failing = failing_spec();
+    failing.owner_desk = Some("ghost-desk".to_string());
+
+    let outcome = fix_workflow_from_failure(&runtime, &failing, &failure_ctx())
+        .await
+        .expect("the fixer runs");
+    match outcome {
+        DescriptionDraftOutcome::Graph { spec, .. } => assert_eq!(
+            spec.owner_desk.as_deref(),
+            Some("ghost-desk"),
+            "an omitted ownerDesk restores the saved one rather than unassigning it"
+        ),
         DescriptionDraftOutcome::NotAutomatable(reason) => panic!("expected a graph: {reason}"),
     }
 }

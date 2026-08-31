@@ -39,6 +39,7 @@
 //! on the wire frame *and* a per-agent breakdown on `CycleResult` — deliberately
 //! out of scope here.
 
+use crate::metering::ModelSlug;
 use crate::ports::types::{CompanyId, LedgerEntry, TokenUsage};
 use crate::ports::usage::{SampleKind, UsageMeter, UsageSample};
 use crate::ports::{CompanyStore, now_millis};
@@ -98,7 +99,21 @@ pub fn inference_ledger_entry(usage: &TokenUsage, agent: &str) -> Option<LedgerE
 
 /// Builds the [`UsageSample`] for a metered inference unit (a harness turn or a
 /// brain cycle), or `None` for a zero-usage one.
-pub fn inference_sample(usage: &TokenUsage, agent: &str, provider: &str) -> Option<UsageSample> {
+///
+/// `model` is the classified [`ModelSlug`] this unit's spend went to, or `None`
+/// when the cognition path cannot name one (issue #1749). It is a parameter of
+/// the *shared* mapping rather than something the harness stamps afterwards —
+/// the way [`run_id`](UsageSample::run_id) is — because every path that reaches
+/// here ran a model: the cycle paths read it off
+/// [`Cognition::model`](crate::ports::brain::Cognition::model) and the harness
+/// off the live provider. A `None` here is a path that genuinely could not
+/// identify one, which is a fact worth carrying rather than a gap to fill in.
+pub fn inference_sample(
+    usage: &TokenUsage,
+    agent: &str,
+    provider: &str,
+    model: Option<ModelSlug>,
+) -> Option<UsageSample> {
     if usage.is_zero() {
         return None;
     }
@@ -112,6 +127,7 @@ pub fn inference_sample(usage: &TokenUsage, agent: &str, provider: &str) -> Opti
         cost_usd: usage.cost_usd,
         kind: SampleKind::Inference,
         run_id: None,
+        model,
     })
 }
 
@@ -127,6 +143,7 @@ pub async fn record_inference_usage(
     usage: &TokenUsage,
     agent: &str,
     provider: &str,
+    model: Option<ModelSlug>,
     company: &CompanyId,
     store: &dyn CompanyStore,
     meter: &dyn UsageMeter,
@@ -154,7 +171,7 @@ pub async fn record_inference_usage(
             "[usage] failed to append the inference spend entry; the cycle itself succeeded"
         );
     }
-    if let Some(sample) = inference_sample(usage, agent, provider)
+    if let Some(sample) = inference_sample(usage, agent, provider, model)
         && let Err(err) = meter.record(company, &sample).await
     {
         tracing::warn!(
@@ -369,7 +386,7 @@ mod tests {
     fn zero_usage_produces_no_entry_or_sample() {
         let usage = TokenUsage::default();
         assert!(inference_ledger_entry(&usage, "ceo").is_none());
-        assert!(inference_sample(&usage, "ceo", MEDULLA_PROVIDER).is_none());
+        assert!(inference_sample(&usage, "ceo", MEDULLA_PROVIDER, None).is_none());
     }
 
     /// The managed passthrough reports tokens but no USD (billing happens
@@ -383,14 +400,14 @@ mod tests {
             cached_input: 0,
             cost_usd: 0.0,
         };
-        assert!(inference_sample(&usage, "ceo", "managed").is_some());
+        assert!(inference_sample(&usage, "ceo", "managed", None).is_some());
         // No USD ⇒ no ledger entry, but the token sample still lands.
         assert!(inference_ledger_entry(&usage, "ceo").is_none());
     }
 
     #[test]
     fn sample_carries_every_token_field_and_the_inference_kind() {
-        let sample = inference_sample(&usage_with(0.25), "ceo", MEDULLA_PROVIDER).unwrap();
+        let sample = inference_sample(&usage_with(0.25), "ceo", MEDULLA_PROVIDER, None).unwrap();
         assert_eq!(sample.kind, SampleKind::Inference);
         assert_eq!(sample.agent, "ceo");
         assert_eq!(sample.provider, MEDULLA_PROVIDER);
@@ -404,9 +421,9 @@ mod tests {
     /// provider exactly like an OAuth one — `Medulla` and `medulla` are one row.
     #[test]
     fn provider_is_normalized_like_an_oauth_sample() {
-        let sample = inference_sample(&usage_with(0.1), "ceo", "  MEDULLA ").unwrap();
+        let sample = inference_sample(&usage_with(0.1), "ceo", "  MEDULLA ", None).unwrap();
         assert_eq!(sample.provider, MEDULLA_PROVIDER);
-        let blank = inference_sample(&usage_with(0.1), "ceo", "").unwrap();
+        let blank = inference_sample(&usage_with(0.1), "ceo", "", None).unwrap();
         assert_eq!(blank.provider, crate::metering::UNKNOWN_PROVIDER);
     }
 
@@ -427,6 +444,7 @@ mod tests {
             &usage_with(1.5),
             UNATTRIBUTED_AGENT,
             MEDULLA_PROVIDER,
+            None,
             &CompanyId::new("acme"),
             &store,
             &meter,
@@ -452,6 +470,7 @@ mod tests {
             &TokenUsage::default(),
             UNATTRIBUTED_AGENT,
             MEDULLA_PROVIDER,
+            None,
             &CompanyId::new("acme"),
             &store,
             &meter,
@@ -469,6 +488,7 @@ mod tests {
             &usage_with(1.0),
             UNATTRIBUTED_AGENT,
             MEDULLA_PROVIDER,
+            None,
             &CompanyId::new("acme"),
             &FailingStore,
             &FailingMeter,
@@ -485,8 +505,13 @@ mod tests {
         use crate::metering::{UsageRange, bucket_usage};
 
         let now = 1_700_000_000_000u64;
-        let mut sample = inference_sample(&usage_with(0.75), UNATTRIBUTED_AGENT, MEDULLA_PROVIDER)
-            .expect("non-zero usage samples");
+        let mut sample = inference_sample(
+            &usage_with(0.75),
+            UNATTRIBUTED_AGENT,
+            MEDULLA_PROVIDER,
+            None,
+        )
+        .expect("non-zero usage samples");
         sample.at_millis = now;
 
         let usage = bucket_usage(&[sample], UsageRange::D7, now, &HashMap::new());
@@ -500,5 +525,26 @@ mod tests {
         assert_eq!(usage.series.last().unwrap().input_tokens, 100);
         // An inference sample is not an OAuth call, so it never inflates those.
         assert_eq!(usage.totals.oauth_calls, 0);
+    }
+
+    /// Issue #1749: the shared mapping every cognition path goes through
+    /// carries the model, and carries it as a vocabulary member.
+    #[test]
+    fn a_cycles_sample_names_the_model_the_brain_reported() {
+        let sample = inference_sample(
+            &usage_with(0.2),
+            "ceo",
+            MEDULLA_PROVIDER,
+            Some(crate::metering::ModelSlug::classify(
+                "deepseek/deepseek-v4-pro",
+            )),
+        )
+        .expect("a real cycle meters");
+        assert_eq!(sample.model.map(|m| m.as_str()), Some("deepseek-v4-pro"));
+
+        // A path that cannot name one says so, rather than guessing.
+        let blind = inference_sample(&usage_with(0.2), "ceo", MEDULLA_PROVIDER, None)
+            .expect("a real cycle meters");
+        assert_eq!(blind.model, None);
     }
 }

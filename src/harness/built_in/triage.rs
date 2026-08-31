@@ -221,6 +221,14 @@ impl TriageEvaluator {
         self.model.telemetry_provider_id()
     }
 
+    /// The model this pass's usage is metered against, read live off the
+    /// provider and already folded onto the closed vocabulary (issue #1749).
+    /// `None` before the provider has issued a turn, or when it cannot name a
+    /// model.
+    pub fn model_slug(&self) -> Option<crate::metering::ModelSlug> {
+        self.model.telemetry_model()
+    }
+
     /// Classifies one operator message, with what the call cost.
     ///
     /// Never returns an error: every failure is [`TriageVerdict::Unavailable`]
@@ -307,6 +315,7 @@ impl TriageEscalation for MeteredTriage {
         crate::metering::record_triage_usage(
             &usage,
             &self.evaluator.provider_slug(),
+            self.evaluator.model_slug(),
             &self.company,
             self.store.as_ref(),
             self.meter.as_ref().map(|meter| meter.as_ref()),

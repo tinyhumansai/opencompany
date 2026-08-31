@@ -93,14 +93,21 @@ export function isAddressableBaseUrl(baseUrl: string): boolean {
  * different origin means no cookie is coming and the console has to hold a
  * token itself — which is what a hub console is built out of.
  *
- * False in the desktop whatever the address, and that is not an oversight: its
- * requests go through `ProxyTransport` to the Rust core, which attaches the
- * credential it holds in the keychain. Having the webview carry one too would
- * put a token in the page for no benefit, on the one runtime that had
- * successfully kept it out.
+ * True on the desktop too, for every cross-origin address, and the reason is
+ * one rung below the browser's: the core's HTTP client has no cookie jar —
+ * `reqwest` without the `cookies` feature — so the cookie a sign-in would
+ * otherwise set is discarded on arrival (issue #1855). Until this said so, the
+ * desktop signed in on the cookie path and was anonymous from the next request
+ * onward, which is the exact symptom the paragraph above warns about.
+ *
+ * What differs on the desktop is not whether the session is carried but WHO
+ * holds it: `adoptSession` hands it to the core, which stores it in the OS
+ * keychain and attaches it proxy-side — so the token still never lives in the
+ * page, which is the property this function's old desktop exemption was
+ * guarding. That exemption guarded it by making sign-in impossible; the core
+ * holding the token guards it while letting sign-in work.
  */
 export function needsCarriedSession(baseUrl: string): boolean {
-  if (isDesktopRuntime()) return false;
   // The empty string *is* same-origin, by the convention `ConsoleConfig` sets.
   if (baseUrl === "") return false;
   if (typeof window === "undefined") return false;

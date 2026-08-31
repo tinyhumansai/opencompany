@@ -172,6 +172,7 @@ describe("a blocked node on the canvas", () => {
         workflowId: "feature_pipeline",
         runId: "run-1",
         scheduled: false,
+        startedBy: "operator",
       },
       {
         type: "workflow_node_finished",

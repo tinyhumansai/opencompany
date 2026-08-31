@@ -65,6 +65,7 @@ function renderHits(hits: SearchHit[]) {
         loading: false,
         error: null,
         onOpen: () => {},
+        rosterNames: new Map(),
       }),
     ),
   );

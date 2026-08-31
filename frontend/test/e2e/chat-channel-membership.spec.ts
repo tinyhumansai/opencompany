@@ -183,7 +183,12 @@ test("#369 a DM reads as two people, not as the whole company", async ({ page })
 
 test("#369 a host with no desks surface still shows the whole roster", async ({ page }) => {
   await mockApi(page, () => "404");
-  await openChannel(page, "general");
+  // `strategy`, not `general` (issue #1743): `#general` is no longer one of the
+  // static fallback desks — it is derived from the roster and every teammate is
+  // in it, which is what the test below this one pins. `strategy` is still a
+  // fallback desk with `members` absent, so it is the fixture this test is
+  // actually about: membership *unknown*, as distinct from membership empty.
+  await openChannel(page, "strategy");
 
   // The fallback desks have no membership to scope to, so this is unchanged
   // behaviour on purpose — one plain roster, no "in this channel" claim.
@@ -191,6 +196,21 @@ test("#369 a host with no desks surface still shows the whole roster", async ({ 
   await openPane(page);
   await expect(pane(page)).toContainText("17 teammates");
   await expect(pane(page).getByRole("heading", { name: "In this channel" })).toHaveCount(0);
+  await expect(pane(page).locator("ul").first().locator("li")).toHaveCount(17);
+});
+
+test("#1743 #general is everyone, even with no desks surface", async ({ page }) => {
+  // The other half of the case above, and the reason it had to move off
+  // `general`. `#general` is not a desk and never comes from `/desks` — it is
+  // built from the roster this render was handed — so its membership is known
+  // even when `/desks` 404s, and it is the whole company by construction.
+  await mockApi(page, () => "404");
+  await openChannel(page, "general");
+
+  await expect(membersToggle(page)).toHaveText(/17/);
+  await openPane(page);
+  await expect(pane(page)).toContainText("17 in this channel · 17 in the company");
+  await expect(pane(page).getByRole("heading", { name: "In this channel" })).toBeVisible();
   await expect(pane(page).locator("ul").first().locator("li")).toHaveCount(17);
 });
 
@@ -231,7 +251,12 @@ test("#370 an unknown channel opens the first one and says so", async ({ page })
   // (issue #934), and an unqualified `getByRole("status")` matches both.
   const notice = page.getByRole("status").filter({ hasText: /isn't a channel here/ });
   await expect(notice).toContainText("#does-not-exist");
-  await expect(notice).toContainText("#engineering");
+  // `#general` rather than `#engineering` since issue #1743: the built-in
+  // company-wide channel is prepended to every company's list, so "the first
+  // one" is now `#general` in every company rather than whichever desk the
+  // host happened to return first. The property under test is unchanged — the
+  // notice names the channel you actually landed in.
+  await expect(notice).toContainText("#general");
   // The hash is left alone deliberately — rewriting it needs replace-semantics
   // the shell does not thread through yet, and a push would fight the back
   // button. The notice is what closes the gap between URL and content.
@@ -307,7 +332,10 @@ test("#485 a DM has no desk to manage", async ({ page }) => {
 
 test("#485 a fallback desk offers no link to a desk the host doesn't have", async ({ page }) => {
   await mockApi(page, () => "404");
-  await openChannel(page, "general");
+  // `strategy`, not `general`, for the same reason as the #369 case above:
+  // since issue #1743 `#general` is derived from the roster rather than being
+  // one of the static fallback desks, so it is no longer an example of one.
+  await openChannel(page, "strategy");
   await openPane(page);
 
   // No `.../desks` route at all, so these channels come from `lib/desks.ts` and

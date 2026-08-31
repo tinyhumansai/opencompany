@@ -8,23 +8,24 @@
 //   * `avatarFor(dto.id || name)` — what `fromDto` computes into
 //     `TeamMember.avatar`, and what `lib/team.ts` documents ("renaming a
 //     teammate does not change its face");
-//   * `avatarFor(name)` — the fallback inside `Avatar` when no `avatar` prop is
-//     passed, which is what **every** call site in the console actually hits,
-//     chat included. Nothing passes the prop.
+//   * `avatarFor(name)` — the fallback inside `TeammateAvatar` when no `avatar`
+//     prop is passed.
 //
-// #1181 asked for the mascot to reach the Company cards and the teammate detail
-// header, and warned that seeding one surface on the id and another on the name
-// gives the same teammate two different faces — "worse than the current
+// #1181 warned that seeding one surface on the id and another on the name gives
+// the same teammate two different faces — "worse than the current
 // inconsistency, and harder to notice, because each screen looks internally
 // consistent."
 //
-// That warning assumed chat was id-seeded. It is not. So the Company surfaces
-// deliberately pass **no `avatar` prop**, landing on the same name fallback chat
-// uses, and every surface agrees today.
+// The console now settles that on the **id**: chat, the member pane, the org
+// chart, the desk picker and the teammate detail header all pass a reference
+// resolved from the id, and a face somebody *chose* arrives through that same
+// field (`avatarRef(dto.avatar, id)`) rather than through a second one. So the
+// choice and the default are one kind of value, carried one way.
 //
-// This test is the tripwire on that choice. If someone "tidies" the Company
-// surfaces into passing `TeamMember.avatar` without moving chat at the same
-// time, the two seeds below are what they will have silently split apart.
+// This test is the tripwire on that. If someone drops the `avatar` prop from a
+// surface — falling it back to the name seed — or splits the chosen face out
+// into a parallel prop, the two seeds below are what they will have silently
+// pulled apart.
 
 import { describe, expect, it } from "vitest";
 
@@ -51,10 +52,10 @@ describe("teammate mascot seeding", () => {
     }
   });
 
-  it("`TeamMember.avatar` is the id-seeded one, and is not what surfaces render", () => {
-    // The field is computed and carried, and is currently rendered by nothing.
-    // Passing it anywhere is only safe once every surface — chat included —
-    // passes it too.
+  it("`TeamMember.avatar` is the id-seeded one, and is what surfaces render", () => {
+    // The field every surface passes. With no chosen face it is exactly the
+    // id-seeded default, which is what keeps a teammate's face the same on the
+    // roster, in chat and on its own page.
     for (const row of ROWS) {
       const member = fromDto({ id: row.id, name: row.name, role: row.name });
       expect(member.avatar).toBe(avatarFor(row.id));
@@ -67,7 +68,10 @@ describe("teammate mascot seeding", () => {
     // resolve the same mascot.
     for (const row of ROWS) {
       expect(avatarFor(row.name)).toBe(avatarFor(row.name));
-      expect(avatarFor(row.name)).toMatch(/^[a-z]+$/);
+      // A full reference, not a bare flavour: what surfaces hand to
+      // `TeammateAvatar` is the same grammar an operator's *chosen* face uses,
+      // so the default and the choice are one kind of value everywhere.
+      expect(avatarFor(row.name)).toMatch(/^tiny:[a-z]+$/);
     }
   });
 });

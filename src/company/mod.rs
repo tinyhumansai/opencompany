@@ -9,11 +9,25 @@
 // alternative to inline `[[agent]]` entries, carrying a custom prompt and its
 // own briefing documents. Always compiled: it is part of parsing a company, and
 // `opencompany check` must report on it in every build.
+/// The account-activation funnel (issue #1843): whether a company has confirmed
+/// its name, connected + granted Composio, and run a real workflow to success —
+/// the shared substrate the onboarding gate and the week-1 nudge both read.
+/// Always compiled: the REST read projection is a default-build console route,
+/// and gating the derivation behind a feature its caller lacks is exactly how
+/// `create_company_workflow` (issue #168) and this module's own name-confirmed
+/// input drifted apart before.
+pub(crate) mod activation;
 pub(crate) mod agent_file;
 /// Issue #552: the seam between a task artifact and the shared workspace tree.
 /// Always compiled — the console's workspace and artifact routes reach it in
 /// every build, and only the publish drain's half is behind `openhuman`.
 pub mod artifact_mirror;
+/// Avatar references: which face a teammate or a person wears when somebody has
+/// chosen one (`docs/spec/runtime/avatars.md`). Always compiled — the team and
+/// user write planes validate through it in every build, and the rule it
+/// enforces (an avatar names something this host holds, never a URL) is a
+/// control rather than a convenience.
+pub mod avatar;
 pub mod company_key;
 pub mod composio;
 #[cfg(test)]
@@ -66,6 +80,12 @@ pub mod mcp_oauth;
 // rules are ordinary text handling with real edge cases, and they are worth
 // testing in the default build rather than only where the agent runtime links.
 pub mod prompt;
+// The shape of one drafted teammate mandate or persona (issue #1776). Same
+// always-compiled argument as `prompt` above: the model call that produces a
+// draft is behind `openhuman`, but what a draft IS — which fields are
+// draftable, the bound each obeys, and the three distinct reasons there might
+// be no draft — is ordinary data handling the default build should test.
+pub mod profile_draft;
 // Rendering that composition back out for a human, from a manifest alone. Same
 // always-compiled argument as `prompt` above, one step further: a debugging
 // surface that only existed in a `--features openhuman` build is one nobody
@@ -99,6 +119,12 @@ pub mod task_intent;
 // build.
 pub mod tool_catalog;
 mod types;
+/// The week-1 "did this user save a workflow" query (issue #1845): the
+/// per-user attribution check
+/// [`runtime::LifecycleScheduler`](crate::runtime::LifecycleScheduler) reads
+/// before nudging. Always compiled — it is a pure journal scan, no different
+/// from `activation`'s own workflow-run check.
+pub(crate) mod week1_nudge;
 mod workflow_create;
 mod workflow_file;
 // The shared workspace-file read (node + content + `[[wikilink]]` backlinks)
@@ -158,22 +184,24 @@ pub use task_file::{TASKS_FILE, TaskSeed, has_task_file, load_dir_tasks};
 pub use types::{
     ACP_AGENTS, ACP_TRANSPORTS, AcpHarness, Agent, BRAIN_MODES, Brain, Budget, ChannelConfig,
     Company, CompanyManifest, ComposioTools, Connection, ContextAccess, ContextEntry,
-    DEFAULT_ALWAYS_APPROVE, DEFAULT_HARNESS_KIND, DEFAULT_MAX_DELEGATION_DEPTH,
+    CreationGrant, DEFAULT_ALWAYS_APPROVE, DEFAULT_HARNESS_KIND, DEFAULT_MAX_DELEGATION_DEPTH,
     DEFAULT_MAX_IN_FLIGHT_RUNS, DEFAULT_SEARCH_DAILY_CALLS, GATEABLE_NAMESPACES, GroupChat,
     HARNESS_KINDS, Harness, IMPLICIT_HARNESS_ID, INFERENCE_PROVIDERS, INFERENCE_TIERS, Inference,
     KNOWN_CHANNELS, LedgerAccess, LedgerGrant, MAX_DELEGATION_DEPTH_BOUNDS, McpServer,
     ORCHESTRATOR_TIER, PLAN_NAMES, PLAN_PERIODS, POLICY_MODES, PROMPT_CLASSES,
     PROMPT_FILE_BUDGET_CHARS, PROVISIONED_POLICY_MODE, Place, Plan, Policy, Schedule, Skill, TIERS,
-    TOOL_PROVIDERS, Tools, grants_chargebee_explicit, grants_composio_explicit,
-    grants_files_or_docs, grants_hosting_explicit, grants_media_explicit, grants_paypal_explicit,
-    grants_search_explicit, grants_workspace_write_explicit, orchestrator_id,
+    TOOL_PROVIDERS, Tools, creation_default_grants, grants_chargebee_explicit,
+    grants_composio_explicit, grants_confer_native, grants_files_or_docs, grants_hosting_explicit,
+    grants_media_explicit, grants_paypal_explicit, grants_search_explicit,
+    grants_workspace_write_explicit, native_capability_namespaces, orchestrator_id,
 };
 pub use workflow_file::{
     STAGELESS_SCHEDULE_REFUSAL, STAGELESS_WORKFLOW_NOTICE, UNDELIVERABLE_SCHEDULE_REFUSAL,
     WORKFLOW_DESTINATION_KINDS, WORKFLOW_NODE_KINDS, WorkflowDestinationDef, WorkflowEdgeDef,
-    WorkflowFile, WorkflowNodeDef, WorkflowNodeKind, WorkflowRetryDef, destination_is_reachable,
-    list_source_workflows, list_workflows_union, list_workflows_with_globals,
-    load_company_workflows, load_workflow_union, load_workflow_with_globals, parse_workflow,
+    WorkflowFile, WorkflowNodeDef, WorkflowNodeKind, WorkflowPostconditionDef, WorkflowRetryDef,
+    destination_is_reachable, list_source_workflows, list_workflows_union,
+    list_workflows_with_globals, load_company_workflows, load_workflow_union,
+    load_workflow_with_globals, parse_workflow,
 };
 // Crate-internal only: the workflow creator (issue #69) builds a `RawWorkflow`
 // from its request body, renders it to TOML, and re-parses it through

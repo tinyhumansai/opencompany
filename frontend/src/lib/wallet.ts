@@ -105,3 +105,41 @@ export function base58(bytes: Uint8Array): string {
   for (let i = digits.length - 1; i >= 0; i -= 1) out += ALPHABET[digits[i]];
   return out;
 }
+
+/**
+ * Decodes a base58 string back into the bytes it encodes, or `null` when it
+ * contains a character outside the alphabet.
+ *
+ * The mirror of [`base58`], written out for the same reason — and the one
+ * consumer, deciding whether a `wallet:`-prefixed identity key really is a
+ * wallet key, must agree with the host's `decode_wallet_address`
+ * (`src/ports/users.rs`), which is the same check on the same bytes. Leading
+ * `1`s decode back to the leading zero bytes the encoder promised to preserve.
+ */
+export function base58ToBytes(value: string): Uint8Array | null {
+  // `digits` is the value in base 256, least-significant byte first.
+  const digits: number[] = [];
+  for (const ch of value) {
+    const digit = ALPHABET.indexOf(ch);
+    if (digit === -1) return null;
+    let carry = digit;
+    for (let i = 0; i < digits.length; i += 1) {
+      carry += digits[i] * 58;
+      digits[i] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      digits.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  // Leading `1`s in the base58 form are leading zero bytes.
+  let zeros = 0;
+  for (const ch of value) {
+    if (ch !== ALPHABET[0]) break;
+    zeros += 1;
+  }
+  const out = new Uint8Array(zeros + digits.length);
+  for (let i = 0; i < digits.length; i += 1) out[zeros + i] = digits[digits.length - 1 - i];
+  return out;
+}

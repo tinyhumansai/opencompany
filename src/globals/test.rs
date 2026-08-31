@@ -93,14 +93,37 @@ fn every_global_workflow_names_a_global_agent() {
 }
 
 #[test]
-fn the_default_tool_belt_is_the_wildcard_belt_without_search() {
-    // The belt a company starts from, authored rather than hardcoded. `search`
-    // stays out of it: it bills per call, and a company that never asked for
-    // web search must never spend on it by default.
+fn the_default_tool_belt_carries_every_namespace_the_wildcard_excludes() {
+    // The belt a company starts from, authored rather than hardcoded. `*`
+    // covers files/docs/shell/code/web/subagent and nothing else, so every
+    // namespace it deliberately excludes is spelled out beside it — otherwise
+    // a company that declares no `[tools]` ships teammates that cannot write
+    // the workspace, cannot search, and cannot call an MCP server the operator
+    // installed, and each of those surfaces to the operator as the teammate
+    // reporting its own tools as not enabled.
+    //
+    // `repo` is the one exclusion that stays excluded: a host on filesystem
+    // storage refuses to boot a company whose allow-list names it, so a
+    // default carrying it would be a default that cannot start.
     assert_eq!(
         default_tool_allow(),
-        vec!["*".to_string(), "media".to_string(), "composio".to_string()]
+        vec![
+            "*".to_string(),
+            "workspace.*".to_string(),
+            "workspace.write".to_string(),
+            "media".to_string(),
+            "composio".to_string(),
+            "search".to_string(),
+            "mcp:*".to_string(),
+        ]
     );
+}
+
+#[test]
+fn the_default_tool_belt_grants_workspace_writes_explicitly() {
+    assert!(crate::company::grants_workspace_write_explicit(
+        &default_tool_allow()
+    ));
 }
 
 #[test]

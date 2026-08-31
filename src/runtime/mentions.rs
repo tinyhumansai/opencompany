@@ -185,32 +185,19 @@ pub fn directory(record: &CompanyRecord, users: &[UserRecord]) -> Vec<MentionAli
 
 /// How a person is named to other members of their company.
 ///
-/// Display name, else the local part of their login identity, else `"someone"`
+/// Display name, else one derived from their login identity, else `"someone"`
 /// — the same ladder [`author_labels`](crate::server::chat_history) walks, and
 /// deliberately the same one: a mention chip that read differently from the
 /// author line above it on the very same message would look like two people.
+/// It is also the same rule `UserRecord::display_label` uses everywhere else a
+/// person is named, so the identity a member sees in the profile pane is the
+/// one they see on a mention chip.
 ///
 /// Never the full identity. An email address is not a handle, and handing one
 /// to every member of a company so they can @ each other would leak it.
 pub fn user_label(user: &UserRecord) -> String {
-    if let Some(name) = user.display_name.as_deref() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    let local = user
-        .email
-        .split('@')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if local.is_empty() {
-        "someone".to_string()
-    } else {
-        local
-    }
+    user.display_label()
+        .unwrap_or_else(|| "someone".to_string())
 }
 
 /// A typable alias for each user, in the order given, disambiguated so no two
@@ -241,7 +228,21 @@ pub fn user_slugs(users: &[UserRecord]) -> Vec<String> {
     let mut emitted: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(users.len());
     for user in users {
-        let base = mention_slug(&user_label(user));
+        let mut base = mention_slug(&user_label(user));
+        if base.is_empty() {
+            // A symbol-only display name ("🙂", "!!!") slugs to nothing, and an
+            // empty alias would match every `@` — but dropping the alias makes
+            // the person unmentionable while the picker still offers a row
+            // (`mentionableText` falls back to the label, and the host refuses
+            // the span because `opens_mention` needs a word char after `@`).
+            // Fall back to the email local part, the same handle `user_label`
+            // already uses when there is no display name, and then to the id,
+            // which is guaranteed non-empty and typable.
+            base = mention_slug(user.email.split('@').next().unwrap_or_default().trim());
+            if base.is_empty() {
+                base = user.id.clone();
+            }
+        }
         loop {
             let count = seen.entry(base.clone()).or_insert(0);
             *count += 1;
@@ -316,9 +317,22 @@ pub fn strip_code_regions(text: &str) -> String {
                             break bytes.len();
                         }
                         let indent = line_start + leading_spaces(bytes, line_start);
+                        // CommonMark: a closing fence may be followed only by
+                        // spaces or tabs (or a CR in a CRLF line ending), never
+                        // by text. A line like ```not-a-close stays inside the
+                        // block, so blanking must not stop there and unmask a
+                        // later `@` the renderer still shows as code. The same
+                        // line also has to be the same character
+                        // (`bytes[indent] == ch`) and at least as long, which
+                        // `run_len` already enforces.
+                        let close_run = run_len(bytes, indent, ch);
+                        let after = indent + close_run;
                         if indent < bytes.len()
                             && bytes[indent] == ch
-                            && run_len(bytes, indent, ch) >= run
+                            && close_run >= run
+                            && bytes[after..line_end(bytes, indent)]
+                                .iter()
+                                .all(|b| *b == b' ' || *b == b'\t' || *b == b'\r')
                         {
                             break line_end(bytes, indent);
                         }
@@ -694,7 +708,16 @@ fn is_valid_alias_for(mention: &Mention, dir: &[MentionAlias]) -> bool {
     // `"#engineering"`, which is nobody's alias and would fail every desk
     // mention the console's own picker can produce for that spelling.
     let body = mention.text.strip_prefix('@').unwrap_or(&mention.text);
-    let body = body.strip_prefix('#').unwrap_or(body);
+    // `@#…` is the desk-only spelling. `extract_with_known` narrows a hashed
+    // body to desk targets when scanning text, and revalidation must apply the
+    // same rule: without it, a user or agent whose label happens to start with
+    // `#` would pass the alias check below (the hash is stripped, leaving a
+    // plain word) with a visually desk-shaped mention that never names them.
+    let desk_spelling = body.strip_prefix('#');
+    if desk_spelling.is_some() && !matches!(mention.target, MentionTarget::Desk { .. }) {
+        return false;
+    }
+    let body = desk_spelling.unwrap_or(body);
     let body = body.to_lowercase();
     dir.iter()
         .any(|entry| entry.target == mention.target && entry.aliases.iter().any(|a| a == &body))
@@ -855,6 +878,11 @@ pub fn mention_responder(record: &CompanyRecord, mentions: &[Mention]) -> Option
 /// desk's effective membership, so `@everyone` in `#engineering` names the
 /// engineering desk rather than the whole company.
 ///
+/// The one channel where it *does* name the whole company is the built-in
+/// `#general` (issue #1743), which is not a desk and has no membership of its
+/// own: there, `@everyone` expands to the roster, derived at read time, so a
+/// teammate added a minute ago is named without anything having been written.
+///
 /// # This is a list, not a fan-out
 ///
 /// One operator message spawns exactly one turn — the invariant the chat POST
@@ -888,13 +916,41 @@ pub fn mentioned_agents(
                     }
                 }
             }
-            MentionTarget::Everyone => {
-                if let Some(desk_id) = record.resolve_desk_id(desk) {
+            // An **overlay** desk cannot stand in for the built-in `#general`
+            // channel here, and does not need filtering out: `resolve_desk_id`
+            // declines to match one against a General spelling at all (issue
+            // #1743), so a desk that took `general`/`main`/`General` before
+            // those were reserved cannot narrow a company-wide broadcast to its
+            // own membership. A desk the *blueprint* declares still wins, which
+            // is the grandfathering this host has always honoured.
+            MentionTarget::Everyone => match record.resolve_desk_id(desk) {
+                Some(desk_id) => {
                     for member in record.effective_desk_members(&desk_id) {
                         push(&mut out, record, responder, member);
                     }
                 }
-            }
+                // The built-in `#general` channel is not a desk (issue #1743),
+                // so it has no membership to expand against — it *is* the whole
+                // roster, derived here on every read. Before this, `@everyone`
+                // on the company-wide line resolved to nobody: the arm above
+                // found no desk and the broadcast named no one, which is the
+                // one channel where it should name everyone.
+                //
+                // Still a **list, not a fan-out** — see this function's note.
+                // One operator message spawns one turn whatever it names, so a
+                // broadcast here costs the same as any other message; it only
+                // tells the answering teammate who else was addressed.
+                //
+                // Ordered by the same manifest-then-overlay walk `desk_ids`
+                // uses, so "who is in #general" reads the same as every other
+                // roster surface.
+                None if crate::server::chat_history::is_general_chat(Some(desk)) => {
+                    for id in crate::runtime::delegation_tools::roster_agent_ids(record) {
+                        push(&mut out, record, responder, id);
+                    }
+                }
+                None => {}
+            },
             MentionTarget::User { .. } => {}
         }
     }
@@ -936,7 +992,7 @@ pub fn mentioned_users(users: &[UserRecord], mentions: &[Mention]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::types::{AgentOverride, CompanyId, CompanyRecord};
+    use crate::ports::types::{AgentOverride, CompanyId, CompanyRecord, OverlayAgent};
     use crate::ports::users::{UserRole, UserStatus};
 
     const MANIFEST: &str = r#"
@@ -972,10 +1028,14 @@ members = ["engineer", "ceo"]
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 
@@ -988,6 +1048,7 @@ members = ["engineer", "ceo"]
             id: id.to_string(),
             email: email.to_string(),
             display_name: display.map(str::to_string),
+            avatar: None,
             role: UserRole::Member,
             status: UserStatus::Active,
             password_hash: None,
@@ -1084,6 +1145,32 @@ members = ["engineer", "ceo"]
         assert!(resolve_text(text).is_empty());
     }
 
+    /// A line like ```not-a-close is code, not a closing fence: CommonMark
+    /// only lets a fence be followed by spaces or tabs. Closing the mask there
+    /// would unmask a later `@engineer` the renderer still shows as code.
+    #[test]
+    fn a_false_closing_fence_does_not_unmask_a_later_mention() {
+        let text = "before\n```\ncode\n```not-a-close\n@engineer\n```\nafter";
+        assert!(resolve_text(text).is_empty());
+    }
+
+    /// Trailing whitespace on a closing fence is still a valid close
+    /// (CommonMark allows spaces or tabs), so the block keeps masking.
+    #[test]
+    fn a_fence_closed_with_trailing_whitespace_still_masks() {
+        let text = "before\n```\n@engineer\n```  \nafter";
+        assert!(resolve_text(text).is_empty());
+    }
+
+    /// A CRLF line ending is still a close — the `\r` is part of the ending,
+    /// not fence text, and must keep closing the block as it did before the
+    /// suffix was restricted.
+    #[test]
+    fn a_fence_closed_over_crlf_still_masks() {
+        let text = "before\n```\n@engineer\n```\r\nafter";
+        assert!(resolve_text(text).is_empty());
+    }
+
     /// The reason [`strip_code_regions`] blanks rather than removes: a mention
     /// *after* a code span must still land on its real byte offset.
     #[test]
@@ -1114,6 +1201,20 @@ members = ["engineer", "ceo"]
     #[test]
     fn an_unclosed_backtick_does_not_mask_the_rest() {
         let found = resolve_text("weird ` tick then @engineer");
+        assert_eq!(targets(&found), vec![&agent("engineer")]);
+    }
+
+    /// A longer closing run cannot close a shorter opener: CommonMark only lets
+    /// a *whole* run of exactly the opening length close a span, so
+    /// `` `code @engineer here`` `` (one opener, two trailing) is not code and
+    /// the mention — which opens after a space and closes before one — must
+    /// resolve. The console's mask has to agree with this or it would suppress
+    /// a mention the renderer still shows. (`` `@engineer`` `` does *not*
+    /// resolve either side: an `@` right after a backtick is not a
+    /// mention-opening position.)
+    #[test]
+    fn a_longer_backtick_run_does_not_close_a_shorter_opener() {
+        let found = resolve_text("`code @engineer here``");
         assert_eq!(targets(&found), vec![&agent("engineer")]);
     }
 
@@ -1224,6 +1325,21 @@ members = ["engineer", "ceo"]
         assert_eq!(mention_slug("Ana  M. Ruiz"), "ana-m-ruiz");
     }
 
+    /// A symbol-only display name ("🙂") slugs to nothing, which would leave
+    /// the person unmentionable while the picker still advertises a row. The
+    /// fallback must hand such a user a real, typable alias — the email local
+    /// part, then the id — so the picker can insert a spelling the host's
+    /// `opens_mention` accepts and the directory can resolve.
+    #[test]
+    fn a_symbol_only_display_name_still_gets_a_typable_slug() {
+        let users = vec![
+            user("u1", "smiley@acme.test", Some("🙂")),
+            user("u2", "no_name@acme.test", Some("!!!")),
+            user("u3", "plain@acme.test", Some("Ada")),
+        ];
+        assert_eq!(user_slugs(&users), vec!["smiley", "no-name", "ada"]);
+    }
+
     // -----------------------------------------------------------------------
     // Desks and everyone
     // -----------------------------------------------------------------------
@@ -1283,6 +1399,29 @@ members = ["engineer", "ceo"]
     fn a_hash_prefixed_non_desk_alias_does_not_resolve() {
         let found = resolve_text("@#engineer please");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The same desk-only rule applies when a structured caller supplies the
+    /// span: `@#engineer` paired with the agent target must not ping them.
+    /// `is_valid_alias_for` strips the hash for the alias comparison, so
+    /// without the kind check here the `#`-shaped mention would validate.
+    #[test]
+    fn a_hash_prefixed_non_desk_target_is_demoted_in_revalidation() {
+        let supplied = vec![Mention {
+            target: agent("engineer"),
+            text: "@#engineer".to_string(),
+            offset: 0,
+            quiet: false,
+        }];
+        let out = resolve(
+            "@#engineer please",
+            Some(supplied),
+            None,
+            &acme(),
+            &people(),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].quiet, "{out:?}");
     }
 
     #[test]
@@ -1504,6 +1643,144 @@ members = ["engineer", "ceo"]
         );
     }
 
+    /// `@everyone` on the built-in `#general` channel names the whole roster,
+    /// under every spelling the host folds into it (issue #1743).
+    ///
+    /// Before this it named **nobody**: `#general` is not a desk, so
+    /// `resolve_desk_id` found nothing and the broadcast arm expanded against
+    /// an empty membership. The one channel where "everyone" literally means
+    /// everyone was the one channel where `@everyone` reached no one.
+    #[test]
+    fn everyone_on_the_general_channel_names_the_whole_roster() {
+        let found = resolve_text("@everyone standup in five");
+        for spelling in ["general", "General", "main", "Main", ""] {
+            assert_eq!(
+                mentioned_agents(&acme(), spelling, &found, None),
+                vec!["engineer".to_string(), "ceo".to_string()],
+                "@everyone addressed as {spelling:?} must name the whole roster"
+            );
+        }
+    }
+
+    /// An **overlay** desk that took a General spelling before those were
+    /// reserved must not narrow the company-wide broadcast (issue #1743).
+    ///
+    /// `resolve_desk_id` matches a desk by id *or* by case-insensitive name, so
+    /// a persisted `{id: "ops", name: "General"}` is selected when
+    /// `HarnessBrain::everyone_desk` folds the built-in `main` thread to
+    /// `General` — and `@everyone` on the one channel where everyone means
+    /// everyone would reach only that desk's members. A desk the *blueprint*
+    /// declares is the company's own General desk and still wins; this is only
+    /// about state `create_desk` used to accept and now refuses.
+    #[test]
+    fn an_overlay_desk_squatting_a_general_spelling_does_not_narrow_the_broadcast() {
+        let mut record = acme();
+        record.overlay_desks.push(crate::ports::types::OverlayDesk {
+            id: "ops".to_string(),
+            name: "General".to_string(),
+            description: None,
+            responder: Default::default(),
+            members: vec!["ceo".to_string()],
+        });
+        let found = resolve_text("@everyone standup in five");
+        for spelling in ["general", "General", "main", ""] {
+            assert_eq!(
+                mentioned_agents(&record, spelling, &found, None),
+                vec!["engineer".to_string(), "ceo".to_string()],
+                "@everyone addressed as {spelling:?} must still name the whole roster"
+            );
+        }
+        // And the squatting desk keeps working as the desk it is, addressed by
+        // its own id — this narrows the broadcast, nothing else.
+        assert_eq!(
+            mentioned_agents(&record, "ops", &found, None),
+            vec!["ceo".to_string()],
+            "the desk itself is unchanged"
+        );
+    }
+
+    /// A named desk keeps expanding against **its own** membership, not the
+    /// roster — the reservation above must not leak into every channel.
+    #[test]
+    fn everyone_on_a_named_desk_still_names_only_that_desk() {
+        let mut record = acme();
+        // A teammate on nobody's desk: on the roster, off `#engineering`.
+        record.overlay_agents.push(OverlayAgent {
+            id: "designer".to_string(),
+            name: "Dana".to_string(),
+            role: "Designer".to_string(),
+            description: None,
+            tools: None,
+            model: None,
+            harness: None,
+        });
+        let found = resolve_text("@everyone standup in five");
+        assert_eq!(
+            mentioned_agents(&record, "engineering", &found, None),
+            vec!["engineer".to_string(), "ceo".to_string()],
+            "a desk broadcast is bounded by the desk"
+        );
+    }
+
+    /// Membership of `#general` is **derived, never stored**: a teammate added
+    /// to the roster a moment ago is in it, with no membership write anywhere
+    /// (issue #1743).
+    ///
+    /// The proof is the mutation, not the assertion: the only thing this test
+    /// changes is `overlay_agents` — the roster. `overlay_desk_members`,
+    /// `overlay_desks` and `overlay_desk_order` are asserted still empty, so
+    /// there is no second copy of "who is in #general" that could drift from
+    /// the roster. That is the whole reason the channel is not a desk.
+    #[test]
+    fn a_teammate_added_to_the_roster_is_in_general_with_no_membership_write() {
+        let mut record = acme();
+        let found = resolve_text("@everyone standup in five");
+        assert_eq!(
+            mentioned_agents(&record, "general", &found, None),
+            vec!["engineer".to_string(), "ceo".to_string()]
+        );
+
+        record.overlay_agents.push(OverlayAgent {
+            id: "designer".to_string(),
+            name: "Dana".to_string(),
+            role: "Designer".to_string(),
+            description: None,
+            tools: None,
+            model: None,
+            harness: None,
+        });
+
+        assert_eq!(
+            mentioned_agents(&record, "general", &found, None),
+            vec![
+                "engineer".to_string(),
+                "ceo".to_string(),
+                "designer".to_string()
+            ],
+            "the new teammate is in #general the moment it joins the roster"
+        );
+        assert!(
+            record.overlay_desk_members.is_empty()
+                && record.overlay_desks.is_empty()
+                && record.overlay_desk_order.is_empty(),
+            "nothing was written to any desk overlay to make that true"
+        );
+    }
+
+    /// A retired teammate drops out of `#general` on the same read, for the
+    /// same reason: `push` re-checks `is_roster_agent`, which is what a derived
+    /// membership buys — there is no stale seat to clean up.
+    #[test]
+    fn a_retired_teammate_leaves_general_on_the_next_read() {
+        let mut record = acme();
+        record.overlay_retired_agents.push("engineer".to_string());
+        let found = resolve_text("@everyone standup in five");
+        assert_eq!(
+            mentioned_agents(&record, "general", &found, None),
+            vec!["ceo".to_string()]
+        );
+    }
+
     #[test]
     fn a_desk_mention_expands_to_that_desk_not_the_addressed_one() {
         let found = resolve_text("@engineering can you take this");
@@ -1555,10 +1832,18 @@ members = ["engineer", "ceo"]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn a_label_falls_back_from_display_name_to_local_part() {
+    fn a_label_falls_back_from_display_name_to_a_derived_name() {
         assert_eq!(user_label(&user("u", "jane@x.test", Some("Jane"))), "Jane");
-        assert_eq!(user_label(&user("u", "jane@x.test", None)), "jane");
-        assert_eq!(user_label(&user("u", "jane@x.test", Some("  "))), "jane");
+        // No chosen name: the same derived name `display_label` uses for the
+        // profile pane, not the raw local part — the same person must read the
+        // same way on a mention chip and in the people list.
+        assert_eq!(user_label(&user("u", "jane.doe@x.test", None)), "Jane Doe");
+        // A blanked display name is the same intent as `null`.
+        assert_eq!(
+            user_label(&user("u", "jane.doe@x.test", Some("  "))),
+            "Jane Doe"
+        );
+        // An identity with no name in it to derive stays the honest fallback.
         assert_eq!(user_label(&user("u", "@x.test", None)), "someone");
     }
 
@@ -1595,6 +1880,7 @@ members = ["engineer", "ceo"]
             description: None,
             tools: None,
             instructions: None,
+            avatar: None,
             ..Default::default()
         });
         let found = resolve("hey @Ada, got a sec?", None, None, &record, &people());

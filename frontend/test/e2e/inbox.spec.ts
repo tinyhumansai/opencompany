@@ -54,18 +54,30 @@ test("Inbox is reachable, explains that it is parked, and reads the host's per-a
   await page.getByTestId("team-card-open").first().click();
   const toggle = page.getByTestId("agent-inbox-toggle");
   await expect(toggle).toBeVisible({ timeout: 30_000 });
-  const agentUrl = page.url();
   if (!(await toggle.isChecked())) {
     await toggle.click();
   }
   await expect(toggle).toBeChecked({ timeout: 30_000 });
+  // The switch's checked state is optimistic — `toggleInbox` flips it before
+  // the PUT lands and holds the switch disabled (`busy`) until the host
+  // acknowledges. Waiting for it to be enabled again is waiting for the write
+  // to actually reach the `InboxStore`; only then is a reload a meaningful
+  // persistence check.
+  await expect(toggle).toBeEnabled({ timeout: 30_000 });
 
   // Drop every client-side store, then reload: only host state can survive this.
   await page.evaluate(() => {
     localStorage.clear();
     sessionStorage.clear();
   });
-  await page.goto(agentUrl);
+  // A real reload, not `goto(agentUrl)`: navigating to the URL the page is
+  // already on is a same-document no-op in Chromium, so no reload fires, the
+  // optimistic toggle state survives, and the assertion below would prove
+  // nothing about the host.
+  await page.reload();
+  // Clearing storage also clears the tour's "seen" marker, so the first-run
+  // overlay is back. Dismiss it again rather than let it sit over the page.
+  await dismissTour(page);
   await expect(page.getByTestId("agent-inbox-toggle")).toBeChecked({ timeout: 30_000 });
 
   // The Inbox page lists that inbox and shows only real mail. With no ingested

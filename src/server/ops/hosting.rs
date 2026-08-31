@@ -274,6 +274,7 @@ mod tests {
                 overlay_agents: Vec::new(),
                 overlay_desk_members: Vec::new(),
                 overlay_desk_order: Vec::new(),
+                overlay_tool_grants: None,
                 overlay_desk_tools: Default::default(),
                 overlay_desks: Vec::new(),
                 overlay_workflows: Vec::new(),
@@ -282,6 +283,9 @@ mod tests {
                 disabled_workflows: Vec::new(),
                 template_provenance: None,
                 setup: None,
+                name_confirmed: false,
+                activation_completed_at: None,
+                created_at_millis: None,
             })
             .await
             .expect("save");

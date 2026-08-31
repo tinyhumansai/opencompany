@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -55,6 +56,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
@@ -134,22 +141,27 @@ function Header() {
   const backHref = withHostParam("overview");
   return (
     <header
-      className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur"
+      className="sticky top-0 z-10 bg-background/95 backdrop-blur"
       data-testid="styleguide-header"
     >
       {/*
-        Wraps rather than overflows. The title block's min-content width is set
-        by an unbreakable path (`docs/design-system/`), and the controls do not
-        shrink — so on a 320px viewport a single row would push "Back to
-        console" off the right edge instead of stacking under the heading.
+        Wraps rather than overflows (`PageHeader`'s row is `flex-wrap`). The
+        title block's min-content width is set by an unbreakable path
+        (`docs/design-system/`) and the controls do not shrink, so on a 320px
+        viewport a single row would push "Back to console" off the right edge
+        instead of stacking under the heading.
       */}
-      <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-x-6 gap-y-4 px-6 py-4">
-        <div className="min-w-0">
-          <p className="text-2xs font-medium tracking-wide text-sidebar-accent-foreground uppercase">
+      <PageHeader
+        title="Styleguide"
+        width="5xl"
+        gutter="px-6"
+        eyebrow={
+          <span className="text-2xs font-medium tracking-wide text-sidebar-accent-foreground uppercase">
             OpenCompany design system
-          </p>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight">Styleguide</h1>
-          <p className="mt-2 max-w-2xl text-sm break-words text-muted-foreground">
+          </span>
+        }
+        description={
+          <>
             Every token and component state the console ships, rendered by the
             console&apos;s own stylesheet. Switch the theme to check both. Written
             reference lives in{" "}
@@ -157,19 +169,21 @@ function Header() {
               docs/design-system/
             </code>
             .
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <ThemeToggle />
-          <a
-            className="inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
-            href={backHref}
-          >
-            <ArrowLeft className="size-4" />
-            Back to console
-          </a>
-        </div>
-      </div>
+          </>
+        }
+        actions={
+          <>
+            <ThemeToggle />
+            <a
+              className="inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+              href={backHref}
+            >
+              <ArrowLeft className="size-4" />
+              Back to console
+            </a>
+          </>
+        }
+      />
     </header>
   );
 }
@@ -363,7 +377,7 @@ function ColorSection() {
           Text hierarchy
         </h3>
         <Card>
-          <CardContent className="space-y-1 py-4">
+          <CardContent className="space-y-1">
             <p className="text-sm text-ink-primary">
               ink-primary — active labels, channel headers. 16.5:1
             </p>
@@ -469,7 +483,7 @@ function StatusSection() {
       hint="Five states, five colours, used identically wherever a run appears. Each ships a mark weight, an accessible text weight, and a soft background — one value cannot do all three jobs."
     >
       <Card>
-        <CardContent className="space-y-4 py-5">
+        <CardContent className="space-y-4">
           <div className="flex flex-wrap gap-2">
             {STATUSES.map((s) => (
               <span
@@ -547,7 +561,7 @@ function ToneSection() {
       hint="A categorical palette for who, not what state. Assigned by hash, so a name keeps its colour — and carrying no meaning beyond 'not the other one'."
     >
       <Card>
-        <CardContent className="space-y-4 py-5">
+        <CardContent className="space-y-4">
           <div className="flex flex-wrap gap-2">
             {TONES.map((t, i) => (
               <span
@@ -589,15 +603,31 @@ function ToneSection() {
   );
 }
 
+/**
+ * The scale, and what each step is actually for.
+ *
+ * The top of it moved in issue #1763. `text-lg` was labelled "Card titles" and
+ * `text-2xl` "View titles"; both were out of date the moment `PageHeader`
+ * shipped, and a styleguide that names the size a page title should be is not
+ * a specimen sheet — it is the instruction the next page follows. Every page
+ * title is now `PageHeader`'s `text-lg`, and `CardTitle` is `text-base`
+ * (`text-sm` on a `size="sm"` card), so the two labels swap ends of the scale
+ * rather than one of them simply being deleted.
+ *
+ * `text-2xl` survives, but not as a page title: it is the size of a *number* —
+ * the balance on Finance, the spend on Usage — and of the two headings that
+ * live outside the console shell, sign-in and the company picker. Those are
+ * the "hero with air above it" case `page-header.tsx` argues a bar cannot be.
+ */
 const TYPE_STEPS = [
   { cls: "text-3xs", px: "10px", sample: TAGLINE, use: "Table meta, graph labels, counters" },
   { cls: "text-2xs", px: "11px", sample: TAGLINE, use: "Captions, timestamps, key/value rows" },
   { cls: "text-xs", px: "12px", sample: TAGLINE, use: "Dense body — the workhorse" },
   { cls: "text-sm", px: "14px", sample: TAGLINE, use: "Default body, labels, buttons" },
-  { cls: "text-base", px: "16px", sample: TAGLINE, use: "Long-form prose, empty states" },
-  { cls: "text-lg", px: "18px", sample: "A company of one", use: "Card titles" },
+  { cls: "text-base", px: "16px", sample: TAGLINE, use: "Card titles, long-form prose, empty states" },
+  { cls: "text-lg", px: "18px", sample: "A company of one", use: "Page titles — every PageHeader" },
   { cls: "text-xl", px: "20px", sample: "A company of one", use: "Section headings" },
-  { cls: "text-2xl", px: "24px", sample: "A company of one", use: "View titles" },
+  { cls: "text-2xl", px: "24px", sample: "A company of one", use: "Stat values, sign-in and company-picker heroes" },
 ] as const;
 
 function TypeSection() {
@@ -607,7 +637,7 @@ function TypeSection() {
       hint="Geist Variable for everything the operator reads. Mono only for values that change in place — ids, durations, token counts — so digits do not reflow."
     >
       <Card>
-        <CardContent className="divide-y divide-border py-0">
+        <CardContent className="divide-y divide-border">
           {TYPE_STEPS.map((t) => (
             <div
               key={t.cls}
@@ -729,7 +759,7 @@ function MotionSection() {
       hint="Three durations, two curves, and that is the whole vocabulary. Reduced-motion is honoured globally in the base layer, not per component."
     >
       <Card>
-        <CardContent className="space-y-4 py-5">
+        <CardContent className="space-y-4">
           <div className="flex items-center gap-3">
             <Switch checked={on} onCheckedChange={setOn} id="sg-motion" />
             <Label htmlFor="sg-motion" className="text-sm">
@@ -938,6 +968,41 @@ function ComponentSection() {
               Nothing here.
             </TabsContent>
           </Tabs>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm">Popover</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="mb-3 text-sm text-muted-foreground">
+            Tooltip is hover/focus-only by design — a mouse-only glance. Use
+            Popover instead for anything a touch or keyboard user must be able
+            to open, not just see: it opens on click/tap out of the box, with{" "}
+            <code>openOnHover</code> layered on top when the mouse case should
+            still work like a tooltip.
+          </p>
+          <Popover>
+            <PopoverTrigger
+              openOnHover
+              render={<Button variant="outline" size="sm" />}
+            >
+              Click or hover me
+            </PopoverTrigger>
+            <PopoverContent>
+              {/* Codex review on #1821: this example's popup is the
+               * canonical Popover pattern shown in the styleguide, so it
+               * must demonstrate the accessible-name requirement it
+               * documents rather than contradict it — a bare-text popup has
+               * no PopoverTitle to supply Popover.Popup's aria-labelledby,
+               * so it opens as an unnamed dialog. */}
+              <PopoverTitle>Popover</PopoverTitle>
+              <p className="mt-1 text-muted-foreground">
+                Popovers open on click, tap, and hover.
+              </p>
+            </PopoverContent>
+          </Popover>
         </CardContent>
       </Card>
 

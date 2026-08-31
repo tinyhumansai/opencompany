@@ -208,6 +208,14 @@ impl RosterBuilder {
         self.model.telemetry_provider_id()
     }
 
+    /// The model this pass's usage is metered against, read live off the
+    /// provider and already folded onto the closed vocabulary (issue #1749).
+    /// `None` before the provider has issued a turn, or when it cannot name a
+    /// model.
+    pub fn model_slug(&self) -> Option<crate::metering::ModelSlug> {
+        self.model.telemetry_model()
+    }
+
     /// Proposes a roster for these answers.
     ///
     /// **Infallible by design.** There is no `Result`, because there is no
@@ -339,8 +347,9 @@ impl RosterBuilder {
     }
 
     /// One model call, parsed and validated. Never fails upward: an unreachable
-    /// model, a timeout and an unreadable answer are all "no roster from this
-    /// attempt", which is the only distinction a caller acts on.
+    /// model, a timeout and an unreadable answer all yield "no roster from this
+    /// attempt", but only the first two are `ModelUnreachable` — an unreadable
+    /// answer is `NotDesignable`, and the caller's next step differs for the two.
     async fn attempt(&self, message: Message, deadline: Instant) -> Attempt {
         let now = Instant::now();
         if now >= deadline {
@@ -403,11 +412,15 @@ struct Attempt {
 impl Attempt {
     /// No roster, because the call never landed — a timeout, or a provider that
     /// could not be reached.
+    ///
+    /// This is [`FallbackReason::ModelUnreachable`], not [`NoModel`](FallbackReason::NoModel):
+    /// a builder exists (that is why the call was made), so the operator's
+    /// credential is not the thing to fix.
     fn unreachable() -> Self {
         Self {
             roster: None,
             usage: TokenUsage::default(),
-            reason: FallbackReason::NoModel,
+            reason: FallbackReason::ModelUnreachable,
         }
     }
 }
@@ -867,6 +880,27 @@ mod test {
         }
     }
 
+    /// A model that cannot be reached: `invoke` errors, as a provider that is
+    /// down or a key the host refuses does. The pass must report this as an
+    /// unreachable model rather than "no model", because the operator's next
+    /// move differs — a key is already wired.
+    struct UnreachableModel;
+
+    #[async_trait]
+    impl ChatModel<()> for UnreachableModel {
+        async fn invoke(&self, _state: &(), _request: ModelRequest) -> TaResult<ModelResponse> {
+            Err(tinyagents::TinyAgentsError::Model(
+                "provider refused the call".to_string(),
+            ))
+        }
+    }
+
+    impl HarnessModel for UnreachableModel {
+        fn telemetry_provider_id(&self) -> String {
+            "managed".to_string()
+        }
+    }
+
     /// Three jobs, so a gap is expressible.
     fn three_jobs() -> SetupAnswers {
         SetupAnswers {
@@ -1062,7 +1096,7 @@ mod test {
             ("Meta Ads Specialist", "operations", &[0]),
             ("SEO Specialist", "analysis", &[]),
             ("Logistics Coordinator", "operations", &[1]),
-            ("Operations Manager", "operations", &[]),
+            ("Fulfillment Manager", "operations", &[]),
             ("Accountant", "analysis", &[]),
         ]);
         let model = SequencedModel::new(&[&echoed]);
@@ -1113,6 +1147,32 @@ mod test {
             .propose(&answers)
             .await;
         assert_eq!(proposal.reason, Some(FallbackReason::NotDesignable));
+    }
+
+    /// A call that never lands is not "no model": a builder exists (that is why
+    /// the call was made), so the operator's next move is to retry or check the
+    /// provider, not to add a key that is already wired.
+    #[tokio::test]
+    async fn an_unreachable_call_reports_unreachable_not_no_model() {
+        let answers = SetupAnswers {
+            industry: "I sell homeware online".to_string(),
+            team_hint: String::new(),
+            automate: "Meta ads, order dispatch".to_string(),
+        };
+        let (proposal, _) = RosterBuilder::new(Arc::new(UnreachableModel), "test-model")
+            .propose(&answers)
+            .await;
+        assert_eq!(proposal.source, RosterSource::Fallback);
+        assert_eq!(
+            proposal.reason,
+            Some(FallbackReason::ModelUnreachable),
+            "a configured but unreachable model must not be reported as no_model"
+        );
+        assert_eq!(
+            proposal.reason.map(|r| r.as_str()),
+            Some("model_unreachable"),
+            "the wire spelling must round-trip"
+        );
     }
 
     /// A designed roster reports no reason at all — there is nothing to explain.

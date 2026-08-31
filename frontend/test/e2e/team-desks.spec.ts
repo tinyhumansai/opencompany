@@ -89,11 +89,23 @@ async function mockApi(page: Page) {
         source: "overlay",
         editable: ["name", "role", "description"],
         isOrchestrator: false,
-        tools: { requested: [], companyAllow: [], effective: [] },
+        tools: { requested: [], companyAllow: [], deskAllow: [], deskCeilingActive: false, effective: [] },
         inboxEnabled: false,
       });
     }
     if (path.endsWith("/me")) return json({ id: "op", email: "op@example.com", role: "admin" });
+    // Issue #1844: without this the fallback below answers `GET …/activation`
+    // with `[]` — truthy, so `shouldShowOnboardingGate` reads `isActivated` as
+    // `undefined` and, since `/me` above already resolves this operator as
+    // admin, opens the blocking gate over every one of this file's tests
+    // instead of the shell they actually exercise.
+    if (path.endsWith("/activation"))
+      return json({
+        nameConfirmed: true,
+        integrationConnected: true,
+        workflowRunSucceeded: true,
+        isActivated: true,
+      });
     if (path.endsWith("/events"))
       return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     return json([]);
@@ -175,4 +187,28 @@ test("#1391 the teammate action is a focused title button, not an interactive ca
   await expect(open).toBeFocused();
   await open.press("Enter");
   await expect(page).toHaveURL(/#\/team\/maya$/);
+});
+
+test("#1810 the teammate card opens without swallowing its actions menu", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/#/company");
+
+  const maya = card(page, "Maya");
+  await expect(maya).toBeVisible({ timeout: 30_000 });
+
+  // The description is deliberately plain card content, not the title button.
+  // Clicking it proves the stretched title action covers the card surface.
+  const description = await maya.getByTestId("team-card-description").boundingBox();
+  if (!description) throw new Error("Maya's description has no clickable bounds");
+  await page.mouse.click(description.x + 4, description.y + 4);
+  await expect(page).toHaveURL(/#\/team\/maya$/);
+
+  await page.goto("/#/company");
+  await expect(maya).toBeVisible({ timeout: 30_000 });
+
+  // The overflow stays above the stretched target: it opens Remove without
+  // navigating to the teammate underneath it.
+  await maya.getByRole("button", { name: "Teammate actions" }).click();
+  await expect(page.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/company$/);
 });

@@ -507,13 +507,20 @@ impl CompanyWorkspace {
         segment == self.agent_id || segment == kebab_name_or(&self.agent_id, &self.agent_id)
     }
 
-    /// Adopt-or-create this agent's own `agents/<id>/` folder, returning its id.
+    /// Adopt-or-create this agent's own `agents/<id>/` folder, returning its id
+    /// and whether *this* call minted it (issue #1801).
     ///
     /// Since issue #551 a member folder is minted on first use rather than
     /// provisioned for every roster member at boot, so the agent's home may
-    /// legitimately not exist yet the first time it puts something there.
-    async fn ensure_own_home(&self) -> crate::Result<String> {
-        crate::company::workspace_scaffold::ensure_agent_folder(
+    /// legitimately not exist yet the first time it puts something there. The
+    /// mint happens before the note that justifies the folder, so the caller
+    /// needs the bool: a note create that then fails must not leave the home
+    /// standing empty, and only a home *this* call brought into existence is
+    /// safe to roll back (see [`rollback_empty_minted_folders`]).
+    ///
+    /// [`rollback_empty_minted_folders`]: crate::company::workspace_scaffold::rollback_empty_minted_folders
+    async fn ensure_own_home(&self) -> crate::Result<(String, bool)> {
+        crate::company::workspace_scaffold::ensure_agent_folder_tracked(
             self.store.as_ref(),
             &self.company,
             &self.agent_id,
@@ -2070,7 +2077,13 @@ impl Tool for WorkspaceCreateTool {
         // path ambiguous for **every** agent from then on, and the reserved
         // `Agents` root is exactly the path an agent must not be able to
         // shadow with a rival of its own.
-        if let Some(existing) = index.lookup(&normalized) {
+        if let Some(existing) = index.lookup(&normalized)
+            // The agent's own home is handled by the adopt-or-create path below,
+            // even when it was already present in this initial snapshot. This
+            // makes retries idempotent rather than rejecting the stale-looking
+            // folder before its ownership-aware adoption can run.
+            && !(kind == NodeKind::Folder && self.workspace.is_own_home(&segments))
+        {
             let what = match existing.first().map(|e| e.node.kind) {
                 Some(NodeKind::Folder) => "a folder",
                 _ => "a note",
@@ -2103,6 +2116,10 @@ impl Tool for WorkspaceCreateTool {
         // reply has to name the path the node can actually be read back at, not
         // the one that was asked for.
         let mut parent_display: Option<String> = None;
+        // Folders this call mints on the way to the target that must not survive
+        // if the create below fails (issue #1801) — today only the agent's own
+        // home, minted by the branch just below.
+        let mut minted_folders: Vec<String> = Vec::new();
         let parent_id = if parent_segments.is_empty() {
             None
         } else {
@@ -2130,7 +2147,15 @@ impl Tool for WorkspaceCreateTool {
                 // The agent's own home, not yet minted: make it and carry on.
                 None if self.workspace.is_own_home(parent_segments) => {
                     match self.workspace.ensure_own_home().await {
-                        Ok(id) => {
+                        Ok((id, created)) => {
+                            // A home this call brought into existence is rolled
+                            // back if the note create below fails, so the agent
+                            // is not left an empty `agents/<id>/` for the Repair
+                            // button to sweep (issue #1801). A home that was
+                            // already there is not ours to remove.
+                            if created {
+                                minted_folders.push(id.clone());
+                            }
                             // The scaffold names the home, so it may not be the
                             // spelling the agent typed: it mints
                             // `agents/<dashed id>` and adopts a legacy folder
@@ -2181,49 +2206,114 @@ impl Tool for WorkspaceCreateTool {
         };
 
         let origin = self.workspace.origin();
-        let node = WorkspaceNode {
-            id: crate::ports::generate_id(),
-            name: name.clone(),
-            kind,
-            parent_id,
-            updated_at_millis: crate::ports::now_millis(),
-            created_by: origin.clone(),
-            updated_by: origin,
-            mime: None,
-            size: None,
-            sha256: None,
-        };
-        match self
-            .workspace
-            .store
-            .create(&self.workspace.company, &node, content)
-            .await
-        {
-            // The id and revision go back with the acknowledgement so an
-            // immediate follow-up `workspace_write` needs no extra round trip
-            // through list + read.
-            Ok(()) => Ok(ToolResult::success(match kind {
-                NodeKind::Folder => format!(
-                    "Created the workspace folder `{path}` (id={id}). Create notes inside it with \
-                     `{WORKSPACE_CREATE_TOOL}`.",
-                    path = echo_path(&normalized),
-                    id = node.id,
-                ),
-                NodeKind::File => format!(
-                    "Created the workspace note `{path}` (id={id}, rev={rev}, {bytes} bytes). To \
-                     revise it, call `{WORKSPACE_WRITE_TOOL}` with expected_updated_at={rev} and \
-                     the complete new body.",
-                    path = echo_path(&normalized),
-                    id = node.id,
-                    rev = node.updated_at_millis,
-                    bytes = content.map_or(0, str::len),
-                ),
-            })),
-            Err(e) => Ok(ToolResult::error(format!(
-                "Could not create `{path}`: {reason}.",
-                path = echo_path(&normalized),
-                reason = store_reason(&e),
-            ))),
+        match kind {
+            // Idempotent folder create (issue #1801): route through the store's
+            // atomic adopt-or-create rather than the generic `create`, so a
+            // second create of the same folder — the stale-snapshot race the
+            // pre-check at the top of this handler cannot close — adopts the
+            // folder already there instead of minting a rival sibling under one
+            // name. `store.create`'s documented file-vs-folder contract is left
+            // untouched; only this one create path changes.
+            NodeKind::Folder => {
+                match self
+                    .workspace
+                    .store
+                    .adopt_or_create_folder(
+                        &self.workspace.company,
+                        parent_id.as_deref(),
+                        &name,
+                        origin,
+                    )
+                    .await
+                {
+                    Ok(claim) => {
+                        // The id goes back with the acknowledgement so an
+                        // immediate follow-up needs no list + read round trip.
+                        // Whether it was minted or adopted decides the wording:
+                        // an adopted folder must not be reported as freshly
+                        // created, or the agent believes a duplicate landed.
+                        let id = &claim.node().id;
+                        Ok(ToolResult::success(if claim.was_created() {
+                            format!(
+                                "Created the workspace folder `{path}` (id={id}). Create notes \
+                                 inside it with `{WORKSPACE_CREATE_TOOL}`.",
+                                path = echo_path(&normalized),
+                            )
+                        } else {
+                            format!(
+                                "The workspace folder `{path}` already exists (id={id}); adopted \
+                                 it rather than creating a duplicate. Create notes inside it with \
+                                 `{WORKSPACE_CREATE_TOOL}`.",
+                                path = echo_path(&normalized),
+                            )
+                        }))
+                    }
+                    Err(e) => {
+                        crate::company::workspace_scaffold::rollback_empty_minted_folders(
+                            self.workspace.store.as_ref(),
+                            &self.workspace.company,
+                            &minted_folders,
+                        )
+                        .await;
+                        Ok(ToolResult::error(format!(
+                            "Could not create `{path}`: {reason}.",
+                            path = echo_path(&normalized),
+                            reason = store_reason(&e),
+                        )))
+                    }
+                }
+            }
+            NodeKind::File => {
+                let node = WorkspaceNode {
+                    id: crate::ports::generate_id(),
+                    name,
+                    kind,
+                    parent_id,
+                    updated_at_millis: crate::ports::now_millis(),
+                    created_by: origin.clone(),
+                    updated_by: origin,
+                    mime: None,
+                    size: None,
+                    sha256: None,
+                    adopted: false,
+                };
+                match self
+                    .workspace
+                    .store
+                    .create(&self.workspace.company, &node, content)
+                    .await
+                {
+                    // The id and revision go back with the acknowledgement so an
+                    // immediate follow-up `workspace_write` needs no extra round
+                    // trip through list + read.
+                    Ok(()) => Ok(ToolResult::success(format!(
+                        "Created the workspace note `{path}` (id={id}, rev={rev}, {bytes} bytes). \
+                         To revise it, call `{WORKSPACE_WRITE_TOOL}` with expected_updated_at={rev} \
+                         and the complete new body.",
+                        path = echo_path(&normalized),
+                        id = node.id,
+                        rev = node.updated_at_millis,
+                        bytes = content.map_or(0, str::len),
+                    ))),
+                    // The note create failed after this call may have minted the
+                    // agent's own home; undo an empty home before surfacing the
+                    // store's error, so it is not left for Repair to sweep
+                    // (issue #1801).
+                    Err(e) => {
+                        crate::company::workspace_scaffold::rollback_empty_minted_folders(
+                            self.workspace.store.as_ref(),
+                            &self.workspace.company,
+                            &minted_folders,
+                        )
+                        .await;
+                        Ok(ToolResult::error(format!(
+                            "Could not create `{path}`: {reason}.",
+                            path = echo_path(&normalized),
+                            reason = store_reason(&e),
+                        )))
+                    }
+                }
+            }
         }
     }
 }
@@ -2440,6 +2530,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 
@@ -2455,6 +2546,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 
@@ -4721,7 +4813,44 @@ mod tests {
         assert_eq!(ceo.kind, NodeKind::Folder);
     }
 
-    /// The steered-for case as the brief actually tells an agent to do it:
+    /// A retry whose initial snapshot already contains the agent's home adopts
+    /// that folder instead of rejecting it before the ownership-aware path runs.
+    #[tokio::test]
+    async fn create_inside_existing_own_home_adopts_without_duplication() {
+        let (_dir, store) = seeded("acme").await;
+        let id = CompanyId::new("acme");
+        crate::company::workspace_scaffold::ensure_workspace_scaffold(store.as_ref(), &id)
+            .await
+            .unwrap();
+        let home = crate::company::workspace_scaffold::ensure_agent_folder(
+            store.as_ref(),
+            &id,
+            TEST_AGENT,
+        )
+        .await
+        .unwrap();
+        let tool = WorkspaceCreateTool::new(ws(store.clone(), id.clone()));
+
+        let out = tool
+            .execute(json!({
+                "path": "agents/ceo/Retry note.md",
+                "kind": "file",
+                "content": "# Retry",
+            }))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", text(&out));
+
+        let tree = store.tree(&id).await.unwrap();
+        assert_eq!(
+            tree.iter()
+                .filter(|node| node.parent_id.as_deref() == Some(home.as_str()))
+                .count(),
+            1,
+            "the existing home must not be duplicated"
+        );
+    }
+
     /// straight to the note, with no folder call first.
     ///
     /// Since issue #551 stopped provisioning a folder per roster member, the
@@ -4870,6 +4999,236 @@ mod tests {
             store.tree(&id).await.unwrap().len(),
             before,
             "a refused create made intermediate folders"
+        );
+    }
+
+    /// A store wrapper over a real backend with the two test knobs issue #1801
+    /// needs. `hidden` drops one node from every `tree()` read — the stale
+    /// snapshot a racing create acts on, while the real folder still answers
+    /// `adopt_or_create_folder`. `refuse_note` fails every *file* create — the
+    /// shape a store error or quota refusal takes — while folders still mint,
+    /// so the home is created on the way in and only the note fails.
+    struct ProxyStore {
+        inner: Arc<dyn WorkspaceStore>,
+        hidden: Option<String>,
+        refuse_note: bool,
+    }
+
+    impl ProxyStore {
+        fn hiding(inner: Arc<dyn WorkspaceStore>, hidden: &str) -> Self {
+            Self {
+                inner,
+                hidden: Some(hidden.to_string()),
+                refuse_note: false,
+            }
+        }
+        fn refusing_notes(inner: Arc<dyn WorkspaceStore>) -> Self {
+            Self {
+                inner,
+                hidden: None,
+                refuse_note: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceStore for ProxyStore {
+        async fn tree(&self, company: &CompanyId) -> crate::Result<Vec<WorkspaceNode>> {
+            let mut nodes = self.inner.tree(company).await?;
+            if let Some(hidden) = &self.hidden {
+                nodes.retain(|node| &node.id != hidden);
+            }
+            Ok(nodes)
+        }
+        async fn read(
+            &self,
+            company: &CompanyId,
+            id: &str,
+        ) -> crate::Result<Option<(WorkspaceNode, String)>> {
+            self.inner.read(company, id).await
+        }
+        async fn write(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            content: &str,
+            author: WorkspaceOrigin,
+        ) -> crate::Result<WorkspaceNode> {
+            self.inner.write(company, id, content, author).await
+        }
+        async fn create(
+            &self,
+            company: &CompanyId,
+            node: &WorkspaceNode,
+            content: Option<&str>,
+        ) -> crate::Result<()> {
+            if self.refuse_note && node.kind == NodeKind::File {
+                return Err(crate::error::OpenCompanyError::InvalidRequest(
+                    "over quota".to_string(),
+                ));
+            }
+            self.inner.create(company, node, content).await
+        }
+        async fn adopt_or_create_folder(
+            &self,
+            company: &CompanyId,
+            parent: Option<&str>,
+            name: &str,
+            origin: WorkspaceOrigin,
+        ) -> crate::Result<crate::ports::workspace::FolderClaim> {
+            self.inner
+                .adopt_or_create_folder(company, parent, name, origin)
+                .await
+        }
+        async fn create_binary(
+            &self,
+            company: &CompanyId,
+            node: &WorkspaceNode,
+            bytes: &[u8],
+        ) -> crate::Result<WorkspaceNode> {
+            self.inner.create_binary(company, node, bytes).await
+        }
+        async fn write_binary(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            bytes: &[u8],
+            mime: Option<&str>,
+            author: WorkspaceOrigin,
+        ) -> crate::Result<WorkspaceNode> {
+            self.inner
+                .write_binary(company, id, bytes, mime, author)
+                .await
+        }
+        async fn read_bytes(
+            &self,
+            company: &CompanyId,
+            id: &str,
+        ) -> crate::Result<Option<(WorkspaceNode, crate::ports::workspace::BlobStream)>> {
+            self.inner.read_bytes(company, id).await
+        }
+        async fn rename_move(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            name: Option<&str>,
+            parent: Option<Option<&str>>,
+        ) -> crate::Result<WorkspaceNode> {
+            self.inner.rename_move(company, id, name, parent).await
+        }
+        async fn swap_files(
+            &self,
+            company: &CompanyId,
+            expected_id: Option<&str>,
+            replacement_id: &str,
+            name: &str,
+        ) -> crate::Result<Option<WorkspaceNode>> {
+            self.inner
+                .swap_files(company, expected_id, replacement_id, name)
+                .await
+        }
+        async fn delete(&self, company: &CompanyId, id: &str) -> crate::Result<bool> {
+            self.inner.delete(company, id).await
+        }
+        async fn is_empty(&self, company: &CompanyId) -> crate::Result<bool> {
+            self.inner.is_empty(company).await
+        }
+    }
+
+    /// Issue #1801, Fix B: a folder create that slips past the up-front
+    /// duplicate check because the folder appeared *after* the snapshot was
+    /// read — the stale-snapshot race — adopts the folder already there rather
+    /// than minting a rival sibling under one name. Routing the create through
+    /// the store's atomic adopt-or-create is what closes the window the
+    /// tool-level pre-check cannot.
+    #[tokio::test]
+    async fn create_folder_adopts_a_racing_twin_instead_of_duplicating() {
+        let (_dir, ops) = seeded("acme").await;
+        let id = CompanyId::new("acme");
+        crate::company::workspace_scaffold::ensure_workspace_scaffold(ops.as_ref(), &id)
+            .await
+            .unwrap();
+        let home =
+            crate::company::workspace_scaffold::ensure_agent_folder(ops.as_ref(), &id, TEST_AGENT)
+                .await
+                .unwrap();
+        // The twin a racing publisher already committed to the store — present
+        // for real, but hidden from the snapshot this call will read.
+        let plans = ops
+            .adopt_or_create_folder(&id, Some(&home), "plans", agent_origin())
+            .await
+            .unwrap()
+            .into_node()
+            .id;
+
+        let stale: Arc<dyn WorkspaceStore> = Arc::new(ProxyStore::hiding(ops.clone(), &plans));
+        let tool = WorkspaceCreateTool::new(ws(stale, id.clone()));
+        let out = tool
+            .execute(json!({ "path": "agents/ceo/plans", "kind": "folder" }))
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "{}", text(&out));
+        assert!(
+            text(&out).contains("already exists"),
+            "an adopted folder must not be reported as freshly created: {}",
+            text(&out)
+        );
+
+        let siblings = ops
+            .tree(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.name == "plans" && n.parent_id.as_deref() == Some(home.as_str()))
+            .count();
+        assert_eq!(
+            siblings, 1,
+            "the race must adopt the existing folder, never duplicate it"
+        );
+    }
+
+    /// Issue #1801, Fix A: a note create that fails after this call minted the
+    /// agent's own home must not leave an empty `agents/<id>/` behind. The
+    /// `ProxyStore` mints the home for real, then refuses the note, and the
+    /// rollback sweeps the home it just made rather than stranding it for the
+    /// Repair button.
+    #[tokio::test]
+    async fn a_failed_note_create_does_not_orphan_the_minted_home() {
+        let (_dir, ops) = seeded("acme").await;
+        let id = CompanyId::new("acme");
+        crate::company::workspace_scaffold::ensure_workspace_scaffold(ops.as_ref(), &id)
+            .await
+            .unwrap();
+
+        let refusing: Arc<dyn WorkspaceStore> = Arc::new(ProxyStore::refusing_notes(ops.clone()));
+        let tool = WorkspaceCreateTool::new(ws(refusing, id.clone()));
+        let out = tool
+            .execute(json!({
+                "path": "agents/ceo/brief.md",
+                "kind": "file",
+                "content": "# Brief",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            out.is_error,
+            "the refused note create must surface an error: {}",
+            text(&out)
+        );
+
+        let tree = ops.tree(&id).await.unwrap();
+        assert!(
+            !tree
+                .iter()
+                .any(|n| n.name == TEST_AGENT && n.kind == NodeKind::Folder),
+            "the empty home minted for the refused note was orphaned: {tree:?}"
+        );
+        assert!(
+            tree.iter()
+                .any(|n| n.name == AGENTS_ROOT && n.parent_id.is_none()),
+            "the scaffolded root must survive: {tree:?}"
         );
     }
 
@@ -5155,6 +5514,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         };
         store
             .create(&id, &node, Some("maya's draft"))
@@ -5231,6 +5591,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         };
         store.create(&id, &node, Some("a note")).await.unwrap();
 

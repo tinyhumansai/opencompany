@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::company::WorkflowFile;
-use crate::ports::types::{CompanyId, WorkflowNodeStatus};
+use crate::ports::types::{CompanyId, StartedBy, WorkflowNodeStatus};
 
 /// The outcome of running one workflow to completion.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +312,52 @@ pub struct WorkflowRunApprovalRow {
     pub approval_id: Option<String>,
 }
 
+/// How many of `pending_approvals`' **nodes** have no live-parked call left
+/// among `approvals` (issue #1865 Codex review).
+///
+/// This is the synchronous-response twin of
+/// [`workflow_verdict::stranded_approvals`](crate::ports::workflow_verdict::stranded_approvals):
+/// that one reconciles against the live approvals queue and is deliberately
+/// not run on the hot settle path (a guaranteed-zero JOIN microseconds after
+/// the park), so this one answers the same per-*node* question — "does this
+/// node have a live card left?" — from the structural receipts a run already
+/// carries in [`WorkflowRun::approvals`].
+///
+/// `pending_approvals` and `approvals` are counted in different units —
+/// one entry per **node** against one entry per **gated call** — so `count()`
+/// over `approvals.filter(unparkable)` is not this number: a node with one
+/// parked call and one failed park is not stranded (an operator can still act
+/// on it), and a node with two failed parks and zero parked ones is, but a
+/// call-level count cannot tell the two apart. Grouping by node first is what
+/// keeps this **never greater than `pending_approvals.len()`**, matching
+/// [`RunVerdictFacts::stranded_approvals`](crate::ports::workflow_verdict::RunVerdictFacts::stranded_approvals)'s
+/// own invariant.
+///
+/// **Absence of a receipt is not a failed park** (PR #1883 Codex review). A
+/// `requires_approval` gate `park_pending_gates` parks is never given an
+/// `approvals` row at all — that receipt shape is `park_gated_calls`'s alone,
+/// for a call gated inside an agent turn (see the module docs on
+/// [`WorkflowRunApprovalRow`] and `workflow_verdict`'s two-shapes note). A
+/// node in `pending_approvals` with zero rows here is therefore that ordinary
+/// gate shape, structurally silent by design, not a park that failed — so it
+/// must NOT count as stranded. Only a node that has at least one row, and
+/// none of them `Parked`, is one this function can actually see fail.
+pub fn stranded_approvals(
+    pending_approvals: &[String],
+    approvals: &[WorkflowRunApprovalRow],
+) -> usize {
+    pending_approvals
+        .iter()
+        .filter(|node_id| {
+            let mut rows = approvals
+                .iter()
+                .filter(|a| a.node_id.as_deref() == Some(node_id.as_str()))
+                .peekable();
+            rows.peek().is_some() && rows.all(|a| a.outcome != WorkflowApprovalOutcome::Parked)
+        })
+        .count()
+}
+
 /// One node's structural outcome inside a run (issue #542).
 ///
 /// The port-side twin of the HTTP layer's `WorkflowRunNode` and of a
@@ -563,6 +609,15 @@ pub enum DeliveryReason {
     /// The channel adapter refused the message. As with mail, the adapter's own
     /// reason stays in `detail`.
     ChannelRefused,
+    /// The operator feed's collision fallback
+    /// ([`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK))
+    /// is itself shadowed by a second grandfathered desk name, so there is no
+    /// address left to journal this report to that would not land it in that
+    /// desk's own transcript — see
+    /// [`CompanyRecord::operator_feed_channel_fallback_shadowed`](crate::ports::types::CompanyRecord::operator_feed_channel_fallback_shadowed)
+    /// (issue #1781 review). Refused rather than delivered, unlike the primary
+    /// collision.
+    ChannelCollisionShadowed,
     /// The destination kind is not one this runtime knows how to deliver to
     /// (unreachable through `parse_workflow`, which rejects unknown kinds).
     UnknownDestinationKind,
@@ -637,6 +692,10 @@ impl std::fmt::Display for DeliveryReason {
             Self::ChannelPosted => "posted to the channel",
             Self::ChannelNotWired => "the destination channel is not wired on this runtime",
             Self::ChannelRefused => "the channel refused the message",
+            Self::ChannelCollisionShadowed => {
+                "the operator feed's collision-fallback address is itself shadowed by another \
+                 desk's name, so the report was refused rather than journaled to that desk"
+            }
             Self::UnknownDestinationKind => {
                 "the destination kind is not one this runtime can deliver to"
             }
@@ -759,6 +818,25 @@ pub struct WorkflowRunContext {
     /// point (cron, resume) leaves it off — a scheduled or resumed run is always
     /// for real.
     pub dry_run: bool,
+    /// Who or what started this run (issue #1862 prerequisite). Rides the
+    /// run's [`WorkflowRunStarted`](crate::ports::types::CompanyEvent) event so
+    /// a parked blocker later has a fact — not a guess — to attribute its DM
+    /// to.
+    ///
+    /// [`new`](Self::new) derives it from `scheduled` via
+    /// [`StartedBy::from_scheduled`], which is deliberately the coarse
+    /// default: every current call through `new`/`begin` names a run
+    /// `scheduled: false` unless the cron fired it, even the ones an agent
+    /// triggered rather than an operator
+    /// ([`run_workflow`](crate::harness::built_in::orchestrator), which calls
+    /// [`RunSupervisor::begin`](crate::runtime::RunSupervisor::begin) with
+    /// `scheduled: false` and so reads back as [`StartedBy::Operator`] here).
+    /// A caller that knows the real triggering agent should use
+    /// [`with_started_by`](Self::with_started_by) to override the default —
+    /// wiring that override into `run_workflow` itself is left to a follow-up
+    /// (issue #1861) precisely so this prerequisite slice does not have to
+    /// touch that call site.
+    pub started_by: StartedBy,
 }
 
 /// A one-way stop signal for one workflow run (issue #383).
@@ -863,7 +941,12 @@ impl RunCancel {
 /// [`RunCancel`] is a shared handle whose value changes under both sides, so
 /// including it would make two clones of one context compare unequal the moment
 /// one of them was cancelled. The id and the scheduled flag are what callers
-/// (and tests) actually mean by "the same run context".
+/// (and tests) actually mean by "the same run context". `started_by` (issue
+/// #1862 prerequisite) is deliberately left out of this comparison too, for
+/// the same reason: it is derived attribution riding alongside the identity,
+/// not part of it — two contexts for the same run id stay "the same context"
+/// to every existing caller of this `==` regardless of who is credited with
+/// starting it.
 impl PartialEq for WorkflowRunContext {
     fn eq(&self, other: &Self) -> bool {
         self.run_id == other.run_id && self.scheduled == other.scheduled
@@ -892,7 +975,21 @@ impl WorkflowRunContext {
             // flips it after the fact — which is exactly what `WorkflowSpawn`
             // does with the dry flag the run route hands it (issue #542).
             dry_run: false,
+            // Issue #1862 prerequisite: the coarse default, derived from
+            // `scheduled` alone. See the field doc for why callers that know
+            // the real triggering agent should override it with
+            // `with_started_by` instead of trusting this.
+            started_by: StartedBy::from_scheduled(scheduled),
         }
+    }
+
+    /// Overrides the [`started_by`](Self::started_by) this context was built
+    /// with (issue #1862 prerequisite) — for a caller that knows the real
+    /// triggering agent and wants the journal to say so, rather than settling
+    /// for [`new`](Self::new)'s `scheduled`-derived default.
+    pub fn with_started_by(mut self, started_by: StartedBy) -> Self {
+        self.started_by = started_by;
+        self
     }
 }
 
@@ -913,4 +1010,136 @@ pub trait WorkflowRunner: Send + Sync {
         input: Value,
         ctx: &WorkflowRunContext,
     ) -> Result<WorkflowRun>;
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn row(node: &str, outcome: WorkflowApprovalOutcome) -> WorkflowRunApprovalRow {
+        WorkflowRunApprovalRow {
+            node_id: Some(node.to_string()),
+            tool: Some("send_email".to_string()),
+            outcome,
+            approval_id: matches!(outcome, WorkflowApprovalOutcome::Parked)
+                .then(|| "appr-1".to_string()),
+        }
+    }
+
+    /// Codex review (#1865): a node with one live parked call and one failed
+    /// park is not stranded — an operator can still act on it — even though a
+    /// call-level count of unparkable rows would equal `pending_approvals.len()`
+    /// (1 node, 1 unparkable call) and wrongly report it as fully stranded.
+    #[test]
+    fn a_node_with_one_live_card_is_not_stranded_even_with_one_failed_park() {
+        let pending = vec!["gate".to_string()];
+        let approvals = vec![
+            row("gate", WorkflowApprovalOutcome::Parked),
+            row("gate", WorkflowApprovalOutcome::ParkFailed),
+        ];
+        assert_eq!(stranded_approvals(&pending, &approvals), 0);
+    }
+
+    /// The complementary case: a node whose every gated call failed to park
+    /// has no live card left, so it counts once — not twice, even though it
+    /// made two unparkable rows.
+    #[test]
+    fn a_node_with_every_call_unparkable_counts_once() {
+        let pending = vec!["gate".to_string()];
+        let approvals = vec![
+            row("gate", WorkflowApprovalOutcome::ParkFailed),
+            row("gate", WorkflowApprovalOutcome::Discarded),
+        ];
+        assert_eq!(stranded_approvals(&pending, &approvals), 1);
+    }
+
+    /// Never greater than `pending_approvals.len()` — the invariant
+    /// `RunVerdictFacts::stranded_approvals` documents. Two nodes, one fully
+    /// stranded and one with a live card, must read `1`, not `2` even though
+    /// three of the four rows are unparkable.
+    #[test]
+    fn mixed_nodes_stay_within_pending_approvals_count() {
+        let pending = vec!["gate-a".to_string(), "gate-b".to_string()];
+        let approvals = vec![
+            row("gate-a", WorkflowApprovalOutcome::Parked),
+            row("gate-a", WorkflowApprovalOutcome::ParkFailed),
+            row("gate-b", WorkflowApprovalOutcome::ParkFailed),
+            row("gate-b", WorkflowApprovalOutcome::Discarded),
+        ];
+        assert_eq!(stranded_approvals(&pending, &approvals), 1);
+    }
+
+    /// PR #1883 Codex review: a `requires_approval` gate `park_pending_gates`
+    /// parks — the ordinary authored/policy-raised gate shape, not a call
+    /// gated inside an agent turn — never gets an `approvals` row at all
+    /// (`park_pending_gates` writes straight to the approvals queue and
+    /// `WorkflowRun::approvals`, and never touches it). Before the fix this
+    /// read as `!approvals.iter().any(node_id && Parked)` — vacuously true
+    /// for a node with zero rows — so every ordinary gate reported stranded
+    /// on a run that never made a single failed park. A card is live and
+    /// waiting; `pending` alone, with no matching row, must count zero.
+    #[test]
+    fn a_node_with_no_approval_rows_at_all_is_not_stranded() {
+        let pending = vec!["gate".to_string()];
+        let approvals: Vec<WorkflowRunApprovalRow> = Vec::new();
+        assert_eq!(stranded_approvals(&pending, &approvals), 0);
+    }
+
+    /// The same shape, mixed with a genuinely gated-and-unparkable node: the
+    /// receipt-less gate must still not count, while the node with real
+    /// failed-park rows does.
+    #[test]
+    fn a_receiptless_gate_beside_a_genuinely_stranded_node_counts_only_the_latter() {
+        let pending = vec!["gate".to_string(), "agent-node".to_string()];
+        let approvals = vec![row("agent-node", WorkflowApprovalOutcome::ParkFailed)];
+        assert_eq!(stranded_approvals(&pending, &approvals), 1);
+    }
+
+    /// A manual `new(false)` reads back [`StartedBy::Operator`] — the coarse
+    /// default every call through `new`/`begin` gets unless overridden (issue
+    /// #1862 prerequisite).
+    #[test]
+    fn new_with_scheduled_false_defaults_started_by_to_operator() {
+        let ctx = WorkflowRunContext::new(false);
+        assert_eq!(ctx.started_by, StartedBy::Operator);
+        assert!(!ctx.scheduled);
+    }
+
+    /// A cron-started `new(true)` reads back [`StartedBy::Schedule`] —
+    /// unambiguous, since only the scheduler ever sets `scheduled: true`.
+    #[test]
+    fn new_with_scheduled_true_defaults_started_by_to_schedule() {
+        let ctx = WorkflowRunContext::new(true);
+        assert_eq!(ctx.started_by, StartedBy::Schedule);
+        assert!(ctx.scheduled);
+    }
+
+    /// [`WorkflowRunContext::with_started_by`] overrides the `scheduled`-derived
+    /// default — the lever a caller that knows the real triggering agent uses
+    /// instead of settling for `new`'s coarse reading.
+    #[test]
+    fn with_started_by_overrides_the_default() {
+        let ctx =
+            WorkflowRunContext::new(false).with_started_by(StartedBy::Agent("ceo".to_string()));
+        assert_eq!(ctx.started_by, StartedBy::Agent("ceo".to_string()));
+        // Overriding the sender does not retroactively flip `scheduled` — the
+        // two are independent facts about the run.
+        assert!(!ctx.scheduled);
+    }
+
+    /// `started_by` does not participate in [`WorkflowRunContext`] equality
+    /// (see the `impl PartialEq` doc) — two contexts sharing a run id and
+    /// `scheduled` flag are "the same context" regardless of who is credited
+    /// with starting it.
+    #[test]
+    fn started_by_is_excluded_from_equality() {
+        let a = WorkflowRunContext::new(false).with_started_by(StartedBy::Operator);
+        let mut b =
+            WorkflowRunContext::new(false).with_started_by(StartedBy::Agent("ceo".to_string()));
+        b.run_id = a.run_id.clone();
+        assert_eq!(
+            a, b,
+            "differing started_by must not break the identity comparison"
+        );
+    }
 }

@@ -52,7 +52,8 @@ async function openHistory(page: Page) {
   } catch {
     test.skip(true, "this host does not serve …/workflows/runs");
   }
-  await toggle.click();
+  // Issue #1683: the toggle no longer needs a click to open the rail — index
+  // select already did, so clicking it here would close it instead.
   const panel = page.getByTestId("workflow-run-history");
   await expect(panel).toBeVisible();
   return panel;

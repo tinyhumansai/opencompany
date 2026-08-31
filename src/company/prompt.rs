@@ -217,7 +217,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,

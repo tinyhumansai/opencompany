@@ -27,6 +27,7 @@ import {
 } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
 import { ApiError } from "@/api/types";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -55,6 +56,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { personName } from "@/lib/person";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 
@@ -170,25 +172,63 @@ export function PeopleView({ client, company }: Props) {
     }
   }
 
+  /*
+    One header for all three states, hoisted above the loading return (codex
+    review, #1785): the skeleton used to run first, so a fresh
+    `#/settings/people` exposed nothing but anonymous skeletons to a screen
+    reader — no page name at all.
+
+    Every prop keys off `isAdmin`, which is derived from `me` and is false
+    until that read lands — so the header is driven by *what is known*, not by
+    `loading`. `Invite` therefore appears the moment the role is known, which
+    may be while the member list is still arriving (the two reads are one
+    `Promise.all`, but `me` can settle first): offering it then is correct, and
+    it is never offered before the role is known, which is the part that
+    matters.
+
+    The width is the one thing `loading` does decide. It stays `4xl` while the
+    skeletons show so the common path — an admin who came here to manage
+    access — has no reflow when the rows arrive; a non-admin sees the column
+    narrow once, at the same moment the content replaces the skeletons.
+  */
+  const header = (
+    <PageHeader
+      title="People"
+      width={loading || isAdmin ? "4xl" : "3xl"}
+      description={
+        isAdmin
+          ? "The humans who can sign in. Access is invite-only."
+          : "The humans who can sign in to this company."
+      }
+      actions={
+        isAdmin ? (
+          <Button size="sm" variant="outline" onClick={() => setInviteOpen(true)}>
+            <UserPlus className="mr-1.5 size-4" />
+            Invite
+          </Button>
+        ) : null
+      }
+    />
+  );
+
   if (loading) {
     return (
-      <div className="space-y-3 px-4 py-6">
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-24 w-full" />
-        <Skeleton className="h-24 w-full" />
+      <div className="flex min-h-0 flex-1 flex-col">
+        {header}
+        <div className="mx-auto w-full max-w-4xl space-y-3 px-4 py-6">
+          <Skeleton className="h-8 w-48" />
+          <Skeleton className="h-24 w-full" />
+          <Skeleton className="h-24 w-full" />
+        </div>
       </div>
     );
   }
 
   if (!isAdmin) {
     return (
-      <div className="mx-auto w-full max-w-3xl px-4 py-6">
-        <div className="mb-6 space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">People</h1>
-          <p className="text-sm text-muted-foreground">
-            The humans who can sign in to this company.
-          </p>
-        </div>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {header}
+        <div className="mx-auto min-h-0 w-full max-w-3xl flex-1 overflow-y-auto px-4 py-6">
         <Alert>
           <ShieldCheck className="size-4" />
           <AlertDescription>
@@ -196,24 +236,15 @@ export function PeopleView({ client, company }: Props) {
             change access.
           </AlertDescription>
         </Alert>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-6 px-4 py-6">
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">People</h1>
-          <p className="text-sm text-muted-foreground">
-            The humans who can sign in. Access is invite-only.
-          </p>
-        </div>
-        <Button size="sm" variant="outline" onClick={() => setInviteOpen(true)}>
-          <UserPlus className="mr-1.5 size-4" />
-          Invite
-        </Button>
-      </div>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {header}
+      <div className="mx-auto min-h-0 w-full max-w-4xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
 
       {error ? (
         <Alert variant="destructive">
@@ -295,6 +326,7 @@ export function PeopleView({ client, company }: Props) {
           </CardContent>
         </Card>
       </section>
+      </div>
 
       <InviteDialog
         open={inviteOpen}
@@ -342,9 +374,11 @@ function PersonRow({
     <div className="flex items-center gap-3 p-4">
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium">
-            {person.displayName ?? person.email}
-          </span>
+          {/* The name they chose, else the one derived from their address —
+              the same one every other surface calls them by. The address itself
+              is on the line below, where an admin needs it and it is not
+              standing in for a name. */}
+          <span className="truncate text-sm font-medium">{personName(person)}</span>
           {person.role === "admin" ? <Badge variant="secondary">Admin</Badge> : null}
           {suspended ? <Badge variant="destructive">Suspended</Badge> : null}
           {person.mustChangePassword ? (
@@ -353,7 +387,7 @@ function PersonRow({
           {isSelf ? <span className="text-xs text-muted-foreground">you</span> : null}
         </div>
         <p className="truncate text-xs text-muted-foreground">
-          {person.displayName ? `${person.email} · ` : ""}
+          {`${person.email} · `}
           {person.hasPassword ? "password set" : "magic link only"}
           {/* "signed in", not "seen": this is stamped when a session is minted,
               not on every request. Saying "last seen" would imply activity

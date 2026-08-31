@@ -329,6 +329,16 @@ export interface Task {
    * {@link rejectWorkflowProposal}.
    */
   workflowProposal?: TaskWorkflowProposal;
+  /**
+   * Why a failed or cancelled run returned this card to `todo` (issue #1865).
+   *
+   * Absent for every card that has never bounced — a fresh card, one dragged
+   * to `todo` by an operator, or one re-dispatched since its last bounce
+   * (cleared on the `todo` → `in_progress` transition, so a retry does not go
+   * on advertising the reason its last attempt failed). This is the one field
+   * that tells a bounced card apart from a fresh one without opening it.
+   */
+  bounced?: string;
 }
 
 /** The create body; the host defaults column→`pending`, priority→`medium`. */
@@ -877,7 +887,41 @@ export interface InflightRun {
   pendingAction: string | null;
 }
 
-/** The steer body. `redirect` requires `instruction`; `cancel` requires `confirm`. */
+/**
+ * The live board state Chat needs for a card-linked background turn (#1758).
+ *
+ * `column` is the task's stage when the current three-column API provides one,
+ * otherwise its column. `startedAt` is present only while the task appears in
+ * the in-flight read, so it supplies the elapsed clock and wins a brief race
+ * where the board has already moved but the run has not disappeared yet.
+ */
+export interface TaskStatus {
+  column: string;
+  startedAt?: number;
+}
+
+/** Task id -> status, merged from the board and in-flight reads (#1758). */
+export function taskStatusesById(
+  tasks: readonly Task[],
+  inflight: readonly InflightRun[],
+): Record<string, TaskStatus> {
+  const statuses: Record<string, TaskStatus> = {};
+
+  for (const task of tasks) {
+    statuses[task.id] = { column: task.stage ?? task.column };
+  }
+
+  for (const run of inflight) {
+    if (!run.taskId) continue;
+    statuses[run.taskId] = {
+      column: statuses[run.taskId]?.column ?? "in_progress",
+      startedAt: run.startedAt,
+    };
+  }
+
+  return statuses;
+}
+
 export interface SteerInput {
   action: SteerAction;
   instruction?: string;

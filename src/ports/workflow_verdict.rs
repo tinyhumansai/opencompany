@@ -180,6 +180,25 @@ pub enum WorkflowRunVerdict {
     /// Something about this run is waiting on a person: a gate it paused at, or
     /// a report parked in Approvals (issue #846).
     AwaitingApproval,
+    /// The run settled with no failure, no stop, no stranding, no block, no
+    /// dropped report and nobody left to answer — but at least one node under
+    /// `on_error: continue|route` errored and the graph kept going past it
+    /// (issue #1865).
+    ///
+    /// Amber, not red: the run is not [`Failed`](Self::Failed) — the author
+    /// asked for the branch to survive the error, and it did, so calling the
+    /// whole run a failure would override a choice the graph's own config
+    /// made. But it is not [`Ok`](Self::Ok) either — `WorkflowRunVerdict::of`
+    /// never read `nodes[].status` before this, so a run with an errored node
+    /// scored clean on every surface but the canvas overlay, which is the
+    /// silent half of issue #1865.
+    ///
+    /// Ranked **last**, immediately above `Ok` — every other non-`Ok` verdict
+    /// describes something more actionable than "a soft node error happened
+    /// inside an otherwise-settled run", and none of them may be hidden behind
+    /// this one. A run that is also `Failed`, `Stopped`, `Stranded`, `Blocked`,
+    /// `Undelivered` or `AwaitingApproval` reports that instead.
+    Degraded,
     /// Finished, delivered what it routed, and is waiting on nobody.
     Ok,
 }
@@ -199,6 +218,7 @@ impl WorkflowRunVerdict {
             Self::Blocked => "blocked",
             Self::Undelivered => "undelivered",
             Self::AwaitingApproval => "awaiting-approval",
+            Self::Degraded => "degraded",
             Self::Ok => "ok",
         }
     }
@@ -231,6 +251,12 @@ impl WorkflowRunVerdict {
     ///   alone (issue #846): a run that paused at a `requires_approval` node
     ///   never reached an `output` node, so a delivery-only read scored the
     ///   gated case — the common one — as clean.
+    /// * `degraded` **last**, immediately before `Ok` (issue #1865) — a node
+    ///   under `on_error: continue|route` errored and the run kept going past
+    ///   it. Checked after everything above so a run that is ALSO failed,
+    ///   stopped, stranded, blocked, undelivered or awaiting approval reports
+    ///   that instead: a soft node error must never hide a hard failure or a
+    ///   decidable gate.
     pub fn of(facts: RunVerdictFacts<'_>) -> Self {
         if facts.running {
             return Self::Running;
@@ -252,6 +278,9 @@ impl WorkflowRunVerdict {
         }
         if awaiting_count(facts.deliveries, facts.pending_approvals) > 0 {
             return Self::AwaitingApproval;
+        }
+        if facts.errored_nodes > 0 {
+            return Self::Degraded;
         }
         Self::Ok
     }
@@ -290,6 +319,20 @@ pub struct RunVerdictFacts<'a> {
     /// it is a filter over the same list. Zero for every caller that cannot
     /// reconcile against the queue, which is the pre-#1189 reading.
     pub stranded_approvals: usize,
+    /// How many of this run's nodes settled `Error` (issue #1865) — genuine
+    /// engine errors only, read **after** [`reclassify_blocked`] (or the
+    /// read-side `relabel_blocked` twin) has flipped a blocked node's row to
+    /// [`Blocked`](crate::ports::types::WorkflowNodeStatus::Blocked), so a node
+    /// waiting on a person is never counted as one that broke.
+    ///
+    /// [`reclassify_blocked`]: crate::workflows::runner
+    ///
+    /// Feeds [`Degraded`](WorkflowRunVerdict::Degraded) only, and only when
+    /// checked last: a run under `on_error: continue|route` that also failed,
+    /// stopped, stranded, blocked, dropped a report or is still awaiting an
+    /// answer reports that instead — this count never overrides a more
+    /// specific fact.
+    pub errored_nodes: usize,
 }
 
 impl RunVerdictFacts<'_> {
@@ -497,6 +540,7 @@ mod test {
             deliveries: &[],
             pending_approvals: 0,
             stranded_approvals: 0,
+            errored_nodes: 0,
         }
     }
 
@@ -580,6 +624,9 @@ mod test {
             // Issue #1189: the one gate this run stopped for has no card left,
             // so the facts satisfy `stranded` too.
             stranded_approvals: 1,
+            // Issue #1865: also satisfies `degraded`, so this fact set proves
+            // every arm outranks it too.
+            errored_nodes: 1,
         };
         assert_eq!(
             WorkflowRunVerdict::of(everything),
@@ -645,6 +692,38 @@ mod test {
             }),
             WorkflowRunVerdict::AwaitingApproval
         );
+        // Issue #1865: with every fact above cleared and only the errored node
+        // left, the run reads `degraded` — not `ok`, and not `failed`.
+        assert_eq!(
+            WorkflowRunVerdict::of(RunVerdictFacts {
+                running: false,
+                error: None,
+                cancelled: false,
+                stranded_approvals: 0,
+                blocked_nodes: 0,
+                deliveries: &[],
+                pending_approvals: 0,
+                ..everything
+            }),
+            WorkflowRunVerdict::Degraded
+        );
+        // …and clearing the errored-node count too is the only way back to
+        // `ok`, which is the base case this whole ladder falls through to.
+        // Every field of `everything` is overridden here, so this is written
+        // out in full rather than spread — the base case earns no shortcut.
+        assert_eq!(
+            WorkflowRunVerdict::of(RunVerdictFacts {
+                running: false,
+                error: None,
+                cancelled: false,
+                stranded_approvals: 0,
+                blocked_nodes: 0,
+                deliveries: &[],
+                pending_approvals: 0,
+                errored_nodes: 0,
+            }),
+            WorkflowRunVerdict::Ok
+        );
     }
 
     /// A parked report is waiting on a person, not on a fix — so it must never
@@ -705,6 +784,7 @@ mod test {
             (WorkflowRunVerdict::Blocked, "blocked"),
             (WorkflowRunVerdict::Undelivered, "undelivered"),
             (WorkflowRunVerdict::AwaitingApproval, "awaiting-approval"),
+            (WorkflowRunVerdict::Degraded, "degraded"),
             (WorkflowRunVerdict::Ok, "ok"),
         ] {
             assert_eq!(
@@ -993,6 +1073,71 @@ mod test {
         assert_eq!(
             stranded_approvals(None, &nodes(&["fetch_bbc"]), &[], &live),
             0
+        );
+    }
+
+    // ── Issue #1865: a run whose node errored under `on_error: continue|route` ──
+
+    /// The defect this issue filed: a node under `on_error: continue|route`
+    /// errors, the graph keeps going, and the run reaches the end with no
+    /// error, no cancel, nothing blocked, nothing undelivered and nobody
+    /// awaited — which fell all the way through to `ok` before this arm
+    /// existed.
+    #[test]
+    fn a_run_with_an_errored_continue_node_is_degraded_not_ok() {
+        let verdict = WorkflowRunVerdict::of(RunVerdictFacts {
+            errored_nodes: 1,
+            ..clean()
+        });
+        assert_eq!(verdict, WorkflowRunVerdict::Degraded);
+        assert_ne!(verdict, WorkflowRunVerdict::Ok);
+        assert_ne!(
+            verdict,
+            WorkflowRunVerdict::Failed,
+            "the author asked for the branch to survive the error"
+        );
+    }
+
+    /// A run with no errored node is unaffected — the new arm changes nothing
+    /// for the common case.
+    #[test]
+    fn a_clean_run_with_no_errored_nodes_is_still_ok() {
+        assert_eq!(
+            WorkflowRunVerdict::of(RunVerdictFacts {
+                errored_nodes: 0,
+                ..clean()
+            }),
+            WorkflowRunVerdict::Ok
+        );
+    }
+
+    /// `degraded` is checked LAST — a run that is also genuinely `failed`
+    /// (an error the host actually recorded, distinct from a per-node
+    /// `on_error: continue` error) reports the failure, not the softer
+    /// reading.
+    #[test]
+    fn an_errored_node_never_hides_a_real_failure() {
+        assert_eq!(
+            WorkflowRunVerdict::of(RunVerdictFacts {
+                error: Some("node `draft` errored"),
+                errored_nodes: 1,
+                ..clean()
+            }),
+            WorkflowRunVerdict::Failed
+        );
+    }
+
+    /// Nor does it hide a decidable gate — a run that is both degraded and
+    /// still awaiting an answer reports the thing an operator can act on.
+    #[test]
+    fn an_errored_node_never_hides_awaiting_approval() {
+        assert_eq!(
+            WorkflowRunVerdict::of(RunVerdictFacts {
+                pending_approvals: 1,
+                errored_nodes: 1,
+                ..clean()
+            }),
+            WorkflowRunVerdict::AwaitingApproval
         );
     }
 

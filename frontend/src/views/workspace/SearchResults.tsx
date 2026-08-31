@@ -23,6 +23,7 @@ import {
 } from "@/api/workspace";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { type RosterNames } from "@/lib/roster-names";
 import { cn } from "@/lib/utils";
 import {
   DERIVED_LABEL,
@@ -43,6 +44,12 @@ interface Props {
   loading: boolean;
   error: string | null;
   onOpen: (hit: SearchHit) => void;
+  /**
+   * The roster read, so an agent origin on a hit reads as the teammate's name
+   * rather than the raw handle (issue #1723) — the same resolution the tree
+   * beside it does.
+   */
+  rosterNames: RosterNames;
 }
 
 /**
@@ -97,6 +104,7 @@ export function SearchResults({
   loading,
   error,
   onOpen,
+  rosterNames,
 }: Props) {
   if (error) {
     return (
@@ -173,7 +181,7 @@ export function SearchResults({
           // a `Seeded` note under `secrets/` really was seeded (the host lays
           // down one README there on first boot), so both badges are true and
           // say different things (issue #1465).
-          const origin = derived ? null : originLabel(hit.updatedBy);
+          const origin = derived ? null : originLabel(hit.updatedBy, rosterNames);
           return (
             <li key={hit.id}>
               <button

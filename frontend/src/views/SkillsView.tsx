@@ -13,6 +13,7 @@ import {
   type Skill,
 } from "@/api/skills";
 import type { OpenCompanyClient } from "@/api/client";
+import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -176,20 +177,24 @@ export function SkillsView({ client, company }: Props) {
   }, [query, registry]);
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-5xl space-y-5 px-4 py-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="space-y-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Skills</h1>
-            <p className="text-sm text-muted-foreground">
-              Playbooks your teammates read. Enable, install from the registry, or add your own.
-            </p>
-          </div>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <PageHeader
+        title="Skills"
+        width="5xl"
+        description={
+          <>
+            Playbooks your teammates read. Enable, install from the registry, or add your own.
+          </>
+        }
+        actions={
+          <>
           <Button onClick={() => setAddOpen(true)}>
             <Plus className="size-4" /> Add skill
           </Button>
-        </div>
-
+          </>
+        }
+      />
+      <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-5 overflow-y-auto px-4 py-6">
         {/* Issue #569: what install / enable actually buy. A desk agent can list,
             describe and read a skill and can never run one — deliberate, and
             pinned by `dispatched_belt_excludes_every_deferred_family` — but this
@@ -304,7 +309,7 @@ function InstalledCard({
 }) {
   return (
     <Card data-testid="installed-card" className={cn(!skill.enabled && "opacity-70")}>
-      <CardContent className="space-y-2 py-4">
+      <CardContent className="space-y-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2">
             <Sparkles className="size-4 text-muted-foreground" />
@@ -353,7 +358,7 @@ function RegistryCard({
 }) {
   return (
     <Card data-testid="registry-card">
-      <CardContent className="space-y-2 py-4">
+      <CardContent className="space-y-2">
         <div className="flex items-center gap-2">
           <Sparkles className="size-4 text-muted-foreground" />
           <p className="font-medium">{skill.name}</p>

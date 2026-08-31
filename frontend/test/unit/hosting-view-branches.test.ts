@@ -28,12 +28,23 @@ const HOSTING_OK = {
   supportedProviders: ["vercel"],
 };
 
-/** A client answering the hosting read with a value or a rejection. */
-function clientWith(answer: unknown): OpenCompanyClient {
+/**
+ * A client answering the hosting read with a value or a rejection.
+ *
+ * `/auth/me` is answered separately, and as an admin by default: since #1796
+ * this page resolves the viewer's role to decide whether to offer the grant
+ * control, and a client that rejected every `GET` alike would leave every test
+ * here asserting a non-admin's view by accident. `role` makes that explicit.
+ */
+function clientWith(answer: unknown, role: "admin" | "member" = "admin"): OpenCompanyClient {
   return {
     scopeFor: () => "/api/v1/companies/acme",
-    get: () =>
-      answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer ?? HOSTING_OK),
+    get: (path: string) =>
+      path.endsWith("/auth/me")
+        ? Promise.resolve({ id: "u1", email: "a@b.c", role, company: "acme", hasPassword: true })
+        : answer instanceof Error
+          ? Promise.reject(answer)
+          : Promise.resolve(answer ?? HOSTING_OK),
   } as unknown as OpenCompanyClient;
 }
 
@@ -75,17 +86,44 @@ describe("HostingView status surfaces", () => {
     expect(at("hosting-not-in-build")).toBeNull();
   });
 
-  it("names the manifest, not the form, when the company does not grant hosting", async () => {
-    // A token stored and still nothing reaches a teammate. The remedy is
-    // `company.toml`, so saying "not connected" here would send the operator
-    // back through a form that is already correct.
+  it("names the grant, not the form, when the company does not grant hosting", async () => {
+    // A token stored and still nothing reaches a teammate, so saying "not
+    // connected" here would send the operator back through a form that is
+    // already correct.
     await show(clientWith({ ...HOSTING_OK, granted: false }));
 
-    expect(at("hosting-not-granted")?.textContent).toContain("[tools].allow");
+    expect(at("hosting-not-granted")?.textContent).toContain("hosting");
     expect(at("hosting-not-in-build")).toBeNull();
     // The token is fully configured (HOSTING_OK) and the badge must still not
     // agree with a page that just said this integration reaches nobody.
     expect(at("hosting-connected")).toBeNull();
+  });
+
+  it("offers to grant the namespace rather than dead-ending (issue #1796)", async () => {
+    // This page used to end the sentence with "it cannot be fixed from this
+    // page" — true when written, and the whole of the bug: on a hosted tenant
+    // the manifest is a read-only boot snapshot, so the operator had nowhere
+    // left to go and the integration read "Connected" forever.
+    await show(clientWith({ ...HOSTING_OK, granted: false }));
+
+    const action = at("hosting-not-granted-action");
+    expect(action).not.toBeNull();
+    expect(action?.textContent).toContain("Grant hosting");
+    expect(at("hosting-not-granted")?.textContent).not.toContain(
+      "cannot be fixed from this page",
+    );
+  });
+
+  it("offers a non-admin the explanation and no control", async () => {
+    // Every write behind the control is admin-only, so a member gets told what
+    // is wrong and who can fix it. Offering the button anyway would trade the
+    // old dead end for a button whose only possible outcome is a 403 toast.
+    await show(clientWith({ ...HOSTING_OK, granted: false }, "member"));
+
+    const warning = at("hosting-not-granted");
+    expect(warning).not.toBeNull();
+    expect(warning?.textContent).toContain("An admin has to grant it");
+    expect(at("hosting-not-granted-action")).toBeNull();
   });
 
   it("says the host lacks the tools, and says only that", async () => {

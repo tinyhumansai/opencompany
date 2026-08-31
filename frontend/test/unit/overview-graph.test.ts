@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import type { Person as HostPerson } from "@/api/auth";
+import type { Task } from "@/api/tasks";
 import type { WorkflowGraph } from "@/api/workflows";
 import type { DeskDto } from "@/api/types";
 import type { TeamMember } from "@/lib/team";
-import { adapt, DERIVED_NOTICE, orderStages, UNPLACED } from "@/views/overview/kg/adapter";
+import {
+  adapt,
+  type AdaptInput,
+  DERIVED_NOTICE,
+  orderStages,
+  UNPLACED,
+} from "@/views/overview/kg/adapter";
 import { buildKnowledgeGraph, SELF_ID } from "@/views/overview/kg/model";
 import { ownedBy } from "@/views/overview/pulse";
 
@@ -57,6 +64,62 @@ function person(id: string, email: string, role: "admin" | "member"): HostPerson
 }
 
 const BASE = { tasks: [], people: [] as HostPerson[], workflows: [], ownedBy };
+
+describe("adapt", () => {
+  it("returns byte-identical graph data for repeated calls with one host snapshot", () => {
+    // The order is deliberately not alphabetical. It is the order the host
+    // served, and the graph must retain it rather than sorting its inputs to
+    // manufacture stability.
+    const input: AdaptInput = {
+      members: [
+        member({
+          id: "grace",
+          name: "Grace",
+          effectiveTools: ["workspace.read", "mcp:calendar"],
+        }),
+        member({ id: "ada", name: "Ada", effectiveTools: ["composio"] }),
+      ],
+      desks: [desk("go-to-market", "Go to market", ["grace"]), desk("eng", "Engineering", ["ada"])],
+      tasks: [
+        {
+          id: "launch",
+          title: "Launch the campaign",
+          note: "Publish after approval.",
+          column: "working",
+          priority: "high",
+          assignee: "grace",
+          updatedAt: 1,
+        } satisfies Task,
+      ],
+      people: [{ ...person("operator", "operator@example.com", "admin"), displayName: "Operator" }],
+      workflows: [
+        flow({
+          id: "digest",
+          name: "Daily digest",
+          description: "Summarise the day.",
+          nodes: [
+            { id: "send", kind: "output", name: "Send" },
+            { id: "start", kind: "trigger", name: "Start" },
+            { id: "write", kind: "agent", name: "Write", agent: "ada" },
+          ],
+          edges: [
+            { from: "start", to: "write" },
+            { from: "write", to: "send" },
+          ],
+        }),
+      ],
+      ownedBy,
+    };
+    const snapshot = JSON.stringify(input);
+    const outputs = Array.from({ length: 3 }, () => JSON.stringify(adapt(input)));
+
+    // `adapt` is the graph's pure host-data boundary. If a render changes the
+    // serialized graph without receiving a new host snapshot, the wheel can
+    // jump even though the company did not.
+    expect(outputs).toEqual([outputs[0], outputs[0], outputs[0]]);
+    expect(JSON.stringify(input)).toBe(snapshot);
+  });
+});
 
 describe("a teammate's tools", () => {
   it("are the grants the host resolved, verbatim", () => {

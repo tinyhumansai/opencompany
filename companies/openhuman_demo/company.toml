@@ -1,7 +1,7 @@
 # A minimal company for the embedded OpenHuman harness (issue #9).
 #
 # Every `agents/<id>.toml` becomes one live openhuman agent, wired with memory, an
-# approval policy, and the hosted inference provider. Run it with the harness
+# explicit approval-request tool and the hosted inference provider. Run it with the harness
 # brain by setting an inference credential in the environment:
 #
 #   TINYHUMANS_API_KEY=<jwt> \
@@ -15,12 +15,12 @@
 [company]
 name = "OpenHuman Demo Co"
 output = "Answers, plans, and short written drafts"
-human_role = "Steering the company and approving anything costly"
+human_role = "Steering the company and answering explicit approval requests"
 
 [policy]
-# `full` lets ordinary turns flow without an approval prompt; costly or
-# external effects still route through the gate. Use `supervised` to approve
-# every agent action, or `readonly` to block mutations entirely.
+# Policy-generated HITL is disabled. `readonly` remains a hard brake on
+# mutations; other modes do not create approval prompts. Agents ask explicitly
+# with `request_approval` when they need an operator decision.
 mode = "full"
 
 [tools]

@@ -316,6 +316,7 @@ mod tests {
             mime: None,
             size: None,
             sha256: None,
+            adopted: false,
         }
     }
 

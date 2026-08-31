@@ -37,12 +37,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::Result;
+use crate::company::Policy;
 use crate::company::steer::SteerControl;
 use crate::error::OpenCompanyError;
 use crate::harness::built_in::TurnOutcome;
 use crate::harness::built_in::run_trace::RunTraceSink;
 use crate::ports::types::{CompanyId, CompanyRecord};
-use crate::runtime::delegation::RunTurn;
+use crate::runtime::delegation::{ChatTarget, RunTurn};
 
 /// Routes each agent's turn to the [`RunTurn`] of the harness it is bound to.
 pub struct HarnessRouter {
@@ -165,6 +166,25 @@ impl HarnessRouter {
             "agent `{agent_id}` is bound to harness `{harness}`, but {detail}."
         )))
     }
+
+    /// Records each lane's warm-up outcome: a failure is remembered with its
+    /// reason, a success clears any earlier one. Shared by
+    /// [`ensure`](RunTurn::ensure) and
+    /// [`ensure_with_policy`](RunTurn::ensure_with_policy) so the two warm-up
+    /// paths cannot drift apart.
+    fn record_warm_up(&self, outcomes: Vec<(String, Result<()>)>) {
+        let mut failures = self.failures.lock().expect("router failures");
+        for (harness, result) in outcomes {
+            match result {
+                Ok(()) => {
+                    failures.remove(&harness);
+                }
+                Err(err) => {
+                    failures.insert(harness, err.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -174,10 +194,10 @@ impl RunTurn for HarnessRouter {
         company: &CompanyId,
         agent_id: &str,
         message: &str,
-        chat_id: Option<&str>,
+        chat: ChatTarget<'_>,
     ) -> Result<TurnOutcome> {
         self.engine_for(agent_id)?
-            .run(company, agent_id, message, chat_id)
+            .run(company, agent_id, message, chat)
             .await
     }
 
@@ -187,11 +207,11 @@ impl RunTurn for HarnessRouter {
         agent_id: &str,
         message: &str,
         control: &SteerControl,
-        chat_id: Option<&str>,
+        chat: ChatTarget<'_>,
         run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.engine_for(agent_id)?
-            .run_steered(company, agent_id, message, control, chat_id, run_sink)
+            .run_steered(company, agent_id, message, control, chat, run_sink)
             .await
     }
 
@@ -213,9 +233,31 @@ impl RunTurn for HarnessRouter {
         company: &CompanyId,
         agent_id: &str,
         message: &str,
+        run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome> {
         self.engine_for(agent_id)?
-            .run_background(company, agent_id, message)
+            .run_background(company, agent_id, message, run_sink)
+            .await
+    }
+
+    async fn run_background_workflow(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        run_sink: Option<Arc<RunTraceSink>>,
+        workflow_run_id: &str,
+        node_id: &str,
+    ) -> Result<TurnOutcome> {
+        self.engine_for(agent_id)?
+            .run_background_workflow(
+                company,
+                agent_id,
+                message,
+                run_sink,
+                workflow_run_id,
+                node_id,
+            )
             .await
     }
 
@@ -231,18 +273,41 @@ impl RunTurn for HarnessRouter {
         for (harness, engine) in &self.engines {
             outcomes.push((harness.clone(), engine.ensure(company).await));
         }
-        let mut failures = self.failures.lock().expect("router failures");
-        for (harness, result) in outcomes {
-            match result {
-                Ok(()) => {
-                    failures.remove(&harness);
-                }
-                Err(err) => {
-                    failures.insert(harness, err.to_string());
-                }
-            }
-        }
+        self.record_warm_up(outcomes);
         Ok(())
+    }
+
+    async fn ensure_with_policy(&self, company: &CompanyRecord, policy: &Policy) -> Result<()> {
+        // The same fan-out as `ensure`, but every lane pins its policy axis to
+        // the cycle-start snapshot, so no engine's roster can drift from the
+        // native gate's mid-turn. Lanes that do not override this fall back to
+        // their own `ensure`.
+        let mut outcomes = Vec::with_capacity(self.engines.len());
+        for (harness, engine) in &self.engines {
+            outcomes.push((
+                harness.clone(),
+                engine.ensure_with_policy(company, policy).await,
+            ));
+        }
+        self.record_warm_up(outcomes);
+        Ok(())
+    }
+
+    async fn end_cycle(&self, company: &CompanyId) {
+        // Fan the release out to every lane that pinned, so no engine's pool is
+        // left holding a stale snapshot after its cycle ends (issue #1455).
+        for engine in self.engines.values() {
+            engine.end_cycle(company).await;
+        }
+    }
+
+    fn release_policy_pin_sync(&self, company: &CompanyId) {
+        // The synchronous fan-out for a cycle's drop guard: a cancelled or
+        // panicked cycle cannot await `end_cycle`, but must still release the
+        // pin it installed on every lane (issue #1455).
+        for engine in self.engines.values() {
+            engine.release_policy_pin_sync(company);
+        }
     }
 }
 
@@ -254,10 +319,11 @@ mod tests {
 
     /// An engine that records which agent it was asked to run, so a test can
     /// assert on *which* harness served a turn rather than only that one did.
-    #[derive(Default)]
+    /// Also records `end_cycle` releases, so a test can assert the fan-out.
     struct SpyEngine {
         label: String,
         seen: Mutex<Vec<String>>,
+        cycle_ends: Mutex<Vec<CompanyId>>,
     }
 
     impl SpyEngine {
@@ -265,6 +331,7 @@ mod tests {
             Arc::new(Self {
                 label: label.to_string(),
                 seen: Mutex::new(Vec::new()),
+                cycle_ends: Mutex::new(Vec::new()),
             })
         }
     }
@@ -276,14 +343,17 @@ mod tests {
             _company: &CompanyId,
             agent_id: &str,
             _message: &str,
-            _chat_id: Option<&str>,
+            _chat_id: ChatTarget<'_>,
         ) -> Result<TurnOutcome> {
             self.seen.lock().unwrap().push(agent_id.to_string());
             Ok(TurnOutcome {
                 reply: self.label.clone(),
                 steps: Vec::new(),
                 hit_iteration_cap: false,
+                // Test fixture, not the ACP fold (PR #1880 review).
+                abnormal_stop: None,
                 halted_for_spend: None,
+                budget_paused: None,
             })
         }
 
@@ -293,7 +363,7 @@ mod tests {
             agent_id: &str,
             message: &str,
             _control: &SteerControl,
-            chat_id: Option<&str>,
+            chat_id: ChatTarget<'_>,
             _run_sink: Option<Arc<RunTraceSink>>,
         ) -> Result<TurnOutcome> {
             self.run(company, agent_id, message, chat_id).await
@@ -307,7 +377,16 @@ mod tests {
             _control: &SteerControl,
             _run_sink: Option<Arc<RunTraceSink>>,
         ) -> Result<TurnOutcome> {
-            self.run(company, agent_id, message, None).await
+            self.run(company, agent_id, message, ChatTarget::default())
+                .await
+        }
+
+        async fn end_cycle(&self, company: &CompanyId) {
+            self.cycle_ends.lock().unwrap().push(company.clone());
+        }
+
+        fn release_policy_pin_sync(&self, company: &CompanyId) {
+            self.cycle_ends.lock().unwrap().push(company.clone());
         }
     }
 
@@ -339,13 +418,16 @@ mod tests {
             _company: &CompanyId,
             _agent_id: &str,
             _message: &str,
-            _chat_id: Option<&str>,
+            _chat_id: ChatTarget<'_>,
         ) -> Result<TurnOutcome> {
             Ok(TurnOutcome {
                 reply: self.label.clone(),
                 steps: Vec::new(),
                 hit_iteration_cap: false,
+                // Test fixture, not the ACP fold (PR #1880 review).
+                abnormal_stop: None,
                 halted_for_spend: None,
+                budget_paused: None,
             })
         }
 
@@ -355,7 +437,7 @@ mod tests {
             agent_id: &str,
             message: &str,
             _control: &SteerControl,
-            chat_id: Option<&str>,
+            chat_id: ChatTarget<'_>,
             _run_sink: Option<Arc<RunTraceSink>>,
         ) -> Result<TurnOutcome> {
             self.run(company, agent_id, message, chat_id).await
@@ -369,7 +451,8 @@ mod tests {
             _control: &SteerControl,
             _run_sink: Option<Arc<RunTraceSink>>,
         ) -> Result<TurnOutcome> {
-            self.run(company, agent_id, message, None).await
+            self.run(company, agent_id, message, ChatTarget::default())
+                .await
         }
 
         async fn ensure(&self, _company: &CompanyRecord) -> Result<()> {
@@ -401,10 +484,14 @@ mod tests {
             overlay_workflows: Vec::new(),
             overlay_budgets: Vec::new(),
             overlay_policy: None,
+            overlay_tool_grants: None,
             overlay_desk_tools: Default::default(),
             disabled_workflows: Vec::new(),
             template_provenance: None,
             setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
         }
     }
 
@@ -424,12 +511,15 @@ mod tests {
             .bind("researcher", "deep");
 
         let out = router
-            .run(&company(), "researcher", "hi", None)
+            .run(&company(), "researcher", "hi", ChatTarget::default())
             .await
             .unwrap();
         assert_eq!(out.reply, "deep");
 
-        let out = router.run(&company(), "ceo", "hi", None).await.unwrap();
+        let out = router
+            .run(&company(), "ceo", "hi", ChatTarget::default())
+            .await
+            .unwrap();
         assert_eq!(out.reply, "embedded", "an unbound agent takes the default");
 
         assert_eq!(&*deep.seen.lock().unwrap(), &["researcher".to_string()]);
@@ -451,7 +541,14 @@ mod tests {
 
         assert_eq!(
             router
-                .run_steered(&company(), "researcher", "hi", &control, None, None)
+                .run_steered(
+                    &company(),
+                    "researcher",
+                    "hi",
+                    &control,
+                    ChatTarget::default(),
+                    None
+                )
                 .await
                 .unwrap()
                 .reply,
@@ -467,7 +564,7 @@ mod tests {
         );
         assert_eq!(
             router
-                .run_background(&company(), "researcher", "hi")
+                .run_background(&company(), "researcher", "hi", None)
                 .await
                 .unwrap()
                 .reply,
@@ -494,7 +591,7 @@ mod tests {
             .bind("coder", "my_laptop");
 
         let err = router
-            .run(&company(), "coder", "hi", None)
+            .run(&company(), "coder", "hi", ChatTarget::default())
             .await
             .expect_err("must not fall back");
         let msg = err.to_string();
@@ -515,7 +612,7 @@ mod tests {
     async fn an_unknown_harness_binding_fails_closed() {
         let router = HarnessRouter::new("embedded").with_engine("embedded", SpyEngine::new("e"));
         let err = router
-            .run(&company(), "ghost_bound", "hi", None)
+            .run(&company(), "ghost_bound", "hi", ChatTarget::default())
             .await
             .expect("agent is unbound, so it takes the default")
             .reply;
@@ -524,7 +621,7 @@ mod tests {
         let router = router.bind("ghost_bound", "nowhere");
         assert!(
             router
-                .run(&company(), "ghost_bound", "hi", None)
+                .run(&company(), "ghost_bound", "hi", ChatTarget::default())
                 .await
                 .is_err()
         );
@@ -546,7 +643,7 @@ mod tests {
         router.ensure(&record()).await.unwrap();
 
         let err = router
-            .run(&company(), "researcher", "hi", None)
+            .run(&company(), "researcher", "hi", ChatTarget::default())
             .await
             .expect_err("the failed lane's turn must error");
         let msg = err.to_string();
@@ -554,7 +651,10 @@ mod tests {
         assert!(msg.contains("deep"), "{msg}");
         assert!(msg.contains("warm-up"), "names the failed warm-up: {msg}");
 
-        let out = router.run(&company(), "ceo", "hi", None).await.unwrap();
+        let out = router
+            .run(&company(), "ceo", "hi", ChatTarget::default())
+            .await
+            .unwrap();
         assert_eq!(out.reply, "embedded", "the healthy lane keeps working");
     }
 
@@ -573,7 +673,7 @@ mod tests {
         router.ensure(&record()).await.unwrap();
         assert!(
             router
-                .run(&company(), "researcher", "hi", None)
+                .run(&company(), "researcher", "hi", ChatTarget::default())
                 .await
                 .is_err(),
             "the failed lane errors before recovery"
@@ -582,9 +682,113 @@ mod tests {
         deep.set_fail(false);
         router.ensure(&record()).await.unwrap();
         let out = router
-            .run(&company(), "researcher", "hi", None)
+            .run(&company(), "researcher", "hi", ChatTarget::default())
             .await
             .unwrap();
         assert_eq!(out.reply, "deep", "recovery needs no restart");
+    }
+
+    /// `ensure_with_policy` fans out the same failure bookkeeping as `ensure`:
+    /// one lane failing to pin its roster against the cycle snapshot must block
+    /// only that lane's agents, and a later successful `ensure_with_policy`
+    /// clears the recorded failure. `FlakyEngine` overrides only `ensure`, and
+    /// the trait default routes `ensure_with_policy` to it, so the same double
+    /// exercises the router's own bookkeeping on this path.
+    #[tokio::test]
+    async fn ensure_with_policy_records_and_recovers_a_failed_lane() {
+        let policy = Policy {
+            mode: "supervised".to_string(),
+            always_approve: Vec::new(),
+            auto_approve_under_usd: None,
+            approval_ttl_hours: None,
+        };
+        let embedded = FlakyEngine::new("embedded");
+        let deep = FlakyEngine::new("deep");
+        let router = HarnessRouter::new("embedded")
+            .with_engine("embedded", embedded.clone())
+            .with_engine("deep", deep.clone())
+            .bind("researcher", "deep")
+            .bind("ceo", "embedded");
+
+        deep.set_fail(true);
+        router.ensure_with_policy(&record(), &policy).await.unwrap();
+
+        let err = router
+            .run(&company(), "researcher", "hi", ChatTarget::default())
+            .await
+            .expect_err("the failed lane's turn must error");
+        let msg = err.to_string();
+        assert!(msg.contains("researcher"), "{msg}");
+        assert!(msg.contains("deep"), "{msg}");
+        assert!(msg.contains("warm-up"), "names the failed warm-up: {msg}");
+
+        let out = router
+            .run(&company(), "ceo", "hi", ChatTarget::default())
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "embedded", "the healthy lane keeps working");
+
+        // A later success clears the entry, so the lane comes back.
+        deep.set_fail(false);
+        router.ensure_with_policy(&record(), &policy).await.unwrap();
+        let out = router
+            .run(&company(), "researcher", "hi", ChatTarget::default())
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "deep", "recovery needs no restart");
+    }
+
+    /// `end_cycle` fans the policy-pin release out to *every* lane, so a named
+    /// lane's pool cannot keep rebuilding against a stale cycle snapshot after
+    /// its cycle is over (issue #1455).
+    #[tokio::test]
+    async fn end_cycle_fans_out_to_every_lane() {
+        let embedded = SpyEngine::new("embedded");
+        let deep = SpyEngine::new("deep");
+        let router = HarnessRouter::new("embedded")
+            .with_engine("embedded", embedded.clone())
+            .with_engine("deep", deep.clone())
+            .bind("researcher", "deep")
+            .bind("ceo", "embedded");
+
+        router.end_cycle(&company()).await;
+
+        assert_eq!(
+            *embedded.cycle_ends.lock().unwrap(),
+            vec![company()],
+            "the default lane must receive the release"
+        );
+        assert_eq!(
+            *deep.cycle_ends.lock().unwrap(),
+            vec![company()],
+            "a named lane must receive the release"
+        );
+    }
+
+    /// The drop-guard half of the same fan-out: the synchronous release reaches
+    /// every lane too, so a cancelled or panicked cycle (which cannot await
+    /// `end_cycle`) still releases each pool's pin (issue #1455).
+    #[test]
+    fn release_policy_pin_sync_fans_out_to_every_lane() {
+        let embedded = SpyEngine::new("embedded");
+        let deep = SpyEngine::new("deep");
+        let router = HarnessRouter::new("embedded")
+            .with_engine("embedded", embedded.clone())
+            .with_engine("deep", deep.clone())
+            .bind("researcher", "deep")
+            .bind("ceo", "embedded");
+
+        router.release_policy_pin_sync(&company());
+
+        assert_eq!(
+            *embedded.cycle_ends.lock().unwrap(),
+            vec![company()],
+            "the default lane must receive the synchronous release"
+        );
+        assert_eq!(
+            *deep.cycle_ends.lock().unwrap(),
+            vec![company()],
+            "a named lane must receive the synchronous release"
+        );
     }
 }

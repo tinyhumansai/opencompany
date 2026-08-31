@@ -6,11 +6,32 @@
  *
  *   - not in build   — the host was compiled without the feature. Nothing on
  *                      this page will ever help.
- *   - not granted    — both credentials stored and STILL nothing reaches an
- *                      agent, because the manifest does not grant the tool.
- *                      The fix is `company.toml`.
+ *   - not granted    — the credentials are stored and STILL nothing reaches an
+ *                      agent, because the company does not grant the tool.
  *   - not configured — no credential. This is the one the form is for.
  *   - connected      — working.
+ *
+ * `not_granted` is now fixable from here too (issue #1796): the grant used to
+ * be reachable only by editing `company.toml` — impossible on a hosted tenant,
+ * where the manifest is a read-only boot snapshot — so the panel said so and
+ * stopped. `grantNamespace` names what the panel should offer to grant.
+ *
+ * # The precedence bug this file shipped with (issue #1796)
+ *
+ * `not_granted` outranking `not_configured` is right, but only for a company
+ * that has actually connected. The guards used to test `!granted` **before**
+ * asking whether any credential existed, so a company that had never touched
+ * Chargebee fell into the `not_granted` arm — which asserts "Connected" and
+ * interpolates the site into the label. With no site stored that rendered, on a
+ * live tenant, as:
+ *
+ *     Chargebee · Connected to null — but no teammate can use it
+ *
+ * Two claims in one line, both false: nothing was connected, and `null` was not
+ * an account. The definition above already said what the guard did not — "the
+ * credentials are stored and STILL nothing reaches an agent" — so the fix is to
+ * make the guard say it: a missing grant is only the worst problem once there
+ * is something for it to be blocking.
  *
  * `BillingView` reported all four as separate alerts, which is right for a
  * settings page an operator reads top to bottom. A panel that collapses to one
@@ -34,6 +55,16 @@ export interface Health {
   remedy: string | null;
   /** Whether the panel's own form can fix it. Drives whether it opens itself. */
   fixableHere: boolean;
+  /**
+   * The `[tools].allow` namespace this panel should offer to grant, when a
+   * missing grant is what is wrong (issue #1796).
+   *
+   * `undefined` for every other state — including `not_in_build`, where the
+   * grant would be real and still useless because the host has no such tools to
+   * hand out. Offering a button there would trade one dead end for a subtler
+   * one: a grant that succeeds and changes nothing.
+   */
+  grantNamespace?: string;
 }
 
 /** Chargebee's verdict. */
@@ -46,13 +77,17 @@ export function chargebeeHealth(status: BillingStatus): Health {
         "This host was built without Chargebee support. Credentials saved here will be stored and have no effect.",
       fixableHere: false,
     };
-  if (!status.granted)
+  // The configured-check comes first deliberately — see the precedence note at
+  // the top. `status.site` is interpolated below, so reaching this arm without
+  // one is what produced "Connected to null".
+  if (status.apiKeyConfigured && status.site && !status.granted)
     return {
       state: "not_granted",
       label: `Connected to ${status.site} — but no teammate can use it`,
       remedy:
-        "This company does not grant `chargebee`, so billing tools reach no teammate even with the key stored. Add `chargebee` to [tools].allow in the company's manifest — it cannot be fixed from this page.",
+        "This company does not grant `chargebee`, so billing tools reach no teammate even with the key stored.",
       fixableHere: false,
+      grantNamespace: "chargebee",
     };
   if (!status.apiKeyConfigured || !status.site)
     return {
@@ -83,13 +118,21 @@ export function paypalHealth(status: PaypalStatus): Health {
         "This host was built without PayPal support. Credentials saved here will be stored and have no effect.",
       fixableHere: false,
     };
-  if (!status.granted)
+  // Configured first, for the reason chargebeeHealth gives: an unconnected
+  // company reporting "Connected — but no teammate can use it" is the same
+  // false claim without the `null` to make it obvious.
+  if (
+    status.clientIdConfigured &&
+    status.clientSecretConfigured &&
+    !status.granted
+  )
     return {
       state: "not_granted",
       label: "Connected — but no teammate can use it",
       remedy:
-        "This company does not grant `paypal`, so wallet tools reach no teammate. Add `paypal` to [tools].allow in the company's manifest.",
+        "This company does not grant `paypal`, so wallet tools reach no teammate.",
       fixableHere: false,
+      grantNamespace: "paypal",
     };
   if (!status.clientIdConfigured || !status.clientSecretConfigured)
     return {

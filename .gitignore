@@ -51,3 +51,9 @@ instance-id
 
 # Playwright MCP scratch output when a client ignores `--output-dir`.
 .playwright-mcp/
+
+# Playwright's per-run tracking file when a run happens with the repo root as
+# cwd (its default `outputDir` resolves relative to the run's cwd, not the
+# config). CI and normal runs write `frontend/test-results/`, which
+# `frontend/.gitignore` already covers; this catches the root-level copy.
+test-results/

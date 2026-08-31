@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 
+import type { ChatMentionDto } from "@/api/types";
 import type { OpenCompanyClient } from "@/api/client";
 import type {
   DeliveryReport,
@@ -40,6 +41,14 @@ export type CompanyStreamEvent =
        * that predates persisted threads.
        */
       parentId?: string;
+      /**
+       * Who this reply names, as the host resolved them (issue #1645).
+       *
+       * Absent when the event predates the field, and on a host that does not
+       * project mentions onto the SSE feed. The same mentions are always
+       * available through `chat/history` (see {@link fromHistory}).
+       */
+      mentions?: ChatMentionDto[];
     }
   | { type: "task_dispatched"; seq: number; atMillis: number; taskId: string }
   | {
@@ -272,6 +281,13 @@ export type CompanyStreamEvent =
       workflowId: string;
       runId: string;
       scheduled: boolean;
+      // Optional, not just possibly-absent-looking: the server only sets
+      // this key `if let Some(started_by)` (`project_event_for_viewer` in
+      // `src/server/operator.rs`). A run journaled before issue #1862's
+      // prerequisite landed, or any producer with genuinely no sender,
+      // projects with the key absent — never `null` — so a consumer must
+      // handle `undefined` rather than trust it as always present.
+      startedBy?: "operator" | "schedule" | { agent: string };
     }
   // Issue #382: a non-trigger node began executing. Structural ids only — the
   // node has not run, so there is no status or duration, and never any input.
@@ -340,6 +356,16 @@ export type CompanyStreamEvent =
       seq: number;
       agentId?: string;
       chatId?: string;
+      /**
+       * The workflow run this frame belongs to (issue #1702) — present instead
+       * of `chatId` when the turn is a workflow agent node rather than a chat
+       * turn. The run-trace sheet keys its live tool timeline on this so a
+       * node's in-flight frames append to the right run.
+       */
+      workflowRunId?: string;
+      /** The workflow node inside that run (issue #1702), so the sheet groups a
+       * run's live frames under the node the durable trace attributes them to. */
+      nodeId?: string;
       toolCallId?: string;
       label?: string;
       status?: string;
@@ -349,9 +375,22 @@ export type CompanyStreamEvent =
       seq: number;
       agentId?: string;
       chatId?: string;
+      /** See {@link CompanyStreamEvent} `tool_call.workflowRunId` (issue #1702). */
+      workflowRunId?: string;
+      /** See {@link CompanyStreamEvent} `tool_call.nodeId` (issue #1702). */
+      nodeId?: string;
       toolCallId?: string;
       label?: string;
       detail?: string;
+      /**
+       * What came back — a success's shape summary or a failure's cause,
+       * scrubbed at the source like `detail`. The wire has always carried it
+       * (`TurnStreamEvent.result`); it was simply not declared here while the
+       * only publisher was the built-in harness, whose rows lean on `detail`.
+       * An ACP tool call has no arguments to derive a detail from and reports
+       * only this.
+       */
+      result?: string;
       status?: string;
       elapsedMs?: number;
     }
@@ -380,7 +419,199 @@ export type CompanyStreamEvent =
       chatId: string;
       parentId?: string;
       atMillis: number;
+    }
+  // A coarse "near your credit limit" warning (issue #1846), off the same
+  // ephemeral bus as `tool_call`/`tool_result` — a soft heads-up, never
+  // journaled, never carrying a per-task cost claim. `agentId` absent means
+  // the company-wide ceiling; present means one teammate's own daily cap.
+  | {
+      type: "budget_proximity";
+      agentId?: string;
+      message: string;
+      atMillis: number;
     };
+
+/**
+ * The stable prefix a budget-paused system notice starts with (issue #1846),
+ * mirrored from `BUDGET_PAUSE_NOTICE_PREFIX` in
+ * `src/harness/built_in/brain.rs`. There is no structured wire field for a
+ * chat message's "kind" — an unauthored system bubble is just an
+ * `AgentReplyEvent` with `agentId` unset — so this prefix IS the contract
+ * between the two sides. Keep the two constants in sync by hand.
+ */
+export const BUDGET_PAUSE_NOTICE_PREFIX = "⏸ Paused — out of credits:";
+
+/**
+ * Whether a chat message's text is the **redeemable** budget-pause system
+ * notice — the one that gets an "Add credits & resend" CTA.
+ *
+ * Issue #1846 review (Codex #3870562586 / #3870562590): the host has a
+ * deliberate SIBLING prefix, `BUDGET_PAUSE_NOTICE_NO_RESEND_PREFIX`
+ * ("⏸ Paused — out of credits (add credits, then start this again):"), for the
+ * two paths that pause with no marker this CTA can redeem — the confined
+ * workflow copilot (no marker is ever parked) and an approval continuation
+ * (its marker is parked `background: true`, which the redeem route refuses).
+ * That prefix must NOT match here: those notices render as ordinary system
+ * bubbles precisely so no unusable button is drawn. Do not "fix" the near-miss
+ * by loosening this to a substring check or by matching both prefixes — the
+ * near-miss is the mechanism.
+ */
+export function isBudgetPauseNotice(text: string): boolean {
+  return text.startsWith(BUDGET_PAUSE_NOTICE_PREFIX);
+}
+
+/**
+ * The host's NON-redeemable sibling prefix, mirrored from
+ * `BUDGET_PAUSE_NOTICE_NO_RESEND_PREFIX` in `src/harness/built_in/brain.rs`
+ * (issue #1906). Kept in sync by hand, exactly like
+ * {@link BUDGET_PAUSE_NOTICE_PREFIX}.
+ *
+ * Deliberately NOT matched by {@link isBudgetPauseNotice} — see that
+ * function's doc for why the near-miss is the mechanism. It is exported so
+ * the supersession scan can see these notices, which is a different question
+ * from whether to draw a button on one.
+ */
+export const BUDGET_PAUSE_NOTICE_NO_RESEND_PREFIX =
+  "⏸ Paused — out of credits (add credits, then start this again):";
+
+/**
+ * Whether a chat message is a budget-pause notice of EITHER kind — redeemable
+ * or no-resend (issue #1906).
+ *
+ * The distinction {@link isBudgetPauseNotice} draws is "does this notice get a
+ * button". This one answers a different question: "did a pause happen for this
+ * agent, parking a marker that overwrote the last one". The backend keeps at
+ * most one marker per agent and a no-resend pause parks one too — an approval
+ * continuation parks `background: true` — so a supersession scan that only
+ * counts redeemable notices concludes an older, now-overwritten notice is
+ * still the latest, and leaves its CTA enabled on a marker that can only
+ * answer `Stale` → 409.
+ *
+ * Use this for supersession ({@link isBudgetPauseNoticeSuperseded}'s map) and
+ * `isBudgetPauseNotice` for rendering. Never the other way round: widening the
+ * render check is what puts an unusable button back on a no-resend notice.
+ */
+export function isAnyBudgetPauseNotice(text: string): boolean {
+  return (
+    text.startsWith(BUDGET_PAUSE_NOTICE_PREFIX) ||
+    text.startsWith(BUDGET_PAUSE_NOTICE_NO_RESEND_PREFIX)
+  );
+}
+
+/**
+ * Extracts the paused teammate's agent id from a budget-pause notice's text,
+ * so the "Add credits" CTA knows which marker to redeem — there is no
+ * structured wire field carrying it (see {@link BUDGET_PAUSE_NOTICE_PREFIX}).
+ *
+ * Coupled by hand to `budget_paused_summary`'s exact wording in
+ * `src/harness/built_in/mod.rs` ("Paused — {agent_id}'s turn ran out of
+ * inference budget/credits…"). If that wording ever changes, update this
+ * pattern in lockstep — a mismatch here means the CTA silently cannot find
+ * the agent to redeem for, not a wrong redeem (the button call-site guards
+ * on `null`).
+ */
+export function parseBudgetPauseAgent(text: string): string | null {
+  const match = /Paused — (\S+)'s turn ran out of inference budget/.exec(text);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Whether a budget-pause notice's "Add credits & resend" CTA must be
+ * disabled because a NEWER pause has since been parked for the same agent
+ * (issue #1846 review, Codex #3864988184).
+ *
+ * The backend keeps at most one marker per agent (a fresh pause overwrites
+ * the last), so redeeming an old notice would resend whatever pause is
+ * parked NOW, not the one on the card the operator clicked — silently
+ * reissuing a different message than the one shown. `latestMessageIdByAgent`
+ * is `undefined` for a caller that has not been taught to compute it (or an
+ * isolated render, as in a test): that reads as "unknown", not "stale", so
+ * this returns `false` rather than disabling every card by default.
+ */
+export function isBudgetPauseNoticeSuperseded(
+  agentId: string | null,
+  messageId: string,
+  latestMessageIdByAgent: Map<string, string> | undefined,
+): boolean {
+  if (agentId == null || latestMessageIdByAgent == null) return false;
+  return latestMessageIdByAgent.get(agentId) !== messageId;
+}
+
+/**
+ * The upper bound the "nearing its limit" budget-proximity banner is allowed
+ * to keep claiming its warning without a fresh `budget_proximity` frame
+ * renewing it (issue #1846 review, Codex #3866418899) — a plan-period
+ * rollover or an operator raising the cap has no fixed reset instant the
+ * console can compute, so the COMPANY-WIDE case (see
+ * {@link isBudgetProximityExpired}'s `agentId` param) falls back to this
+ * flat ceiling. The PER-AGENT DAILY case no longer uses it directly, per
+ * Codex #3868962376's review — see {@link nextUtcMidnightAfter}'s doc for
+ * why a flat 24h-from-`atMillis` window was wrong for the far more common
+ * daily reset.
+ */
+export const BUDGET_PROXIMITY_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The next UTC-midnight instant strictly after `atMillis` (issue #1846
+ * review, Codex #3868962376) — the boundary the backend's PER-AGENT DAILY
+ * cap actually resets against. **Only** the right boundary for a per-agent
+ * warning (`budget_proximity`'s `agentId` present) — see
+ * {@link isBudgetProximityExpired}'s `agentId` param for the company-wide
+ * case, which is not necessarily aligned to a UTC day at all (issue #1846
+ * review, Codex #3869601278) and must not use this.
+ *
+ * `isBudgetProximityExpired` used to add a flat {@link BUDGET_PROXIMITY_TTL_MS}
+ * (24h) to `atMillis` instead, on the theory that 24h "matches the daily
+ * reset cadence" — but a warning that fires at 23:58 UTC and a warning that
+ * fires at 00:02 UTC are on opposite sides of that night's reset despite
+ * being four minutes apart, and the flat window kept the first banner alive
+ * for nearly a full EXTRA day after the count it was warning about had
+ * already reset to zero. Anchoring to the next actual midnight instead means
+ * a late-day warning clears within minutes of the reset that actually
+ * clears it.
+ */
+export function nextUtcMidnightAfter(atMillis: number): number {
+  const d = new Date(atMillis);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+}
+
+/**
+ * When a `budget_proximity` frame parked at `atMillis` ages out and must no
+ * longer be shown (issue #1846 review, Codex #3866418899 / #3868962376 /
+ * #3869601278).
+ *
+ * `agentId` is the frame's own field (present for one teammate's daily cap,
+ * absent for the company-wide ceiling — see the `budget_proximity` event's
+ * doc) and decides which boundary applies:
+ * - **Present** (a per-agent DAILY warning): the next UTC midnight after
+ *   `atMillis` — see {@link nextUtcMidnightAfter}'s doc for why a flat
+ *   window was wrong here.
+ * - **Absent** (the COMPANY-WIDE warning): a plan/billing period is not
+ *   necessarily UTC-day-aligned at all, so anchoring THIS case to midnight
+ *   would clear a still-valid warning early — a monthly period rolling over
+ *   mid-afternoon, say, would have its warning vanish at the NEXT midnight
+ *   regardless, hours or days before the period the warning is actually
+ *   about ends. Falls back to the flat {@link BUDGET_PROXIMITY_TTL_MS}
+ *   ceiling instead, same as before the per-agent fix.
+ */
+export function isBudgetProximityExpired(
+  atMillis: number,
+  nowMillis: number,
+  agentId?: string,
+): boolean {
+  if (agentId != null) return nowMillis >= nextUtcMidnightAfter(atMillis);
+  return nowMillis - atMillis >= BUDGET_PROXIMITY_TTL_MS;
+}
+
+/**
+ * When a `budget_proximity` frame parked at `atMillis` is next due to expire
+ * (issue #1846 review, Codex #3869601278) — the timer-arming counterpart of
+ * {@link isBudgetProximityExpired}, so `app-shell.tsx`'s expiry effect does
+ * not have to re-derive the same per-agent-vs-company-wide branch itself.
+ */
+export function budgetProximityExpiresAt(atMillis: number, agentId?: string): number {
+  return agentId != null ? nextUtcMidnightAfter(atMillis) : atMillis + BUDGET_PROXIMITY_TTL_MS;
+}
 
 /** An `AgentReply` the hook hands back for injection into a chat transcript. */
 export interface AgentReplyEvent {
@@ -405,6 +636,14 @@ export interface AgentReplyEvent {
    * `h` prefix.
    */
   parentId?: string;
+  /**
+   * Who this reply names, as the host resolved them (issue #1645).
+   *
+   * Absent when the event predates the field, and on a host that does not
+   * project mentions onto the SSE feed. The same mentions are always
+   * available through  (see {@link fromHistory}).
+   */
+  mentions?: ChatMentionDto[];
 }
 
 interface Options {
@@ -480,6 +719,12 @@ interface Options {
    */
   onDispatchTerminal?: (event: CompanyStreamEvent) => void;
   /**
+   * Whether this console is currently showing the channel a completed task
+   * came from (#1758). Only that exact view suppresses the completion toast;
+   * the channel's inline terminal marker is already the notification there.
+   */
+  isViewingTaskOrigin?: (event: CompanyStreamEvent) => boolean;
+  /**
    * Called for each `workspace_changed` frame (issue #327) so the Workspace
    * view can re-read the tree — and the open note — live.
    *
@@ -510,6 +755,14 @@ interface Options {
   onPresenceEvent?: (event: CompanyStreamEvent) => void;
   /** Called for each `typing` frame. Toast-free for the same reason. */
   onTypingEvent?: (event: CompanyStreamEvent) => void;
+  /**
+   * Called for each `budget_proximity` frame (issue #1846) — the coarse
+   * "near your credit limit" warning — so the chat can show a soft,
+   * non-blocking banner. Toast-free like the turn frames above: this can fire
+   * mid-conversation and a banner that stays until dismissed says more than an
+   * interruption that vanishes in four seconds.
+   */
+  onBudgetProximityEvent?: (event: CompanyStreamEvent) => void;
   /**
    * Called for each `workflow_run_finished` event (issue #228) so the Workflows
    * view can refresh its run history live. Matters most for a *scheduled* run:
@@ -595,10 +848,12 @@ export function useEvents(
     onTaskEvent,
     onRunEvent,
     onDispatchTerminal,
+    isViewingTaskOrigin,
     onWorkspaceEvent,
     onTurnEvent,
     onPresenceEvent,
     onTypingEvent,
+    onBudgetProximityEvent,
     onWorkflowRunEvent,
     onWorkflowChanged,
     onApprovalEvent,
@@ -624,6 +879,10 @@ export function useEvents(
   useEffect(() => {
     onDispatchTerminalRef.current = onDispatchTerminal;
   }, [onDispatchTerminal]);
+  const isViewingTaskOriginRef = useRef(isViewingTaskOrigin);
+  useEffect(() => {
+    isViewingTaskOriginRef.current = isViewingTaskOrigin;
+  }, [isViewingTaskOrigin]);
   const onWorkspaceEventRef = useRef(onWorkspaceEvent);
   useEffect(() => {
     onWorkspaceEventRef.current = onWorkspaceEvent;
@@ -640,6 +899,10 @@ export function useEvents(
   useEffect(() => {
     onTypingEventRef.current = onTypingEvent;
   }, [onTypingEvent]);
+  const onBudgetProximityEventRef = useRef(onBudgetProximityEvent);
+  useEffect(() => {
+    onBudgetProximityEventRef.current = onBudgetProximityEvent;
+  }, [onBudgetProximityEvent]);
   const onWorkflowRunEventRef = useRef(onWorkflowRunEvent);
   useEffect(() => {
     onWorkflowRunEventRef.current = onWorkflowRunEvent;
@@ -741,10 +1004,12 @@ export function useEvents(
             onTaskEvent: onTaskEventRef.current,
             onRunEvent: onRunEventRef.current,
             onDispatchTerminal: onDispatchTerminalRef.current,
+            isViewingTaskOrigin: isViewingTaskOriginRef.current,
             onWorkspaceEvent: onWorkspaceEventRef.current,
             onTurnEvent: onTurnEventRef.current,
             onPresenceEvent: onPresenceEventRef.current,
             onTypingEvent: onTypingEventRef.current,
+            onBudgetProximityEvent: onBudgetProximityEventRef.current,
             onWorkflowRunEvent: onWorkflowRunEventRef.current,
             onWorkflowChanged: onWorkflowChangedRef.current,
             onApprovalEvent: onApprovalEventRef.current,
@@ -795,10 +1060,12 @@ export function handleEvent(
     onTaskEvent,
     onRunEvent,
     onDispatchTerminal,
+    isViewingTaskOrigin,
     onWorkspaceEvent,
     onTurnEvent,
     onPresenceEvent,
     onTypingEvent,
+    onBudgetProximityEvent,
     onWorkflowRunEvent,
     onWorkflowChanged,
     onApprovalEvent,
@@ -825,6 +1092,11 @@ export function handleEvent(
       break;
     case "typing":
       onTypingEvent?.(event);
+      break;
+    // Issue #1846: a coarse, non-blocking proximity warning. No toast — see
+    // the doc comment on `onBudgetProximityEvent`.
+    case "budget_proximity":
+      onBudgetProximityEvent?.(event);
       break;
     case "mcp_call_failed":
       toast.error(`MCP ${event.server} failed`, {
@@ -871,13 +1143,23 @@ export function handleEvent(
     // missing: a reader watching only the relay prose could not tell a card
     // that parked in `paused` from one that finished.
     //
-    // Still **no toast**, and for the reason written above the board arm: this
-    // fires on every settle, and the marker appearing in the channel IS the
-    // notification. A toast on top would be the second notification for one
-    // action that #379 argues against.
+    // The origin channel's inline marker remains the notification while it is
+    // on screen. Away from that exact channel, #1758 adds one linked toast so a
+    // background turn cannot finish silently while the operator works elsewhere.
     case "desk_task_completed":
       onTaskEvent?.(event);
       onDispatchTerminal?.(event);
+      if (!isViewingTaskOrigin?.(event)) {
+        toast("Task run finished", {
+          description: "Background work has stopped. Open the card for its result and next state.",
+          action: {
+            label: "Open task",
+            onClick: () => {
+              window.location.hash = `/tasks/${encodeURIComponent(event.taskId)}`;
+            },
+          },
+        });
+      }
       break;
     // Issue #327, and **no toast** for the same reason the board frames above
     // raise none — more strongly, if anything. A workspace write is not an
@@ -903,6 +1185,10 @@ export function handleEvent(
         // Issue #364: and lands in the same thread a reload would put it in,
         // rather than arriving in the channel and jumping on the next refresh.
         parentId: event.parentId,
+        // Issue #1645: who this reply names, projected from the stored event.
+        // Absent when the host's projection omits it; the same mentions are
+        // always available through `chat/history` (see {@link fromHistory}).
+        mentions: event.mentions,
       });
       break;
     // Issue #379. No toast: the rising-edge "needs a sign-off" toast off the

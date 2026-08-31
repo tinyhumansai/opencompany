@@ -57,6 +57,17 @@ pub(crate) fn may_read_approval_contents(auth: &GqlAuth) -> bool {
     }
 }
 
+/// May this principal read a run's **deep** trace — the unredacted reasoning,
+/// tool arguments and raw output the Observatory shows behind a fold?
+///
+/// The same rule as [`may_read_approval_contents`]: those bodies can carry
+/// credentials and file contents, exactly as an approval payload can, so the
+/// admin/tenant boundary applies to them too. Kept beside the approval rule so
+/// the two sensitive-content gates cannot drift.
+pub(crate) fn may_read_deep_trace(auth: &GqlAuth) -> bool {
+    may_read_approval_contents(auth)
+}
+
 /// Applies [`may_read_approval_contents`] to a projection on its way out.
 ///
 /// Takes the whole list rather than one summary because every caller has a
@@ -161,6 +172,7 @@ mod tests {
             payload: Some(serde_json::json!({ "to": "board@example.test" })),
             thread: None,
             workflow_run_id: None,
+            workflow_id: None,
             broadly_grantable: false,
             broadly_deniable: false,
             contents_hidden: false,
@@ -243,5 +255,32 @@ mod tests {
         bare.amount_usd = None;
         let out = for_principal(&principal(UserRole::Admin), vec![bare]);
         assert!(!out[0].contents_hidden);
+    }
+
+    /// Issue #1418: the workflow origin's *second half* survives redaction.
+    ///
+    /// `workflow_run_id` already rides through `hide_contents` untouched — it is
+    /// structural, not contents. The workflow id must too, or a member holding
+    /// up a stalled native `workflow.approve` would keep the run id and lose the
+    /// one thing that turns it into an address: exactly the stalled-work
+    /// visibility issue #468 exists to protect.
+    #[test]
+    fn a_member_keeps_the_workflow_origin_when_contents_are_hidden() {
+        let mut gate = summary();
+        gate.kind = "workflow.approve".to_string();
+        gate.payload =
+            Some(serde_json::json!({ "workflow_id": "feature_pipeline", "node_id": "spec" }));
+        gate.workflow_id = Some("feature_pipeline".to_string());
+        let out = for_principal(&principal(UserRole::Member), vec![gate]);
+        assert!(out[0].payload.is_none(), "contents stay withheld");
+        assert!(
+            out[0].contents_hidden,
+            "and the card still says it may not show them"
+        );
+        assert_eq!(
+            out[0].workflow_id.as_deref(),
+            Some("feature_pipeline"),
+            "the workflow origin is an address, not contents, and survives"
+        );
     }
 }

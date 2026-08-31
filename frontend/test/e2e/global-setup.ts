@@ -5,13 +5,22 @@ import {
   type FullConfig,
 } from "@playwright/test";
 
+import {
+  EXPECTED_INSTANCE_ID,
+  MANAGED_HOST_HOME,
+  SPEC_PATH,
+  identityFailure,
+  readHomeInstanceId,
+} from "./host-identity";
+
 const ADMIN_EMAIL = "harness-e2e@tinyhumans.ai";
 const REQUEST_PATH = "/api/v1/company/auth/request";
 const VERIFY_PATH = "/api/v1/company/auth/verify";
 
 /**
- * Authenticates once and shares the session with every spec through Playwright
- * storage state, so the suite signs in a single time.
+ * Identifies the server Playwright adopted, then authenticates once and shares
+ * the session with every spec through Playwright storage state, so the suite
+ * signs in a single time.
  *
  * Every failure here aborts the whole run before a single spec executes, so the
  * message has to carry enough to diagnose it without a second run: the endpoint,
@@ -19,8 +28,30 @@ const VERIFY_PATH = "/api/v1/company/auth/verify";
  * `202 {"sent": true}` for *every* outcome by design — it refuses to say whether
  * an address is a member — so a missing `dev_code` is otherwise indistinguishable
  * from a broken host, which is exactly what issue #271 sent people chasing.
+ *
+ * The identity check comes first, and ahead of the storage-state early return,
+ * because this hook runs after `webServer` has resolved and is therefore the
+ * only place that sees which server was actually adopted rather than which one
+ * was configured — issue #1773, and `host-identity.ts` for the whole story. A
+ * run with no sign-in still gets it: what is on the port is worth knowing even
+ * when nothing is about to log in to it.
  */
 export default async function globalSetup(config: FullConfig) {
+  const baseURL = config.projects[0]?.use.baseURL as string | undefined;
+  if (!baseURL) {
+    throw new Error(
+      "[e2e global-setup] no baseURL is configured. Set PW_BASE_URL to the " +
+        "running OpenCompany host, e.g. PW_BASE_URL=http://127.0.0.1:8080.",
+    );
+  }
+
+  const identity = await request.newContext({ baseURL });
+  try {
+    await identifyServer(identity, baseURL);
+  } finally {
+    await identity.dispose();
+  }
+
   // Read the RESOLVED path off the config, not `process.env.PW_STORAGE_STATE`.
   // The config now defaults it when it is the one bringing the host up (issue
   // #406), and reading the raw variable meant this returned early in exactly
@@ -29,14 +60,6 @@ export default async function globalSetup(config: FullConfig) {
   // set: the config honours it first.
   const storageState = config.projects[0]?.use.storageState as string | undefined;
   if (!storageState) return;
-
-  const baseURL = config.projects[0]?.use.baseURL as string | undefined;
-  if (!baseURL) {
-    throw new Error(
-      "[e2e global-setup] no baseURL is configured. Set PW_BASE_URL to the " +
-        "running OpenCompany host, e.g. PW_BASE_URL=http://127.0.0.1:8080.",
-    );
-  }
 
   const context = await request.newContext({ baseURL });
   try {
@@ -88,6 +111,44 @@ export default async function globalSetup(config: FullConfig) {
   } finally {
     await context.dispose();
   }
+}
+
+/**
+ * Asks `/spec` who answered, and throws unless it is this run's host.
+ *
+ * The `instance-id` read happens **after** the request and not before: the id
+ * is minted lazily on first use, so answering us is what creates that file
+ * under the responder's own data root. Read in this order, a root of ours with
+ * no file is proof the responder does not serve it. See `host-identity.ts`.
+ */
+async function identifyServer(context: APIRequestContext, baseURL: string): Promise<void> {
+  const url = `${baseURL.replace(/\/$/, "")}${SPEC_PATH}`;
+
+  let response: APIResponse;
+  try {
+    response = await context.get(SPEC_PATH);
+  } catch (error) {
+    throw new Error(
+      `[e2e global-setup] GET ${url} did not answer: ${String(error)}\n` +
+        "Either nothing is serving this address, or something is holding the " +
+        "connection open without ever replying — a wedged process still owns " +
+        "the port. Either way the suite has no host to drive.",
+    );
+  }
+
+  const failure = identityFailure({
+    url,
+    status: response.status(),
+    contentType: response.headers()["content-type"] ?? null,
+    // Text, not JSON: a dev server's HTML fallback is exactly the body worth
+    // quoting back, and `.json()` would throw over it before it could be shown.
+    body: await response.text().catch(() => "<body could not be read>"),
+    expectedInstanceId: EXPECTED_INSTANCE_ID,
+    home: MANAGED_HOST_HOME,
+    homeInstanceId: MANAGED_HOST_HOME ? readHomeInstanceId(MANAGED_HOST_HOME) : undefined,
+  });
+
+  if (failure) throw new Error(`[e2e global-setup] ${failure}`);
 }
 
 /** A response paired with the request that produced it, for reporting. */

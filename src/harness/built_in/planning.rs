@@ -3,13 +3,22 @@
 //!
 //! A card entering [`COLUMN_PLANNING`] edge-fires exactly one pass through this
 //! module. The pass writes a [`TaskPlan`] onto the card and then settles the
-//! card itself, three ways:
+//! card itself, four ways:
 //!
 //! | Outcome | Landing | Card carries |
 //! | --- | --- | --- |
 //! | plan written, nothing blocking, a valid assignee | [`COLUMN_IN_PROGRESS`] | the plan; the dispatch edge fires |
-//! | plan written, a hard prerequisite missing | [`COLUMN_TODO`] | the plan **and** the named gap |
+//! | plan written, a hard prerequisite missing | [`COLUMN_PAUSED`] | the plan, the named gap, and a parked question (issue #1861) |
+//! | plan written, no usable owner | [`COLUMN_TODO`] | the plan and the candidates the operator picks from (issue #1106) |
 //! | the pass itself failed | [`COLUMN_TODO`] | the reason only — no plan |
+//!
+//! The prerequisite row is the one that changed in #1861. Every gap the pass
+//! names is something a **person** closes — reconnect the app, supply the file,
+//! grant the namespace — so the card parks a durable blocker and asks, rather
+//! than returning to To-do where a blocked card and one nobody has started look
+//! the same. It still falls back to To-do if the park cannot be written: a card
+//! reading `paused` with nothing on the queue to release it would be worse than
+//! the silence it replaced.
 //!
 //! # Evidence before prescription — achieved by inverting who gathers
 //!
@@ -78,6 +87,7 @@
 //! [`COLUMN_PLANNING`]: crate::ports::tasks::COLUMN_PLANNING
 //! [`COLUMN_IN_PROGRESS`]: crate::ports::tasks::COLUMN_IN_PROGRESS
 //! [`COLUMN_TODO`]: crate::ports::tasks::COLUMN_TODO
+//! [`COLUMN_PAUSED`]: crate::ports::tasks::COLUMN_PAUSED
 //! [`CompanyRuntime`]: crate::company::runtime::CompanyRuntime
 
 use std::collections::{HashMap, HashSet};
@@ -94,8 +104,8 @@ use crate::harness::build::{grants_cover, model_for_tier};
 use crate::harness::provider::HarnessModel;
 use crate::ports::now_millis;
 use crate::ports::tasks::{
-    AssigneeCandidate, COLUMN_IN_PROGRESS, COLUMN_PLANNING, COLUMN_TODO, PlanStep, PrereqKind,
-    PrereqStatus, Prerequisite, TaskPlan, TaskRecord,
+    AssigneeCandidate, COLUMN_IN_PROGRESS, COLUMN_PAUSED, COLUMN_PLANNING, COLUMN_TODO, PlanStep,
+    PrereqKind, PrereqStatus, Prerequisite, TaskPlan, TaskRecord,
 };
 use crate::ports::types::{CompanyRecord, TokenUsage};
 use crate::runtime::advance::{SYSTEM_ATTRIBUTION, append_result};
@@ -213,6 +223,14 @@ impl TaskPlanner {
     /// BYOK switch re-attributes the next pass.
     pub fn provider_slug(&self) -> String {
         self.model.telemetry_provider_id()
+    }
+
+    /// The model this pass's usage is metered against, read live off the
+    /// provider and already folded onto the closed vocabulary (issue #1749).
+    /// `None` before the provider has issued a turn, or when it cannot name a
+    /// model.
+    pub fn model_slug(&self) -> Option<crate::metering::ModelSlug> {
+        self.model.telemetry_model()
     }
 
     /// Claims `task_id` for a pass, or returns `None` if one is already in
@@ -424,6 +442,11 @@ pub async fn run_planning_pass(runtime: Arc<CompanyRuntime>, task_id: String) {
             plan,
             None,
             &ambiguity_reason(&candidates),
+            // Issue #1106 already gives this its own surface: the candidates
+            // ride on the plan and the brief renders them for the operator to
+            // pick from. Parking a second question beside that would ask twice
+            // for one decision.
+            None,
         )
         .await;
         return;
@@ -437,6 +460,9 @@ pub async fn run_planning_pass(runtime: Arc<CompanyRuntime>, task_id: String) {
             None,
             "nobody on the roster is assigned to this card, and the plan did not name a teammate \
              who could take it",
+            // Same family as the ambiguous case above, and #1106's territory:
+            // who owns a card is one decision, asked in one place.
+            None,
         )
         .await;
         return;
@@ -458,7 +484,37 @@ pub async fn run_planning_pass(runtime: Arc<CompanyRuntime>, task_id: String) {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        settle_blocked(&runtime, &task_id, token, plan, Some(assignee), &reason).await;
+        // Issue #1861: this is the answerable one. Every gap on that list is
+        // something a person closes — reconnect the app, supply the file,
+        // grant the namespace — so the card asks instead of silently returning
+        // to To-do where a blocked card and an untouched one look identical.
+        //
+        // The gap class comes from the prerequisites themselves rather than
+        // from prose: an integration nobody but the operator can see routes
+        // differently from a missing brief a teammate might hold (#1866).
+        let blocker = crate::ports::blockers::BlockerPayload {
+            kind: crate::ports::blockers::BlockerKind::for_prereqs(
+                plan.blockers().into_iter().map(|p| p.kind),
+            ),
+            source: crate::ports::blockers::BlockerSource::Prereq,
+            step: Some(crate::ports::blockers::BlockerStep::Task {
+                task_id: task_id.clone(),
+            }),
+            reason: reason.clone(),
+            needed: crate::harness::built_in::blockers::PREREQ_BLOCKER
+                .needed
+                .to_string(),
+        };
+        settle_blocked(
+            &runtime,
+            &task_id,
+            token,
+            plan,
+            Some(assignee),
+            &reason,
+            Some(blocker),
+        )
+        .await;
     }
 }
 
@@ -486,6 +542,7 @@ async fn record_usage(
     crate::metering::record_planning_usage(
         usage,
         &planner.provider_slug(),
+        planner.model_slug(),
         runtime.id(),
         runtime.store().as_ref(),
         runtime.usage().as_ref(),
@@ -621,6 +678,21 @@ async fn settle_dispatch(
 ///
 /// [`TaskStore::upsert`]: crate::ports::TaskStore::upsert
 /// [`advance_settled_card`]: crate::runtime::advance::advance_settled_card
+///
+/// # The `blocker` argument (issue #1861)
+///
+/// `Some(payload)` asks the operator instead of only telling them. Epic #183 §3
+/// sent every blocked card back to To-do so no card could sit in a stuck column
+/// of its own, and that is still right for a gap nobody can answer — but a
+/// missing prerequisite is answerable by definition: somebody reconnects the
+/// integration, or supplies the brief. Parking it puts the question on the
+/// approvals queue and lands the card `paused`, where it reads as waiting
+/// rather than as fresh work nobody has started.
+///
+/// **Fails open.** If the park cannot be written the card still returns to
+/// To-do with the reason on it, which is exactly the pre-#1861 behaviour. A
+/// gate that is down must not strand a card in `paused` with nothing on the
+/// queue to release it.
 async fn settle_blocked(
     runtime: &Arc<CompanyRuntime>,
     task_id: &str,
@@ -628,6 +700,7 @@ async fn settle_blocked(
     plan: TaskPlan,
     assignee: Option<String>,
     reason: &str,
+    blocker: Option<crate::ports::blockers::BlockerPayload>,
 ) {
     let Some(mut card) = claim_settle(runtime, task_id, token).await else {
         return;
@@ -641,16 +714,66 @@ async fn settle_blocked(
     if let Some(assignee) = assignee {
         card.assignee = assignee;
     }
-    card.column = COLUMN_TODO.to_string();
+    // Parked **before** the card is written, so the column the operator sees
+    // and the queue they would answer from cannot disagree: a card that says
+    // `paused` while nothing is parked is a card nothing can release.
+    let parked = match blocker {
+        Some(payload) => match runtime.park_blocker(&payload, task_id).await {
+            Ok(approval_id) => {
+                tracing::info!(
+                    company = %runtime.id(),
+                    task = %task_id,
+                    %approval_id,
+                    kind = payload.kind.as_str(),
+                    "[planning] parked a blocker for the operator instead of returning the card"
+                );
+                Some(approval_id)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    company = %runtime.id(),
+                    task = %task_id,
+                    error = %err,
+                    "[planning] could not park the blocker; the card returns to To-do carrying \
+                     the reason, as it did before blockers existed"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    card.column = if parked.is_some() {
+        COLUMN_PAUSED.to_string()
+    } else {
+        COLUMN_TODO.to_string()
+    };
     card.updated_at_millis = now_millis();
     if let Err(err) = runtime.tasks().upsert(runtime.id(), &card).await {
         tracing::warn!(
             company = %runtime.id(),
             task = %task_id,
             error = %err,
-            "[planning] could not return a blocked card to To-do; it stays in Planning until the \
-             next boot sweep returns it"
+            "[planning] could not settle a blocked card; it stays in Planning until the next \
+             boot sweep returns it"
         );
+        // The park landed and the card write did not, so the blocker now names
+        // a card nobody paused. Withdraw it: an operator answering a blocker
+        // for a card still in Planning releases nothing, and the TTL sweep
+        // cannot repair the pair either — `return_expired_blocker_card` only
+        // moves cards already in `paused`. Better a card the boot sweep returns
+        // than a question with no card behind it.
+        if let Some(approval_id) = parked
+            && let Err(err) = runtime.unpark_blocker(&approval_id).await
+        {
+            tracing::error!(
+                company = %runtime.id(),
+                task = %task_id,
+                %approval_id,
+                error = %err,
+                "[planning] a blocker outlived the card write that failed and could not be \
+                 withdrawn; it stays in the queue against a card that is not paused"
+            );
+        }
     }
 }
 
@@ -744,6 +867,16 @@ struct Evidence {
     /// Distinct from [`Self::composio_reachable`], which is "did the probe
     /// answer" — a liveness fact. This one is "do we hold a bearer at all".
     composio_credential: bool,
+    /// Native capability namespaces some plannable teammate holds a built-in
+    /// tool for — the company can serve these without any Composio connection.
+    ///
+    /// Union scope over the roster's grants
+    /// ([`grants_confer_native`](crate::company::grants_confer_native) over each
+    /// teammate), keyed to the shared native vocabulary
+    /// ([`native_capability_namespaces`](crate::company::native_capability_namespaces)).
+    /// A `connection`/`composio` prerequisite naming one of these is satisfied by
+    /// the built-in tool rather than parked on a connection it never needed.
+    native_capabilities: HashSet<String>,
 }
 
 impl Evidence {
@@ -795,6 +928,23 @@ fn settled_assignee(card_assignee: &str, proposed: Option<String>) -> Option<Str
     }
 }
 
+/// The native capability namespaces the company can serve with a built-in tool,
+/// as a union over the roster: a namespace is included when **any** teammate's
+/// grants confer it. Union scope is deliberate — one teammate holding the tool
+/// means the company can do the work natively, so no card should park on a
+/// Composio connection for it.
+fn native_capabilities_of(teammates: &[TeammateBrief]) -> HashSet<String> {
+    crate::company::native_capability_namespaces()
+        .into_iter()
+        .filter(|ns| {
+            teammates
+                .iter()
+                .any(|t| crate::company::grants_confer_native(&t.grants, ns))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Reads the company's own state — deterministically, with no model in the
 /// loop, and with nothing secret leaving the store.
 ///
@@ -842,7 +992,7 @@ async fn gather_evidence(
             id: a.id.clone(),
             role: a.role.clone(),
             description: a.description.clone(),
-            grants: crate::runtime::builder::agent_effective_grants(&allow, &a.tools),
+            grants: crate::runtime::builder::agent_effective_grants(&allow, a.tools.as_deref()),
             global: a.global,
         })
         .collect();
@@ -856,7 +1006,10 @@ async fn gather_evidence(
                 id: overlay.id.clone(),
                 role: overlay.role.clone(),
                 description: overlay.description.clone(),
-                grants: crate::runtime::builder::agent_effective_grants(&allow, &overlay.tools),
+                grants: crate::runtime::builder::agent_effective_grants(
+                    &allow,
+                    overlay.tools.as_deref(),
+                ),
                 global: false,
             }),
     );
@@ -976,6 +1129,8 @@ async fn gather_evidence(
     )
     .await;
 
+    let native_capabilities = native_capabilities_of(&teammates);
+
     Ok(Evidence {
         company_name: record.manifest.company.name.clone(),
         policy_mode: record.manifest.policy.mode.clone(),
@@ -994,6 +1149,7 @@ async fn gather_evidence(
         skills,
         mail_configured: runtime.mail().is_some(),
         composio_credential,
+        native_capabilities,
     })
 }
 
@@ -1469,6 +1625,16 @@ fn evidence_prompt(e: &Evidence) -> String {
 /// dispatch into work it cannot do. See `verify_connection` for the arm and
 /// issues #319/#396 for when that stops being true.
 ///
+/// **One exception precedes both arms: a capability the company already serves
+/// with a built-in tool.** When the prerequisite name is a native capability
+/// namespace some plannable teammate holds a tool for
+/// ([`Evidence::native_capabilities`]), `connection` and `composio` both return
+/// `satisfied` with a note that no Composio connection is needed — a
+/// web-research card must not park on a `composio search` connection it never
+/// needed when `web_search` is wired. This is checked before the outage
+/// `unknown` guard, so a built-in capability stays satisfied even when the
+/// Composio probe is down.
+///
 /// Permissions are checked against the **manifest** only: the tool allow-list,
 /// the agent's own list, and `[policy]`. Not the live grant set
 /// (`runtime::grants`) and not the harness [`ApprovalPolicy`] — those are the
@@ -1522,6 +1688,12 @@ async fn verify_prerequisites(
 }
 
 fn verify_connection(e: &Evidence, name: &str) -> (PrereqStatus, String) {
+    if e.native_capabilities.contains(&name.to_ascii_lowercase()) {
+        return (
+            PrereqStatus::Satisfied,
+            format!("{name} is served by a built-in tool — no Composio connection is needed"),
+        );
+    }
     match e.connections.get(&name.to_ascii_lowercase()) {
         Some((_, _, true)) => (
             PrereqStatus::Unknown,
@@ -1574,6 +1746,12 @@ fn verify_connection(e: &Evidence, name: &str) -> (PrereqStatus, String) {
 }
 
 fn verify_composio(e: &Evidence, name: &str) -> (PrereqStatus, String) {
+    if e.native_capabilities.contains(&name.to_ascii_lowercase()) {
+        return (
+            PrereqStatus::Satisfied,
+            format!("{name} is served by a built-in tool — no Composio connection is needed"),
+        );
+    }
     if !e.composio_reachable {
         return (
             PrereqStatus::Unknown,

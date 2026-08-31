@@ -357,14 +357,36 @@ impl LocalHosts {
     async fn start_at(&mut self, index: usize) {
         let entry = &self.instances[index].entry;
         let root = root_of(&self.data_dir, entry);
-        // The instance at the data root seeds a starter company; one an
-        // operator created runs the setup wizard instead. See `FirstRun` — the
-        // difference is not cosmetic, because a seeded company makes the host
-        // report `setup_complete` and the wizard never opens again.
-        let first_run = match entry.root {
-            None => FirstRun::SeedStarterCompany,
-            Some(_) => FirstRun::RunSetupWizard,
-        };
+        // Every instance adopts what its root already holds and seeds nothing
+        // — the one at the data root included, which used to be the exception.
+        //
+        // That exception was an ordering artifact rather than a decision. #632
+        // seeded a starter company because a double-clicked application had no
+        // other way in: there was no setup wizard yet, and an empty registry is
+        // a login form addressing a company that does not exist. The wizard
+        // arrived later and this arm was never revisited — so the one install
+        // that most needs onboarding became the one install that could never
+        // reach it. Seeding is not merely a head start: it makes `/spec` report
+        // `setup_complete` (`stamp || !registry.is_empty()`), `ConnectionConsole`
+        // enters its setup phase from that field and nothing else, and no
+        // settings link re-opens the wizard. One silent answer, permanently.
+        //
+        // Note what does **not** change, because it is the whole risk of
+        // touching this: an install that already has a company still boots
+        // straight into it, with no wizard. Seeding was only ever the fallback
+        // half of `desktop::bootstrap_companies`, reached when adoption came
+        // back empty — so the arm dropped here could only ever fire on a root
+        // holding no companies at all, which on the default instance means a
+        // genuinely fresh install. Everything else is the adopt half, which
+        // stays.
+        //
+        // #632's guarantee survives too, as a guarantee about *reachability*
+        // rather than about seeding: the wizard is anonymous on loopback while
+        // the registry is empty (`server::setup::authorize`), its model step is
+        // skippable onto a curated roster, and finishing it seeds a template
+        // through `desktop::seed_company`. Still enterable with no terminal, no
+        // mail server and no credential — it asks first, which is the point.
+        let first_run = FirstRun::RunSetupWizard;
         match embedded::start_with(root, first_run).await {
             Ok(host) => {
                 tracing::info!(
@@ -695,21 +717,24 @@ mod test {
         );
     }
 
-    /// And the instance at the data root keeps the behaviour #632 gave it.
+    /// And the instance at the data root gets the same guarantee, which is the
+    /// half that used to be missing.
     ///
-    /// The pair matters more than either alone: these two hosts differ in
-    /// exactly one decision, and the whole risk of splitting them is that the
-    /// seeding half quietly stops applying to the install that depends on it.
+    /// The pair matters more than either alone: these two hosts made exactly
+    /// one decision differently, and it was the decision that made onboarding
+    /// unreachable on the only install most operators will ever have. Asserted
+    /// over `/spec` for the reason the sibling test gives — `setup_complete` is
+    /// the whole of what the console consults, so an empty company list would
+    /// prove only half of it.
     #[tokio::test]
-    async fn the_instance_at_the_data_root_is_still_enterable_with_no_decisions() {
+    async fn the_instance_at_the_data_root_opens_the_setup_wizard_too() {
         let dir = tempfile::tempdir().unwrap();
         let hosts = LocalHosts::load(dir.path().to_path_buf()).await;
         let default = hosts.default_instance().expect("it starts");
 
-        assert_eq!(
-            default.companies.len(),
-            1,
-            "a fresh install still gets its starter company"
+        assert!(
+            default.companies.is_empty(),
+            "a fresh install must not be handed a company nobody chose"
         );
         let spec: serde_json::Value = reqwest::get(format!(
             "{}/spec",
@@ -720,7 +745,50 @@ mod test {
         .json()
         .await
         .expect("a spec document");
-        assert_eq!(spec["setup_complete"], serde_json::json!(true));
+        assert_eq!(
+            spec["setup_complete"],
+            serde_json::json!(false),
+            "the wizard opens on the default instance, or nothing does: {spec}"
+        );
+    }
+
+    /// The migration guarantee, and the only thing standing between this change
+    /// and "my company is gone".
+    ///
+    /// Not seeding a *fresh* root must not mean ignoring a *used* one. Every
+    /// install that has ever been opened keeps its company under the data dir
+    /// itself (see the module header), and that company has to come back
+    /// without a wizard in front of it — the operator set this machine up long
+    /// ago and has nothing left to decide.
+    #[tokio::test]
+    async fn a_data_root_that_already_holds_a_company_boots_straight_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // What a used install looks like on disk: a bundle under the data dir,
+        // put there by an older launch that seeded, or by a completed wizard.
+        let existing = seed_a_company_into(dir.path()).await;
+        assert_eq!(existing.len(), 1, "the fixture writes one company");
+
+        let hosts = relaunch(dir.path()).await;
+        let default = hosts.default_instance().expect("it starts");
+
+        assert_eq!(
+            default.companies, existing,
+            "a root with a company in it must adopt it, not ignore it"
+        );
+        let spec: serde_json::Value = reqwest::get(format!(
+            "{}/spec",
+            default.base_url.as_deref().expect("running")
+        ))
+        .await
+        .expect("the reported address answers")
+        .json()
+        .await
+        .expect("a spec document");
+        assert_eq!(
+            spec["setup_complete"],
+            serde_json::json!(true),
+            "an install that is already set up must never be walked through setup: {spec}"
+        );
     }
 
     /// Skipping the *seed* must not skip the *adopt*.

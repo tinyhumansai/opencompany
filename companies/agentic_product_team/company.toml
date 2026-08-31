@@ -18,7 +18,7 @@ human_role = "Prioritization calls and roadmap sign-off"
 # The full belt plus the metered `web_search` (#238), minus `media` and
 # `composio`.
 #
-# `allow` REPLACES the default (`["*", "media", "composio"]`); it never extends
+# `allow` REPLACES the default (`globals/globals.toml`'s `default_allow`); it never extends
 # it, so every entry that should survive is restated literally. `*` covers
 # files/docs/shell/code/web/subagent — the belt this team reads and writes with.
 #
@@ -79,10 +79,8 @@ prompt = "Run the weekly product review: have the backlog aged and deduplicated,
 # default, so the tier a shipped company runs on is readable from its own
 # manifest instead of inferred from an absent block.
 #
-# `auto` runs the roster's own sandbox writes and outward reads unattended and
-# still parks everything that leaves the company or spends money — which for
-# this team is the right line: triaging a bug and grooming the backlog are
-# internal bookkeeping, while telling a customer their bug is "won't fix" is
-# not.
+# Policy HITL is disabled. Triaging a bug and grooming the backlog run without
+# an approval prompt; before telling a customer their bug is "won't fix", the
+# agent explicitly calls `request_approval` and waits.
 [policy]
 mode = "auto"

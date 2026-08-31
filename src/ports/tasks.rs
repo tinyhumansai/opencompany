@@ -153,6 +153,7 @@ pub fn is_board_column(column: &str) -> bool {
 /// | [`Paused`](RunStatus::Paused) | [`COLUMN_PAUSED`] | resumed, not approved |
 /// | [`Failed`](RunStatus::Failed) | [`COLUMN_TODO`] | with the run's error on the card |
 /// | [`Cancelled`](RunStatus::Cancelled) | [`COLUMN_TODO`] | with the cancellation reason on the card |
+/// | [`Declined`](RunStatus::Declined) | [`COLUMN_TODO`] | a by-design decline (#1809); reason on the card, now a one-off |
 /// | [`Pending`](RunStatus::Pending) / [`Running`](RunStatus::Running) | — | not settled |
 ///
 /// # `Succeeded` lands in review, **not** in Done
@@ -219,9 +220,27 @@ pub fn column_for_settled_run(status: RunStatus) -> Option<&'static str> {
         // re-fires dispatch. `WaitingApproval` keeps saying *who* unblocks it on
         // the run status — the column only says the work has not happened.
         RunStatus::WaitingApproval | RunStatus::Paused => Some(COLUMN_PAUSED),
+        // Issue #1861: a blocker is a question for a person, so the work has
+        // not happened and the card parks — the same answer the column gives
+        // its two neighbours, for the same reason. What is *different* lives on
+        // the run status, which says a person owes an answer rather than a
+        // decision; the column only ever says whether the work happened.
+        //
+        // Emphatically not `todo`. Epic #183 §3 sends a card that *cannot*
+        // proceed back to To-do, and a blocked card can proceed the moment it
+        // is answered — sending it to To-do would file an open question as
+        // fresh work and lose the question with it. An unanswered blocker does
+        // reach To-do eventually, but through the TTL sweep, carrying its
+        // question on the card.
+        RunStatus::Blocked => Some(COLUMN_PAUSED),
         // Not reviewable work. Epic #183 §3: a card that cannot proceed returns
         // to To-do carrying the reason, never into a stuck column of its own.
         RunStatus::Failed | RunStatus::Cancelled => Some(COLUMN_TODO),
+        // A by-design decline (issue #1809) also returns the card to To-do: the
+        // builder declined to automate it, the card body carries the reason, and
+        // the deliverable is flipped to `once` so its next dispatch reaches the
+        // assignee to do by hand rather than re-entering the builder.
+        RunStatus::Declined => Some(COLUMN_TODO),
         // Still in flight. Nothing to land.
         RunStatus::Pending | RunStatus::Running => None,
     }
@@ -1079,6 +1098,25 @@ pub struct TaskRecord {
     /// whenever it is — the two are stamped together by the one call site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_workflow_id: Option<String>,
+    /// Why a failed or cancelled run returned this card to [`COLUMN_TODO`]
+    /// (issue #1865) — set the instant the settle writes that landing, cleared
+    /// the instant the card leaves `todo` any other way.
+    ///
+    /// **The gap this closes**: `todo` was both the failure state and the
+    /// fresh state, and a bounced card looked identical to one nobody had
+    /// touched yet — an operator had to open every card in the column to tell
+    /// them apart. This is the chip the board renders instead, so the
+    /// distinction is visible in the grid.
+    ///
+    /// `None` is the honest default for everything this is not: a card that
+    /// has never bounced, one that bounced and was then re-dispatched (cleared
+    /// on the `todo` → `in_progress` transition — a fresh attempt earns a
+    /// fresh reading, not a stale chip from the last one), one dragged to
+    /// `todo` by an operator rather than a run, and every card written before
+    /// this field existed. Additive on the wire like [`Self::plan`] and
+    /// [`Self::output`], so no stored board needs migrating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounced: Option<String>,
 }
 
 /// Durable per-company task board. Company A's tasks MUST be invisible to
@@ -1197,6 +1235,13 @@ mod test {
             column_for_settled_run(RunStatus::Cancelled),
             Some(COLUMN_TODO)
         );
+        // Issue #1809: a by-design decline returns the card to To-do, same as a
+        // failure or cancel — the reason is on the note and the card becomes a
+        // one-off, never a stuck column of its own.
+        assert_eq!(
+            column_for_settled_run(RunStatus::Declined),
+            Some(COLUMN_TODO)
+        );
         // Not settled — an in-flight attempt has no landing to write.
         assert_eq!(column_for_settled_run(RunStatus::Pending), None);
         assert_eq!(column_for_settled_run(RunStatus::Running), None);
@@ -1224,6 +1269,7 @@ mod test {
             RunStatus::Succeeded,
             RunStatus::Failed,
             RunStatus::Cancelled,
+            RunStatus::Declined,
         ] {
             assert_ne!(
                 column_for_settled_run(status),
@@ -1253,6 +1299,7 @@ mod test {
             RunStatus::Paused,
             RunStatus::Failed,
             RunStatus::Cancelled,
+            RunStatus::Declined,
         ] {
             assert_ne!(
                 column_for_settled_run(status),
@@ -1282,6 +1329,7 @@ mod test {
             RunStatus::Succeeded,
             RunStatus::Failed,
             RunStatus::Cancelled,
+            RunStatus::Declined,
         ] {
             if let Some(column) = column_for_settled_run(status) {
                 assert!(is_board_column(column), "{status} lands in '{column}'");
@@ -1499,6 +1547,7 @@ mod test {
             workflow_proposal: None,
             origin_run_id: None,
             origin_workflow_id: None,
+            bounced: None,
         }
     }
 

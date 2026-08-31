@@ -12,7 +12,7 @@ use crate::ports::types::{CompanyId, SecretValue};
 use crate::runtime::CompanyRegistry;
 use crate::server::platform_auth::PlatformAuthConfig;
 use crate::server::webhook::WebhookConfig;
-use crate::{VERSION, tiny::RuntimeModuleStatus};
+use crate::{BUILD_COMMIT, VERSION, tiny::RuntimeModuleStatus};
 
 /// Runtime configuration for OpenCompany.
 ///
@@ -508,6 +508,16 @@ pub struct AppState {
     /// `restartRequired` and the console still says so, which is the honest
     /// answer when a rebuild is genuinely unavailable.
     rebuilder: Option<Arc<dyn crate::runtime::RuntimeRebuilder>>,
+    /// Where this host reports product analytics, if anywhere (issue #1739).
+    ///
+    /// Held here because it is a **process-wide** decision — one deployment
+    /// kind, one identity, one destination — that every company's builder then
+    /// inherits, and threading it separately to boot, to provisioning and to
+    /// the rebuilder is how one of the three comes to be missed. The default is
+    /// [`NullTracker`](crate::analytics::NullTracker): a state nobody wired
+    /// reports nothing, which is what every test, every desktop build and every
+    /// self-hosted install gets.
+    analytics: Arc<dyn crate::analytics::Tracker>,
     /// Builds the engine for a `transport = "local"` `acp` harness (issue
     /// #1245). `None` — every test host, and any embedder that does not wire
     /// one — leaves every such harness `unavailable`. Only the desktop shell
@@ -569,12 +579,25 @@ impl AppState {
             nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
             #[cfg(feature = "mcp")]
             oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            analytics: crate::analytics::null_tracker(),
             rebuilder: None,
             acp_agents: None,
             #[cfg(feature = "acp")]
             acp_sessions: Arc::new(crate::server::acp::SessionRegistry::new()),
             boot_inputs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Wires this host's analytics tracker (issue #1739).
+    pub fn with_analytics(mut self, analytics: Arc<dyn crate::analytics::Tracker>) -> Self {
+        self.analytics = analytics;
+        self
+    }
+
+    /// Where this host reports analytics. A [`NullTracker`](crate::analytics::NullTracker)
+    /// unless something wired one, which is every build but a hosted tenant's.
+    pub fn analytics(&self) -> Arc<dyn crate::analytics::Tracker> {
+        self.analytics.clone()
     }
 
     /// Wires this host's in-place runtime rebuilder (issue #290).
@@ -594,6 +617,35 @@ impl AppState {
         self.acp_agents.clone()
     }
 
+    /// Whether a `transport = "local"` ACP harness can actually run here.
+    ///
+    /// Issue #1814. Two callers — the harness picker and the teammate `PATCH`
+    /// validator — used to ask [`acp_agents`](Self::acp_agents) directly, which
+    /// answers a different question: whether a factory was HANDED OVER, not
+    /// whether this build can use one. Those coincide on every server build and
+    /// on a desktop compiled with `acp`, and diverge on exactly one
+    /// configuration — a desktop compiled WITHOUT it:
+    ///
+    /// * [`with_acp_agents`](Self::with_acp_agents) is deliberately ungated, so
+    ///   that `src-tauri` can hand over a factory without pulling the whole
+    ///   embedded harness in behind `crate::harness` (`crate::ports::acp` exists
+    ///   for that reason). The desktop shell calls it unconditionally.
+    /// * The runtime cannot use what it was given: `RuntimeBuilder` forces
+    ///   `acp_agents = None` under `cfg(not(feature = "acp"))`, and
+    ///   `lanes::resolve_acp_engine` is an unconditional `Err` there — its
+    ///   factory parameter is typed `Infallible`, so `Some` is uninhabited.
+    ///
+    /// The result was a picker that offered `claude` and `codex`, a `PATCH`
+    /// that accepted the binding, and then every turn failing with `lanes.rs`'s
+    /// "run it from the desktop app" — advice for somebody already in it.
+    ///
+    /// One method rather than the same conjunct at both call sites: they were
+    /// already copy-paste siblings, comments included, and a predicate the two
+    /// can state differently is what opened the gap in the first place.
+    pub fn can_run_local_acp(&self) -> bool {
+        cfg!(feature = "acp") && self.acp_agents.is_some()
+    }
+
     /// Sessions opened through the host's ACP HTTP transport.
     #[cfg(feature = "acp")]
     pub fn acp_sessions(&self) -> Arc<crate::server::acp::SessionRegistry> {
@@ -603,6 +655,23 @@ impl AppState {
     /// This host's in-place runtime rebuilder, when one is wired.
     pub fn rebuilder(&self) -> Option<Arc<dyn crate::runtime::RuntimeRebuilder>> {
         self.rebuilder.clone()
+    }
+
+    /// Whether this host can rebuild a registered company's runtime in place
+    /// (issue #290) — the capability behind every surface that offers to apply
+    /// a configuration change without a process restart.
+    ///
+    /// [`crate::server::setup`] and [`crate::server::ops::memory_engine`]
+    /// establish the same fact by *attempting* a rebuild and reporting the
+    /// failure. That is the right shape for an action already under way, and
+    /// the wrong one for a surface deciding whether to *offer* the action at
+    /// all: a console that cannot ask up front renders a control whose only
+    /// possible outcome is the `Config` error [`rebuild_company`] returns
+    /// (issue #1736). Asking is what lets it say "not on this host" instead.
+    ///
+    /// [`rebuild_company`]: crate::runtime::rebuild_company
+    pub fn can_rebuild_in_place(&self) -> bool {
+        self.rebuilder.is_some()
     }
 
     /// Records the boot-only builder inputs for `id`, at registration.
@@ -1058,6 +1127,7 @@ impl AppState {
         AppSpec {
             name: "opencompany",
             version: VERSION,
+            build_commit: BUILD_COMMIT,
             framework: "axum",
             modules: vec![
                 "app",
@@ -1126,6 +1196,31 @@ pub struct AppSpec {
     pub name: &'static str,
     /// Crate version.
     pub version: &'static str,
+    /// The Git commit this host was built from: a short object id, suffixed
+    /// `-dirty` when the tree carried uncommitted changes, or `"unknown"`
+    /// when the build could not determine one.
+    ///
+    /// On the unauthenticated handshake, beside [`Self::version`], because the
+    /// line this surface polices is **build facts versus deployment facts**. A
+    /// build fact is identical for every instance compiled from the same
+    /// artifact and says nothing about *this* host. A deployment fact — the
+    /// storage path two fields below, a connection string, a data root — is
+    /// unique to this host and directly actionable, which is why
+    /// [`Self::storage`] reports a kind and not a location. A revision id is
+    /// the first kind: it is `version` at usable precision, and `version` has
+    /// always been served here.
+    ///
+    /// That line survives this repository going private, which is the case
+    /// worth stating explicitly. A commit id is an opaque hash; without the
+    /// repository it maps to nothing, so closing the source *narrows* what
+    /// this field discloses rather than widening it. The residual risk is the
+    /// public case — an unauthenticated caller can look the revision up and
+    /// read off which fixes are missing — and it is accepted deliberately.
+    /// Answering "which build is this host actually running?" without a shell
+    /// on the box is the entire reason the field exists: an operator served a
+    /// three-day-old binary on 2026-08-25 had to compare `strings` output to
+    /// work that out.
+    pub build_commit: &'static str,
     /// HTTP framework used by this host.
     pub framework: &'static str,
     /// First-class source modules.

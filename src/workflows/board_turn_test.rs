@@ -242,6 +242,7 @@ async fn a_workflow_node_assigns_an_existing_card_without_moving_it() {
         workflow_proposal: None,
         origin_run_id: None,
         origin_workflow_id: None,
+        bounced: None,
     };
     let (run, store, _run_id) = run_with_board(
         dir.path(),

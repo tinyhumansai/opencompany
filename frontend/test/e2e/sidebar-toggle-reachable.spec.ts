@@ -168,16 +168,26 @@ test.describe("sidebar toggle reachability", () => {
       "…and never among the nav rows, which is what issue #1177 was",
     ).toHaveCount(0);
 
-    // Beside the switcher, not on top of it, and not a second half of it: the
-    // header holds two separate controls and the boxes must not overlap.
+    // Below the switcher, not on top of it and not a second half of it. It sat
+    // to the switcher's RIGHT until the four utility controls — Settings,
+    // Feedback, Discord and this one — were gathered onto their own bar under
+    // the nameplate; the claim that survives the move is the one that mattered
+    // then too, which is that the two boxes do not overlap and the reader can
+    // tell them apart.
     const switcherBox = await page.getByTestId("host-switcher").boundingBox();
     const toggleBox = await toggle.boundingBox();
     expect(switcherBox, "the host switcher should have a box").not.toBeNull();
     expect(toggleBox, "the collapse control should have a box").not.toBeNull();
     expect(
-      toggleBox!.x,
-      "the collapse button stands clear of the host switcher's trailing edge",
-    ).toBeGreaterThanOrEqual(switcherBox!.x + switcherBox!.width);
+      toggleBox!.y,
+      "the collapse button stands clear of the host switcher's lower edge",
+    ).toBeGreaterThanOrEqual(switcherBox!.y + switcherBox!.height);
+
+    // And it is on the utility bar rather than loose in the header, which is
+    // what keeps it beside the three controls of its own kind.
+    await expect(
+      page.getByTestId("sidebar-utilities").getByTestId("sidebar-collapse"),
+    ).toHaveCount(1);
 
     // Operable from the keyboard, not just under a pointer. An icon-only
     // button is exactly the kind that gets rebuilt as a `div` with an

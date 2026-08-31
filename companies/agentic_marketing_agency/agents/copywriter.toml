@@ -47,3 +47,13 @@ ledgers = [
     { name = "audiences", access = "read" },
     { name = "experiments", access = "record" },
 ]
+
+# The company belt minus `chargebee` (#788), stated explicitly rather than left
+# empty because an omitted `tools` line inherits the WHOLE company grant,
+# billing included — omission is how capability arrives here, not how it is
+# withheld. The creative desk ceiling already strips `search`/`media`/`composio`
+# from this member; stating the belt here additionally keeps the `chargebee`
+# exclusion riding on the member, so a future cross-seat onto an unrestricted
+# desk (desks combine by UNION) cannot widen them to billing. An operator naming
+# this member the biller from the console adds `chargebee` here.
+tools = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*"]

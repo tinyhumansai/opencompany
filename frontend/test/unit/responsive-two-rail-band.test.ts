@@ -78,6 +78,27 @@ describe("settings sub-rail collapses to chips below lg (issue #1383)", () => {
     expect(settings).toContain("flex gap-1 overflow-x-auto p-2");
     expect(settings).not.toContain("border-b sm:hidden");
   });
+
+  /**
+   * Codex review on PR #1931: `ContentSurface` overlays every page's top 28px
+   * with an absolutely-positioned, pointer-events-enabled drag band
+   * (`WindowDragBar`, z-20) on the macOS desktop so the window stays movable
+   * without a native title bar. This chip row is the one place in the console
+   * that puts real, clickable navigation into that exact strip below `lg` —
+   * so without a higher stacking order than the drag band, its links are
+   * unreachable at 880–1023px window widths on macOS.
+   *
+   * jsdom cannot evaluate the actual overlap (that is the drag band's own
+   * media query and stacking order in a real compositor), so this pins the
+   * source contract the fix rests on: the chip row's wrapper carries its own
+   * `relative z-30` stacking context, above the drag band's `z-20`.
+   */
+  it("keeps the chip row above the macOS drag band (z-30 over the band's z-20)", () => {
+    const idx = settings.indexOf('border-b lg:hidden');
+    expect(idx).toBeGreaterThan(-1);
+    const wrapper = settings.slice(Math.max(0, idx - 60), idx);
+    expect(wrapper).toContain("relative z-30");
+  });
 });
 
 describe("composer keeps Send in-flow in a narrow pane (issue #1383)", () => {
@@ -99,5 +120,25 @@ describe("composer keeps Send in-flow in a narrow pane (issue #1383)", () => {
     const sendButton = composer.slice(Math.max(0, idx - 300), idx);
     expect(sendButton).toContain("ml-auto");
     expect(sendButton).not.toMatch(/\babsolute\b|\bfixed\b/);
+  });
+});
+
+describe("mention clearing is gated on the transcript being visible (codex P1)", () => {
+  const chatView = read("views/ChatView.tsx");
+
+  it("only reports a channel viewed while the chat pane is actually on screen", () => {
+    // The view-report effect that clears mentions must not fire while a sub-`lg`
+    // pane shows only the rail — a mention landing then would be marked read
+    // behind the operator's back. A jsdom render cannot prove it (the whole
+    // failure is the `lg` media query), so this pins the gate to the same
+    // `mobilePane` toggle and `lg` breakpoint the pane's class contract above
+    // uses: a future move of the rail off `lg` trips that class test too.
+    expect(chatView).toMatch(/if \(channel && chatPaneVisible\)/);
+    expect(chatView).toContain(
+      'const chatPaneVisible = mobilePane === "chat" || isDesktop;',
+    );
+    // The visibility flag is a dependency, so re-opening the pane from the rail
+    // re-runs the report and clears whatever is newly visible.
+    expect(chatView).toContain("chatPaneVisible,\n  ]);");
   });
 });

@@ -132,6 +132,46 @@ test("#/tasks/<id> still opens the card detail page, untouched by the switcher",
   expect(new URL(page.url()).hash).toBe(`#/tasks/${id}`);
 });
 
+test("List is a navigable view that survives a task-detail round trip", async ({
+  page,
+  request,
+}) => {
+  const title = `e2e list route card ${Date.now()}`;
+  const seeded = await request.post(`${API}/tasks`, { data: { title } });
+  expect(seeded.ok()).toBeTruthy();
+  const id = (await seeded.json()).id as string;
+
+  await page.goto("/#/ledgers/tasks");
+  await dismissTour(page);
+
+  await page.getByRole("button", { name: "List", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/ledgers/tasks?view=list");
+
+  const detailLink = page.locator(`a[href="#/tasks/${id}?view=list"]`);
+  await expect(detailLink).toHaveText(title);
+  await detailLink.click();
+  await expect.poll(() => new URL(page.url()).hash).toBe(`#/tasks/${id}?view=list`);
+
+  await page.goBack();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/ledgers/tasks?view=list");
+  await expect(page.getByRole("button", { name: "Board" })).toBeVisible();
+});
+
+test("Back after choosing List returns to Board before leaving Work", async ({ page }) => {
+  await page.goto("/#/overview");
+  await dismissTour(page);
+
+  await page.locator('[data-tour="nav-ledgers"]').getByRole("button").click();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/ledgers/tasks");
+
+  await page.getByRole("button", { name: "List", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/ledgers/tasks?view=list");
+
+  await page.goBack();
+  await expect.poll(() => new URL(page.url()).hash).toBe("#/ledgers/tasks");
+  await expect(page.getByRole("button", { name: "List", exact: true })).toBeVisible();
+});
+
 test("Manage lists opens from the switcher, in Work — not Company", async ({ page }) => {
   await page.goto("/#/ledgers");
   await dismissTour(page);

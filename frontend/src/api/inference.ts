@@ -45,6 +45,15 @@ export interface InferenceStatus {
   baseUrl: string;
   /** Abstract-tier → concrete model id. */
   models: Record<string, string>;
+  /**
+   * The shipped tier → model defaults, independent of `provider`/`models`
+   * above. The console's OpenRouter preset used to hard-code its own copy of
+   * these ids so the form had something to prefill before an operator typed
+   * an override; that duplicate could silently drift from what the host
+   * actually defaults to. This is read off the host on every status load, so
+   * the preset is never more than one request stale.
+   */
+  defaultTierModels: Record<string, string>;
   /** Provenance badge. */
   source: InferenceSource;
   /** Whether an outbound key is stored — never the key itself. */
@@ -67,6 +76,29 @@ export interface InferenceStatus {
    * (this host has no harness path at all) — tell those apart with `cognition`.
    */
   restartRequired: boolean;
+  /**
+   * Whether the harness cognition path is reachable on this host at all (the
+   * `openhuman` feature compiled in and a pool attached). `false` means no
+   * model configuration can ever move this company onto the design path, so
+   * the setup dialog's "set up a model" call-to-action would be a dead end —
+   * it omits the CTA rather than send the operator round a redesign loop that
+   * cannot end.
+   */
+  harnessReachable: boolean;
+  /**
+   * Whether this host can rebuild the company's runtime in place, so the
+   * console may offer to perform the restart `restartRequired` names (issue
+   * #1736).
+   *
+   * The two are independent, and the card only had the first: it rendered a
+   * "Restart now" button on hosts where `POST …/inference/restart` can only
+   * answer "this host cannot rebuild a company runtime in place". An operator
+   * was told a restart was required, handed the control for it, and the control
+   * could never work. `false` means name the remedy instead of offering the
+   * action — the same rule the setup capability flags exist for (`api/setup.ts`):
+   * say "not in this build" rather than offer a switch that does nothing.
+   */
+  canRebuildInPlace: boolean;
 }
 
 /** The set-provider body. `key` is write-only (never returned). */
@@ -84,6 +116,13 @@ export interface InferenceMutation {
   note: string;
 }
 
+/** One model published by the OpenRouter registry. */
+export interface InferenceModel {
+  id: string;
+  name?: string;
+  contextLength?: number;
+}
+
 /** The live-probe result. */
 export interface InferenceTestResult {
   ok: boolean;
@@ -99,6 +138,14 @@ export function getInferenceStatus(
   company: string | null,
 ): Promise<InferenceStatus> {
   return client.get<InferenceStatus>(`${client.scopeFor(company)}/inference`);
+}
+
+/** The cached OpenRouter model catalog exposed by the company host. */
+export function listInferenceModels(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<InferenceModel[]> {
+  return client.get<InferenceModel[]>(`${client.scopeFor(company)}/inference/models`);
 }
 
 /** Set (or replace) the runtime provider override, optionally rotating the key. */

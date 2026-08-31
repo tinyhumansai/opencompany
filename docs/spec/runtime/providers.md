@@ -137,7 +137,7 @@ What goes on the wire differs by path, and sending the wrong one fails
 | path | wire value | why |
 |---|---|---|
 | proxied | the tier name (`chat-v1`) | the platform's registry routes on it, pinning each tier to a sub-provider so its rate card stays exact |
-| direct | a concrete slug (`deepseek/deepseek-v4-flash`) | OpenRouter has never heard of `chat-v1` |
+| direct | a concrete slug (`anthropic/claude-sonnet-5`) | OpenRouter has never heard of `chat-v1` |
 
 On the direct path an unmapped tier takes `DEFAULT_TIER_MODELS`, which mirrors
 the platform's own OpenRouter bindings — so both paths reach the same models and
@@ -160,6 +160,32 @@ wants a specific model through the proxy writes the `openrouter/…` form into
 
 ---
 
+## Model catalog
+
+`GET {scope}/inference/models` lists OpenRouter's public model registry for
+the console's picker — the operator-facing complement to `DEFAULT_TIER_MODELS`
+above, used when an operator wants to pick a *specific* model rather than
+accept a tier default.
+
+The route is authenticated like the rest of `{scope}/inference/*` but does not
+read the calling company's own config: the registry is a public, per-process
+resource shared by every tenant on the host, not something scoped per company.
+
+| property | value |
+|---|---|
+| cache lifetime | 1 hour (`MODEL_CATALOG_TTL`) |
+| fetch timeout | 10 seconds (`MODEL_CATALOG_TIMEOUT`) — a console page-load waits at most this long on a cold cache, whatever its position in a `fetch_lock` queue |
+| concurrent misses | coalesced onto a single upstream fetch (`ModelCatalogCache::fetch_lock`) — after startup or a TTL expiry, several console requests arriving together do not each fire their own OpenRouter call. The lock wait and the fetch share one timeout budget per caller, so a caller queued behind others during an outage is not left waiting `N × MODEL_CATALOG_TIMEOUT` for its turn to fail too |
+| malformed entries | skipped individually rather than failing the whole response, so one bad record does not hide every valid model the registry returned |
+| response ordering | sorted by model id, distinct from the provider order `discover_models` preserves for the local/custom setup probe |
+
+A registry fetch failure (timeout, non-2xx, an empty catalog) surfaces as an
+error on this route rather than silently returning stale or empty data — the
+picker shows a failure state instead of an incomplete list that looks
+complete.
+
+---
+
 ## Outbound headers
 
 | header | when | why |
@@ -176,6 +202,30 @@ It must never reach a third party. A tenant's own OpenRouter account, a
 self-hosted OpenAI-compatible server and a local Ollama all belong to operators
 who have no relationship with TinyHumans and gain nothing from learning which
 product a tenant runs.
+
+---
+
+## History protection
+
+The managed inference profile advertises a **context window**
+(`max_input_tokens`) because openhuman's turn loop engages
+`ContextCompressionMiddleware` and `ImageAwareMessageTrimMiddleware` only for a
+positive window. Without one, intra-turn history grows unbounded across many tool
+iterations, and an oversized request to a hosted model can fail *silently*:
+HTTP 200, `finish_reason: "failed"`, an empty message, and zero usage — no
+diagnosable provider error.
+
+The advertised window defaults to 240,000 tokens and is configurable through
+`OPENCOMPANY_CONTEXT_WINDOW` (see [config.md](config.md)). Compression and
+deterministic trimming activate at 90% of the window (`window - window / 10`), so
+the estimated budget stays under the model's hard limit; the full derivation is
+documented in `src/harness/built_in/provider.rs`.
+
+An operator using a model with a smaller advertised window must lower the
+threshold to that window (with an estimation margin) rather than trusting the
+default, or requests can exceed the provider limit before compaction engages.
+`OPENCOMPANY_CONTEXT_WINDOW=off` or `0` restores the previous unbounded behavior
+for a model that tolerates arbitrarily long turns.
 
 ---
 
@@ -212,4 +262,5 @@ different payers, and merging them would tell the operator nothing.
 | resolution, scoping, aliasing | `src/company/inference.rs` |
 | the chat models and request plan | `src/harness/built_in/provider.rs` |
 | read/write plane | `src/server/ops/inference.rs` |
+| model catalog discovery, cache, single-flight | `src/server/inference_models.rs` |
 | the subscription proxy itself | the TinyHumans backend |

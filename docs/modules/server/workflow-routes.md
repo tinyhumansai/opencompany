@@ -82,6 +82,23 @@ without a client migration.
 `400`. The id keys the union read path, the scheduler and every journalled run,
 so a rename would silently orphan all three. A rename is a create plus a delete.
 
+**The `ownerDesk` field (issue #1862).** `GET` returns `ownerDesk` (camelCase)
+alongside `version`; on disk it is `owner_desk` in the workflow's TOML. `POST`
+and `PUT` accept the same field in the body. There is no console control to set
+or change it today — the create/edit dialog only carries forward whatever a
+previous read hydrated it with — so an API caller is currently the only way to
+assign or move one. Because `PUT` replaces the graph wholesale, **`ownerDesk`
+must be echoed back exactly like `version`**; omitting it on an edit clears the
+desk assignment rather than leaving it untouched.
+
+A stored `ownerDesk` can stop resolving after the desk it names is renamed or
+removed. The `GET` path already tolerates that — a saved graph must still load
+— and `PUT` now grandfathers it too: a desk that is both unresolvable *and*
+unchanged from what was already stored does not block the save, so editing
+some other field is never refused by desk drift the console gave the operator
+no way to fix. A **newly typed or selected** desk that fails to resolve is
+still a validation error.
+
 **Past runs are orphaned, not reaped.** A deleted workflow's
 `WorkflowRunFinished` entries stay in the company journal and keep coming back
 from `GET …/workflows/runs`. The journal is append-only and shared with chat and
@@ -100,14 +117,18 @@ job is re-syncing cron rows that live in a second durable store.
 # Read the graph and its concurrency token.
 curl -s "$HOST/api/v1/company/workflows/weekly_digest" \
      -H "Authorization: Bearer $TOKEN"
-# → { "id": "weekly_digest", …, "editable": true, "version": "73e8ccc6…" }
+# → { "id": "weekly_digest", …, "ownerDesk": "engineering", "editable": true,
+#     "version": "73e8ccc6…" }
 
 # Correct the schedule, conditional on nothing having changed since that read.
+# `ownerDesk` is echoed back verbatim from the read above — a PUT that drops
+# it clears the desk assignment instead of leaving it alone.
 curl -X PUT "$HOST/api/v1/company/workflows/weekly_digest" \
      -H "Authorization: Bearer $TOKEN" \
      -H 'content-type: application/json' -d '{
   "id": "weekly_digest",
   "name": "Weekly digest",
+  "ownerDesk": "engineering",
   "nodes": [ { "id": "start", "kind": "trigger", "name": "Monday 10:00",
                "schedule": "0 10 * * MON" },
              { "id": "done", "kind": "output", "name": "Owner summary",
@@ -165,8 +186,20 @@ are refused with a `400` when the workflow is written, not only when it runs:
 
 | Destination | Refused when | Checked in |
 | --- | --- | --- |
-| `channel` | the target is not one this **running company** can deliver to — `CompanyRuntime::deliverable_channel_ids()`, which is also what `GET …/workflows/wired-channels` serves the console's picker, and which never includes `operator` | `validate_draft_against_record` in `src/company/workflow_create.rs` (issue #1191), reading the deliverable set the caller passes in. Both write routes pass it; so does the proposal-apply path. The agent tool surfaces pass `None` (no runtime handle) and skip the rule |
+| `channel` | the target is not one this **running company** can deliver to — `CompanyRuntime::deliverable_channel_ids()`, which is also what `GET …/workflows/wired-channels` serves the console's picker. Desk channels and enabled OpenHuman-provider manifest channels, plus the always-present `operator` channel (issue #1757) — now a durable, journal-backed destination, so the console offers it like any other rather than excluding it | `validate_draft_against_record` in `src/company/workflow_create.rs` (issue #1191), reading the deliverable set the caller passes in. Both write routes pass it; so does the proposal-apply path. The agent tool surfaces pass `None` (no runtime handle) and skip the rule |
 | `email` | this company's `[tools].allow` does not grant `email`, which delivery answers with `Denied` / `EmailNotGranted` before it even looks for a mailbox | `validate_draft_against_record` in `src/company/workflow_create.rs`, beside the `tool_call` grant gate — so the orchestrator's `create_workflow` tool is held to it too |
+
+The `operator` destination above is a delivery-plane fact only — it is unrelated
+to how the console *lists* the feed. `GET {scope}/desks` carries zero operator
+logic: it is the company's real desks (manifest `[[group_chat]]`s plus
+operator-created overlay desks) and nothing else. The Operator feed's identity
+— its id (ordinarily `operator`, or the collision-fallback id for the one
+grandfathered company shape where a roster teammate already owns that id — see
+`CompanyRecord::operator_feed_channel`), name, and description — is served by
+its own read-only endpoint, `GET {scope}/operator-channel`, which the console
+renders as a pinned row below a divider in the chat rail rather than folding
+into the desk list (issue #1757 rework, replacing an earlier synthetic-desk
+approach that collided with #1762's `#general`).
 
 The `channel` rule lived on the two write routes until issue #1191, which is
 why applying a copilot proposal persisted a graph the editor then refused to
@@ -372,7 +405,7 @@ wired. `email` is the only kind that can address an outsider, and it needs
 established inbound thread from that address — the same rule the agent send
 path applies; a cold recipient is skipped and reported, never mailed. Note the
 grant half is satisfied by default: since #230 an unset `[tools].allow` defaults
-to `["*", "media", "composio"]` and `*` covers `email`, so on a
+to the globals `default_allow` (which opens with `*`) and `*` covers `email`, so on a
 default-configured company the established-thread rule is the gate actually
 holding the line. Narrow `[tools].allow` explicitly to close the first one.
 
@@ -381,118 +414,53 @@ responses expose only non-secret status. The networked seams (DNS, SMTP, OAuth
 exchange) are dependency-inverted behind traits carried on `ConnectionsRuntime`
 and default to empty (offline) — a surface whose seam is absent returns
 `404 {"code":"not_wired"}`, which the console degrades gracefully.
-## Building a workflow from a task card (issue #580)
 
-A board card marked `deliverable: "workflow"` does not dispatch to a teammate
-when it enters In Progress — it builds a *reusable workflow* instead. The builder
-pass (`src/harness/workflow_build.rs`) proposes a graph and lands the card **In
-Review** with a `TaskWorkflowProposal`; the graph does not exist yet. Two task
-routes finish the loop:
+### The files a run produced (issue #1684)
 
-- `POST …/tasks/{id}/workflow-proposal/apply` rebuilds a `RawWorkflow` from the
-  **stored** proposal `ops` (host authority — the browser's copy is never
-  trusted) and runs it through the **same** `create_company_workflow` core this
-  page's `POST …/workflows` uses, so a proposed graph passes exactly the checks a
-  hand-authored one does — including #276's create-disarm for a scheduled graph.
-  On success the card links to the created workflow (issue #339) and moves to
-  Done; a refused create (roster drift, a name taken since) keeps the card In
-  Review with the reason and returns a 400.
-- `POST …/tasks/{id}/workflow-proposal/reject` clears the proposal and returns
-  the card to To-do.
-
-The full contract — the deliverable choice, the builder pass, and the
-review-before-creation gate — is [workflow-build.md](../../spec/runtime/workflow-build.md).
-
-## Drafting a workflow from a description (issue #753)
-
-`POST …/workflows/draft-from-description` is the New-workflow dialog's copilot: it
-turns a sentence into a graph the create form loads, so an operator can start
-from a description instead of a blank form. It is the same engine as the #580
-card builder (`draft_workflow_from_description` in `src/harness/workflow_build.rs`)
-with the board card removed — the company evidence, the one tool-less model call,
-and the host's authority over the id, the display name, the approval gating and
-the node-kind vocabulary are identical. The one extra it grounds the model in is
-the company's **effective tool slugs** (`workflow_effective_tool_slugs`), because
-a typed description is far likelier to want a `tool_call` step than a card is.
-
-**It never persists.** The draft is validated exactly as `POST …/workflows`
-would (`courtesy_validate_draft`), handed back, and hydrated into the create
-form; the operator reviews and edits it there and presses Create, which is still
-the only call that saves a graph. So a bad draft costs a review, not a rollback,
-and the review-before-creation discipline the card builder keeps is preserved
-without a board card.
-
-Like the cron preview, it answers **200 in both model-answer cases** — a drafted
-graph, or an honest "this is better done once" — keyed by `automatable`:
-
-```bash
-curl -X POST "$HOST/api/v1/company/workflows/draft-from-description" \
-     -H "Authorization: Bearer $TOKEN" \
-     -H 'content-type: application/json' \
-     -d '{"description":"Every Monday, have the writer draft the weekly digest and email the team."}'
-```
+`GET …/workflows/runs/{rid}/artifacts` answers the deliverables one past run
+made, for the run inspector's "Files associated" section:
 
 ```jsonc
-{ "automatable": true,
-  "summary": "Draft and email the weekly digest every Monday",
-  "workflow": { "id": "weekly-digest", "name": "Weekly digest", "nodes": [ … ], "edges": [ … ] } }
+{
+  "files": [
+    { "taskId": "t_a", "artifactId": "art_a1", "title": "Launch spec",
+      "kind": "markdown", "source": "specs/launch.md", "latestVersion": 2,
+      "updatedAtMillis": 1717000000000, "workspaceNodeId": "node_9",
+      "taskTitle": "Draft the launch" }
+  ],
+  "truncated": false
+}
 ```
 
-```jsonc
-{ "automatable": false,
-  "reason": "this is better done once than built into a workflow: it names a one-time cleanup" }
-```
+There is no direct "artifacts by run" index — `ArtifactVersion.run_id` is the
+task **attempt** id, not the workflow run id. The authoritative link is the
+card's `origin_run_id`, the run that **opened** the card, so the route joins
+`run_id → cards where origin_run_id == run_id → each card's artifacts`, reading
+the two broad list primitives (`TaskStore::list` once, then `ArtifactStore::list`
+per matched card) and filtering in memory. It is **metadata only** — never the
+artifact body — and each row is enough for the console to deep-link the file into
+its card's Artifacts tab at `latestVersion` (and, when `workspaceNodeId` is set,
+to `#/workspace/<id>`).
 
-An empty description is a `400`. A build with no embedded brain classifies the
-gap the way the run route does — `not_wired` (404), `restart_required` or
-`inference_required` (409) — so the console points the operator at the same next
-step (a restart, or configuring inference in Settings) rather than a bare
-failure. The spend is metered like a card pass, under a freshly minted id and a
-`workflow:copilot` sentinel agent; there is no `RunStore` row, because a
-synchronous request is not a card's attempt at its own work.
+Like `GET …/workflows/runs/{rid}/output` it is a **lazy per-run fetch**, NOT
+folded into `GET …/workflows/runs` (that fold is already expensive, and an
+inspector opens one run at a time). The one contract difference from `output`:
+**a run with no files answers `200 { files: [], truncated: false }`, never
+`404`** — a run that opened no cards, or cards that published nothing, is the
+common case, not an error. `truncated` flips to `true` only when a run's file
+count passes the host's defensive cap (`MAX_RUN_ARTIFACTS`), which the console
+labels "newest files shown" rather than presenting an incomplete list as
+exhaustive.
 
-## Which tools a proposal may name (issues #783, #874)
+Provenance is the **opening** run: `origin_run_id` is stamped once, at card
+creation, so a card re-owned by a later run still lists its files under the run
+that opened it; a `sub_workflow` child stamps its parent run, so sub-workflow
+cards roll up to the parent. A legacy record with no `source` (a pre-#244
+auto-captured chat reply) is still returned, with `source` omitted, so the
+console labels it rather than the history silently dropping it.
 
-`GET …/workflows/tool-slugs` is the browser-side copilot's tool grounding — the
-`CopilotPanel` reads it once and inlines the answer in the message it composes,
-so a proposed `tool_call` names a real slug instead of an invented one.
+## Authoring a workflow — copilot & task-card proposals (issues #580, #753, #783, #874)
 
-```jsonc
-{ "slugs": ["shell", "read_workspace_state"],
-  "unwired": [ { "slug": "web_search",
-                 "reason": "searchBackendNotConfigured",
-                 "detail": "granted, but no managed search backend is configured on this deployment; …" } ] }
-```
-
-`slugs` is the **effective** set — `workflow_effective_tool_slugs`: the catalogue,
-the company's `[tools].allow`, and this deployment's wiring all agreeing. It is
-the same set the in-process create/fix copilot grounds on, so the two surfaces
-cannot drift.
-
-`unwired` is the granted-but-unwired remainder, with the reason from the same
-`WorkflowToolWiring` the run-time gate reads — `searchBackendNotConfigured` or
-`capabilityTierFiltered`, matching the two sentences `refusal_for` produces at
-run time. Reporting it, rather than dropping it, is what lets a reader tell "this
-company is not allowed that tool" (absent from both lists) from "allowed, but
-nobody configured the provider here".
-
-That distinction is issue #874. The route used to answer the wider **grant-only**
-set, so on a deployment with no search credential a granted `web_search` was
-offered, the copilot authored a node on it, and the run failed at the first node
-with `tool_call 'web_search' is not available in company workflows`.
-
-Two deliberate non-changes:
-
-- **Create/save validation stays permissive.** `validate_tool_call_node` still
-  checks grants alone, so authoring a graph now and wiring the provider later
-  remains legal. This route narrows what a caller is *told is available*, not
-  what the host will *accept*.
-- **Unknowable wiring is not "unwired".** With no harness deps attached the
-  deployment cannot be asked, so `slugs` falls back to the grant-only set and
-  `unwired` is empty — the pre-#874 answer. Claiming every granted tool is broken
-  would be the worse failure. A default build (no `openhuman` feature) wires no
-  `tool_call` grants at all and answers two empty lists rather than a 404, so the
-  copilot grounds on "no tools" instead of being unable to tell.
-
-A host predating #874 sends no `unwired` key; the client defaults it to `[]`,
-which reads identically to a fully wired deployment.
+Building a graph from a task card, drafting one from a free-text description,
+and grounding either on the tools a company can actually reach have their own
+focused page: [workflow-authoring-routes.md](workflow-authoring-routes.md).

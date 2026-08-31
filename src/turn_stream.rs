@@ -75,6 +75,8 @@ pub enum LiveFrame {
     Presence(PresenceFrame),
     /// Somebody is typing in a channel.
     Typing(TypingFrame),
+    /// A coarse "near your credit limit" warning (issue #1846).
+    BudgetProximity(BudgetProximityFrame),
 }
 
 impl LiveFrame {
@@ -110,6 +112,44 @@ impl From<TypingFrame> for LiveFrame {
     fn from(frame: TypingFrame) -> Self {
         Self::Typing(frame)
     }
+}
+
+impl From<BudgetProximityFrame> for LiveFrame {
+    fn from(frame: BudgetProximityFrame) -> Self {
+        Self::BudgetProximity(frame)
+    }
+}
+
+/// A coarse, non-blocking "near your credit limit" warning (issue #1846).
+///
+/// Rides the same ephemeral, journal-less bus as [`TurnStreamEvent`] and for
+/// the same reason: this is a soft heads-up, not an authoritative fact worth
+/// persisting — a console that missed one because it was offline sees the
+/// next one on the next dispatch, and there is nothing to "catch up" on. It
+/// is published **beside the existing pre-flight cap reads** in
+/// [`crate::harness::HarnessPool`]'s dispatch gate, reusing the meter read
+/// that already happens there — never a second query, and never a per-task
+/// cost estimate (that needs a net-new `TaskPlan` cost primitive and is
+/// explicitly out of scope here).
+///
+/// Fail-open by construction: this is emitted only on the branch where the
+/// meter read already SUCCEEDED and a coarse threshold was crossed. An
+/// unreadable meter publishes nothing, exactly like the pre-flight refusals
+/// beside it fall through to running the turn rather than bricking dispatch.
+#[derive(Clone, Debug, Serialize)]
+pub struct BudgetProximityFrame {
+    /// Always `"budget_proximity"`.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// The teammate whose dispatch triggered the read, when the warning is
+    /// scoped to one agent's own cap. `None` for the company-wide ceiling.
+    #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// An operator-facing sentence — no raw figures the config threshold
+    /// might not want surfaced verbatim, just "you're near your limit".
+    pub message: String,
+    #[serde(rename = "atMillis")]
+    pub at_millis: u64,
 }
 
 /// One person's presence changed.
@@ -220,6 +260,18 @@ pub struct TurnStreamEvent {
     /// Wall-clock the completed call took, on `tool_result` only.
     #[serde(rename = "elapsedMs", skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    /// The workflow **run** this frame belongs to, when the turn is a workflow
+    /// agent node rather than a chat turn (issue #1702). The console's run-trace
+    /// sheet keys the live tool timeline on this so a node's in-flight frames
+    /// append to the right run. Absent on a chat turn, which routes by `chatId`
+    /// instead — the two are mutually exclusive routing dimensions, never both.
+    #[serde(rename = "workflowRunId", skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
+    /// The workflow **node** inside that run this frame belongs to (issue
+    /// #1702), so the sheet groups a run's live frames under the same node the
+    /// durable trace attributes them to. Absent on a chat turn.
+    #[serde(rename = "nodeId", skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 impl Default for TurnStreamEvent {
@@ -241,6 +293,8 @@ impl Default for TurnStreamEvent {
             truncated: false,
             status: None,
             elapsed_ms: None,
+            workflow_run_id: None,
+            node_id: None,
         }
     }
 }
@@ -258,6 +312,17 @@ impl TurnStreamEvent {
         self.chat_id = Some(chat_id.into());
         self
     }
+
+    /// Stamp the workflow run + node onto a frame just before publish, so the
+    /// console's run-trace sheet routes it under the right run and node (issue
+    /// #1702). Used instead of [`with_chat`](Self::with_chat) on a workflow
+    /// agent node, which carries no chat thread — the two routing dimensions
+    /// are mutually exclusive.
+    pub fn with_workflow(mut self, run_id: impl Into<String>, node_id: impl Into<String>) -> Self {
+        self.workflow_run_id = Some(run_id.into());
+        self.node_id = Some(node_id.into());
+        self
+    }
 }
 
 /// Routing context a turn carries so its live frames reach the right console
@@ -272,11 +337,30 @@ pub struct TurnStreamCtx {
     pub company: CompanyId,
     /// The responding agent/desk, stamped onto each frame's `agentId`.
     pub agent_id: String,
+    /// Where this turn's live frames route on the console: a chat thread, or a
+    /// workflow run+node. The two are mutually exclusive, so an enum keeps a
+    /// frame from ever carrying both (or neither) routing key.
+    pub route: LiveRoute,
+}
+
+/// Which console surface a turn's live frames route to.
+///
+/// A chat turn keys its in-flight tool timeline on `chatId`; a workflow agent
+/// node has no chat thread and keys on the workflow run + node instead (issue
+/// #1702). Modelled as an enum rather than two `Option`s so a frame cannot be
+/// built with both keys set or neither — the same "make the illegal state
+/// unrepresentable" posture the run-trace sink takes.
+#[derive(Clone, Debug)]
+pub enum LiveRoute {
     /// The chat/desk thread this turn answers, stamped onto each frame's
     /// `chatId` so the console routes the live timeline to the same thread the
     /// durable `agent_reply` lands on. Matches the id journaled as
     /// `AgentReply.chat_id` for this turn.
-    pub chat_id: String,
+    Chat { chat_id: String },
+    /// The workflow run + node this turn belongs to, stamped onto each frame's
+    /// `workflowRunId`/`nodeId` so the console's run-trace sheet appends the
+    /// node's in-flight frames to the right run while it is still executing.
+    Workflow { run_id: String, node_id: String },
 }
 
 /// The sender for a company, created on first use. Mirrors `store::fs`'s
@@ -439,6 +523,48 @@ mod tests {
         assert_ne!(a.chat_id, b.chat_id);
     }
 
+    /// Issue #1702: a workflow agent node's frame carries the workflow run +
+    /// node instead of a chat thread, and serializes them as `workflowRunId` /
+    /// `nodeId`. This is what lets the console's run-trace sheet key the live
+    /// tool timeline on the run.
+    #[test]
+    fn with_workflow_stamps_run_and_node_on_the_wire() {
+        let f = frame("tool_call", 3)
+            .with_agent("researcher")
+            .with_workflow("wfr-42", "summarise");
+        assert_eq!(f.workflow_run_id.as_deref(), Some("wfr-42"));
+        assert_eq!(f.node_id.as_deref(), Some("summarise"));
+        // A workflow node has no chat thread, so `with_workflow` must not invent
+        // one — the two routing dimensions are mutually exclusive.
+        assert!(f.chat_id.is_none());
+
+        let j = serde_json::to_value(&f).expect("serialize");
+        assert_eq!(j["workflowRunId"], "wfr-42");
+        assert_eq!(j["nodeId"], "summarise");
+        assert!(
+            j.get("chatId").is_none(),
+            "a workflow-tagged frame carries no chatId"
+        );
+    }
+
+    /// The tagging is additive: a chat turn's frame still stamps `chatId` and
+    /// omits the workflow ids entirely, so an existing chat console reads the
+    /// wire form byte-for-byte as it did before #1702.
+    #[test]
+    fn a_chat_frame_omits_the_workflow_ids() {
+        let j =
+            serde_json::to_value(frame("tool_call", 0).with_chat("General")).expect("serialize");
+        assert_eq!(j["chatId"], "General");
+        assert!(
+            j.get("workflowRunId").is_none(),
+            "a chat frame must not carry a workflowRunId"
+        );
+        assert!(
+            j.get("nodeId").is_none(),
+            "a chat frame must not carry a nodeId"
+        );
+    }
+
     /// A publish with no subscriber is a silent no-op — a turn streams whether or
     /// not a console is watching.
     #[test]
@@ -465,6 +591,8 @@ mod tests {
             truncated: false,
             status: Some("ok"),
             elapsed_ms: Some(12),
+            workflow_run_id: None,
+            node_id: None,
         };
         let j = serde_json::to_value(f.with_chat("General")).expect("serialize");
         assert_eq!(j["type"], "tool_result");

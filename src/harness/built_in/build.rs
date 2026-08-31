@@ -320,6 +320,14 @@ pub fn build_agent(
     // Deliberate-memory tools, oc-authored over this company's own context
     // port — see `memory_tools`'s doc comment for why not the vendored ones.
     let mut tools: Vec<Box<dyn Tool>> = memory_tools(deps, company, &manifest_agent.id);
+    // Approvals are an explicit agent action, not a policy side effect. Every
+    // roster agent gets this intrinsic tool regardless of external grants.
+    tools.push(Box::new(
+        crate::harness::approval_tool::RequestApprovalTool::new(
+            manifest_agent.id.clone(),
+            deps.approval_requests.clone(),
+        ),
+    ));
     #[cfg(feature = "mcp")]
     {
         // These read the installed-server registry, so installs and lifecycle
@@ -371,6 +379,22 @@ pub fn build_agent(
     // Unlike `media` the grant is the ordinary namespace rule (a bare `*`
     // confers it): publishing spends nothing and reaches nothing outside the
     // company's own board.
+    // Issue #1861: every agent can ask. Unconditional and ungated — a question
+    // is not a capability, it is the alternative to guessing, and an agent
+    // narrow enough to have no other tools is the one most likely to need it.
+    //
+    // Safe to wire everywhere because both drains exist: a chat or task turn
+    // parks what this stages through `park_approval_requests`, a workflow agent
+    // node through `park_gated_calls`. There is no belt on which the question
+    // would stage into a queue nothing empties — the `media` failure mode the
+    // publish gate below guards against.
+    tools.push(Box::new(
+        crate::harness::built_in::blockers::EscalateToHumanTool::new(
+            deps.approval_requests.clone(),
+            manifest_agent.id.clone(),
+        ),
+    ));
+
     let publishing = wants_files && deps.artifacts.is_some();
     if publishing {
         tools.push(Box::new(crate::harness::publish::PublishArtifactTool::new(
@@ -407,7 +431,7 @@ pub fn build_agent(
     // run commands with a tool that is not there.
     let mut shell_wired = false;
     if wants_shell || wants_code || wants_web {
-        let exec_security = Arc::new(toolbelt::exec_security(&workspace, policy.mode()));
+        let exec_security = Arc::new(toolbelt::exec_security(&workspace, policy.toolbelt_mode()));
         // `shell` and `code` are separate grant namespaces and are wired from
         // separate tool vectors — a company granting only one MUST NOT receive
         // the other's tools (the production `CapabilityFilter` is identity and
@@ -503,6 +527,13 @@ pub fn build_agent(
     // `authorize` / `execute` tools additionally park for operator approval via
     // the `ApprovalPolicy`. Gated on the `composio` feature; the default/
     // `openhuman` build never compiles this.
+    // Issue #1759: the connected toolkits to name in the capability-grounding +
+    // Composio-routing brief, captured HERE — where the tools are actually wired
+    // — and rendered into the persona further down. `Some` only when the tools
+    // land on the belt (grant + resolved credential), so the brief can never
+    // advertise a Composio surface this agent does not hold.
+    #[cfg(feature = "composio")]
+    let mut composio_toolkits: Option<Vec<String>> = None;
     #[cfg(feature = "composio")]
     if crate::company::grants_composio_explicit(grants) {
         match &deps.composio {
@@ -510,14 +541,17 @@ pub fn build_agent(
             // usage sample per completed call, so the Usage view's
             // calls-by-provider chart reflects real connected-tool activity
             // (issue #152). A `None` meter simply leaves metering off.
-            Some(config) => tools.extend(crate::harness::composio::composio_tools(
-                config,
-                crate::harness::composio::ComposioMetering {
-                    company: company.clone(),
-                    agent: manifest_agent.id.clone(),
-                    meter: deps.meter.clone(),
-                },
-            )),
+            Some(config) => {
+                composio_toolkits = Some(config.toolkits.clone());
+                tools.extend(crate::harness::composio::composio_tools(
+                    config,
+                    crate::harness::composio::ComposioMetering {
+                        company: company.clone(),
+                        agent: manifest_agent.id.clone(),
+                        meter: deps.meter.clone(),
+                    },
+                ));
+            }
             None => tracing::warn!(
                 company = %company,
                 agent = %manifest_agent.id,
@@ -834,6 +868,33 @@ pub fn build_agent(
         persona.push_str(&crate::harness::publish::publish_brief());
     }
 
+    // Issue #1759: ground the agent in its connected-integration surface and
+    // route provider actions through it. Appended ONLY when the Composio tools
+    // were actually wired above (`composio_toolkits` is `Some`), so — like every
+    // other tool brief here — it never describes a surface this agent does not
+    // hold. The brief itself is a pure renderer in `composio_catalog` (not behind
+    // the `composio` feature) so CI's `openhuman` test lane exercises it; this
+    // call site is feature-gated because the tools it describes are.
+    //
+    // Same `deps.capabilities` check as the `shell`/`code` sandbox brief above
+    // (PR #1780 review): `composio_toolkits` reflects only the GRANT, not the
+    // per-turn capability tier. When a `free`/`starter`/`pro` plan's Composio
+    // budget is exhausted, `filter_by_capabilities` strips every
+    // `composio_*` tool from the belt below — without this check the brief
+    // would still tell the agent to call one.
+    #[cfg(feature = "composio")]
+    if toolbelt::composio_capability_admits(composio_toolkits.is_some(), &deps.capabilities)
+        && let Some(toolkits) = composio_toolkits.as_deref()
+    {
+        let native_caps: Vec<&str> = toolbelt::native_capabilities_on_belt(&tools)
+            .into_iter()
+            .collect();
+        persona.push_str(&crate::harness::composio_catalog::composio_brief(
+            toolkits,
+            &native_caps,
+        ));
+    }
+
     // Skill read surface (read-only catalogue slice). Only materializes when the
     // harness is wired to a skills source; otherwise the agent stays skill-less
     // and the default path is untouched. The catalogue is folded into the
@@ -894,8 +955,11 @@ pub fn build_agent(
         let mcp_security = Arc::new(SecurityPolicy::default());
         // The known-secret set for the scrubber: every credential the agent's
         // granted servers carry, so no configured token can leak into an
-        // agent-visible MCP error (the error-hardening cell).
-        let secrets = granted_secrets(&deps.mcp_servers, manifest_agent);
+        // agent-visible MCP error (the error-hardening cell). Use the same
+        // effective grants that selected `registry`, not the raw manifest
+        // request: an empty request inherits the company belt and can therefore
+        // reach servers even when `manifest_agent.tools` is empty.
+        let secrets = granted_secrets(&deps.mcp_servers, grants);
         tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
         tools.push(Box::new(McpListToolsTool::new(registry.clone())));
         // `OcMcpCallTool` replaces upstream's `McpCallTool`: same name/schema,
@@ -967,6 +1031,7 @@ pub fn build_agent(
             manifest_agent.id.clone(),
             manifest_agent.tools.clone(),
             grants.to_vec(),
+            deps.notifications.clone(),
         ));
     }
     // Recursive desk delegation (issue #176): a NON-orchestrator agent whose
@@ -1066,6 +1131,21 @@ pub fn build_agent(
         Box::new(AttrTolerantXmlDispatcher::default())
     };
 
+    // OpenHuman's tool-pack table withholds `composio_*` schemas unless the
+    // session identifies as its integrations specialist. OpenCompany already
+    // narrows this agent's actual belt by the explicit company and agent grants
+    // above; once that grants Composio, use the supported specialist identity
+    // so the model can call the real tools rather than being offered an absent
+    // pack proxy.
+    #[cfg(feature = "composio")]
+    let agent_definition_name = if composio_toolkits.is_some() {
+        "integrations_agent"
+    } else {
+        manifest_agent.id.as_str()
+    };
+    #[cfg(not(feature = "composio"))]
+    let agent_definition_name = manifest_agent.id.as_str();
+
     let mut agent = AgentBuilder::default()
         // `HarnessModel` upcasts to the tinyagents `ChatModel<()>` the builder's
         // native injection seam takes (the old `Provider` adapter is gone).
@@ -1087,7 +1167,7 @@ pub fn build_agent(
         })
         .model_name(model)
         .workspace_dir(workspace)
-        .agent_definition_name(manifest_agent.id.clone())
+        .agent_definition_name(agent_definition_name)
         .auto_save(false)
         .build()
         .map_err(|e| {
@@ -1739,7 +1819,7 @@ mod tests {
             description: description.map(str::to_string),
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -1876,6 +1956,7 @@ mod tests {
         let mcp_home = Some(root.join("mcp"));
         let audit_root = root;
         HarnessDeps {
+            notifications: None,
             ledgers: None,
             ledger_registry: Default::default(),
             provider: Arc::new(MockProvider::new("mock: ")),
@@ -1931,6 +2012,8 @@ mod tests {
             // tools are never built and the pinned belt below is the
             // pre-#237 belt exactly.
             workspace: None,
+            workflow_runs: None,
+            deep_trace: None,
         }
     }
 
@@ -1958,7 +2041,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: delegates_to.iter().map(|d| d.to_string()).collect(),
             context: None,
             budget_usd_daily: None,
@@ -2010,7 +2093,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -2042,6 +2125,76 @@ mod tests {
         names
     }
 
+    /// The native capabilities `native_capabilities_on_belt` reads off the SAME
+    /// agent [`built_tool_names_with_search`] builds — proving the brief's native
+    /// set is derived from tools that were actually wired, not from the grants.
+    fn built_native_caps_with_search(grants: &[&str]) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deps = pin_deps(dir.path().to_path_buf());
+        deps.search = Some(crate::harness::search::SearchBackend::new(
+            "https://api.example.test".to_string(),
+            crate::company::credentials::Credential::from_value("managed-platform-token"),
+            crate::company::DEFAULT_SEARCH_DAILY_CALLS,
+        ));
+        let manifest_agent = ManifestAgent {
+            global: false,
+            id: "desk".to_string(),
+            role: "Desk Lead".to_string(),
+            name: None,
+            description: None,
+            tier: None,
+            harness: None,
+            tools: None,
+            delegates_to: Vec::new(),
+            context: None,
+            budget_usd_daily: None,
+            prompt: None,
+            prompt_files: Vec::new(),
+            prompt_files_resolved: Vec::new(),
+            classes: Vec::new(),
+            ledgers: None,
+            can_declare_ledgers: true,
+            model: None,
+        };
+        let policy = ApprovalPolicy::new(&Policy::default(), None);
+        let grants: Vec<String> = grants.iter().map(|g| g.to_string()).collect();
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            policy,
+            &deps,
+            &grants,
+            &[],
+            &[],
+            None,
+            false,
+        )
+        .expect("agent builds");
+        toolbelt::native_capabilities_on_belt(agent.tools())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The brief's native set is read off the wired belt: an explicit `search`
+    /// grant with a credential wires `web_search`, so `search` shows up in the
+    /// belt's native capabilities — and a bare `*` (which never wires the metered
+    /// tool) does not.
+    #[test]
+    fn native_capabilities_on_belt_track_the_wired_search_tool() {
+        let granted = built_native_caps_with_search(&["search"]);
+        assert!(
+            granted.contains(&"search".to_string()),
+            "an explicit search grant wires web_search, so `search` is native on the belt: {granted:?}"
+        );
+        let wildcard = built_native_caps_with_search(&["*"]);
+        assert!(
+            !wildcard.contains(&"search".to_string()),
+            "a bare `*` wires no metered search tool, so `search` is not native on the belt: {wildcard:?}"
+        );
+    }
+
     /// Build one agent under `grants` with BOTH a managed search backend and a
     /// company's own `provider` connection wired, and return its live tool
     /// names. The two together is the interesting case: it is what a company
@@ -2069,7 +2222,7 @@ mod tests {
             tier: None,
             harness: None,
             model: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -2167,7 +2320,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -2213,7 +2366,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,
@@ -2578,8 +2731,15 @@ mod tests {
             "memory_recall",
             "memory_store",
             "read_workspace_state",
+            "request_approval",
             "shell",
             "web_fetch",
+            // Issue #1861: intrinsic, on every belt and gated by nothing. The
+            // ability to ask a person a question is not a capability an agent
+            // can be too narrow to hold — a narrow agent is the one most likely
+            // to hit something only the operator can answer, and its
+            // alternatives are guessing or going quiet.
+            "escalate_to_human",
         ];
         // The global baseline installs skills in every company (issue: global
         // agents/skills/workflows), so the three skill read tools are on every
@@ -2598,6 +2758,12 @@ mod tests {
             expected.sort();
         }
         assert_eq!(names, expected, "dispatched desk belt drifted: {names:?}");
+    }
+
+    #[test]
+    fn request_approval_is_intrinsic_and_needs_no_manifest_grant() {
+        let names = built_tool_names(&[], false);
+        assert!(names.contains(&"request_approval".to_string()), "{names:?}");
     }
 
     /// Issue #988: the tool-iteration ceiling is **stated** on every agent this
@@ -2624,7 +2790,7 @@ mod tests {
             name: None,
             description: None,
             tier: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             harness: None,
@@ -2885,7 +3051,7 @@ mod tests {
             description: None,
             tier: None,
             harness: None,
-            tools: Vec::new(),
+            tools: None,
             delegates_to: Vec::new(),
             context: None,
             budget_usd_daily: None,

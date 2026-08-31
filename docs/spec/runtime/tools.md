@@ -21,15 +21,30 @@ yields a grant `[tools].allow` does not already cover, which is what makes the
 lower two levels safe to hand to an operator: the worst a desk or an agent
 declaration can do is remove capability.
 
-Each level is **optional**, and an omitted level is a pass-through rather than a
-denial. This matters more than it looks:
+Each level is **optional**, and an **omitted** level is a pass-through rather
+than a denial:
 
-> An empty grant list means **"inherit"**, not **"nothing"**.
+> An **absent** grant means **"inherit"**, not **"nothing"**.
 
 An agent with no `tools` line holds its desk's ceiling; a desk with no `tools`
-line imposes the company's. Any surface that renders an empty list as "no tools"
-has inverted the meaning — see `AgentToolsDto` in
-`src/server/ops/team_agent.rs`, whose field docs carry the same warning.
+line imposes the company's.
+
+Since issue #1804 the **agent** level draws a further distinction that the desk
+level does not, because a grant is a three-state value there:
+
+> At the **agent** level: **absent** (`None`) inherits; an **explicit empty
+> list** (`[]`) is a deliberate **deny-all** (nothing); a **non-empty list**
+> narrows.
+
+This is a deliberate contract inversion: `[]` used to mean "inherit" and now
+means "hold nothing". It lets an operator lock a single teammate down to no
+tools without touching the company or desk ceiling. The **desk** level keeps the
+older rule — an empty desk `tools` states no ceiling (full pass-through), never
+a company-wide deny-all — so the union sharp edge there is unchanged.
+
+Any surface that renders an absent agent grant as "no tools", or an explicit
+empty agent grant as "inherit", has inverted the meaning — see `AgentToolsDto`
+in `src/server/ops/team_agent.rs`, whose field docs carry the same warning.
 
 Resolution lives in one function,
 [`agent_scoped_grants`](../../../src/runtime/builder.rs), and every reader goes
@@ -39,8 +54,58 @@ tool the gate refuses is the exact failure this single-source rule prevents.
 
 ### Levels in detail
 
-**Company — `[tools].allow`.** The ceiling. Defaults to
-`["*", "media", "composio"]`.
+**Company — `[tools].allow`.** The ceiling, and **the one place a capability is
+turned off for a whole company**. It defaults to `globals/globals.toml`'s
+`default_allow`:
+
+```toml
+default_allow = ["*", "workspace.*", "workspace.write", "media", "composio", "search", "mcp:*"]
+```
+
+Every capability in the list above is on by default, and dropping an entry from
+this list is how it comes off — for every teammate at once, whatever their own
+`tools` line asks for. `allow` **replaces** the default rather than extending
+it, so a company that means to withhold one namespace writes the rest of the
+list out and leaves that one off.
+
+The default withholds the credential-gated `chargebee`, `hosting` and `paypal`
+integrations, and `repo`. The first three are opt-in by name because each is a
+company-specific third-party integration — `hosting` publishes the workspace to
+the public internet and provisions databases the company pays for. `repo` is
+withheld for a different reason, and not as a preference: a host on filesystem
+storage refuses to boot a company whose allow-list names it, because a
+repository credential would sit on that filesystem in plaintext. A
+MongoDB-backed company that wants it adds `repo.*` here and on the teammates
+that need it.
+
+#### Granting a credential-gated namespace from the console (issue #1796)
+
+`[tools].allow` is seed-authoritative: a rebuild re-persists it from
+`company.toml`, and for `[tools]` that is a security property rather than an
+implementation detail. That left the credential-gated integrations above with no
+way in on a hosted tenant, where the manifest is a read-only boot snapshot baked
+into the image — so a company could connect Chargebee from the console, see
+**Connected**, and reach no teammate, with the page correctly reporting that it
+"cannot be fixed from this page".
+
+A connect surface can now add the grant itself, through `PUT …/tools/grants`
+([the write plane](api-write-plane.md)). It is an attributed operator override
+folded into the effective list, **not** a manifest write, and it is bounded two
+ways:
+
+- **A closed list.** `CONSOLE_GRANTABLE_NAMESPACES` is exactly the five the
+  console holds a credential form for — `chargebee`, `composio`, `hosting`,
+  `paypal`, `search`. Granting is the second half of an action the operator
+  already took against an account they already hold. `shell`, `code` and `web`
+  have no such form and are not grantable from any page.
+- **Version control still wins.** A `[tools]` edit in `company.toml` clears
+  every console grant on the next rebuild. This layer only ever *widens*, so a
+  grant outliving a seed edit would be a runtime capability surviving the
+  operator revoking it — the named harm the seed-wins rule exists to prevent.
+
+Narrowing is unchanged and lives one level down: the console withdraws a
+namespace it granted, and takes capability *away* through desk ceilings, never
+by subtracting from the company's own list.
 
 **Desk — `[[group_chat]].tools`.** A department's ceiling. A company organises
 its teammates into desks — a finance desk, a creative desk — and this is where
@@ -69,13 +134,18 @@ company grant itself — but it is not the intuitive one.
 ## The wildcard does not mean everything
 
 `*` covers `files`, `docs`, `shell`, `code`, `web` and `subagent`. It
-deliberately does **not** confer four namespaces, each of which must be named:
+deliberately does **not** confer the explicit opt-in namespaces, each of which
+must be named:
 
 | Namespace | Why it must be named |
 | --- | --- |
 | `media` | Spends real money per generated image or video. |
 | `composio` | Reaches the tenant's connected third-party accounts and moves real side effects — sends email, opens PRs. |
 | `search` | The queries leave the building, and a call is billed — to the managed platform, or to the company's own provider account. See [search.md](search.md). |
+| `mcp:*` | Reaches every `[[mcp_server]]` the company wired, each holding its own endpoint and credentials; a bare `*` must not hand a third-party server's tools to every teammate. |
+| `chargebee` | Billing API, wired only against the company's own Chargebee credentials. |
+| `paypal` | Wallet reads — a business's private figure, not a `*` wildcard's business. |
+| `hosting` | Publishes the workspace to the public internet and provisions databases the company pays for. |
 | `repo` | Materializes a third party's source inside a sandbox where the agent may also hold `shell`. |
 
 `repo.write` is tighter still: only the exact string confers it. A bare `repo`
@@ -87,7 +157,15 @@ Each rule has its own predicate beside the manifest types
 (`grants_media_explicit` and siblings in `src/company/types.rs`). Nothing may
 re-derive these answers from the generic glob matcher: it reports `*` as
 covering everything, which is right for the ordinary families and wrong for
-these four.
+every opt-in namespace above.
+
+The predicates accept two spellings — the bare namespace (`search`) or a
+`namespace.`-descendant (`search.web`) — plus, for the workspace pair, the exact
+`workspace.write` token. A `*` **glued** to the namespace (`search*`,
+`workspace.write*`) is neither: the write path stores a request glob verbatim,
+and no predicate accepts the glued form, so the coverage check and the card
+preview both report it as not applying. Write the broken form instead
+(`search.*`, or `search.web`) when a sub-grant ask is meant.
 
 ## The catalog
 

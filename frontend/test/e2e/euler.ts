@@ -307,13 +307,10 @@ export interface Approval {
  * Everything waiting on the operator right now.
  *
  * This lane cannot run without it, and finding that out is the most useful
- * thing its first run produced. **An agent-picked `shell` call always stops for
- * a human** — `shell`, `curl`, `http_request`, `web_fetch`, `git_operations`
- * and `run_workflow` are the `UNBOUNDED` set in `src/policy/judgement.rs`, and
- * that arm speaks on every tier including `full`, deliberately (issue #338):
- * `full` promises "the agents act without asking, except the few things on the
- * always-ask list", and running arbitrary code is on it by construction rather
- * than by an operator having remembered to type it.
+ * thing its first run produced. The math-lab agreement explicitly calls
+ * `request_approval` before `shell` or `run_workflow`, then waits; policy HITL
+ * itself is disabled. So the parked card proves the agent followed the routed
+ * computation boundary rather than relying on a host interception.
  *
  * So a lab that computes cannot be unattended, and a spec that only sent
  * messages was testing a company with one hand tied. The first run of this lane

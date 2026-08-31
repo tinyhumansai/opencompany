@@ -15,8 +15,9 @@ REST because it ships no GraphQL client: the two inbox `GET`s and the three
 workspace `GET`s (tree, file, `search`), the task export
 (`GET …/tasks/{taskId}/export`), the skill-registry browse
 (`GET …/skills/registry`), the agent detail (`GET …/team/{agentId}`), the policy
-read (`GET …/policy`), and the credential status `GET` — every one detailed
-below or in the credential section. Every other console read goes through
+read (`GET …/policy`), the activation read (`GET …/activation`, issue #1843),
+and the credential status `GET` — every one detailed below or in the
+credential section. Every other console read goes through
 GraphQL (see the [read plane](api-graphql.md)). Anything a build doesn't serve
 `404`s — the console treats that as "not wired yet".
 
@@ -50,10 +51,18 @@ DELETE …/team/{agentId}                      remove a teammate
 PUT    …/team/{agentId}/inbox                toggle a teammate's inbox
 PUT    …/team/{agentId}/budget               set / change / remove a daily cap
 DELETE …/team/{agentId}/budget               reset the cap to the manifest default
-POST   …/setup/roster                       propose a starting team from three answers (company-setup.md)
-GET    …/policy                              the autonomy tier + always-ask list
-PUT    …/policy                              set the tier and/or the always-ask list
+POST   …/team/{agentId}/draft                one copilot turn on this teammate's mandate or persona (writes nothing)
+POST   …/team/draft                          the same, for a teammate being added
+POST   …/avatars                            upload an image → an avatar reference (avatars.md)
+POST   …/setup/roster                       propose a starting team from three answers (company-setup/overview.md)
+GET    …/policy                              the autonomy tier + spend cap + deadline + always-ask list
+PUT    …/policy                              set the tier, spend cap, deadline, and/or always-ask list
 DELETE …/policy                              reset the policy to the manifest's
+GET    …/activation                          the account-activation funnel (issue #1843)
+PATCH  {scope}                               set/confirm the company's display name (issue #1844)  [admin]
+GET    …/tools/grants                        the `[tools].allow` in force + what a connect page may grant (#1796)
+PUT    …/tools/grants                        grant one namespace from a connect page  [admin]
+DELETE …/tools/grants                        withdraw one console grant (`?namespace=`) or all of them  [admin]
 POST   …/inboxes/{key}/read                  mark inbox messages read
 POST   …/inboxes/ingest                     HMAC-signed inbound email → inbox
 GET    …/inboxes                            list inboxes + unread counts
@@ -222,7 +231,8 @@ lists, because only the last is the answer:
 |---|---|
 | `requested` | the agent's own `tools` globs. **Empty means the company's standard grant**, not "no tools" |
 | `companyAllow` | the `[tools].allow` ceiling |
-| `deskAllow` | the union of the `tools` ceilings of the desks this agent sits on, already narrowed by `companyAllow`. **Empty means no desk narrows anything** |
+| `deskAllow` | the union of the `tools` ceilings of the desks this agent sits on, already narrowed by `companyAllow`. **Empty means the narrowed ceiling grants nothing** — which is *not* "no desk narrows anything"; `deskCeilingActive` tells those apart |
+| `deskCeilingActive` | whether any desk this agent sits on states a `tools` ceiling. Distinct from `deskAllow`, which can resolve to an empty list while a ceiling is still in play — a console keying on `deskAllow`'s emptiness would substitute `companyAllow` and promise grants the host drops |
 | `effective` | what the agent actually holds, after all three levels |
 
 The three ceilings shrink monotonically, so a console can render them as a
@@ -252,7 +262,7 @@ row because a client
 cannot otherwise tell a company somebody staffed from one nobody has: the
 baseline is on every roster, so `length === 0` is a question with one answer.
 The console's first-run gate turns on it
-([company-setup.md](company-setup.md)); before the field existed that gate could
+([company-setup/overview.md](company-setup/overview.md)); before the field existed that gate could
 never open.
 
 `PATCH …/team/{agentId}` edits a teammate's `name`, `role`, `description` and
@@ -276,10 +286,21 @@ overlay fingerprint (`overlay_fingerprint`, see
 
 Every detail response carries an `editable` list naming the fields this route
 will accept, so a client renders read-only from the host's answer instead of
-re-deriving the rule. `tools` is admin-only for both kinds — an empty list means
-"the company's standard grant", so a `tools` edit is a potential *widening* —
-and `tier` is read-only for both: it has no override layer, and adding one is a
-policy decision rather than a form field.
+re-deriving the rule. `tools` is admin-only for both kinds and three-state since
+#1804 — `null` resets to the company's standard grant (a potential *widening*),
+an **explicit empty list** (`[]`) is a deliberate deny-all, and a non-empty list
+narrows — and `tier` is read-only for both: it has no override layer, and adding
+one is a policy decision rather than a form field.
+
+### Drafting a mandate or a persona
+
+`POST …/team/{agentId}/draft` and `POST …/team/draft` run one turn of a
+conversation about a teammate's `description` or `instructions`. **Neither
+writes**: the answer is text beside the field, and it becomes a persona only
+through the ordinary `PATCH` a Save performs. The conversation shape, the
+host-side grounding, the four refusal reasons and the argument for why the
+first-run design pass's rule still stands are in
+[api-team-drafting.md](api-team-drafting.md).
 
 `DELETE …/team/{agentId}` removes a teammate. An overlay teammate is deleted
 outright — the record is the only thing that declares it. A **manifest**
@@ -329,23 +350,73 @@ nothing in the console read or wrote it, so an operator drowning in approval
 cards could change it only by redeploying an edited `company.toml` — or, on a
 hosted tenant with a read-only manifest snapshot, not at all.
 
-`GET` returns the tier and always-ask list **in force**, what the manifest would
-restore, whether an override is set and by whom, and the selectable tiers with
-the host's own description of each (`POLICY_MODES` narrowed to tiers the console
-has text for, so it never offers one the host would downgrade). `PUT` takes `mode`
-and `alwaysApprove`, both optional and independent — `{"mode": "auto"}`
-leaves the list alone, `{"alwaysApprove": []}` clears it (a real state, not a
-reset), `{"mode": null}` stops overriding the tier, and `{}` is a **`422`**
-because a body that sets nothing is never stored. An unknown `mode` is `422`
+`GET` returns the tier, spend cap, approval deadline, and always-ask list **in force**, what the manifest would restore, whether an override is set and by whom, and the selectable tiers with the host's own description of each (`POLICY_MODES` narrowed to tiers the console has text for, so it never offers one the host would downgrade). `PUT` takes `mode`, `alwaysApprove`, `autoApproveUnderUsd`, and `approvalTtlHours`, all optional and independent — `{"mode": "auto"}` leaves the other fields alone, `{"alwaysApprove": []}` clears the list (a real state, not a reset), `{"autoApproveUnderUsd": 25}` permits qualifying spends strictly below $25 without asking, `{"autoApproveUnderUsd": null}` stores an explicit no-cap override so every spend remains subject to approval, and `{"approvalTtlHours": 48}` changes the approval deadline. `{"mode": null}` and `{"approvalTtlHours": null}` stop overriding those individual fields, while `{}` is a **`422`** because a body that sets nothing is never stored. An unknown `mode` is `422`
 too, not accepted-and-downgraded, or the console would show a tier the gate was
 not running. Both writes are admin-only and attributed. `DELETE` restores the
 manifest's `[policy]` — its own verb, since a `PUT` of the manifest's current
-values would pin them. The change takes effect on the company's **next turn**
-(`ApprovalPolicy` is built per roster build, and this override is fingerprinted
-alongside the other freshness axes). It survives a rebuild unless the seed's
-`[policy]` itself changed: version control wins when it speaks, so tightening
-`company.toml` clears a looser tier set here, and a redeploy that changed
-nothing does not.
+values would pin them. Tier, cap, and always-ask changes take effect on the
+company's **next turn** (`ApprovalPolicy` is built per roster build, and these
+overrides are fingerprinted alongside the other freshness axes). A deadline
+change is enforced **immediately** by the live approval gate, including when
+parked approvals are swept against their new deadline. The daily budget and
+always-ask list still outrank a spend cap, and the strict cap comparison means
+a spend exactly equal to the cap still parks. The override survives a rebuild
+unless the seed's `[policy]` itself changed: version control wins when it
+speaks, so tightening `company.toml` clears a looser setting here, and a
+redeploy that changed nothing does not.
+
+`GET …/activation` (issue #1843) answers the account-activation funnel: three
+booleans (`nameConfirmed`, `integrationConnected`, `workflowRunSucceeded`), the
+overall `isActivated` verdict, and `activationCompletedAtMillis` — omitted from
+the body entirely (not `null`) until the funnel has latched. `nameConfirmed`
+mirrors the record's own field; `workflowRunSucceeded` is true once the
+journal shows one real (non-dry) run reach the `Ok` verdict, the same ladder
+the console's Steps panel uses; `integrationConnected` requires a live Composio
+connection **and** an explicit `composio` grant in `[tools].allow` — except in
+two cases, where the step is waived rather than permanently blocking
+activation. First, when the manifest can never grant that namespace at all
+(several bundled companies drop `composio` on purpose, e.g. `agentic_math_lab`,
+`agentic_product_team`). Second, when the running binary was built without the
+`composio` feature — including the documented default `cargo run --bin
+opencompany -- serve` — because that build has no client with which to hold a
+connection, so no company running under it could ever satisfy the step. In
+that build the step reads true even for a manifest that does grant `composio`
+and holds no connection; a build that compiles the feature still requires a
+live one. Once every step has read
+true simultaneously, the answer **latches**: `isActivated` stays `true`
+forever after even if a live signal later regresses (a connection gets
+disconnected), because the question is "did this operator ever clear
+onboarding", not "is onboarding state currently intact". This GET is not a
+pure read — the first call where every step is true durably **persists** the
+latch before answering, which is why it is a console read exception here
+rather than a GraphQL resolver. It then appends the terminal
+`OnboardingCompleted` event on a **best-effort** basis: the latch has already
+landed by that point, so a journal failure is logged and ignored rather than
+un-activating the company, and the response can report activation with the
+audit entry missing. Every call after the latch is set short-circuits before any
+Composio round trip or journal scan, so polling an already-activated company
+stays cheap. Any member may call it — it decides nothing on the company's
+behalf, only answers a question.
+
+`PATCH {scope}` (issue #1844) is the funnel's naming step: it sets
+`[company].name` and stamps `CompanyRecord::name_confirmed`, the field
+`nameConfirmed` above mirrors. Admin-only, body is `{"name": "…"}`, `422` on a
+blank name. Unlike every other console write it lands directly on the
+manifest field rather than an overlay — see the route's own doc comment
+(`src/server/ops/company_profile.rs`) for why that survives a rebuild.
+Idempotent and re-callable after confirmation (an ordinary rename), but the
+`OnboardingStepCompleted` audit event fires only on the first call. A company
+saved by build code that predates the funnel is told apart from a fresh
+company's own interrupted first boot by the store-level
+`CompanyStore::activation_gate_seen` marker — see that method's doc comment.
+
+### Tool grants
+
+The three **tool-grant** routes (issue #1796) are the same shape again, applied
+to the field next door — connecting an integration stores a credential, it
+does not grant the tool namespace. Full detail, including the grantable-list
+rationale and the three-answer "when does it take effect" table, is in
+[api-tool-grants.md](api-tool-grants.md).
 
 ### Credential-bearing surfaces (feature-gated)
 
@@ -395,7 +466,12 @@ moment survives instead of being reverted, however many processes are writing.
 
 Credentials written before that split still carry the password inside the
 configuration blob; reads fall back to it, and the first passwordless save after
-the split migrates it to its own key. That migration is the one path that must
+the split migrates it to its own key. It is **read-only**: the configuration
+blob is rewritten on every save without it, guaranteed by
+`#[serde(skip_serializing)]` on the field rather than by every construction site
+remembering to pass `None` (issue #1770). Writing it back would not only put a
+credential in the blob, it would overwrite the pre-split password that the
+legacy read path still depends on. That migration is the one path that must
 read and then write, so `PUT …/smtp` serializes per company for the duration of
 the handler. The lock is in-process, which covers the deployed topology (a
 tenant is a single container); two replicas of one company would reopen the

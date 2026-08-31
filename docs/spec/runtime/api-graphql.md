@@ -137,6 +137,37 @@ conversational surface) and the `/events` work feed
   that needs a real answer must check `cognition` from `GET {scope}/inference`
   — there is no status code to catch.
 
+  **A bare pleasantry runs no cycle at all** (#1725). Before the brain is
+  called, `CycleRunner::run_locked` asks `company::task_intent::small_talk`
+  whether the batch is one operator message that is nothing but "hi" / "hello"
+  / "thanks" — and if it is, answers it from the runtime with a one-line reply,
+  zero steps, zero tokens and no memory trace, in the voice
+  `delegation_tools::chat_responder` resolves for the addressed thread. The
+  reply is journaled, routed and metered by exactly the paths a real turn's is;
+  what is skipped is the thinking.
+
+  This is narrower than `Chatter` on purpose. `small_talk` matches two subsets
+  of the triage's greeting list and excludes every **acknowledgement** — "yes",
+  "ok", "sure", "done" — because those are small talk in isolation and
+  instructions in a conversation: *"yes"* answering a teammate's *"shall I ship
+  it?"* must reach the turn that asked. It also declines a batch, an attachment,
+  a message whose composer carried an explicit "one-off" or "build me the
+  workflow" choice (a positive statement by the person who wrote it, which
+  outranks anything read out of the words), and a workflow copilot thread,
+  whose turns are confined and answered by an agent the runtime cannot speak
+  as.
+
+  Why the runtime answers this itself rather than trusting the turn to be
+  cheap: on staging "hi" ran the full pipeline — memory retrieval, a tool step,
+  and a long analysis belonging to a task nobody had asked about in that turn.
+  The vendored OpenHuman turn re-injects an uncompleted per-thread goal on
+  *every* turn (and resumes a paused one), and the pooled agent's transcript is
+  keyed by agent id alone, so a prior task's fetched page is still in the
+  context window. Both are properties of a turn that runs; the fix that holds
+  regardless of what the vendored runtime does with its goals is not to run
+  one. Scoping that pooled transcript per conversation, and clearing a settled
+  thread goal, are still owed — see the issue.
+
   **There is a third card path, and it has the opposite default** (#984). The
   two above are the route's. When the responder is a desk member rather than
   the orchestrator — a DM, or any addressed thread — the runner also calls
@@ -165,3 +196,31 @@ conversational surface) and the `/events` work feed
 - **`/events`** is the work feed's backend: each frame is a plain-language
   rendering of an event or executed effect plus the raw payload for
   programmatic consumers. Resumable via `since` (event sequence number).
+
+## Run observability
+
+`Company.agentRuns(taskId:, workflowRunId:, limit:)` and `Company.agentRun(id:)`
+return attempts with their step traces, and each step's `deep` half when the host
+keeps one.
+
+REST is unchanged and keeps its job: `GET {scope}/runs/{id}` is shipping, tested,
+and its shape is deliberately the console's `TimelineEntry` contract. This
+surface exists for the **joined** read — run → attempts → steps → detail in one
+request — which over REST would be a round trip per node plus client-side
+assembly.
+
+Deep-trace bodies are deliberately a separate operator write surface. An
+ authenticated administrator (or the hosting platform principal) can destroy
+ them with `DELETE /api/v1/company/deep-trace` (all runs) or
+`DELETE /api/v1/company/deep-trace/{runId}` (one run); the platform-scoped forms
+replace `company` with `companies/{id}`. These routes return `204` and leave
+the redacted run/step skeleton intact. Ordinary members are refused by the
+admin scope guard.
+
+Two shape decisions worth keeping:
+
+- `AgentRun.stepCount` is **nullable on purpose**. `step_count` is written by the
+  settle, so returning the stored `0` for a running attempt would be a lie a
+  client cannot detect. Null is what tells a live reader to count `steps`.
+- `deep` is a field *on* `RunStep`, not a parallel query, so the redacted and
+  unredacted views of one step can never misalign.

@@ -25,7 +25,7 @@
 // round-trip and rebuild preservation — the data change #311 rules out.
 
 import type { DeskDto, TeamMemberDto } from "@/api/types";
-import { fromDto, type TeamMember } from "@/lib/team";
+import { avatarFor, fromDto, type TeamMember } from "@/lib/team";
 
 /**
  * How deep the org chart can go: company, desk, seat.
@@ -53,6 +53,15 @@ export interface OrgSeat {
   name: string;
   /** The teammate's role, or `""` when they resolve to no roster entry. */
   role: string;
+  /**
+   * The face to draw: this teammate's chosen avatar, else the mascot hashed
+   * from the id (`lib/avatar.ts`).
+   *
+   * Carried on the seat rather than recomputed at the node, so a teammate whose
+   * icon somebody set wears it on the chart too — a chart that hashed its own
+   * face would be the one surface still showing the old one.
+   */
+  avatar: string;
   /**
    * Whether this seat leads the desk. True for exactly one seat per non-empty
    * desk — `DeskDto.members[0]`, which is the host's routing target.
@@ -153,9 +162,17 @@ export function buildOrgTree(
           id,
           name: member?.name ?? id,
           role: member?.role ?? "",
+          // A seat the roster cannot resolve still gets a face — the hashed
+          // default from its id — because a blank tile beside a flagged seat
+          // reads as a rendering bug rather than as the missing teammate the
+          // flag is there to report.
+          avatar: member?.avatar ?? avatarFor(id),
           // The host's order carries the hierarchy: index 0 is the lead. Read
           // the position, never re-derive the lead by sorting or by name.
-          lead: index === 0,
+          // Unless the desk is an `auto` channel (issue #1835): there
+          // `members[0]` carries no rank — the host's `desk_lead` is `None` by
+          // definition — so no seat wears the crown.
+          lead: index === 0 && desk.responder !== "auto",
           provenance: overlay.has(id) ? "overlay" : "blueprint",
           known: member !== undefined,
         };

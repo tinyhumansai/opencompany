@@ -17,7 +17,14 @@
         "width": 1280,
         "height": 840,
         "minWidth": 880,
-        "minHeight": 600
+        "minHeight": 600,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 20,
+          "y": 16
+        }
       }
     ],
     "security": {
@@ -34,6 +41,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "12.0"
+    }
   }
 }

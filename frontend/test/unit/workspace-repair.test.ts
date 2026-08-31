@@ -94,7 +94,7 @@ describe("mergeDuplicateFolders", () => {
 
 describe("residualReason", () => {
   it("tells the operator what to do, not what the host called it", () => {
-    for (const cause of ["fileSharesTheName", "fileInTheWay", "treeMovedOn"] as const) {
+    for (const cause of ["fileSharesTheName", "fileInTheWay", "treeMovedOn", "danglingParent"] as const) {
       const reason = residualReason(cause);
       expect(reason).not.toContain(cause);
       expect(reason.length).toBeGreaterThan(20);

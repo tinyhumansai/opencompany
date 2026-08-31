@@ -274,6 +274,14 @@ impl WorkflowBuilder {
         self.model.telemetry_provider_id()
     }
 
+    /// The model this pass's usage is metered against, read live off the
+    /// provider and already folded onto the closed vocabulary (issue #1749).
+    /// `None` before the provider has issued a turn, or when it cannot name a
+    /// model.
+    pub fn model_slug(&self) -> Option<crate::metering::ModelSlug> {
+        self.model.telemetry_model()
+    }
+
     /// Claims `task_id` for a pass, or returns `None` if one is already in
     /// flight for it — the second concurrency layer, covering the drag-out-and-
     /// back-in that a second genuine transition would otherwise let race.
@@ -444,9 +452,9 @@ pub async fn run_workflow_build_pass(
     let spec = match draft.into_outcome() {
         BuildOutcome::NotAutomatable(reason) => {
             // Issue #873: a verdict, not a fault. `settle_not_automatable`
-            // settles the attempt Succeeded and converts the card to a `once`
-            // deliverable so the next dispatch reaches its assignee instead of
-            // re-entering this pass to draw the same conclusion again.
+            // settles the attempt Declined (issue #1809) and converts the card to
+            // a `once` deliverable so the next dispatch reaches its assignee
+            // instead of re-entering this pass to draw the same conclusion again.
             settle_not_automatable(
                 &runtime,
                 &task_id,
@@ -543,6 +551,10 @@ pub async fn run_workflow_build_pass(
         &evidence.record,
         evidence.source_dir.as_deref(),
         Some(&evidence.wired_channels),
+        // A builder pass proposes a NEW workflow — there is no saved
+        // counterpart whose owning desk could be grandfathered (issue #1882
+        // review), so any desk on this draft is a new assignment.
+        None,
     ) {
         settle_to_todo(
             &runtime,
@@ -593,6 +605,7 @@ async fn record_usage(
         runtime.id(),
         agent,
         run_id,
+        builder.model_slug(),
         runtime.store().as_ref(),
         runtime.usage().as_ref(),
     )
@@ -715,14 +728,26 @@ async fn settle_to_todo(
     // earlier proposal reading as current.
     card.workflow_proposal = None;
     card.column = COLUMN_TODO.to_string();
+    // Issue #1865 (CodeRabbit review, PR #1883): the same bounce-chip rule
+    // `advance::advance_settled_card` and `run_task`'s rich settle already
+    // apply. Without this, a builder pass that could not even be attempted —
+    // an unreadable company state, a model timeout, a model error — lands the
+    // card in To-do exactly like any other failed dispatch but skips the
+    // amber chip, because this was the one settle path that never computed
+    // it: dispatching this attempt already cleared any earlier value, so the
+    // card came back indistinguishable from one that had never bounced.
+    card.bounced = crate::runtime::advance::bounced_reason(COLUMN_TODO, RunStatus::Failed, &reason);
     card.updated_at_millis = now_millis();
-    if let Err(err) = runtime.tasks().upsert(runtime.id(), &card).await {
-        tracing::warn!(
-            company = %runtime.id(),
-            task = %task_id,
-            error = %err,
-            "[builder] could not return the card to To-do; it stays In Progress until the next boot"
-        );
+    match runtime.tasks().upsert(runtime.id(), &card).await {
+        Ok(()) => runtime.notify_dispatch_failed(task_id, &reason).await,
+        Err(err) => {
+            tracing::warn!(
+                company = %runtime.id(),
+                task = %task_id,
+                error = %err,
+                "[builder] could not return the card to To-do; it stays In Progress until the next boot"
+            );
+        }
     }
     finish_run(runtime, run_id, RunStatus::Failed, Some(&reason), usage).await;
 }
@@ -734,10 +759,15 @@ async fn settle_to_todo(
 /// bug: the same door served both, so a correct refusal was filed as a failure
 /// and then retried forever.
 ///
-/// 1. **The attempt settles `Succeeded`.** The builder was asked a question and
-///    answered it. Filing that as `Failed` made an honest "don't automate this"
-///    indistinguishable from a model timeout — to the console, to the attempt
-///    history, and to anything counting failures.
+/// 1. **The attempt settles [`Declined`](RunStatus::Declined)** (issue #1809).
+///    The builder was asked a question and answered it. Filing that as `Failed`
+///    made an honest "don't automate this" indistinguishable from a model
+///    timeout — to the console, to the attempt history, and to anything counting
+///    failures. #873 first moved it to `Succeeded`, which stopped the red but
+///    hid a decline among genuine completions and let the external "work that
+///    stopped" surface count it as work that finished. `Declined` is its own
+///    terminal state: neither an error nor an ordinary success, so the refusal
+///    reads as exactly what it is on every surface.
 /// 2. **The card's deliverable flips to `once`.** This is what breaks the loop.
 ///    `CompanyRuntime::dispatch_task` routes a `workflow`-deliverable card to
 ///    this very pass instead of to its assignee, so returning the card to To-do
@@ -795,7 +825,7 @@ async fn settle_not_automatable(
              In Progress until the next boot"
         );
     }
-    finish_run(runtime, run_id, RunStatus::Succeeded, None, usage).await;
+    finish_run(runtime, run_id, RunStatus::Declined, None, usage).await;
 }
 
 /// Settles the attempt row. Best-effort: the work (or its failure) has already
@@ -1934,7 +1964,13 @@ pub(crate) enum CopilotSeed {
     /// Correct `spec` — the saved graph of a workflow whose run failed — grounded
     /// on the precise `failure` (issue #840, PR-3).
     FromFailure {
-        spec: WorkflowGraphSpec,
+        // Boxed (issue #1862 prerequisite): `WorkflowGraphSpec` grew an
+        // `owner_desk` field, which pushed this variant's size far enough
+        // past `FromDescription(String)`'s to trip
+        // `clippy::large_enum_variant`. Boxing is pure indirection here —
+        // every read site already goes through `&spec` or a field clone, both
+        // of which auto-deref through the `Box` unchanged.
+        spec: Box<WorkflowGraphSpec>,
         failure: RunFailureContext,
     },
 }
@@ -1968,7 +2004,7 @@ pub(crate) struct RunFailureContext {
 /// fresh OpenHuman [`Agent`](oh::agent::Agent) is built over the roster's own
 /// inference engine ([`build_copilot_agent`](agent::build_copilot_agent)) with the
 /// three OC-native tools (`list_effective_tools`, `check_workflow`,
-/// `propose_workflow`, see [`tools`]).
+/// `propose_company_workflow`, see [`tools`]).
 ///
 /// **The host authority is unchanged.** The propose tool runs the SAME
 /// post-processing the old inline path did — a safe/unique id (or, on the fix
@@ -2029,6 +2065,11 @@ async fn run_copilot(
             let fixing = Some(tools::FixTarget {
                 id: spec.id.clone(),
                 name: spec.name.clone(),
+                // Carried, not re-derived: the seed spec IS the saved graph
+                // (`workflow_spec_from_graph`), so this is the desk the edit
+                // route will compare the correction against (issue #1882
+                // review).
+                owner_desk: spec.owner_desk.clone(),
             });
             (user, description, fixing)
         }
@@ -2148,7 +2189,7 @@ pub(crate) async fn fix_workflow_from_failure(
     run_copilot(
         runtime,
         CopilotSeed::FromFailure {
-            spec: failing.clone(),
+            spec: Box::new(failing.clone()),
             failure: failure.clone(),
         },
     )

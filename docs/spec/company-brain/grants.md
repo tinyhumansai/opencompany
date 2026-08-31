@@ -5,6 +5,11 @@ approves it: single-use and standing grants, the `auto` tier they define, the
 tier a new company is given, what an `always_approve` entry names, and the order
 the gate decides in. This doc is normative.
 
+Policy-generated HITL is currently disabled. The machinery below remains for
+approvals already in flight, specialized tools that explicitly stage an
+approval, and a future opt-in policy mode. New general approvals come from
+`request_approval`; `supervised`, `auto`, and `full` do not create cards.
+
 Split out of [`approvals.md`](approvals.md), which was over the repository's
 500-line limit. That page holds the trust model around this one — the checkpoint
 taxonomy, the [approval lifecycle](approvals.md#approval-lifecycle) the "as

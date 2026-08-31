@@ -116,8 +116,9 @@ test("the run-history panel opens and shows only the selected workflow's runs", 
   // Issue #1110: History belongs to one workflow, so one has to be open.
   await openFirstWorkflow(page);
 
-  const toggle = await historyToggle(page);
-  await toggle.click();
+  // Issue #1683: index select already opens the History rail, so the toggle
+  // needs waiting on (host-support check) but not clicking.
+  await historyToggle(page);
 
   const panel = page.getByTestId("workflow-run-history");
   await expect(panel).toBeVisible();
@@ -151,8 +152,9 @@ test("running a workflow adds it to the durable history and it survives a reload
   // the same journal rather than of whichever workflow sorted first.
   await openFirstWorkflow(page);
 
-  const toggle = await historyToggle(page);
-  await toggle.click();
+  // Issue #1683: index select already opens the History rail, so the toggle
+  // needs waiting on (host-support check) but not clicking.
+  await historyToggle(page);
   const before = await page
     .getByTestId("workflow-run-history")
     .getByTestId("workflow-run-row")

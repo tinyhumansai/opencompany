@@ -38,14 +38,22 @@ export interface ConversationRuntimeOptions {
   setMessages: (threadId: string, updater: (m: ChatMessage[]) => ChatMessage[]) => void;
   /** Called after a reply lands, so the shell can refresh approvals/status. */
   onReply?: () => void;
-  /** Marks this thread's chat POST as in flight (parent suppresses the SSE echo). */
-  onSendStart?: (threadId: string) => void;
+  /**
+   * Marks this thread's chat POST as in flight (parent suppresses the SSE
+   * echo). Returns the generation the shell stamped this send's receipt with
+   * (issue #1935 review, codex 3892702774) — captured below and threaded
+   * through whichever terminal outcome this POST reaches, so the shell can
+   * tell "my own armed receipt settling" apart from a newer send having
+   * re-armed the same (possibly cross-company-reused) thread id in the
+   * meantime. See `shouldClearReceipt` in `ChatLiveReceipt.tsx`.
+   */
+  onSendStart?: (threadId: string) => number | undefined;
   /** Clears the in-flight mark + live timeline once the POST resolves. */
-  onSendEnd?: (threadId: string) => void;
+  onSendEnd?: (threadId: string, gen?: number) => void;
   /** The host answered `202` and the turn continues on the stream (#983). */
-  onSendDetached?: (threadId: string, turnId?: string) => void;
+  onSendDetached?: (threadId: string, turnId?: string, gen?: number) => void;
   /** The chat POST threw and the turn probably outlived it (#1000). */
-  onSendFailed?: (threadId: string) => void;
+  onSendFailed?: (threadId: string, gen?: number) => void;
   /** Whether a turn is open on this thread — a live POST or a detached one. */
   running: boolean;
   /** Reports a send starting/ending, so the view can hold its working row. */
@@ -103,11 +111,24 @@ export function useConversationRuntime(opts: ConversationRuntimeOptions): Conver
 
   const onNew = useCallback(
     async (appended: AppendMessage) => {
+      // Belt to the composer's own `disabled` state below: never mutate state
+      // or call `client.chat` for a channel the server's read-only guard will
+      // refuse anyway (issue #1757). `threadsFromDesks` builds this thread
+      // list straight from `/desks`, so a bypass of the disabled input still
+      // cannot reach the network.
+      if (thread.readOnly) return;
       const text = textOf(appended);
       if (!text) return;
       setMessages(thread.id, (m) => [...m, makeMessage("you", text)]);
       setSending(true);
-      onSendStart?.(thread.id);
+      // The generation the shell stamped this send's receipt with, if any
+      // (issue #1935 review, codex 3892702774). Threaded through to whichever
+      // terminal callback this POST reaches below, so a clear this send
+      // triggers can never delete a receipt a *later* send — on this same
+      // Conversation surface, or on `ChatView` for the same reused thread id —
+      // has since armed. See `shouldClearReceipt`'s doc for the cross-company
+      // race this closes.
+      const gen = onSendStart?.(thread.id);
       // Which of the POST's three outcomes happened, reported once in the
       // `finally`. Only `"resolved"` means the reply reached the screen — the
       // other two leave a turn running with the stream as its delivery path.
@@ -124,7 +145,7 @@ export function useConversationRuntime(opts: ConversationRuntimeOptions): Conver
           // The reply arrives on the stream, and durably in `chat/history` when
           // the turn settles. Nothing to render here — but the id IS known now,
           // at accept time rather than at settle, which is the improvement.
-          onSendDetached?.(thread.id, answer.turnId);
+          onSendDetached?.(thread.id, answer.turnId, gen);
           return;
         }
         const replies = answer.responses.length
@@ -157,8 +178,8 @@ export function useConversationRuntime(opts: ConversationRuntimeOptions): Conver
         // parent the reply is on screen and so licenses it to drop the live frame
         // it held; a throw rendered nothing and the turn carries on regardless, so
         // that frame is the only copy of the answer this console will be handed.
-        if (outcome === "resolved") onSendEnd?.(thread.id);
-        else if (outcome === "failed") onSendFailed?.(thread.id);
+        if (outcome === "resolved") onSendEnd?.(thread.id, gen);
+        else if (outcome === "failed") onSendFailed?.(thread.id, gen);
       }
     },
     [
@@ -172,6 +193,7 @@ export function useConversationRuntime(opts: ConversationRuntimeOptions): Conver
       setMessages,
       setSending,
       thread.id,
+      thread.readOnly,
     ],
   );
 

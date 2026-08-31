@@ -313,7 +313,7 @@ export function ExternalHarnesses({ client, company }: Props) {
         )}
       </CardContent>
       {rows && rows.length > 0 && (
-        <CardContent className="pt-0">
+        <CardContent>
           <p className="text-xs text-muted-foreground">
             {/* No count while answers are still arriving: "1 of 3 can run a
                 turn" is a claim, and it would be wrong for as long as the

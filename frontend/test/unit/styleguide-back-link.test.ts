@@ -67,14 +67,20 @@ function backHref(): string | null {
   return link!.getAttribute("href");
 }
 
-/** The styleguide header's outer row. */
+/**
+ * The styleguide header's title row — the flex row `PageHeader` puts the
+ * heading, the theme toggle and the back link on (issue #1763).
+ *
+ * Found by walking from the `h1` rather than by position, so the assertions
+ * below stay about *this row* if the component ever gains another wrapper.
+ */
 function headerRow(): HTMLElement {
   act(() => root.render(createElement(StyleguideView)));
-  const row = container.querySelector<HTMLElement>(
-    '[data-testid="styleguide-header"] > div',
+  const heading = container.querySelector<HTMLElement>(
+    '[data-testid="styleguide-header"] h1',
   );
-  expect(row).not.toBeNull();
-  return row!;
+  expect(heading).not.toBeNull();
+  return heading!.parentElement!;
 }
 
 describe("the styleguide back link", () => {
@@ -103,8 +109,12 @@ describe("the styleguide header on a narrow viewport", () => {
     expect(row.className).not.toContain("flex-nowrap");
   });
 
-  it("lets the title block shrink below its min-content width", () => {
-    const title = headerRow().firstElementChild as HTMLElement;
-    expect(title.className).toContain("min-w-0");
+  it("lets the title shrink below its min-content width", () => {
+    const heading = headerRow().querySelector<HTMLElement>("h1");
+    expect(heading?.className).toContain("min-w-0");
+    // The row itself has to allow it too: a flex item defaults to
+    // `min-width: auto`, so `min-w-0` on the heading alone is overridden by the
+    // row's own floor.
+    expect(headerRow().className).toContain("min-w-0");
   });
 });

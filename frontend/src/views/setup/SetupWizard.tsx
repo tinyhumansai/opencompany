@@ -45,7 +45,9 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { OnboardingShell } from "@/components/onboarding-shell";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
+import { useOptionalHosts } from "@/connections/HostsContext";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -169,7 +171,81 @@ interface Props {
   expectsShellRemount?: boolean;
 }
 
+/**
+ * Whether a finished wizard should hand the host a **template slug** rather than
+ * a designed company.
+ *
+ * Pure, and exported, because this one boolean decides what an operator
+ * actually gets: a template seeded whole — its roster, its `[tools]` belt, its
+ * prompts, its provenance — or a company rebuilt from the review screen, which
+ * can carry none of those and is capped at six teammates.
+ *
+ * The rules, and why each is here:
+ *
+ * - **A host with a company seeds nothing.** Setup must never hand an operator
+ *   a second starter company on a re-run.
+ * - **Only a `preset` roster.** A designed team was built for *them*; shipping
+ *   the template instead would throw the design pass away. A `fallback` roster
+ *   is the curated team matched from their answers, which is not any template's.
+ * - **Only an untouched one.** Edits exist nowhere but the review screen, so an
+ *   edited roster has to travel as a designed company.
+ * - **Only when no credential is carried.** The designed path writes the tested
+ *   provider onto the manifest and stores the key against the company; a
+ *   template seed has nowhere to put either, and silently dropping a key the
+ *   operator just watched pass is the worse trade.
+ * - **Except `managed`, which carries nothing.** The designed submit omits
+ *   inference entirely for that provider, because the host already reaches it.
+ *   Taking the designed path there trades the template away for a credential
+ *   that was never going to be written — a pure loss, and an invisible one,
+ *   since the review screen shows the template's roster either way.
+ */
+export function shouldSeedTemplate(input: {
+  hasCompany: boolean;
+  source: "model" | "fallback" | "preset" | null;
+  rosterEdited: boolean;
+  template: string;
+  credentialTested: boolean;
+  provider: string;
+}): boolean {
+  if (input.hasCompany) return false;
+  if (input.source !== "preset") return false;
+  if (input.rosterEdited) return false;
+  if (!input.template.trim()) return false;
+  return !input.credentialTested || input.provider === "managed";
+}
+
+/**
+ * The name to offer for a company nobody has named yet.
+ *
+ * Mirrors what the host derives when no name is sent (`company_name` in
+ * `src/company/setup.rs`) so the suggestion is the name the operator would
+ * otherwise have been given silently — a template's own name when one was
+ * picked, else the first clause of the industry answer.
+ *
+ * Deliberately a *suggestion in a visible field* rather than a better silent
+ * derivation: the id is minted from this and then permanent, and the one screen
+ * where that is still changeable is the one this fills.
+ */
+export function suggestedCompanyName(industry: string, templateName: string | null): string {
+  if (templateName?.trim()) return templateName.trim();
+  const raw = industry.trim();
+  if (!raw) return "";
+  // The same clause rule the host applies: a spaced hyphen is a break, a bare
+  // one is part of a word — so "E-commerce — homeware" gives "E-commerce", not
+  // "E".
+  const normalised = raw.replace(/ [-–] /g, "—");
+  const head = normalised
+    .split(/[—,.:;\n]/)
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+  return (head ?? raw).slice(0, 60).trim();
+}
+
 export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: Props) {
+  // Optional on purpose: this wizard also renders with no console assembled
+  // around it. Undefined in the browser and on a remote host besides — see
+  // `onNameLocalHost`.
+  const onNameLocalHost = useOptionalHosts()?.onNameLocalHost;
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   /**
@@ -193,6 +269,34 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
   const [draft, setDraft] = useState<SetupDraft>(emptySetupDraft);
   /** The shipped company template the operator explicitly chose. */
   const [template, setTemplate] = useState("");
+  /**
+   * What to call the company, as typed on the review step.
+   *
+   * Nothing asked before this. The host derived a name from the *industry*
+   * answer and minted the company id from it, so "what kind of company are you
+   * setting up?" was silently also "what is it called?", permanently — there is
+   * no rename anywhere in the product. Seeded with a suggestion when the roster
+   * arrives, so the field arrives answered rather than as one more question.
+   */
+  const [companyName, setCompanyName] = useState("");
+  /**
+   * Whether the name on screen is the operator's or ours.
+   *
+   * A suggestion has to be *replaceable*, and "is it blank?" cannot tell the
+   * two apart: picking one template, going back, and picking another left the
+   * first template's name in the field — no longer blank, never typed, and
+   * about to become the second company's permanent id.
+   */
+  const [nameTouched, setNameTouched] = useState(false);
+  /**
+   * Whether the operator has changed the proposed roster.
+   *
+   * Load-bearing, not bookkeeping: an untouched `preset` roster is sent back as
+   * a template slug so the host seeds that template whole — its tool belt and
+   * prompts included — while an edited one has to go as a designed company,
+   * because the edits exist nowhere else.
+   */
+  const [rosterEdited, setRosterEdited] = useState(false);
   /** The address that will be able to sign in. */
   const [email, setEmail] = useState("");
   /** Whether the operator has been shown a problem on the current step yet. */
@@ -453,13 +557,28 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
         throw new Error("The host answered without a team to review.");
       }
       setRoster(proposed);
+      setRosterEdited(false);
+      // Suggested, never imposed: the field is editable and this only fills a
+      // blank one, so an operator who has already named their company does not
+      // watch it change under them when they go back and re-design.
+      // Re-suggested on every design, and only over a suggestion: a name the
+      // operator typed survives going back and changing their mind about the
+      // template, and a name they never typed does not.
+      if (!nameTouched) {
+        setCompanyName(
+          suggestedCompanyName(
+            draft.industry,
+            status?.templates.find((candidate) => candidate.id === template)?.name ?? null,
+          ),
+        );
+      }
     } catch (err: unknown) {
       setDesignError(err instanceof Error ? err.message : String(err));
       setRoster(null);
     } finally {
       setDesigning(false);
     }
-  }, [client, draft, template, provider, tested, values.tinyhumans_api_key]);
+  }, [client, draft, template, nameTouched, status, provider, tested, values.tinyhumans_api_key]);
 
   const submit = useCallback(async () => {
     if (!status) return;
@@ -471,10 +590,27 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
     setSaveError(null);
     setBuilt(roster?.agents.length ?? null);
     try {
+      const seedTemplate = shouldSeedTemplate({
+        hasCompany: status.companies.length > 0,
+        source: roster?.source ?? null,
+        rosterEdited,
+        template,
+        credentialTested: tested.kind === "ok",
+        provider,
+      });
+
       const result = await submitSetup(client, {
         fields: changed,
+        name: companyName.trim() || null,
+        // Sent for either path. The designed company carries its own copy
+        // below; a seeded template has no other way to learn it, and no shipped
+        // template names an admin — so without this, choosing a template *and*
+        // a sign-in finishes setup into a company the operator cannot
+        // administer.
+        admin_email: email.trim() || null,
+        template: seedTemplate ? template : null,
         company:
-          status.companies.length === 0 && roster
+          status.companies.length === 0 && roster && !seedTemplate
             ? {
                 industry: draft.industry,
                 teamHint: draft.teamHint,
@@ -495,17 +631,50 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
             : null,
       });
       setApplied(result);
+      // The host takes the company's name. Best-effort and after the fact: the
+      // company exists either way, and a rename that fails is a label, not a
+      // company. Never a reason to show an error on a screen that just
+      // succeeded.
+      if (result.seeded_company && companyName.trim() && onNameLocalHost) {
+        try {
+          await onNameLocalHost(companyName.trim());
+        } catch (error: unknown) {
+          console.warn("[setup] could not name the host after the company", error);
+        }
+      }
     } catch (err: unknown) {
       setSaveError(err instanceof Error ? err.message : String(err));
       setBuilt(null);
     } finally {
       setSaving(false);
     }
-  }, [client, status, changed, roster, draft, email, provider, tested, values.tinyhumans_api_key]);
+  }, [
+    client,
+    status,
+    changed,
+    roster,
+    rosterEdited,
+    template,
+    companyName,
+    draft,
+    email,
+    provider,
+    tested,
+    values.tinyhumans_api_key,
+    onNameLocalHost,
+  ]);
 
   if (loadError) {
     return (
       <OnboardingShell>
+        {/*
+          The first-run flow is outside the console shell, but "outside the
+          shell" is not "unnamed" (codex review, #1785): these two states run
+          before the wizard's own `h1` exists, so an operator on a host that
+          cannot read its own setup got a screen a reader could not announce.
+          `hidden` — the shell already frames the one thing on screen.
+        */}
+        <PageHeader title="Set up this instance" hidden />
         <Alert variant="destructive">
           <AlertTitle>Can&apos;t read this instance&apos;s setup</AlertTitle>
           <AlertDescription>{loadError}</AlertDescription>
@@ -517,6 +686,8 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
   if (!status) {
     return (
       <OnboardingShell>
+        {/* See `loadError` above. */}
+        <PageHeader title="Set up this instance" hidden />
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <Loader2 className="size-4 animate-spin" /> Reading this instance…
         </div>
@@ -868,7 +1039,17 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
             designing={designing}
             designError={designError}
             roster={roster}
-            onRoster={setRoster}
+            name={companyName}
+            onName={(next) => {
+              setCompanyName(next);
+              setNameTouched(true);
+            }}
+            onRoster={(next) => {
+              setRoster(next);
+              // Any edit takes the template path off the table — see
+              // `seedTemplate` in `submit`.
+              setRosterEdited(true);
+            }}
             onRetry={() => void design()}
             changed={changed}
             restartKeys={restartKeys}
@@ -912,6 +1093,46 @@ function requiresSignIn(status: SetupStatus, values: Record<string, string>): bo
 // ---------------------------------------------------------------------------
 // Steps
 // ---------------------------------------------------------------------------
+/**
+ * The sign-in modes this wizard may offer, out of the ones the host accepts.
+ *
+ * `wallet` is withheld, and this is a lockout guard rather than a preference.
+ * A wallet company is bootstrapped by `[users].wallets` — "listing an address
+ * makes it eligible, signing a challenge mints the admin" — and nothing in this
+ * flow can collect one: the account step asks for an email, and both seed paths
+ * write `[users].admins`, which `wallet` mode never reads. Choosing it
+ * therefore finishes setup on a company with **no eligible administrator**, and
+ * the door closes behind it: once a company exists and setup is stamped
+ * complete, `server::setup::authorize` stops answering an anonymous caller, so
+ * the console cannot be used to undo it.
+ *
+ * That was previously unreachable on the instance most operators have, because
+ * it seeded a company and never opened this wizard at all. Making the wizard
+ * the way in is what makes withholding this necessary rather than tidy.
+ *
+ * A mode already in force is always offered, even when withheld: an operator
+ * re-running setup on a wallet host is looking at their own configuration, and
+ * a screen that silently omits the answer it is currently showing would read as
+ * the setting having been lost.
+ *
+ * Wallet remains available the way it is actually set up today — `auth_mode` in
+ * `config.toml` beside a `[users].wallets` list on the company. Collecting a
+ * wallet key here, and writing the mode and its list onto the seeded manifest
+ * together, is the fuller fix and is its own change.
+ */
+export function offeredAuthModes(status: SetupStatus, current: string): string[] {
+  // A field `env` owns is one this screen is *reporting*, not offering, and it
+  // cannot report a mode it has filtered out. It also cannot tell which mode
+  // that is: `FieldDto.value` is read from `config.toml` alone
+  // (`effective_value` in `src/server/setup.rs`), so an `OPENCOMPANY_AUTH_MODE`
+  // the host is actually running never reaches this list. Withholding on top of
+  // that would show a locked picker whose every option is wrong. Nothing here
+  // is selectable in that state, so nothing can be walked into.
+  const field = status.fields.find((f) => f.key === "auth_mode");
+  if (field !== undefined && !field.editable) return status.auth_modes;
+  return status.auth_modes.filter((mode) => mode !== "wallet" || current === "wallet");
+}
+
 function SignInStep({
   status,
   value,
@@ -942,7 +1163,7 @@ function SignInStep({
       )}
 
       <div className="mt-2.5 space-y-2">
-        {status.auth_modes.map((mode) => {
+        {offeredAuthModes(status, value || field?.value || "").map((mode) => {
           const copy = AUTH_MODE_COPY[mode] ?? { label: mode, hint: "" };
           const active = (value || field?.value) === mode;
           return (
@@ -1417,6 +1638,8 @@ function ReviewStep({
   designing,
   designError,
   roster,
+  name,
+  onName,
   onRoster,
   onRetry,
   changed,
@@ -1428,6 +1651,9 @@ function ReviewStep({
   designing: boolean;
   designError: string | null;
   roster: SetupRoster | null;
+  /** What the company will be called. */
+  name: string;
+  onName: (name: string) => void;
   onRoster: (roster: SetupRoster) => void;
   onRetry: () => void;
   changed: Record<string, string | null>;
@@ -1466,6 +1692,9 @@ function ReviewStep({
     );
   }
 
+  /** Whether this roster is a template's own, seeded rather than rebuilt. */
+  const shipped = roster.source === "preset";
+
   const drop = (index: number) =>
     onRoster({ ...roster, agents: roster.agents.filter((_, i) => i !== index) });
 
@@ -1477,14 +1706,47 @@ function ReviewStep({
 
   return (
     <div className="space-y-4" data-testid="setup-review">
+      {/* The name, asked once, here.
+          Last screen before it is permanent: the host mints the company id from
+          this and never changes it, and nothing in the product renames a
+          company afterwards. It sits above the roster because it is the one
+          field on this screen that cannot be revisited later, while any
+          teammate can be added, renamed or dropped from the console. */}
+      <div className="space-y-1.5">
+        <Label htmlFor="setup-company-name">What should we call it?</Label>
+        <Input
+          id="setup-company-name"
+          data-testid="setup-company-name"
+          value={name}
+          // The host clamps to this too (`MAX_COMPANY_NAME`), because the id is
+          // derived from the name and becomes a directory component. Bounded
+          // here as well so the operator sees the limit rather than meeting it
+          // as a truncation after the fact.
+          maxLength={60}
+          placeholder="Your company's name"
+          onChange={(e) => onName(e.target.value)}
+        />
+        <p className="text-xs leading-snug text-muted-foreground">
+          This names the company and its id. You can change it now; you can&apos;t later.
+        </p>
+      </div>
+
       <div>
         <h2 className="text-base font-medium leading-snug">Your team</h2>
         <p className="mt-0.5 text-sm leading-snug text-muted-foreground">
           {roster.source === "model"
             ? "Built from what you told us. Rename or drop anyone — you can add more later."
-            : roster.reason === "not_designable"
+            : roster.source === "preset"
+              ? // The template's own team, which is what the operator picked
+                // from a list that told them its size. Said plainly, because
+                // this screen used to show a *different* standard team under
+                // the same heading and call it theirs.
+                "The team this template ships with, exactly as it comes. You can rename or drop anyone once you're inside."
+              : roster.reason === "not_designable"
               ? "A standard team for your industry — there wasn't enough in your answers to design one around. Go back and say more about the business, or rename and drop anyone here."
-              : "A solid standard team for your industry — we couldn't reach a model to tailor it. Rename or drop anyone, and add a key later to redesign."}
+              : roster.reason === "model_unreachable"
+                ? "A standard team for your industry — we couldn't reach the model to tailor it right now. Check the connection, or rename and drop anyone here."
+                : "A solid standard team for your industry — we couldn't reach a model to tailor it. Rename or drop anyone, and add a key later to redesign."}
         </p>
       </div>
 
@@ -1511,25 +1773,41 @@ function ReviewStep({
               {initials(agent.name || agent.role)}
             </span>
             <div className="min-w-0 flex-1">
-              <Input
-                value={agent.role}
-                aria-label={`Role for ${agent.role}`}
-                data-testid="setup-review-role"
-                onChange={(e) => rename(i, e.target.value)}
-                className="h-7 border-transparent bg-transparent px-1 font-medium shadow-none hover:border-input focus-visible:border-input"
-              />
+              {/* A shipped roster is read here, not edited.
+                  Not a restriction for its own sake: an edited roster can only
+                  be sent back as a *designed* company, and the designed path is
+                  bounded at six teammates — so renaming one row of an
+                  eight-teammate template would silently drop two of them, and
+                  the operator would find out by not finding them. Every one of
+                  these is renameable and removable from the console the moment
+                  setup finishes, where no such bound applies. */}
+              {shipped ? (
+                <p className="px-1 font-medium" data-testid="setup-review-role">
+                  {agent.role}
+                </p>
+              ) : (
+                <Input
+                  value={agent.role}
+                  aria-label={`Role for ${agent.role}`}
+                  data-testid="setup-review-role"
+                  onChange={(e) => rename(i, e.target.value)}
+                  className="h-7 border-transparent bg-transparent px-1 font-medium shadow-none hover:border-input focus-visible:border-input"
+                />
+              )}
               <p className="truncate px-1 text-xs text-muted-foreground">{agent.description}</p>
             </div>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => drop(i)}
-              aria-label={`Remove ${agent.role}`}
-              data-testid="setup-review-remove"
-              className="shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-            >
-              Remove
-            </Button>
+            {!shipped && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => drop(i)}
+                aria-label={`Remove ${agent.role}`}
+                data-testid="setup-review-remove"
+                className="shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+              >
+                Remove
+              </Button>
+            )}
           </li>
         ))}
       </ul>

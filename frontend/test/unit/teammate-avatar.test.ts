@@ -4,7 +4,8 @@ import { dirname, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { avatarFor, avatarSrc } from "@/lib/team";
+import { staticAvatarSrc } from "@/lib/avatar";
+import { avatarFor } from "@/lib/team";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDir = resolve(here, "../../public");
@@ -42,9 +43,11 @@ describe("avatarFor", () => {
       Array.from({ length: 500 }, (_, i) => avatarFor(`seed_${i}`)),
     );
     expect(reachable.size).toBeGreaterThan(1);
-    for (const key of reachable) {
-      const rel = avatarSrc(key).replace(/^\//, "");
-      expect(existsSync(resolve(publicDir, rel)), `missing asset for ${key}`).toBe(true);
+    for (const ref of reachable) {
+      const src = staticAvatarSrc(ref);
+      expect(src, `${ref} resolves to no source at all`).not.toBeNull();
+      const rel = src!.replace(/^\//, "");
+      expect(existsSync(resolve(publicDir, rel)), `missing asset for ${ref}`).toBe(true);
     }
   });
 });
