@@ -1,3 +1,7 @@
 [submodule "vendor/openhuman"]
 	path = vendor/openhuman
 	url = https://github.com/tinyhumansai/openhuman.git
+[submodule "vendor/tinyteams"]
+	path = vendor/tinyteams
+	url = https://github.com/tinyhumansai/tinyteams.git
+	branch = main
