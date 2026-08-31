@@ -36,8 +36,7 @@ pub use tinyteams_core::chat::{GENERAL_DESK, MAIN_THREAD_ID, is_general_chat, sa
 // glossary word has to fold into the identity. Pinned here rather than
 // duplicated, and it costs nothing at runtime.
 const _: () = assert!(
-    matches!(DEFAULT_DESK.as_bytes(), b"General")
-        && matches!(GENERAL_DESK.as_bytes(), b"General"),
+    matches!(DEFAULT_DESK.as_bytes(), b"General") && matches!(GENERAL_DESK.as_bytes(), b"General"),
     "the operator-facing default desk name and the General desk id must agree",
 );
 
