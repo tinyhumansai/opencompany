@@ -16,15 +16,28 @@ use crate::ports::types::{
     Actor, ActorKind, CompanyEvent, CompanyRecord, EventSeq, Mention, MentionTarget, StoredEvent,
     TurnStep,
 };
-use crate::server::ops::language::DEFAULT_DESK as GENERAL_DESK;
+use crate::server::ops::language::DEFAULT_DESK;
 
-/// The console's default/orchestrator thread id
-/// (`frontend/src/lib/threads.ts` `mainThread()`). The console addresses every
-/// send on that thread with `chat: "main"`, so `AgentReply`s answering it are
-/// journaled with `chat_id == "main"` rather than [`GENERAL_DESK`]. `owns`
-/// admits both spellings for the General desk so a transcript is never split
-/// across the two ids depending on which one happened to write it (issue #65).
-pub const MAIN_THREAD_ID: &str = "main";
+// Conversation identity now lives in `tinyteams_core::chat`, and these are
+// re-exported so every existing caller keeps its path (issue #65, #435).
+//
+// The move is what lets `ports::types` stop reaching *upward* into
+// `crate::server::` to fold a General spelling: `resolve_desk_id` and
+// `desk_alias_is_ambiguous` call this rule, and a port calling a server module
+// was a layering violation that only a shared crate could remove.
+pub use tinyteams_core::chat::{GENERAL_DESK, MAIN_THREAD_ID, is_general_chat, same_conversation};
+
+// `DEFAULT_DESK` is the prosumer glossary string mirroring
+// `frontend/src/lib/language.ts`; `GENERAL_DESK` is the desk's identity. They
+// are different concerns that happen to be the same literal, so neither imports
+// the other — but they must never drift, because a message journaled under the
+// glossary word has to fold into the identity. Pinned here rather than
+// duplicated, and it costs nothing at runtime.
+const _: () = assert!(
+    matches!(DEFAULT_DESK.as_bytes(), b"General")
+        && matches!(GENERAL_DESK.as_bytes(), b"General"),
+    "the operator-facing default desk name and the General desk id must agree",
+);
 
 /// The largest message page either history surface may materialize. Keeping
 /// the limit beside the shared reader prevents a new caller from turning its
