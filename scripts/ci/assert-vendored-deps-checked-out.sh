@@ -42,12 +42,19 @@ if [ -z "$vendored" ]; then
 fi
 
 for workflow in .github/workflows/*.yml; do
+  # Match configuration, not prose. Comments in these files quote both
+  # `submodules: false` and vendored paths when they explain this very rule, so
+  # matching raw lines gives a false positive on a workflow that only *mentions*
+  # the setting, and — worse — a false pass on one whose only `vendor/<name>` is
+  # inside a comment. Strip comments first and match the YAML key.
+  config="$(sed 's/[[:space:]]*#.*$//' "$workflow")"
+
   # Only workflows that opt out of automatic submodule checkout have to name
   # what they need. Everything else gets it from `submodules: true|recursive`.
-  grep -q 'submodules: false' "$workflow" || continue
+  echo "$config" | grep -qE '^[[:space:]]*submodules:[[:space:]]*false[[:space:]]*$' || continue
 
   for name in $vendored; do
-    if ! grep -q "vendor/$name" "$workflow"; then
+    if ! echo "$config" | grep -q "vendor/$name"; then
       echo "$workflow sets 'submodules: false' but never checks out vendor/$name" >&2
       status=1
     fi
