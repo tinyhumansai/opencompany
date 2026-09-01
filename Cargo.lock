@@ -3322,6 +3322,7 @@ dependencies = [
  "tinymemory-api",
  "tinymemory-conformance",
  "tinymemory-remote",
+ "tinyteams-core",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -5704,6 +5705,10 @@ dependencies = [
  "displaydoc",
  "zerovec",
 ]
+
+[[package]]
+name = "tinyteams-core"
+version = "0.2.1"
 
 [[package]]
 name = "tinytemplate"
