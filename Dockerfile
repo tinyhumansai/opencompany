@@ -2,9 +2,26 @@
 
 # ── builder ────────────────────────────────────────────────────────────────
 # Compiles the `opencompany` host binary. `FEATURES` selects optional cargo
-# features (e.g. "medulla tinyplace sqlite"); empty = the small default build.
+# features (e.g. "medulla tinyplace sqlite").
+#
+# **`analytics` is in the default set, and that is not the same as reporting.**
+# This image is the hosted tenant workload, and issue #1739's transport lives
+# behind a cargo feature — so an image built without it has no code that could
+# report, whatever the platform injects. That failure is silent in the worst
+# way: the manager sets a token, the boot line says nothing is wrong, and the
+# dashboard stays empty forever with no line anywhere saying why.
+#
+# Compiling the transport in does NOT make a container report. `analytics::
+# config::resolve` still requires a hosted tenant (or an explicit
+# `OPENCOMPANY_ANALYTICS=on`) **and** a token, and still honours
+# `OPENCOMPANY_ANALYTICS=off` above both. A self-hosted operator who runs this
+# image without a tenant namespace and without a token sends exactly what they
+# sent before: nothing. What changes is that the guarantee for *this image* is
+# now "will not" rather than "cannot" — the desktop build, which is where the
+# stronger promise is made and kept, still does not compile the feature at all
+# (`src-tauri/Cargo.toml`, and `docs/spec/runtime/analytics.md`).
 FROM rust:1-slim-bookworm AS builder
-ARG FEATURES=""
+ARG FEATURES="analytics"
 # The revision this image is built from, read by `build.rs` (see
 # `src/build_stamp.rs`). It has to be passed in here: `.dockerignore` excludes
 # `.git`, so the build script has no repository to ask, and `GITHUB_SHA` does

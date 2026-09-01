@@ -642,6 +642,15 @@ pub struct CompanyAgent {
     /// thread every unparented line hangs in, which is every line in a company
     /// that has never threaded.
     bound_chat: Mutex<Option<(String, Option<EventSeq>)>>,
+    /// Where this agent's completed tool calls are reported (issue #1739).
+    ///
+    /// Carried on the agent rather than read from [`HarnessDeps`] because the
+    /// one place a tool call is observable to this crate is the per-turn
+    /// progress collector in [`run_with_steer`](Self::run_with_steer), which
+    /// holds `&self` and no deps. Defaults to the no-op tracker, which is what
+    /// every roster built outside [`HarnessPool`] — every test, and the default
+    /// build — keeps.
+    tracker: Arc<dyn crate::analytics::Tracker>,
 }
 
 /// The graceful reply returned when a turn yields the transient empty-response
@@ -1023,6 +1032,14 @@ impl CompanyAgent {
         // turn's events enter OpenCompany — so the live stream, the durable run
         // trace, and the folded timeline cannot disagree about a step's name.
         let step_labels = self.step_labels.clone();
+        // Issue #1739. Reported from the collector — the same single point the
+        // labels above are applied at — and NOT off the folded timeline, for two
+        // reasons. `fold_steps` can only produce anything once the turn is over,
+        // so a turn killed mid-loop would report none of the calls it actually
+        // made; and a folded row carries a step *label*, which a branded belt
+        // rewrites, so classifying a source from it would report the wrong one
+        // for exactly the tools this dimension exists to tell apart.
+        let tracker = self.tracker.clone();
         let collector = tokio::spawn(async move {
             let mut events = Vec::new();
             let mut seq: u64 = 0;
@@ -1031,6 +1048,11 @@ impl CompanyAgent {
             let mut thinking_open = false;
             while let Some(event) = rx.recv().await {
                 let event = step_labels.apply(event);
+                // One `tool_called` per completed call. Handed every event
+                // unconditionally, exactly like `sink.record` below, so this
+                // line has no branch of its own to get wrong — which of them
+                // report is `track_tool_call`'s decision and is tested there.
+                steps::track_tool_call(tracker.as_ref(), &event);
                 if let Some(ctx) = &stream
                     && let Some(frame) = steps::stream_event_from(&event, seq, &mut thinking_open)
                 {
@@ -1858,6 +1880,21 @@ where
 /// A pool of live agents, one roster per company.
 pub struct HarnessPool {
     agents: RwLock<HashMap<CompanyId, Vec<Arc<CompanyAgent>>>>,
+    /// Where the agents this pool builds report their completed tool calls
+    /// (issue #1739).
+    ///
+    /// A [`OnceLock`](std::sync::OnceLock) set through `&self`, because the pool
+    /// is handed to the runtime builder by
+    /// [`app::harness::attach`](crate::app::harness) *before* `build` resolves
+    /// which tracker this host is on — so there is no construction site that
+    /// knows the answer. Taking it after the fact is what
+    /// [`DeferredTracker`](crate::analytics::DeferredTracker) does for the same
+    /// boot ordering, one level up. Unset until [`install_tracker`] runs, which
+    /// is every roster built by a test and by the default build; those get the
+    /// no-op tracker and change nothing.
+    ///
+    /// [`install_tracker`]: Self::install_tracker
+    tracker: std::sync::OnceLock<Arc<dyn crate::analytics::Tracker>>,
     /// Fingerprint of the effective MCP server set the cached roster was built
     /// from, keyed by company. Drives MCP-freshness: [`ensure`](Self::ensure)
     /// rebuilds the roster whenever the fingerprint changes.
@@ -2130,7 +2167,38 @@ impl HarnessPool {
             context_fingerprints: RwLock::new(HashMap::new()),
             memory_engine: RwLock::new(HashMap::new()),
             workspace_failures: std::sync::Mutex::new(HashSet::new()),
+            tracker: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Points every roster this pool builds from now on at `tracker`
+    /// (issue #1739).
+    ///
+    /// Called once, by `RuntimeBuilder::build`, at the moment the host's
+    /// tracker is chosen. Returns `false` if one was already installed, in which
+    /// case `tracker` is discarded — the same stance
+    /// [`DeferredTracker::install`](crate::analytics::DeferredTracker::install)
+    /// takes, and for the same reason: a second install would split one
+    /// process's events across two destinations. A rebuild re-running `build`
+    /// therefore keeps the tracker it already has, which is the same object
+    /// anyway.
+    ///
+    /// **Rosters already cached keep the tracker they were built with.** The
+    /// pool caches per company and a company's roster is rebuilt on every
+    /// freshness axis, so at worst one company's already-warm agents stay
+    /// silent until their next rebuild; installing at boot means no company
+    /// reaches this state in a real host.
+    pub fn install_tracker(&self, tracker: Arc<dyn crate::analytics::Tracker>) -> bool {
+        self.tracker.set(tracker).is_ok()
+    }
+
+    /// The tracker rosters are built against — the no-op one until
+    /// [`install_tracker`](Self::install_tracker) has run.
+    fn tracker(&self) -> Arc<dyn crate::analytics::Tracker> {
+        self.tracker
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::analytics::null_tracker)
     }
 
     /// Records one workspace-ensure outcome for `(company, agent)` and returns
@@ -2587,7 +2655,13 @@ impl HarnessPool {
         // repair path if boot's create ever fail-softed, since the minter
         // creates the root it needs. A rebuild-time call would now be a tree
         // read that can only ever find its work already done.
-        let roster = build_roster(&fresh_company, &fresh_deps, &skill_deltas, &routed_context)?;
+        let roster = build_roster(
+            &fresh_company,
+            &fresh_deps,
+            &skill_deltas,
+            &routed_context,
+            &self.tracker(),
+        )?;
 
         // Keep the policy snapshot and the roster together for the entire turn.
         // `ensure_with_policy` pins the snapshot on the pool (above), so a
@@ -3531,6 +3605,12 @@ impl HarnessPool {
             step_labels: steps::StepLabels::from_tools(confined.tools()),
             agent: Mutex::new(confined),
             bound_chat: Mutex::new(None),
+            // A confined turn holds an empty belt and its policy denies every
+            // call by name, so this reports nothing today. Wired anyway: the
+            // silence must come from the confinement, not from an agent that
+            // was built without anywhere to report to — a tool wired here by a
+            // later change would otherwise run uncounted.
+            tracker: self.tracker(),
         };
 
         let stream_ctx = Some(crate::turn_stream::TurnStreamCtx {
@@ -4716,6 +4796,13 @@ pub(crate) fn build_roster(
     deps: &HarnessDeps,
     skill_deltas: &[SkillState],
     routed_context: &HashMap<String, Vec<(String, String)>>,
+    // Issue #1739: an explicit parameter rather than a field on `HarnessDeps`,
+    // which is built by struct literal at two dozen sites across the tree — a
+    // required field there is a mechanical edit to every one of them, including
+    // files this change has no business touching. Explicit here also means a
+    // roster built with the wrong tracker is a compile error at the call site
+    // rather than a silence nothing reports.
+    tracker: &Arc<dyn crate::analytics::Tracker>,
 ) -> crate::Result<Vec<Arc<CompanyAgent>>> {
     // Issue #562: the policy in force, not the one the manifest shipped with —
     // the same relationship `effective_budget` (issue #343) has to the manifest
@@ -4826,6 +4913,7 @@ pub(crate) fn build_roster(
             manifest_agent,
             agent_policy,
             deps,
+            tracker,
             &grants,
             skill_deltas,
             routed_context
@@ -4842,6 +4930,7 @@ pub(crate) fn build_roster(
             step_labels: steps::StepLabels::from_tools(agent.tools()),
             agent: Mutex::new(agent),
             bound_chat: Mutex::new(None),
+            tracker: tracker.clone(),
         }));
     }
 
@@ -4910,6 +4999,7 @@ pub(crate) fn build_roster(
             &manifest_agent,
             agent_policy,
             deps,
+            tracker,
             &grants,
             skill_deltas,
             routed_context
@@ -4926,6 +5016,7 @@ pub(crate) fn build_roster(
             step_labels: steps::StepLabels::from_tools(agent.tools()),
             agent: Mutex::new(agent),
             bound_chat: Mutex::new(None),
+            tracker: tracker.clone(),
         }));
     }
 
@@ -5889,8 +5980,14 @@ description = "Builds the product."
     #[tokio::test]
     async fn roster_builds_every_manifest_agent() {
         let fx = fixture();
-        let roster =
-            build_roster(&record(), &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &record(),
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["ceo", "engineer"]);
         assert_eq!(roster[0].role, "Chief Executive");
@@ -6098,8 +6195,14 @@ description = "Builds the product."
             workspace: None,
         };
 
-        let roster = build_roster(&record(), &deps, &[], &HashMap::new())
-            .expect("roster builds with skills");
+        let roster = build_roster(
+            &record(),
+            &deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds with skills");
         assert_eq!(roster.len(), 2);
         // The scratch skill tree was materialized for the first roster agent.
         assert!(
@@ -6131,7 +6234,14 @@ description = "Builds the product."
             harness: None,
         });
 
-        let roster = build_roster(&rec, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &rec,
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["ceo", "engineer", "growth"], "got {ids:?}");
         let overlay_agent = roster
@@ -6155,7 +6265,14 @@ description = "Builds the product."
             ..Default::default()
         });
 
-        let roster = build_roster(&rec, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &rec,
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ceo = roster
             .iter()
             .find(|a| a.agent_id == "ceo")
@@ -6174,7 +6291,14 @@ description = "Builds the product."
         let mut rec = record();
         rec.retire_agent("ceo");
 
-        let roster = build_roster(&rec, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &rec,
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["engineer"], "got {ids:?}");
         assert_eq!(
@@ -6200,7 +6324,14 @@ description = "Builds the product."
             harness: None,
         });
 
-        let roster = build_roster(&rec, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &rec,
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -6276,7 +6407,14 @@ description = "Builds the product."
         let saved = store.load(&company).await.unwrap().expect("record");
         assert_eq!(saved.overlay_agents[0].id, "engineer_2");
 
-        let roster = build_roster(&saved, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+        let roster = build_roster(
+            &saved,
+            &fx.deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster builds");
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -7075,7 +7213,14 @@ description = "Builds the product."
             tenant_search: None,
             workspace: None,
         };
-        let roster = build_roster(&record(), &deps, &[], &HashMap::new()).expect("roster");
+        let roster = build_roster(
+            &record(),
+            &deps,
+            &[],
+            &HashMap::new(),
+            &crate::analytics::null_tracker(),
+        )
+        .expect("roster");
         // Keep the tempdir alive for the agent's workspace by leaking it into the
         // test's lifetime — the process ends the test anyway.
         std::mem::forget(dir);
@@ -10876,6 +11021,7 @@ budget_usd_daily = 0.0
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -10999,6 +11145,7 @@ budget_usd_daily = 0.0
             &manifest_agent,
             ApprovalPolicy::new(&Policy::default(), None),
             &deps,
+            &crate::analytics::null_tracker(),
             &["*".to_string()],
             &[],
             &[],

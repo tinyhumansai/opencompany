@@ -68,6 +68,7 @@ import {
   shouldShowOnboardingGate,
 } from "@/onboarding/gate-logic";
 import { me as fetchMe } from "@/api/auth";
+import { reportConsoleView } from "@/api/console-view";
 import { useCompany } from "@/hooks/use-company";
 import { getRun, listRuns } from "@/api/runs";
 import {
@@ -590,6 +591,14 @@ export function AppShell({
     "overview",
     REWRITE_RETIRED,
   );
+  // Issue #1739: which page the operator opened. Keyed on `view` alone, not on
+  // `sub` — the second segment carries ids (`#/chat/dm:ada`, `#/tasks/<uuid>`)
+  // and must not leave the browser, and re-firing per sub-page would count
+  // opening one task as visiting Tasks twice.
+  useEffect(() => {
+    reportConsoleView(client, company, view);
+  }, [client, company, view]);
+
   const legacyConnectParamsRef = useRef(legacyConnectParams());
   // Track the latest non-default segment per view so returning to a tab with
   // sub-pages restores operator context (for example `#/workflows/<id>`), instead

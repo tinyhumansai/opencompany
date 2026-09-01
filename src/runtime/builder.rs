@@ -1851,6 +1851,16 @@ impl RuntimeBuilder {
             .tracker
             .clone()
             .unwrap_or_else(crate::analytics::null_tracker);
+        // Issue #1739: and the harness pool, whose agents report their own tool
+        // calls. Installed here rather than at construction because the pool is
+        // handed to this builder by `app::harness::attach` — which runs before
+        // any of this and cannot know which tracker the host will end up on.
+        // Idempotent: a second `build` (a rebuild) keeps the tracker already
+        // installed, which is this same process-wide object.
+        #[cfg(feature = "openhuman")]
+        if let Some(pool) = self.harness.as_ref() {
+            pool.install_tracker(tracker.clone());
+        }
         // The WS3 console ports default to a single shared fs backend.
         let fs_ops = Arc::new(FsOps::new(home.clone()));
         // Chosen before the ops struct because two of its members need it: the
@@ -3525,6 +3535,11 @@ impl RuntimeBuilder {
                                         // never continued at all.
                                         continuations: continuations.clone(),
                                         gates: workflow_gates.clone(),
+                                        // Issue #1739: the host's tracker, so
+                                        // a park raised outside a cycle is
+                                        // counted by the same funnel the
+                                        // in-cycle ones are.
+                                        tracker: tracker.clone(),
                                         // Issue #899 (Stage 1): the SAME stash the
                                         // runtime gets below, armed at block-settle
                                         // for a blocked agent node so the resolve
@@ -3679,9 +3694,13 @@ impl RuntimeBuilder {
                             // router, so a workflow node addressing a named-lane
                             // agent lands on that lane's engine instead of the
                             // default pool.
-                            let runner: Arc<dyn WorkflowRunner> = Arc::new(
-                                HarnessWorkflowRunner::new(turn, deps.clone(), record.clone()),
-                            );
+                            let runner: Arc<dyn WorkflowRunner> =
+                                Arc::new(HarnessWorkflowRunner::new(
+                                    turn,
+                                    deps.clone(),
+                                    record.clone(),
+                                    tracker.clone(),
+                                ));
                             // Issue #67: fill the shared handle on `deps` (a clone
                             // of which the runner holds, and which moves into the
                             // brain below) so the orchestrator's `run_workflow` tool

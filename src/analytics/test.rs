@@ -230,14 +230,22 @@ fn every_string_in_a_payload_comes_from_the_compiled_vocabulary() {
     let envelope = envelope();
     let vocabulary = vocabulary();
 
-    // The three values that are strings but are not vocabulary: the opaque id,
-    // and the two platform facts `std::env::consts` supplies. All three are
+    // The values that are strings but are not vocabulary: the opaque id, the two
+    // platform facts `std::env::consts` supplies, and the build stamp. All are
     // fixed for the life of the process and none originates with a user.
+    //
+    // `build_commit` is here rather than in the vocabulary because it cannot be
+    // a compiled-in literal — `build.rs` stamps it per build, and on a dirty
+    // tree it carries a `-dirty` suffix, so no fixed list could name it. It is
+    // still not user content: `commit_slug` folds it to an object id or the
+    // literal `unknown` before it reaches the envelope, which
+    // `a_build_stamp_that_is_not_an_object_id_reports_unknown` pins.
     let allowed_platform = [
         envelope.id.as_str().to_string(),
         envelope.app_version.to_string(),
         envelope.os.to_string(),
         envelope.arch.to_string(),
+        envelope.build_commit.to_string(),
     ];
 
     for event in hostile_events() {
@@ -695,5 +703,89 @@ async fn the_held_buffer_is_bounded() {
         held.last(),
         Some(&event(4_999)),
         "the newest survives; it is the oldest that is dropped"
+    );
+}
+
+/// Issue #1739, raised in review: the build stamp is the **one** envelope string
+/// that is not a literal compiled into this repository, and it has an escape
+/// hatch — `build_stamp.rs` prefers `OPENCOMPANY_BUILD_COMMIT` over `git` on
+/// purpose, and sanitizes rather than validates. So whatever a builder puts
+/// there rides every event this instance ever sends, as a super-property.
+///
+/// `commit_slug` closes that: a value that is not the shape it claims to be is
+/// `unknown`. A release label costs nothing to lose; a branch name that happens
+/// to carry a customer's name is the leak this module exists to refuse.
+#[test]
+fn a_build_stamp_that_is_not_an_object_id_reports_unknown() {
+    use crate::analytics::types::commit_slug;
+
+    // What `build_stamp.rs` actually produces: a shortened id, a full one, an
+    // explicit short one, each optionally marked dirty. These must survive —
+    // a fold that answered `unknown` for everything would pass every rejection
+    // below and destroy the property's only use.
+    for accepted in [
+        "d31e532f7c8a",
+        "d31e532f7c8a-dirty",
+        "d31e532f7c8a4b19e0f6c25a1d8b7e3049fa62c1",
+        "d31e532f7c8a4b19e0f6c25a1d8b7e3049fa62c1-dirty",
+        "abcdef1",
+        "ABCDEF1234",
+    ] {
+        assert_eq!(
+            commit_slug(accepted),
+            accepted,
+            "a real object id: {accepted:?}"
+        );
+    }
+
+    // And everything else, including the shapes an escape hatch invites.
+    for rejected in [
+        "",
+        "unknown",
+        "main",
+        "v1.2.3",
+        "release-2026-08-25",
+        "hotfix-for-acmecorp",
+        "abc123",                                    // hex, but too short to be an id
+        "d31e532f7c8a-dirty-and-then-some",          // a suffix that is not the suffix
+        "d31e532f7c8a4b19e0f6c25a1d8b7e3049fa62c1a", // 41 digits is not an id
+        "zzzzzzzzzzzz",
+    ] {
+        assert_eq!(
+            commit_slug(rejected),
+            "unknown",
+            "not an object id, so it must not travel: {rejected:?}"
+        );
+    }
+
+    // The leak, stated directly — with the house self-check that the needle is
+    // findable in the raw value, so the refusal above is refusing something
+    // that was really there.
+    const NEEDLE: &str = "acmecorp-project-titan";
+    const STAMP: &str = "release-acmecorp-project-titan";
+    assert!(
+        !commit_slug(STAMP).contains(NEEDLE),
+        "the build stamp leaked into the envelope: {}",
+        commit_slug(STAMP)
+    );
+    assert!(STAMP.contains(NEEDLE), "or the guard above is vacuous");
+
+    // And the envelope built for this process carries the folded value, not
+    // `crate::BUILD_COMMIT` read straight off the binary.
+    //
+    // Stated as an invariant on the shape rather than as an equality against
+    // this build's own stamp: what must hold is that folding the envelope's
+    // value again changes nothing, which is only interesting on a build whose
+    // stamp is *not* already an object id. That build is reachable —
+    // `OPENCOMPANY_BUILD_COMMIT=release-2026-08-25 cargo test` — and this line
+    // is the assertion that fails there if the fold is dropped from
+    // `Envelope::new`. On an ordinary `git` checkout the stamp is a real id and
+    // this passes either way, which is why the table above is the load-bearing
+    // half.
+    let stamped = envelope().build_commit;
+    assert_eq!(
+        commit_slug(stamped),
+        stamped,
+        "the envelope must carry the folded stamp, not the raw one"
     );
 }

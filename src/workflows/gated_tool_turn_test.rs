@@ -267,6 +267,10 @@ pub(super) fn deps(base_url: String, dir: &std::path::Path) -> (HarnessDeps, Arc
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             }),
             events: Arc::new(crate::store::FsEventLog::new(dir)),
         }),

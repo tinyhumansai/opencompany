@@ -127,6 +127,31 @@ pub async fn replayed_emergency(
         .unwrap_or(false))
 }
 
+/// The supervised taxonomy group as the word an analytics payload carries
+/// (issue #1739).
+///
+/// An exhaustive `match` rather than a `Debug`/`Display` render or a
+/// `serde` round-trip, because the two vocabularies have to be free to drift:
+/// [`EffectGroup`] is this crate's own type and a refactor may rename a variant
+/// at any time, while the slug is a wire word every saved funnel is keyed on.
+/// Rendering the variant would silently re-key months of history on the day
+/// someone renames `Publish`, and nothing would fail to tell anybody.
+///
+/// Exhaustive on purpose — a group added later stops the build here instead of
+/// quietly reporting as `other`, which is the one answer an oversight funnel
+/// cannot act on.
+pub fn group_slug(group: EffectGroup) -> &'static str {
+    match group {
+        EffectGroup::Spend => "spend",
+        EffectGroup::Send => "send",
+        EffectGroup::Sign => "sign",
+        EffectGroup::Publish => "publish",
+        EffectGroup::Hire => "hire",
+        EffectGroup::Identity => "identity",
+        EffectGroup::Other => "other",
+    }
+}
+
 /// A parked effect awaiting operator resolution.
 #[derive(Clone, Debug)]
 struct ParkedEffect {
@@ -173,9 +198,15 @@ pub struct ManifestApprovalGate {
     policy_hitl_enabled: AtomicBool,
     ttl_millis: AtomicU64,
     parked: Mutex<HashMap<ApprovalId, ParkedEffect>>,
-    /// Effects removed by TTL expiry, retained only until the runtime completes
+    /// Entries removed by TTL expiry, retained only until the runtime completes
     /// their retirement transaction.
-    expired_effects: Mutex<HashMap<ApprovalId, Effect>>,
+    ///
+    /// The whole [`ParkedEffect`] and not just its `effect` (issue #1739): the
+    /// retirement is where an expiry is *reported*, and "how long did this sit
+    /// unanswered?" is the number that reporting exists for. Dropping the park
+    /// instant here left the one caller that needs it — `retire_approval` — with
+    /// no honest source for it and nothing to compute a wait from.
+    expired_effects: Mutex<HashMap<ApprovalId, ParkedEffect>>,
     /// The governance kill switch (issue #86).
     ///
     /// An `AtomicBool` rather than a lock because `evaluate` reads it on every
@@ -425,7 +456,7 @@ impl ManifestApprovalGate {
                 self.expired_effects
                     .lock()
                     .expect("expired effects poisoned")
-                    .insert(id.clone(), parked.effect);
+                    .insert(id.clone(), parked);
             }
         }
         expired
@@ -438,6 +469,29 @@ impl ManifestApprovalGate {
             .lock()
             .expect("expired effects poisoned")
             .remove(id)
+            .map(|pe| pe.effect)
+    }
+
+    /// When an **expired** approval had been parked, in epoch milliseconds.
+    ///
+    /// The expiry counterpart to [`parked_at_millis`](Self::parked_at_millis),
+    /// and the only source of a wait once an entry has left the parked map: by
+    /// the time a retirement runs, the sweep (or a late `resolve_*`) has already
+    /// moved the record here, so `parked_at_millis` answers `None` for it.
+    ///
+    /// **Peeks — it does not remove.** `take_expired_effect` is what consumes
+    /// the entry, so a caller that wants both must read this one *first*; read
+    /// afterwards it is `None` and the wait would have to be invented. That
+    /// ordering is the reason this is a separate accessor rather than a second
+    /// return value: `take_expired_effect` is the retirement's own handshake
+    /// with the gate ("is this mine to retire?"), and folding a reporting
+    /// number into it would make the answer depend on who asked first.
+    pub fn expired_parked_at_millis(&self, id: &ApprovalId) -> Option<u64> {
+        self.expired_effects
+            .lock()
+            .expect("expired effects poisoned")
+            .get(id)
+            .map(|pe| pe.parked_at_millis)
     }
 
     /// A clone of a parked effect without resolving it.
@@ -450,6 +504,26 @@ impl ManifestApprovalGate {
             .expect("parked map poisoned")
             .get(id)
             .map(|pe| pe.effect.clone())
+    }
+
+    /// When a parked approval was parked, in epoch milliseconds.
+    ///
+    /// The park instant is otherwise private to [`ParkedEffect`], and **every**
+    /// `resolve_*` removes the entry inside its own critical section — so a
+    /// caller that wants to say how long a decision sat waiting has to read this
+    /// *before* it resolves. Read afterwards it is always `None`, which reads as
+    /// "no such approval" rather than "you asked too late".
+    ///
+    /// Exposed here rather than widened onto
+    /// [`ResolveOutcome`] because that enum is matched on at several seams that
+    /// have no interest in a duration, and every one of them would have to grow
+    /// a field it ignores.
+    pub fn parked_at_millis(&self, id: &ApprovalId) -> Option<u64> {
+        self.parked
+            .lock()
+            .expect("parked map poisoned")
+            .get(id)
+            .map(|pe| pe.parked_at_millis)
     }
 
     /// Resolves a parked approval to an operator-amended effect
@@ -504,7 +578,7 @@ impl ManifestApprovalGate {
             self.expired_effects
                 .lock()
                 .expect("expired effects poisoned")
-                .insert(id.clone(), parked.effect);
+                .insert(id.clone(), parked);
             return ResolveOutcome::Expired;
         }
         ResolveOutcome::Approved(amended)
@@ -534,7 +608,7 @@ impl ManifestApprovalGate {
             self.expired_effects
                 .lock()
                 .expect("expired effects poisoned")
-                .insert(id.clone(), parked.effect);
+                .insert(id.clone(), parked);
             return ResolveOutcome::Expired;
         }
         match verdict {

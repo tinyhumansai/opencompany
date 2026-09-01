@@ -296,6 +296,7 @@ async fn company_agent(
         &manifest_agent,
         policy,
         &deps,
+        &crate::analytics::null_tracker(),
         &["docs".to_string()],
         &[],
         &[],
@@ -321,6 +322,10 @@ async fn company_agent(
         step_labels: crate::harness::steps::StepLabels::from_tools(agent.tools()),
         agent: tokio::sync::Mutex::new(agent),
         bound_chat: tokio::sync::Mutex::new(None),
+        // This fixture is about the turn's iteration ceiling and its spend
+        // brake, neither of which reads analytics; the no-op tracker is what a
+        // roster built outside `HarnessPool` gets in production too.
+        tracker: crate::analytics::null_tracker(),
     }
 }
 

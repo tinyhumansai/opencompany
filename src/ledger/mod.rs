@@ -40,6 +40,7 @@
 //! ([`budget`]), so a declaration cannot grow its own file past what a reader —
 //! or a turn carrying it — is asked to hold.
 
+pub mod analytics;
 pub mod board;
 pub mod budget;
 pub mod derived;

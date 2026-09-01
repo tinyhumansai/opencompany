@@ -2265,17 +2265,29 @@ pub struct HarnessWorkflowRunner {
     /// policy PUT since then reaches the run's gate; this snapshot is the
     /// fallback when the store is unwired or the row is gone.
     record: CompanyRecord,
+    /// Where this runner reports a run's terminal reading (issue #1739).
+    ///
+    /// Defaults to the no-op tracker via [`new`](Self::new)'s callers passing
+    /// one; the runtime builder passes the host's.
+    tracker: Arc<dyn crate::analytics::Tracker>,
 }
 
 impl HarnessWorkflowRunner {
     /// Builds a runner dispatching through `turn`, sharing `deps` with the
-    /// rest of the harness surface for the company described by `record`.
+    /// rest of the harness surface for the company described by `record`, and
+    /// reporting each run's terminal reading to `tracker`.
     pub fn new(
         turn: Arc<dyn crate::runtime::delegation::RunTurn>,
         deps: HarnessDeps,
         record: CompanyRecord,
+        tracker: Arc<dyn crate::analytics::Tracker>,
     ) -> Self {
-        Self { turn, deps, record }
+        Self {
+            turn,
+            deps,
+            record,
+            tracker,
+        }
     }
 
     /// The effective record for a run: the store's current one when it can be
@@ -2317,8 +2329,45 @@ impl WorkflowRunner for HarnessWorkflowRunner {
         // populated before a node addresses it. The run addresses the record's
         // own company; `_company` is the routed scope, which the runtime
         // resolves to this same record.
-        self.turn.ensure(&record).await?;
-        run_workflow_lane_aware(
+        // Issue #1739, raised in review: a run that dies here is still a run
+        // that finished, and must say so.
+        //
+        // `ensure` builds or refreshes the harness roster on the first run
+        // after a boot or a rebuild, and it is fallible — a provider that will
+        // not construct, a manifest the roster cannot be built from. Returning
+        // straight to the caller left the console, the scheduler and the
+        // orchestrator each with an error and no `workflow_run_finished` event
+        // at all, which removed **exactly** the cold-start and misconfiguration
+        // failures from the failure metric. Those are the ones a dashboard is
+        // for; a company whose workflows have never once run would have shown a
+        // clean sheet.
+        if let Err(err) = self.turn.ensure(&record).await {
+            self.tracker
+                .track(crate::analytics::Event::WorkflowRunFinished {
+                    status: "failed",
+                    // The graph was never handed to the engine, so no node ran.
+                    // Zero here is the same honest answer the `Err` arm below
+                    // gives, and for the same reason.
+                    nodes: 0,
+                    // Warming is deliberately outside the reported runtime (see
+                    // below), and a run that never started has no runtime to
+                    // report. Charging the cost of a *failed* warm to the
+                    // duration distribution would make the one number this
+                    // event carries about speed mean two different things.
+                    duration_ms: 0,
+                });
+            return Err(err);
+        }
+        // Issue #1739. Nothing in this tree measures how long a whole run takes
+        // — the journal records that one started and that one finished, never
+        // the span between — so this is new instrumentation rather than a read
+        // of something already kept. `Instant` because the only question is a
+        // duration, and a wall clock that steps backwards mid-run would report a
+        // negative one. Started after `ensure`: warming a cold roster is a
+        // one-off boot cost of the *first* run, and charging it to the run makes
+        // that run look pathological compared to every later one.
+        let started_at = std::time::Instant::now();
+        let outcome = run_workflow_lane_aware(
             self.turn.clone(),
             self.deps.clone(),
             &record,
@@ -2326,7 +2375,96 @@ impl WorkflowRunner for HarnessWorkflowRunner {
             input,
             ctx,
         )
-        .await
+        .await;
+        // Emitted here rather than inside `run_workflow_lane_aware` for the same
+        // reason the cycle emits at its bracket: this is the port boundary, so
+        // it is the one place every workflow run — console, scheduler, an
+        // orchestrator's `run_workflow` tool — passes through exactly once.
+        self.tracker
+            .track(crate::analytics::Event::WorkflowRunFinished {
+                status: run_status_slug(outcome.as_ref().ok()),
+                // Rows the engine's progress observer actually recorded, so a
+                // run that stopped halfway reports the nodes that ran rather
+                // than the nodes the graph declares. A failed run has no
+                // `WorkflowRun` to count from at all and reports zero, which is
+                // the honest answer: the error carries no per-node record.
+                nodes: outcome.as_ref().map_or(0, |run| run.nodes.len() as u64),
+                duration_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            });
+        outcome
+    }
+}
+
+/// The closed vocabulary an
+/// [`Event::WorkflowRunFinished`](crate::analytics::Event::WorkflowRunFinished)
+/// may name a run's terminal state as: `completed`, `failed`, `blocked`,
+/// `cancelled`, or `other` (issue #1739).
+///
+/// `None` — the runner returned `Err` — is `failed`. Otherwise the reading is
+/// [`WorkflowRunVerdict`], the host's single terminal ladder, folded onto the
+/// four words above by its **wire token** rather than by an exhaustive `match`
+/// on the enum. That is deliberate: the verdict has nine variants today and has
+/// gained three since it was written, and a fold that must be edited every time
+/// one is added is a fold that will one day be edited wrongly, under deadline,
+/// to make a build pass. Reading the token means a verdict nobody here has heard
+/// of degrades to `other` — less information, never wrong information, which is
+/// the whole posture of [`crate::analytics::types`].
+///
+/// # The five verdicts that stay `other`, on purpose
+///
+/// `running`, `stranded`, `undelivered`, `awaiting-approval` and `degraded` are
+/// each a distinct terminal reading with no home in the four-word set, and every
+/// one of them is *nearly* one of the four — `awaiting-approval` and `stranded`
+/// look like `blocked`, `degraded` and `undelivered` look like `completed`.
+/// Folding them onto a neighbour would make that neighbour's count mean two
+/// different things with no way to separate them afterwards; `other` keeps them
+/// countable as "a reading this vocabulary does not cover", which is a question
+/// somebody can then answer by widening the vocabulary.
+fn run_status_slug(run: Option<&WorkflowRun>) -> &'static str {
+    let Some(run) = run else {
+        return "failed";
+    };
+    let verdict = crate::ports::workflow_verdict::WorkflowRunVerdict::of(
+        crate::ports::workflow_verdict::RunVerdictFacts {
+            // The run returned, so it settled by definition.
+            running: false,
+            // A run that errored never becomes a `WorkflowRun` — it is the `Err`
+            // handled above — so there is no error string to read here.
+            error: None,
+            cancelled: run.cancelled,
+            blocked_nodes: run.blocked_nodes.len(),
+            deliveries: &run.deliveries,
+            pending_approvals: run.pending_approvals.len(),
+            // The join against the live approvals queue is a read the runner
+            // does not have and must not perform on the turn's hot path. Zero is
+            // the documented degrade (`RunVerdictFacts::stranded_approvals`):
+            // a fully stranded run reports `awaiting-approval` instead, and both
+            // fold to `other` below, so this costs the reading nothing.
+            stranded_approvals: 0,
+            errored_nodes: run
+                .nodes
+                .iter()
+                .filter(|node| node.status == crate::ports::types::WorkflowNodeStatus::Error)
+                .count(),
+        },
+    );
+    verdict_slug(verdict.as_str())
+}
+
+/// Fold one [`WorkflowRunVerdict`](crate::ports::workflow_verdict::WorkflowRunVerdict)
+/// **wire token** onto the four-word analytics vocabulary.
+///
+/// Split out from [`run_status_slug`] so the fold itself is reachable by a test
+/// with an arbitrary token — including one this vocabulary has never heard of,
+/// which is the case that matters and which no `WorkflowRun` fixture can
+/// produce.
+fn verdict_slug(verdict: &str) -> &'static str {
+    match verdict {
+        "ok" => "completed",
+        "failed" => "failed",
+        "blocked" => "blocked",
+        "stopped" => "cancelled",
+        _ => crate::analytics::types::OTHER,
     }
 }
 
@@ -2348,6 +2486,158 @@ mod tests {
             status,
             elapsed_ms: 10,
             diagnostics: Vec::new(),
+        }
+    }
+
+    /// Issue #1739: what a `workflow_run_finished` event is allowed to say about
+    /// how a run ended.
+    mod analytics {
+        use super::*;
+
+        /// A settled run that ended clean. Each test below flips exactly the
+        /// one field its verdict turns on, so what it is testing is visible.
+        fn clean_run() -> WorkflowRun {
+            WorkflowRun {
+                output: serde_json::Value::Null,
+                pending_approvals: Vec::new(),
+                deliveries: Vec::new(),
+                cancelled: false,
+                nodes: vec![node_row("fetch", WorkflowNodeStatus::Ok)],
+                notices: Vec::new(),
+                board: Vec::new(),
+                blocked_nodes: Vec::new(),
+                approvals: Vec::new(),
+            }
+        }
+
+        /// Every terminal reading this vocabulary covers resolves to its **own**
+        /// word. Pinned as a table so a fold that collapsed two of them onto one
+        /// (a metric that still reads as working, and is wrong) fails here.
+        #[test]
+        fn every_known_verdict_maps_to_its_own_slug() {
+            let table = [
+                ("ok", "completed"),
+                ("failed", "failed"),
+                ("blocked", "blocked"),
+                ("stopped", "cancelled"),
+            ];
+            for (verdict, expected) in table {
+                assert_eq!(verdict_slug(verdict), expected, "verdict {verdict:?}");
+            }
+            // Distinctness, not merely membership: four words are in play, and a
+            // fold answering one word for everything would satisfy no row above
+            // but a fold collapsing two would satisfy most of them.
+            let slugs: std::collections::HashSet<&str> =
+                table.iter().map(|(v, _)| verdict_slug(v)).collect();
+            assert_eq!(slugs.len(), 4, "four verdicts must yield four slugs");
+        }
+
+        /// The one that matters: a reading this vocabulary does not cover folds
+        /// to `other` rather than travelling.
+        ///
+        /// The first five are real `WorkflowRunVerdict` variants deliberately
+        /// left uncovered (see [`run_status_slug`]); the last is the case the
+        /// fold exists for — a verdict added after this was written.
+        #[test]
+        fn an_unrecognised_verdict_folds_to_other() {
+            for verdict in [
+                "running",
+                "stranded",
+                "undelivered",
+                "awaiting-approval",
+                "degraded",
+                "a-verdict-invented-after-this-test-was-written",
+                "",
+            ] {
+                assert_eq!(
+                    verdict_slug(verdict),
+                    crate::analytics::types::OTHER,
+                    "an uncovered verdict must fold to `other`: {verdict:?}"
+                );
+            }
+        }
+
+        /// The caller's string never reaches the slug — the failure the closed
+        /// vocabulary exists to prevent.
+        ///
+        /// Carries the house self-check (`analytics::test`'s shape): the same
+        /// search *does* find the needle in the raw input, so the assertion
+        /// above is refusing something findable rather than passing because the
+        /// needle could never be found anywhere.
+        #[test]
+        fn a_verdict_string_never_reaches_the_status_slug() {
+            const NEEDLE: &str = "acmecorp-project-titan";
+            let verdict = format!("failed-{NEEDLE}");
+            let slug = verdict_slug(&verdict);
+            assert!(
+                !slug.contains(NEEDLE),
+                "the status slug leaked the caller's string: {slug}"
+            );
+            assert!(
+                verdict.contains(NEEDLE),
+                "the needle must be findable in the raw verdict, or the guard above is vacuous"
+            );
+            assert!(
+                [
+                    "completed",
+                    "failed",
+                    "blocked",
+                    "cancelled",
+                    crate::analytics::types::OTHER
+                ]
+                .contains(&slug),
+                "the status must come from the closed set: {slug}"
+            );
+        }
+
+        /// The runner's own reading of a `WorkflowRun`, end to end: the four
+        /// shapes a run actually settles in, plus the `Err` path — which has no
+        /// `WorkflowRun` at all and must still report `failed` rather than
+        /// falling through to a clean word.
+        #[test]
+        fn a_settled_run_reports_the_reading_its_fields_add_up_to() {
+            assert_eq!(run_status_slug(None), "failed", "an Err run");
+            assert_eq!(
+                run_status_slug(Some(&clean_run())),
+                "completed",
+                "a run that settled clean"
+            );
+
+            let mut cancelled = clean_run();
+            cancelled.cancelled = true;
+            assert_eq!(
+                run_status_slug(Some(&cancelled)),
+                "cancelled",
+                "an operator stopped it"
+            );
+
+            let mut blocked = clean_run();
+            blocked.blocked_nodes = vec![crate::ports::WorkflowBlockedNode {
+                node_id: "draft".to_string(),
+                tools: vec!["publish_artifact".to_string()],
+                approval_ids: vec!["a-1".to_string()],
+                unparkable: 0,
+                stranded: 0,
+            }];
+            assert_eq!(
+                run_status_slug(Some(&blocked)),
+                "blocked",
+                "a node stopped for a person"
+            );
+
+            // A soft node error under `on_error: continue` reads `degraded`,
+            // which this vocabulary does not cover — and must therefore NOT be
+            // reported as `completed`. Squeezing it into a neighbouring word is
+            // exactly what `other` exists to refuse.
+            let mut degraded = clean_run();
+            degraded
+                .nodes
+                .push(node_row("summarize", WorkflowNodeStatus::Error));
+            assert_eq!(
+                run_status_slug(Some(&degraded)),
+                crate::analytics::types::OTHER,
+                "a degraded run is not a completed one"
+            );
         }
     }
 
@@ -4282,6 +4572,157 @@ to = "done"
         );
     }
 
+    /// A lane whose roster will not warm: `ensure` fails and no turn is ever
+    /// reachable.
+    ///
+    /// The cold-start shape exactly — a provider that will not construct, a
+    /// manifest the roster cannot be built from — reduced to the one seam that
+    /// matters. Every `run*` method panics rather than returning, so a
+    /// regression that ran the graph anyway is a loud failure rather than a
+    /// quietly different assertion.
+    struct ColdRosterTurn;
+
+    #[async_trait]
+    impl crate::runtime::delegation::RunTurn for ColdRosterTurn {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            _agent_id: &str,
+            _message: &str,
+            _chat_id: crate::runtime::delegation::ChatTarget<'_>,
+        ) -> Result<crate::harness::TurnOutcome> {
+            unreachable!("the roster never warmed; no turn may run")
+        }
+
+        async fn run_steered(
+            &self,
+            _company: &CompanyId,
+            _agent_id: &str,
+            _message: &str,
+            _control: &crate::company::steer::SteerControl,
+            _chat_id: crate::runtime::delegation::ChatTarget<'_>,
+            _run_sink: Option<Arc<crate::harness::run_trace::RunTraceSink>>,
+        ) -> Result<crate::harness::TurnOutcome> {
+            unreachable!("the roster never warmed; no turn may run")
+        }
+
+        async fn run_steered_background(
+            &self,
+            _company: &CompanyId,
+            _agent_id: &str,
+            _message: &str,
+            _control: &crate::company::steer::SteerControl,
+            _run_sink: Option<Arc<crate::harness::run_trace::RunTraceSink>>,
+        ) -> Result<crate::harness::TurnOutcome> {
+            unreachable!("the roster never warmed; no turn may run")
+        }
+
+        async fn ensure(&self, _company: &CompanyRecord) -> Result<()> {
+            Err(OpenCompanyError::Harness(
+                "synthetic: the roster will not build".to_string(),
+            ))
+        }
+    }
+
+    /// Issue #1739, raised in review: a run that dies **warming the roster** is
+    /// still a finished run, and must report as one.
+    ///
+    /// This is the first run after a boot or a rebuild — the run that gets a
+    /// misconfigured provider or an unbuildable manifest. Before this, `ensure`
+    /// returned straight to the caller through `?`, ahead of both the timer and
+    /// the tracked outcome, so precisely the cold-start and configuration
+    /// failures never reached `workflow_run_finished`. A company whose
+    /// workflows had never once succeeded in warming would have shown a clean
+    /// sheet, which is the worst reading a failure metric can give.
+    #[tokio::test]
+    async fn a_run_that_fails_warming_the_roster_still_reports_a_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = record();
+        let tracker = Arc::new(crate::analytics::RecordingTracker::new());
+        let cold = HarnessWorkflowRunner::new(
+            Arc::new(ColdRosterTurn),
+            deps(dir.path()),
+            rec.clone(),
+            tracker.clone() as Arc<dyn crate::analytics::Tracker>,
+        );
+        let file = parse_workflow(GREET).expect("workflow parses");
+
+        let err = WorkflowRunner::run(
+            &cold,
+            &rec.id,
+            &file,
+            serde_json::json!({}),
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect_err("a roster that will not build fails the run");
+        assert!(
+            err.to_string().contains("the roster will not build"),
+            "the caller must still get the real cause: {err}"
+        );
+
+        assert_eq!(
+            tracker.events(),
+            vec![crate::analytics::Event::WorkflowRunFinished {
+                status: "failed",
+                // Nothing was handed to the engine, so no node ran and there is
+                // no runtime to report.
+                nodes: 0,
+                duration_ms: 0,
+            }],
+            "a cold-start failure must reach the failure metric"
+        );
+
+        // The other arm, on a fresh tracker of the same kind: a run whose
+        // roster DOES warm reports something else, over nodes it actually ran.
+        // Without this the assertion above could be satisfied by a runner that
+        // reported `failed`, zero nodes, zero duration for everything.
+        //
+        // Not pinned to `completed`: this fixture's graph settles on a reading
+        // outside the four-word vocabulary (`other`), which
+        // `a_settled_run_reports_the_reading_its_fields_add_up_to` covers
+        // directly. What this arm is for is that the two are distinguishable.
+        let warm_tracker = Arc::new(crate::analytics::RecordingTracker::new());
+        let deps = deps(dir.path());
+        let warm = HarnessWorkflowRunner::new(
+            Arc::new(crate::harness::built_in::run_turn::HarnessRunTurn::new(
+                Arc::new(HarnessPool::new()),
+                Arc::new(deps.clone()),
+            )),
+            deps,
+            rec.clone(),
+            warm_tracker.clone() as Arc<dyn crate::analytics::Tracker>,
+        );
+        WorkflowRunner::run(
+            &warm,
+            &rec.id,
+            &file,
+            serde_json::json!({}),
+            &WorkflowRunContext::new(false),
+        )
+        .await
+        .expect("workflow runs");
+        let [warmed] = warm_tracker.events()[..] else {
+            panic!("one finish: {:?}", warm_tracker.events())
+        };
+        let crate::analytics::Event::WorkflowRunFinished {
+            status,
+            nodes,
+            duration_ms,
+        } = warmed
+        else {
+            panic!("a workflow finish: {warmed:?}")
+        };
+        assert_ne!(status, "failed", "a run that warmed is not a warm failure");
+        assert!(nodes > 0, "a run that warmed ran nodes");
+        // Deliberately NOT `duration_ms > 0` (CodeRabbit, review round 2):
+        // `as_millis` floors, so a fast run legitimately reports 0 and the
+        // assertion would fail on a correct emit. `nodes` is the non-time
+        // invariant that separates the two arms, and it cannot be zero for a
+        // run the engine actually executed.
+        let _ = duration_ms;
+    }
+
     /// The port implementation ensures the roster itself, so a caller need not
     /// pre-`ensure`.
     #[tokio::test]
@@ -4294,7 +4735,8 @@ to = "done"
             pool,
             Arc::new(deps.clone()),
         ));
-        let runner = HarnessWorkflowRunner::new(turn, deps, rec.clone());
+        let runner =
+            HarnessWorkflowRunner::new(turn, deps, rec.clone(), crate::analytics::null_tracker());
 
         let file = parse_workflow(GREET).expect("workflow parses");
         let run = WorkflowRunner::run(
@@ -4345,7 +4787,12 @@ to = "done"
             Arc::new(HarnessPool::new()),
             Arc::new(deps.clone()),
         ));
-        let runner = HarnessWorkflowRunner::new(turn, deps, snapshot.clone());
+        let runner = HarnessWorkflowRunner::new(
+            turn,
+            deps,
+            snapshot.clone(),
+            crate::analytics::null_tracker(),
+        );
 
         let effective = runner.effective_record().await.expect("effective record");
         assert_eq!(
@@ -4369,7 +4816,8 @@ to = "done"
                 .with_engine("deep", deep.clone())
                 .bind("ceo", "deep"),
         );
-        let runner = HarnessWorkflowRunner::new(turn, deps, rec.clone());
+        let runner =
+            HarnessWorkflowRunner::new(turn, deps, rec.clone(), crate::analytics::null_tracker());
 
         let file = parse_workflow(GREET).expect("workflow parses");
         let run = WorkflowRunner::run(
@@ -5650,6 +6098,10 @@ to = "done"
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             }),
             events: Arc::new(crate::store::FsEventLog::new(dir)),
         });
@@ -6203,6 +6655,10 @@ to = "gate"
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             }),
             events: Arc::new(crate::store::FsEventLog::new(dir)),
         });
@@ -7762,6 +8218,10 @@ to = "done"
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             }),
             events: Arc::new(crate::store::FsEventLog::new(dir)),
         }

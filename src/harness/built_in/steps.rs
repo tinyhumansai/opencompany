@@ -105,6 +105,166 @@ use crate::turn_stream::TurnStreamEvent;
 /// (a tight tool loop) is truncated to this many, plus one omission note.
 const MAX_STEPS: usize = 50;
 
+// ---------------------------------------------------------------------------
+// Analytics: what a completed tool call is allowed to say (issue #1739)
+// ---------------------------------------------------------------------------
+
+/// The prefix every tool that reaches an MCP server carries.
+///
+/// This crate exposes MCP through host-owned tools only — `mcp_call_tool`,
+/// `mcp_list_servers`, `mcp_registry_*` — so the *server's* own tool name is an
+/// argument, never a tool name, and never reaches [`tool_source`] at all. That
+/// is not luck; it is what makes the classification below safe, and it is the
+/// fact that would have to change before a remote name could be misfiled.
+const MCP_TOOL_PREFIX: &str = "mcp_";
+
+/// The prefix every per-tenant Composio tool carries (`composio_execute`,
+/// `composio_authorize`, …). The *action* slug the operator is reaching —
+/// `GMAIL_SEND_EMAIL` and its kind — is likewise an argument, not a tool name.
+const COMPOSIO_TOOL_PREFIX: &str = "composio_";
+
+/// The separator third-party tool catalogues namespace with.
+///
+/// MCP clients and aggregators mint `server__tool`; nothing this repository
+/// builds contains a double underscore. See [`tool_source`] for why that is a
+/// discriminator rather than a census of belt names.
+const REMOTE_NAMESPACE_SEPARATOR: &str = "__";
+
+/// Which of the four sources an
+/// [`Event::ToolCalled`](crate::analytics::Event::ToolCalled) may name this tool
+/// as coming from: `built-in`, `mcp`, `composio`, or `other`.
+///
+/// # The tool's name never leaves this function
+///
+/// A tool name is among the richest identifiers a turn produces — an MCP
+/// server's own tool, a Composio action slug, a name a model invented — and the
+/// analytics payload vocabulary has no `String` variant precisely so that none
+/// of it can travel (see [`crate::analytics::types`]). This is the classifier
+/// standing between the two: it takes the runtime name and returns one of four
+/// `&'static str` literals written in this file.
+///
+/// # Why a name *shape*, and not a census of the belt
+///
+/// The obvious `built-in` test is "is this name in the list of tools we build",
+/// and it is the wrong one: the belt is assembled from a dozen modules behind
+/// half a dozen cargo features, so such a list is a second spelling of the
+/// toolbelt that goes stale the first time a tool is added under a feature the
+/// reader did not have on — and a stale entry means real built-in traffic
+/// reported as `other`, which reads as "an unknown tool ran" rather than "the
+/// list rotted".
+///
+/// The shape test cannot rot that way. Every tool this repository builds is
+/// registered under an ASCII lowercase snake_case literal written here, so a
+/// name in any other shape did not come from this belt. Anything failing the
+/// test folds to `other`, which is the safe direction: `other` under-claims,
+/// while calling a remote tool `built-in` would attribute a third party's
+/// traffic to us, and that is the one misreading this dimension exists to
+/// prevent.
+///
+/// **Known limit, stated rather than hidden:** a remote catalogue that minted
+/// plain lowercase snake_case names carrying no `__` would be reported as
+/// `built-in`. Nothing reaches this function in that shape today (see
+/// [`MCP_TOOL_PREFIX`]), and the cost if one ever did is a misattributed
+/// *count* — the name itself still cannot travel.
+pub fn tool_source(tool_name: &str) -> &'static str {
+    let name = tool_name.trim();
+    if name.starts_with(MCP_TOOL_PREFIX) {
+        return "mcp";
+    }
+    if name.starts_with(COMPOSIO_TOOL_PREFIX) {
+        return "composio";
+    }
+    // An empty name is not a tool this host built, and neither is one carrying a
+    // remote catalogue's namespace separator. Both fall through to `other`.
+    if !name.is_empty()
+        && !name.contains(REMOTE_NAMESPACE_SEPARATOR)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return "built-in";
+    }
+    crate::analytics::types::OTHER
+}
+
+/// Report `event` to `tracker` if — and only if — it is a completed tool call
+/// (issue #1739).
+///
+/// Called from the per-turn progress collector in
+/// [`CompanyAgent::run_with_steer`](crate::harness::CompanyAgent) with **every**
+/// event, so the collector carries no decision of its own: which events count,
+/// and what each one is allowed to say, is decided here where it can be tested.
+///
+/// Nothing is awaited and nothing is returned. [`Tracker::track`] is
+/// synchronous and infallible by design, so a tool call is never delayed by, and
+/// can never fail because of, analytics.
+///
+/// # Parent scope only
+///
+/// [`SubagentToolCallCompleted`](AgentProgress::SubagentToolCallCompleted) is
+/// deliberately not reported, matching [`fold_steps`]. A sub-agent's calls are
+/// work done *inside* the parent tool call that spawned it, and counting both
+/// would report one turn's tool use twice — with the double-count concentrated
+/// on exactly the turns that delegate, which is the shape that makes a funnel
+/// lie rather than merely inflate.
+///
+/// # A parked call is not a call
+///
+/// A call our supervised policy gated arrives here as `success = false`
+/// carrying the approval-required refusal — the same event
+/// [`complete`] reads as [`AwaitingApproval`](TurnStepStatus::AwaitingApproval)
+/// and explicitly refuses to count as an error. Reading `success` alone would
+/// therefore score **every approval-gated call as a tool failure**, and this
+/// event exists to answer "does tool traffic work", so the inflation would land
+/// hardest on exactly the companies that supervise the most.
+///
+/// It is not reported as a success either. The tool never ran: nothing left
+/// this process, there is no outcome to have, and a duration measured to a
+/// refusal is not how long the tool takes. The oversight loop is already the
+/// subject of its own two events —
+/// [`ApprovalParked`](crate::analytics::Event::ApprovalParked) and
+/// [`ApprovalDecided`](crate::analytics::Event::ApprovalDecided) — so the park
+/// is counted there, once, rather than half-counted in two vocabularies. If the
+/// operator approves it, the call runs and reports itself here like any other.
+///
+/// Recognised through [`is_awaiting_approval`], the same predicate `complete`
+/// uses, so the timeline an operator reads and the number a dashboard draws
+/// cannot disagree about what a parked call is.
+///
+/// [`Tracker::track`]: crate::analytics::Tracker::track
+pub fn track_tool_call(tracker: &dyn crate::analytics::Tracker, event: &AgentProgress) {
+    let AgentProgress::ToolCallCompleted {
+        tool_name,
+        success,
+        output,
+        elapsed_ms,
+        ..
+    } = event
+    else {
+        return;
+    };
+    // Checked before anything is emitted, and only on the failing arm: a
+    // *successful* call whose output happens to quote the refusal is a real
+    // call that really ran, and `success` is the harness's own answer to
+    // whether it did.
+    if !success && is_awaiting_approval(output) {
+        return;
+    }
+    tracker.track(crate::analytics::Event::ToolCalled {
+        // The source, never the name. A tool name is where an MCP server's own
+        // tool, a Composio action slug, or whatever a model invented would enter
+        // a payload; `tool_source` folds it onto one of four literals written in
+        // this repository, and nothing else escapes.
+        source: tool_source(tool_name),
+        outcome: if *success {
+            crate::analytics::Outcome::Ok
+        } else {
+            crate::analytics::Outcome::Failed
+        },
+        duration_ms: *elapsed_ms,
+    });
+}
+
 /// Fold an ordered progress stream into the scrubbed [`TurnStep`] timeline.
 ///
 /// * Pairs each `ToolCallStarted` with its `ToolCallCompleted` by `call_id` into
@@ -2974,6 +3134,290 @@ mod tests {
             assert!(
                 detail.is_none_or(|d| d.arguments.is_none()),
                 "a started call should carry no unredacted arguments"
+            );
+        }
+    }
+
+    /// Issue #1739: what a `tool_called` event is allowed to say about a tool.
+    mod analytics {
+        use super::*;
+
+        use crate::analytics::{Event, Outcome, RecordingTracker};
+
+        /// A completed call, in the shape the tinyagents path emits. Named
+        /// apart from the outer module's `completed` so neither shadows the
+        /// other by accident.
+        fn finished(tool: &str, success: bool, elapsed_ms: u64) -> AgentProgress {
+            AgentProgress::ToolCallCompleted {
+                call_id: "c1".to_string(),
+                tool_name: tool.to_string(),
+                success,
+                output_chars: 0,
+                output: String::new(),
+                arguments: None,
+                elapsed_ms,
+                iteration: 1,
+                failure: None,
+            }
+        }
+
+        /// Every source this vocabulary knows resolves to its **own** slug —
+        /// pinned as a table so a fold that collapsed two of them onto one word
+        /// (which reads as a working metric, just a wrong one) fails here.
+        #[test]
+        fn every_known_source_maps_to_its_own_slug() {
+            let table = [
+                ("workspace_read", "built-in"),
+                ("shell", "built-in"),
+                ("web_search", "built-in"),
+                ("request_approval", "built-in"),
+                ("media_generate_image", "built-in"),
+                ("mcp_call_tool", "mcp"),
+                ("mcp_list_servers", "mcp"),
+                ("mcp_registry_tool_call", "mcp"),
+                ("composio_execute", "composio"),
+                ("composio_authorize", "composio"),
+            ];
+            for (name, expected) in table {
+                assert_eq!(tool_source(name), expected, "source of {name:?}");
+            }
+            // Distinctness, not just membership: three slugs are in play and a
+            // fold that answered `built-in` for everything would satisfy every
+            // row above that expects it.
+            assert_ne!(tool_source("shell"), tool_source("mcp_call_tool"));
+            assert_ne!(
+                tool_source("mcp_call_tool"),
+                tool_source("composio_execute")
+            );
+        }
+
+        /// The one that matters: a name this vocabulary does not recognise folds
+        /// to `other` rather than travelling. Every shape here is one a remote
+        /// catalogue actually mints.
+        #[test]
+        fn an_unrecognised_source_folds_to_other() {
+            for name in [
+                "GMAIL_SEND_EMAIL",
+                "linear__create_issue",
+                "Notion.appendBlock",
+                "acmecorp-crm-lookup",
+                "",
+                "   ",
+            ] {
+                assert_eq!(
+                    tool_source(name),
+                    crate::analytics::types::OTHER,
+                    "an unrecognised tool name must fold to `other`: {name:?}"
+                );
+            }
+        }
+
+        /// The tool's own name never reaches the payload — the failure the whole
+        /// closed vocabulary exists to prevent.
+        ///
+        /// Carries the house self-check (`analytics::test`'s shape): the same
+        /// search *does* find the needle in the raw input, so the assertion
+        /// above is refusing something findable rather than passing because the
+        /// needle could never be found anywhere.
+        #[test]
+        fn a_tool_name_never_reaches_the_source_slug() {
+            const NEEDLE: &str = "acmecorp-project-titan";
+            let name = format!("mcp_call_{NEEDLE}");
+            let source = tool_source(&name);
+            assert!(
+                !source.contains(NEEDLE),
+                "the source slug leaked the tool name: {source}"
+            );
+            assert!(
+                name.contains(NEEDLE),
+                "the needle must be findable in the raw tool name, or the guard above is vacuous"
+            );
+            // And it is one of ours, not merely "not the input".
+            assert!(
+                [
+                    "built-in",
+                    "mcp",
+                    "composio",
+                    crate::analytics::types::OTHER
+                ]
+                .contains(&source),
+                "the source must come from the closed set: {source}"
+            );
+        }
+
+        /// A completed call is reported once, as source, outcome and duration —
+        /// and nothing else.
+        #[test]
+        fn a_completed_call_is_reported_as_source_outcome_and_duration() {
+            let tracker = RecordingTracker::new();
+            track_tool_call(&tracker, &finished("workspace_read", true, 42));
+            track_tool_call(&tracker, &finished("composio_execute", false, 7));
+
+            assert_eq!(
+                tracker.events(),
+                vec![
+                    Event::ToolCalled {
+                        source: "built-in",
+                        outcome: Outcome::Ok,
+                        duration_ms: 42,
+                    },
+                    Event::ToolCalled {
+                        source: "composio",
+                        outcome: Outcome::Failed,
+                        duration_ms: 7,
+                    },
+                ]
+            );
+        }
+
+        /// A start is not a completion, and a sub-agent's call is the parent
+        /// call's own work — reporting either would count one turn's tool use
+        /// twice, concentrated on exactly the turns that delegate.
+        #[test]
+        fn only_a_parent_scope_completion_is_reported() {
+            let tracker = RecordingTracker::new();
+            track_tool_call(&tracker, &started("c1", "workspace_read", None));
+            track_tool_call(
+                &tracker,
+                &AgentProgress::SubagentToolCallCompleted {
+                    agent_id: "researcher".to_string(),
+                    task_id: "t1".to_string(),
+                    call_id: "c2".to_string(),
+                    tool_name: "workspace_read".to_string(),
+                    success: true,
+                    output_chars: 0,
+                    output: String::new(),
+                    arguments: None,
+                    elapsed_ms: 5,
+                    iteration: 1,
+                    failure: None,
+                },
+            );
+            assert!(
+                tracker.events().is_empty(),
+                "only a parent-scope completion may be reported: {:?}",
+                tracker.events()
+            );
+
+            // The self-check: the same tracker DOES record when handed the event
+            // that should be reported, so the emptiness above is a refusal
+            // rather than a tracker that never records anything.
+            track_tool_call(&tracker, &finished("workspace_read", true, 1));
+            assert_eq!(tracker.events().len(), 1);
+        }
+
+        /// [`finished`], carrying the output the tool actually returned.
+        fn finished_with(tool: &str, success: bool, output: &str) -> AgentProgress {
+            let AgentProgress::ToolCallCompleted {
+                call_id,
+                tool_name,
+                elapsed_ms,
+                ..
+            } = finished(tool, success, 9)
+            else {
+                unreachable!("`finished` builds a completion")
+            };
+            AgentProgress::ToolCallCompleted {
+                call_id,
+                tool_name,
+                success,
+                output_chars: output.chars().count(),
+                output: output.to_string(),
+                arguments: None,
+                elapsed_ms,
+                iteration: 1,
+                failure: None,
+            }
+        }
+
+        /// Raised in review of #1739: a call **our** approval policy parked is
+        /// not a tool failure, and must not be counted as one.
+        ///
+        /// It arrives as `success = false` carrying the refusal, which is the
+        /// same event the timeline reads as
+        /// [`TurnStepStatus::AwaitingApproval`] — so scoring it `failed` here
+        /// would put one call in two irreconcilable places at once, and inflate
+        /// the failure rate most for the companies that supervise the most.
+        ///
+        /// Not reported as a success either: the tool never ran. The park is
+        /// counted by `approval_parked`/`approval_decided` instead.
+        #[test]
+        fn an_approval_parked_call_is_not_reported_at_all() {
+            let tracker = RecordingTracker::new();
+            let parked = finished_with("send_email", false, &approval_refusal("send_email"));
+
+            // The coupling that makes this a real case rather than a guess: the
+            // timeline classifier reads this very event as parked, not failed.
+            let AgentProgress::ToolCallCompleted {
+                tool_name,
+                success,
+                output,
+                ..
+            } = &parked
+            else {
+                unreachable!("a completion")
+            };
+            assert_eq!(
+                complete(tool_name, *success, output, None, None).status,
+                TurnStepStatus::AwaitingApproval,
+                "the fixture must be the event the timeline calls parked"
+            );
+
+            track_tool_call(&tracker, &parked);
+            assert!(
+                tracker.events().is_empty(),
+                "a parked call is neither a success nor a failure: {:?}",
+                tracker.events()
+            );
+
+            // Self-check, and the regression: a call that genuinely failed —
+            // same `success = false`, an ordinary error body — is still
+            // reported, so the emptiness above is the park being recognised
+            // rather than every failure having been dropped.
+            track_tool_call(
+                &tracker,
+                &finished_with("send_email", false, "SMTP 550: mailbox unavailable"),
+            );
+            assert_eq!(
+                tracker.events(),
+                vec![Event::ToolCalled {
+                    source: "built-in",
+                    outcome: Outcome::Failed,
+                    duration_ms: 9,
+                }],
+                "a real failure must still be reported"
+            );
+        }
+
+        /// The predicate is `is_awaiting_approval`, not "the word approval
+        /// appeared". A different `ToolPolicy` on the same host, and a hard deny
+        /// from our own, are both real refusals — dropping them would hide
+        /// failures instead of the reverse.
+        #[test]
+        fn only_our_own_policys_park_escapes_the_failure_count() {
+            let tracker = RecordingTracker::new();
+            for output in [
+                "Blocked: Tool 'shell' requires approval under policy 'some-other-policy'.",
+                "Blocked: Tool 'shell' was denied by policy 'opencompany-approval'.",
+            ] {
+                track_tool_call(&tracker, &finished_with("shell", false, output));
+            }
+            assert_eq!(
+                tracker.events().len(),
+                2,
+                "neither of these is our park: {:?}",
+                tracker.events()
+            );
+            assert!(
+                tracker.events().iter().all(|event| matches!(
+                    event,
+                    Event::ToolCalled {
+                        outcome: Outcome::Failed,
+                        ..
+                    }
+                )),
+                "both must still read as failures: {:?}",
+                tracker.events()
             );
         }
     }

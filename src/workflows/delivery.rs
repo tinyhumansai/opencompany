@@ -273,6 +273,22 @@ pub struct DeliveryParking {
     /// decisions are counted but whose gates are not recorded releases a batch
     /// the host cannot re-dispatch.
     pub gates: crate::runtime::workflow_gates::WorkflowGateQueue,
+    /// Where a park raised **outside a cycle** is reported (issue #1739).
+    ///
+    /// `CycleHostImpl::park` describes itself as "the single write path into
+    /// the operator's queue" and emits `approval_parked` there. It is not: this
+    /// struct exists precisely because three callers park without a
+    /// [`CycleHost`](crate::ports::brain::CycleHost) — a cold `email`
+    /// recipient, a workflow agent node's gated tool call, and a
+    /// `requires_approval` gate the engine paused on — and every one of them
+    /// was counted by nobody. That is not a rounding error in the oversight
+    /// funnel: a workflow-heavy company's parks are *mostly* these, so
+    /// `approval_parked` undercounted exactly the companies the funnel is about.
+    ///
+    /// Carried here rather than passed per call because this is the bundle that
+    /// already owns the park transaction, and a park that reports nowhere must
+    /// not be constructible.
+    pub tracker: Arc<dyn crate::analytics::Tracker>,
     /// The workflow id and trigger input each blocked agent node needs to
     /// re-dispatch its run (issue #899, Stage 1).
     ///
@@ -1179,6 +1195,31 @@ impl DeliveryParking {
         if let Some(turn) = turn {
             self.gates.arm(&turn, &approval_id, &effect);
         }
+        // Issue #1739: one `approval_parked`, reported as taxonomy and nothing
+        // else — the same event `CycleHostImpl::park` emits, deliberately
+        // constructed the same way. `group_slug` is that function's classifier,
+        // called rather than copied: two spellings of one taxonomy is how the
+        // in-cycle and out-of-cycle halves of one funnel come to disagree about
+        // what `send` means.
+        //
+        // Emitted **after** the journal write above, which is this
+        // transaction's commit point. A park that failed to journal is retracted
+        // from the gate and returns `Err` further up, and a retracted park is
+        // one the operator never saw — counting it would inflate the queue this
+        // event claims to describe.
+        //
+        // `priced` is `is_some()` and NOT the figure: an amount is a fact about
+        // this company's business. The kind, the payload, the thread and the
+        // node id are absent for the same reason — `effect.kind` is an
+        // operator- and MCP-supplied string, and the payload is the effect's
+        // arguments.
+        //
+        // Nothing is awaited: `Tracker::track` is synchronous and infallible, so
+        // a park is never delayed by, and can never fail because of, analytics.
+        self.tracker.track(crate::analytics::Event::ApprovalParked {
+            group: crate::policy::gate::group_slug(effect.group),
+            priced: effect.amount_usd.is_some(),
+        });
         Ok(approval_id)
     }
 }
@@ -1906,6 +1947,10 @@ admins = [{list}]
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             });
             self.gate = Some(gate);
             self.journal = Some(journal);
@@ -1937,6 +1982,10 @@ admins = [{list}]
                 continuations: Default::default(),
                 gates: Default::default(),
                 blocked_nodes: Default::default(),
+                // Issue #1739: a test fixture reports nowhere unless it is
+                // asserting on the report. The production wiring is
+                // `RuntimeBuilder`, which hands the host's own tracker in.
+                tracker: crate::analytics::null_tracker(),
             });
             self.gate = Some(gate);
             self.journal = Some(journal);
@@ -4329,5 +4378,169 @@ to = "done"
              so the slot armed for it before the attempt must be released — otherwise the turn \
              is left permanently blocked on a decision that can never arrive"
         );
+    }
+
+    /// Issue #1739: a park raised **outside a cycle** is counted by the same
+    /// funnel the in-cycle ones are.
+    ///
+    /// `CycleHostImpl::park` claims in its own comment to be "the single write
+    /// path into the operator's queue". It is not — this transaction is the
+    /// other one, and it serves the three callers that hold no `CycleHost`: a
+    /// cold `email` recipient, a workflow agent node's gated tool call, and a
+    /// `requires_approval` gate. Every one of them reported nothing, so a
+    /// workflow-heavy company's `approval_parked` count was mostly missing.
+    ///
+    /// Two effects rather than one, with **different** groups and opposite
+    /// `priced`: a report that hardcoded either field would satisfy a
+    /// single-effect test.
+    #[tokio::test]
+    async fn a_workflow_park_reports_its_group_and_whether_it_was_priced() {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-1739-park-")
+            .tempdir()
+            .expect("tempdir");
+        let h = Harness::new(dir.path(), false, false).with_parking(dir.path(), "full");
+        let tracker = Arc::new(crate::analytics::RecordingTracker::new());
+        let mut parking = h.deps.parking.clone().expect("with_parking wired it");
+        parking.tracker = tracker.clone();
+
+        let unpriced = Effect {
+            kind: "publish_artifact".to_string(),
+            group: EffectGroup::Publish,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "call": "publish_artifact" }),
+            agent: Some("ceo".to_string()),
+            run_id: None,
+        };
+        let priced = Effect {
+            kind: "chargebee.invoice".to_string(),
+            group: EffectGroup::Spend,
+            amount_usd: Some(42.50),
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "call": "chargebee_invoice" }),
+            agent: Some("ceo".to_string()),
+            run_id: None,
+        };
+
+        for effect in [unpriced, priced.clone()] {
+            parking
+                .park_and_journal(
+                    &CompanyId::new("acme"),
+                    effect,
+                    crate::runtime::journal::TaskLink::Unlinked,
+                    None,
+                    None,
+                )
+                .await
+                .expect("parks");
+        }
+
+        assert_eq!(
+            tracker.events(),
+            vec![
+                crate::analytics::Event::ApprovalParked {
+                    group: "publish",
+                    priced: false,
+                },
+                crate::analytics::Event::ApprovalParked {
+                    group: "spend",
+                    priced: true,
+                },
+            ],
+            "a park raised outside a cycle must report its taxonomy group and \
+             whether it named an amount at all"
+        );
+
+        // The figure itself is a fact about this company's business and must not
+        // travel. Carries the house self-check (`analytics::test`'s shape): the
+        // same search *does* find the amount in the effect it came from, so the
+        // assertion is refusing something findable rather than passing because
+        // the needle could never be found anywhere.
+        let rendered = format!("{:?}", tracker.events());
+        assert!(
+            !rendered.contains("42.5"),
+            "the payload carried the amount, not merely that there was one: {rendered}"
+        );
+        assert!(
+            format!("{priced:?}").contains("42.5"),
+            "the needle must be findable in the effect, or the guard above is vacuous"
+        );
+    }
+
+    /// The commit point, not the attempt: a park whose durable write failed is
+    /// retracted from the gate and never seen by an operator, so counting it
+    /// would inflate the very queue this event claims to describe.
+    ///
+    /// The companion to
+    /// [`park_and_journal_releases_the_continuation_slot_when_the_journal_write_fails`],
+    /// on the same fixture and for the same reason: the two halves of a failed
+    /// park — the slot and the count — must both come back.
+    #[tokio::test]
+    async fn a_park_whose_journal_write_failed_is_never_reported() {
+        let dir = tempfile::Builder::new()
+            .prefix("oc-1739-park-fail-")
+            .tempdir()
+            .expect("tempdir");
+        let tracker = Arc::new(crate::analytics::RecordingTracker::new());
+
+        let failing =
+            Harness::new(dir.path(), false, false).with_failing_journal(dir.path(), "full");
+        let mut failing_parking = failing
+            .deps
+            .parking
+            .clone()
+            .expect("with_failing_journal wired it");
+        failing_parking.tracker = tracker.clone();
+
+        let effect = || Effect {
+            kind: "publish_artifact".to_string(),
+            group: EffectGroup::Publish,
+            amount_usd: None,
+            established_thread: false,
+            first_time_counterparty: false,
+            payload: serde_json::json!({ "call": "publish_artifact" }),
+            agent: Some("ceo".to_string()),
+            run_id: None,
+        };
+
+        assert!(
+            failing_parking
+                .park_and_journal(
+                    &CompanyId::new("acme"),
+                    effect(),
+                    crate::runtime::journal::TaskLink::Unlinked,
+                    None,
+                    None,
+                )
+                .await
+                .is_err(),
+            "the failing journal must still fail the park"
+        );
+        assert!(
+            tracker.events().is_empty(),
+            "a retracted park must not be counted: {:?}",
+            tracker.events()
+        );
+
+        // The self-check: the SAME tracker does record when the park actually
+        // commits, so the emptiness above is a refusal rather than a tracker
+        // that was never wired to anything.
+        let ok = Harness::new(dir.path(), false, false).with_parking(dir.path(), "full");
+        let mut ok_parking = ok.deps.parking.clone().expect("with_parking wired it");
+        ok_parking.tracker = tracker.clone();
+        ok_parking
+            .park_and_journal(
+                &CompanyId::new("acme"),
+                effect(),
+                crate::runtime::journal::TaskLink::Unlinked,
+                None,
+                None,
+            )
+            .await
+            .expect("parks");
+        assert_eq!(tracker.events().len(), 1);
     }
 }

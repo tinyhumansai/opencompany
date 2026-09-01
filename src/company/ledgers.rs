@@ -49,6 +49,14 @@ pub struct Ledgers {
     /// Written only to publish a derived file. A context without one records
     /// perfectly well and simply publishes nothing.
     workspace: Option<Arc<dyn crate::ports::workspace::WorkspaceStore>>,
+    /// Where a write reports itself (issue #1739).
+    ///
+    /// Defaulted to [`NullTracker`](crate::analytics::NullTracker) rather than
+    /// taken as a constructor argument, so every existing caller — the agent
+    /// tool build, the tests, the runtime — keeps compiling and keeps sending
+    /// nothing. Silence is this module's default in every build; see
+    /// [`crate::analytics`].
+    analytics: Arc<dyn crate::analytics::Tracker>,
 }
 
 impl Ledgers {
@@ -62,6 +70,7 @@ impl Ledgers {
             ledgers,
             tasks: None,
             workspace: None,
+            analytics: crate::analytics::null_tracker(),
         }
     }
 
@@ -103,6 +112,13 @@ impl Ledgers {
         self
     }
 
+    /// Points this context's write reporting at `tracker` (issue #1739).
+    #[must_use]
+    pub fn with_analytics(mut self, tracker: Arc<dyn crate::analytics::Tracker>) -> Self {
+        self.analytics = tracker;
+        self
+    }
+
     /// The company these ledgers belong to.
     pub fn company(&self) -> &crate::ports::types::CompanyId {
         &self.company
@@ -114,6 +130,12 @@ impl From<&CompanyRuntime> for Ledgers {
         Ledgers::new(runtime.id().clone(), runtime.ledgers().clone())
             .with_tasks(runtime.tasks().clone())
             .with_workspace(runtime.workspace().clone())
+            // The company's own tracker, which on a hosted host is the real
+            // one and everywhere else is a `NullTracker`. Read from the field
+            // rather than re-resolved from config: a second answer to "where
+            // does this host report?" is how one surface starts reporting after
+            // the operator turned reporting off.
+            .with_analytics(runtime.tracker.clone())
     }
 }
 
@@ -359,6 +381,16 @@ pub async fn record(
         fields,
     };
     ctx.ledgers.append(&ctx.company, &event).await?;
+    // After the append, so a refused or failed write is not reported as one
+    // that happened — and before the fold, so a republish failure downstream
+    // cannot lose the count. One `LedgerEvent` is one record: this is the only
+    // append site, and it merges a single row.
+    //
+    // The **shape and the count only**. `spec.slug` is author-defined at
+    // runtime and the fields are the company's own business data, so neither
+    // reaches the payload: `track_append` folds the slug onto a compiled list
+    // and is handed no field at all. See `crate::ledger::analytics`.
+    crate::ledger::analytics::track_append(ctx.analytics.as_ref(), &spec.slug, 1);
     let folded = entries(ctx, spec).await?;
     publish(ctx, spec, &folded).await;
     folded.find(id).cloned().ok_or_else(|| {

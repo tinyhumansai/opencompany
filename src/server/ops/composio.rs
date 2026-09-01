@@ -76,6 +76,7 @@ use crate::company::runtime::CompanyRuntime;
 use crate::ports::types::CompanyEvent;
 use crate::server::error::ApiError;
 use crate::server::ops::composio_toolkits::{self, CatalogSource, OpenModeToolkits};
+use crate::server::ops::connections::{Transition, track_connection};
 use crate::server::ops::{AdminScopedCompany, ScopedCompany, scoped};
 
 /// The reminder attached to a set / rotate response.
@@ -504,11 +505,61 @@ async fn get_status(company: ScopedCompany) -> Result<Json<ComposioStatusDto>, A
 /// to Composio, so whoever sets it decides which account those agents act
 /// through. That is a decision made *for* the company, not a member's own, and
 /// [`AdminScopedCompany`] is what says so in the signature.
+/// What a Composio change reports itself as, before folding.
+///
+/// The **plane**, not the toolkit: `set_token` names no toolkit at all, and
+/// `disconnect` is given a Composio connection id rather than one. A slug that
+/// [`provider_slug`](crate::analytics::types::provider_slug) already knows, so
+/// it survives the fold as itself.
+const COMPOSIO_ANALYTICS_PROVIDER: &str = "composio";
+
+/// What a write to the company's Composio credential did, from the state before
+/// it and the state after (issue #1739, raised in review of #1950).
+///
+/// The endpoint is one route for four different events, and reporting every
+/// non-empty write as [`Transition::Connected`] made three of them into the
+/// fourth. `Refreshed` exists precisely for a rotated credential, so a company
+/// that rotates its token monthly was counted as connecting Composio afresh
+/// every month — inflating the numerator of "does connecting a tool provider
+/// work" with writes that connected nothing new. The mirror on the other side:
+/// a clear over a credential that was already absent reported a
+/// `disconnected` for an integration nobody had.
+///
+/// `None` is that last case — nothing was there and nothing is there — and it
+/// reports no event at all rather than a fifth word. A no-op is not a state
+/// change, and the vocabulary describes changes.
+///
+/// Pure, and separate from the handler, for the reason
+/// [`crate::server::ops::mcp`]'s `observed_transition` is: the decision is
+/// testable without standing up a router and a secret store, and the two inputs
+/// are exactly what the handler holds.
+fn token_transition(had_token: bool, has_token: bool) -> Option<Transition> {
+    match (had_token, has_token) {
+        (false, true) => Some(Transition::Connected),
+        (true, true) => Some(Transition::Refreshed),
+        (true, false) => Some(Transition::Disconnected),
+        (false, false) => None,
+    }
+}
+
 async fn set_token(
     company: AdminScopedCompany,
     Json(body): Json<SetToken>,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let runtime = company.runtime.as_ref();
+    // Read BEFORE the write, or the answer is always "there is one now".
+    //
+    // An unreadable prior state degrades to `true`, so the write reports
+    // `refreshed` rather than `connected`. Both are guesses, but they are not
+    // equally bad: `connected` inflates the count of *new* connections, which is
+    // the number this event exists to produce, while `refreshed` only
+    // under-claims it. Under-claiming is this module's documented direction
+    // everywhere else, and the case is narrow anyway — a secret store that
+    // cannot be read is one `store_token` below is about to fail against.
+    let had_token =
+        crate::company::composio::token_configured(runtime.id(), runtime.secrets().as_ref())
+            .await
+            .unwrap_or(true);
     store_token(runtime.id(), runtime.secrets().as_ref(), &body.token)
         .await
         .map_err(ApiError)?;
@@ -527,6 +578,19 @@ async fn set_token(
         "credential_set"
     };
     journal(&company, change, None).await?;
+    // After the store and the journal, so only a completed change is reported.
+    // The credential itself is never in reach of this call: `provider` is the
+    // literal below and `transition` is one of four compiled-in words, so the
+    // token cannot travel even by accident. Clearing is a `disconnected`, not a
+    // failure — the operator withdrew the access on purpose, and folding the
+    // two together would make the failure rate this event exists to measure
+    // read as whatever the churn rate happens to be.
+    //
+    // Which of the four it is comes from `token_transition`, off the state
+    // either side of the write rather than off the new value alone.
+    if let Some(transition) = token_transition(had_token, !body.token.trim().is_empty()) {
+        track_connection(runtime, COMPOSIO_ANALYTICS_PROVIDER, transition);
+    }
     Ok(Json(MutationResponse {
         status: effective_status(runtime).await?,
         note: if body.token.trim().is_empty() {
@@ -800,6 +864,14 @@ async fn disconnect(
 ) -> Result<Json<DisconnectDto>, ApiError> {
     let dto = disconnect_impl(company.runtime.as_ref(), &connection_id).await?;
     journal(&company, "provider_disconnected", None).await?;
+    // `connection_id` is Composio's own opaque handle for this company's
+    // account and is deliberately not offered here — the plane is the
+    // segmentation, and an id is a correlation key into somebody else's system.
+    track_connection(
+        company.runtime.as_ref(),
+        COMPOSIO_ANALYTICS_PROVIDER,
+        Transition::Disconnected,
+    );
     Ok(dto)
 }
 
@@ -1084,6 +1156,17 @@ mod tests {
         company: &str,
         manifest_toml: &str,
     ) -> AppState {
+        state_with_manifest_tracked(home, company, manifest_toml, None).await
+    }
+
+    /// [`state_with_manifest_id`], optionally pointing this company's analytics
+    /// at a recorder so a route's own reporting can be read back.
+    async fn state_with_manifest_tracked(
+        home: &std::path::Path,
+        company: &str,
+        manifest_toml: &str,
+        tracker: Option<std::sync::Arc<crate::analytics::RecordingTracker>>,
+    ) -> AppState {
         use crate::ports::CompanyStore;
         let manifest: CompanyManifest = toml::from_str(manifest_toml).unwrap();
         let store = FsCompanyStore::new(home.to_path_buf());
@@ -1114,15 +1197,141 @@ mod tests {
             })
             .await
             .unwrap();
-        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
-            .with_id(id.clone())
-            .build()
-            .await
-            .unwrap();
+        let builder = RuntimeBuilder::new(home.to_path_buf(), manifest).with_id(id.clone());
+        let builder = match tracker {
+            Some(tracker) => builder.with_analytics(tracker),
+            None => builder,
+        };
+        let runtime = builder.build().await.unwrap();
         let state = AppState::new(AppConfig::default());
         state.registry().insert(id, std::sync::Arc::new(runtime));
         crate::server::test_support::seed_fixed_admin(&state, company).await;
         state
+    }
+
+    /// [`state_with_manifest`], with this company's analytics pointed at a
+    /// recorder so a route's own reporting can be read back.
+    async fn state_with_recorder(
+        home: &std::path::Path,
+        manifest_toml: &str,
+    ) -> (AppState, std::sync::Arc<crate::analytics::RecordingTracker>) {
+        let recorder = std::sync::Arc::new(crate::analytics::RecordingTracker::new());
+        let state =
+            state_with_manifest_tracked(home, "acme", manifest_toml, Some(recorder.clone())).await;
+        (state, recorder)
+    }
+
+    /// **Issue #1739, raised in review of #1950.** One route, four different
+    /// things an operator can do to a credential — and it used to report two.
+    ///
+    /// `PUT …/composio/token` sets, rotates and clears. Reporting every
+    /// non-empty write as `connected` counted a monthly token rotation as a new
+    /// Composio integration every month, inflating the numerator of "does
+    /// connecting a tool provider actually work" with writes that connected
+    /// nothing; and a clear over an already-absent credential reported a
+    /// `disconnected` for an integration nobody had. `Transition::Refreshed`
+    /// exists for exactly the rotation case and was unreachable from here.
+    ///
+    /// Driven through the route rather than over `token_transition` alone,
+    /// because the defect was that the handler never asked: a unit test of the
+    /// classifier passes with the call site reverted.
+    #[tokio::test]
+    async fn a_token_rotation_reports_a_refresh_rather_than_a_new_connection() {
+        let home_dir = home();
+        let (state, recorder) = state_with_recorder(home_dir.path(), GRANTED).await;
+        let changes = |recorder: &crate::analytics::RecordingTracker| {
+            recorder
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    crate::analytics::Event::ConnectionChanged {
+                        provider,
+                        transition,
+                    } => Some((provider, transition)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let put = async |state: &AppState, token: &str| {
+            let (status, _body, raw) = send(
+                state,
+                "PUT",
+                "/api/v1/company/composio/token",
+                Some(json!({ "token": token })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{raw}");
+        };
+
+        // Nothing was configured, so the first write is a connection.
+        put(&state, "first-token").await;
+        assert_eq!(changes(&recorder), vec![("composio", "connected")]);
+
+        // The same route again over a live credential is a rotation, not a
+        // second Composio integration.
+        put(&state, "rotated-token").await;
+        assert_eq!(
+            changes(&recorder),
+            vec![("composio", "connected"), ("composio", "refreshed")],
+            "a rotation must not read as a new connection"
+        );
+
+        // Clearing a live credential is a disconnect — the operator withdrew
+        // access on purpose, which is not a failure and not a no-op.
+        put(&state, "").await;
+        assert_eq!(
+            changes(&recorder),
+            vec![
+                ("composio", "connected"),
+                ("composio", "refreshed"),
+                ("composio", "disconnected"),
+            ]
+        );
+
+        // And clearing what is already clear changed nothing, so it says
+        // nothing. A second `disconnected` here would be a disconnection from
+        // an integration this company never had.
+        put(&state, "").await;
+        assert_eq!(
+            changes(&recorder).len(),
+            3,
+            "a no-op write reported a state change: {:?}",
+            changes(&recorder)
+        );
+    }
+
+    /// The four answers, as a table, so a fold that collapsed two of them onto
+    /// one word fails here rather than in a dashboard six weeks later.
+    #[test]
+    fn every_credential_state_change_maps_to_its_own_transition() {
+        use super::token_transition;
+        use crate::server::ops::connections::Transition;
+
+        assert_eq!(token_transition(false, true), Some(Transition::Connected));
+        assert_eq!(token_transition(true, true), Some(Transition::Refreshed));
+        assert_eq!(
+            token_transition(true, false),
+            Some(Transition::Disconnected)
+        );
+        assert_eq!(
+            token_transition(false, false),
+            None,
+            "a no-op is not a change"
+        );
+
+        // Distinctness, not merely membership: a classifier answering one word
+        // for every write would satisfy any single row above.
+        let answers = [
+            token_transition(false, true),
+            token_transition(true, true),
+            token_transition(true, false),
+            token_transition(false, false),
+        ];
+        for (i, a) in answers.iter().enumerate() {
+            for b in answers.iter().skip(i + 1) {
+                assert_ne!(a, b, "two states share an answer: {answers:?}");
+            }
+        }
     }
 
     async fn send(

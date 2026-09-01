@@ -1,19 +1,32 @@
 # Product analytics
 
 **Status: implemented (issue #1739).** What OpenCompany reports about how it is
-being used, what it deliberately never reports, which installs report at all,
-and how to turn it off.
+being used, what it deliberately never reports, and where each event is raised.
+Which installs report at all, and how to turn it off, is in
+[analytics-configuration.md](analytics-configuration.md).
 
-The short version, and the only three sentences most readers need:
+The short version, and the only four points most readers need:
 
-- A **desktop or self-hosted install sends nothing.** Not "sends nothing by
+- A **desktop install sends nothing, and cannot.** Not "sends nothing by
   default" in the sense of a flag someone could flip in a config file — the
-  network client is behind a cargo feature the shipped default build does not
+  network client is behind a cargo feature `src-tauri/Cargo.toml` does not
   compile, so there is no code in that binary that could make the request.
   Getting one out of that state takes a **recompile**: `--features analytics`
   *and* an explicit `OPENCOMPANY_ANALYTICS=on`, both deliberate, and neither
-  reachable from anything a shipped binary reads at runtime. See
-  [Configuration](#configuration) for the four conditions in full.
+  reachable from anything a shipped binary reads at runtime.
+- A **self-hosted install sends nothing**, and since 2026-08-29 how strong that
+  sentence is depends on how the install was built. Built from source with the
+  default feature set it is the desktop's *cannot*. Built from this
+  repository's `Dockerfile` — whose `ARG FEATURES` now defaults to `analytics`,
+  because that image is the hosted tenant workload — the transport is compiled
+  and the guarantee is a **will not**: `analytics::config::resolve` still
+  requires a hosted tenant, or an explicit `OPENCOMPANY_ANALYTICS=on`, **and** a
+  token, and `OPENCOMPANY_ANALYTICS=off` still outranks both. An operator who
+  runs that image with no tenant namespace and no token sends exactly what they
+  sent before: nothing.
+  [analytics-configuration.md](analytics-configuration.md) has the five
+  conditions in full, and says why the weaker promise is the right trade for
+  that one artifact.
 - A **hosted tenant** — a container the OpenCompany platform provisioned and
   operates — reports **shape and outcome only**, under an **opaque id**.
 - Nothing an operator or an agent wrote ever leaves the process this way. Not
@@ -38,13 +51,20 @@ or stays local, and never rides this channel.
 
 ## What is collected
 
-Three events today. Each carries the context envelope below.
+Ten events today. Each carries the context envelope below.
 
 | Event | Fired when | Properties |
 |---|---|---|
 | `instance_started` | the host finished booting and registered its companies | `companies` (count), `storage` (`fs`/`sqlite`/`mongodb`), `setup_complete` |
 | `turn_finished` | one cycle — the product's unit of work — ended | `trigger`, `outcome` (`ok`/`failed`), `failure` (coarse class), `duration_ms`, `effects_executed`, `approvals_parked` |
 | `turn_metered` | one usage sample was recorded | `sample_kind`, `provider`, `model` (omitted when the sample named none), `input_tokens`, `output_tokens`, `cached_input_tokens`, `cost_usd`, `attributed_to_run` |
+| `approval_parked` | an effect was parked for an operator decision | `group` (`spend`/`send`/`sign`/`publish`/`hire`/`identity`/`other`), `priced` |
+| `approval_decided` | a parked approval was settled | `group`, `verdict` (`approved`/`denied`/`expired`), `waited_ms` |
+| `tool_called` | one tool call finished | `source` (`built-in`/`mcp`/`composio`/`other`), `outcome`, `duration_ms` |
+| `workflow_run_finished` | one workflow run reached a terminal state | `status` (`completed`/`failed`/`blocked`/`cancelled`/`other`), `nodes`, `duration_ms` |
+| `ledger_appended` | a ledger record was appended | `shape` (`tasks`/`goals`/`decisions`/`risks`/`commitments`/`learnings`/`other`), `records` |
+| `connection_changed` | a connection or MCP server changed state | `provider`, `transition` (`connected`/`disconnected`/`refreshed`/`failed`) |
+| `console_viewed` | the operator opened a console view | `view` |
 
 `model` is the closed `ModelSlug` vocabulary from
 [`metering`](../../../src/metering/model.rs) (issue #1749), already folded at the
@@ -59,6 +79,60 @@ before the field existed. Absent rather than `other`, so "no model ran" stays a
 different answer from "a model ran that this build cannot name"; collapsing them
 would inflate the `other` bucket with every tool call.
 
+### What the newer words are folds of
+
+The seven events added on 2026-08-29 introduce eight textual properties. Every
+one is a classifier output or a compiled-in word, and each is the point where a
+name belonging to the company stops:
+
+- **`group`** is the supervised taxonomy (`policy::gate::group_slug`), never
+  `effect.kind` and never the payload — the kind is operator- and MCP-supplied
+  text and the payload is the effect's arguments. **`verdict`** is one of three
+  literals. `priced` is `amount_usd.is_some()` and not the figure: what a
+  company is about to spend is a fact about its business, not about the product,
+  and `waited_ms` is saturating, because park and decision are separate
+  wall-clock reads and an NTP step backwards between them would otherwise wrap a
+  short wait into eighteen quintillion milliseconds.
+- **`source`** on `tool_called` is a test of the tool name's *shape*, not a
+  census of the belt (`harness::built_in::steps::tool_source`). A list of the
+  tools this repository builds would be a second spelling of the toolbelt: it
+  rots the first time a tool lands behind a cargo feature the reader did not
+  have on, and a rotted entry reports real built-in traffic as `other` — which
+  reads as "an unknown tool ran". Sub-agent calls are deliberately not reported;
+  they are work done *inside* the parent call that spawned them, and counting
+  both double-counts exactly the turns that delegate. A call the **approval gate
+  parked** is not reported at all: it arrives as `success = false` carrying the
+  refusal, which is the same event the operator's timeline reads as
+  `AwaitingApproval`, so scoring it `failed` would inflate the failure rate
+  hardest for the companies that supervise the most. It is not a success either
+  — the tool never ran — and the park is already counted by
+  `approval_parked`/`approval_decided`.
+- **`status`** on `workflow_run_finished` reads `WorkflowRunVerdict`'s wire
+  token rather than matching its variants, so a verdict this vocabulary has not
+  heard of degrades to `other`. Five stay there on purpose — `running`,
+  `stranded`, `undelivered`, `awaiting-approval`, `degraded` — each *nearly* one
+  of the four words, and folding one onto its neighbour would make that
+  neighbour's count mean two things with no way to separate them afterwards. A
+  run that fails while **warming the roster** — the first run after a boot or a
+  rebuild, against a provider that will not construct — reports `failed` with
+  zero nodes and zero duration, rather than returning to its caller with no
+  event at all; those are the cold-start and misconfiguration failures a failure
+  metric exists for, and a company whose workflows had never once warmed would
+  otherwise have shown a clean sheet.
+- **`shape`** on `ledger_appended` is the six ledgers every company has whichever
+  vertical it started from, and never a cell. A ledger slug is author-defined at
+  runtime, so `acme-holdings-merger` is a legal one that names the customer; a
+  company bundle's own ledgers (`candidates`, `deals`, `matters`, and ninety
+  more) fold to `other` beside the runtime-declared ones rather than becoming a
+  vocabulary nobody could review as a closed set.
+- **`transition`** is one of four compiled-in words, and **`provider`** on
+  `connection_changed` is the same `provider_slug` list the envelope uses for
+  cognition — one list rather than two that drift. The values in reach of those
+  handlers are an OAuth access token, a Composio connection id, an MCP server
+  name the operator typed and a provider error message; none of them is offered.
+- **`view`** is a console route, and the one event the console raises rather than
+  the host — see [Console views](#console-views-come-from-the-console).
+
 ### The context envelope
 
 Set once at boot, attached to every event:
@@ -68,6 +142,7 @@ Set once at boot, attached to every event:
 | `distinct_id` | the opaque identity — see below |
 | `deployment` | `desktop` \| `self-hosted` \| `hosted-tenant` |
 | `app_version` | the crate version |
+| `build_commit` | the object id this binary was stamped from, optionally `-dirty`, or `unknown` |
 | `os`, `arch` | `std::env::consts` |
 | `cognition_path` | `harness` \| `hosted` \| `echo` \| `sidecar` \| `custom` |
 | `cognition_provider` | `openrouter` \| `subscription` \| `managed` \| `ollama` \| `byok` \| … |
@@ -77,6 +152,34 @@ Set once at boot, attached to every event:
 `cognition_*` is read off [`ports::brain::Cognition`](ports-cognition.md), the
 descriptor the runtime already keeps, rather than re-derived from configuration
 beside the code that picks a brain.
+
+`build_commit` is the commit and not just the version, because `app_version` is
+the crate version: it moves on a release and not on a deploy, so every build
+between two releases is indistinguishable and "did this start after Tuesday's
+rollout?" — the question a regression always asks — has no answer. #1771 already
+stamps the revision into the binary and `/spec` reports it; it simply never
+reached the envelope until 2026-08-29.
+
+It is the one envelope string that is **not** a literal compiled into this
+repository, so it is folded like every other. `build_stamp.rs` prefers
+`OPENCOMPANY_BUILD_COMMIT` over `git` on purpose — an escape hatch for a build
+environment nothing else covers — and it *sanitizes* rather than validates. So
+`release-2026-08-25`, or a branch name carrying a customer's name, reaches
+`crate::BUILD_COMMIT` intact, and until 2026-08-31 it rode every event this
+instance sent.
+
+It no longer does. **`types::commit_slug` folds the value on its way into the
+envelope**: it admits only an object id (7–40 hex digits, with at most the
+`-dirty` suffix `build_stamp.rs` itself appends) and emits `unknown` for
+anything else, so a build stamped `release-2026-08-25` reports `build_commit:
+unknown` rather than the label.
+
+The two readings are therefore deliberately different, and both are correct.
+`crate::BUILD_COMMIT`, `/spec` and every operator-facing surface still carry the
+**raw** stamp, because the person reading them is the person who stamped it and
+the label is the whole point of the escape hatch. Analytics carries the folded
+one. This narrows what leaves the process as telemetry and takes nothing away
+from the builder.
 
 ## What is never collected
 
@@ -114,6 +217,29 @@ know they are the point:
 into a payload, and that **every** string in a rendered payload is either the
 opaque id, a platform constant, or a word from a hand-written vocabulary.
 
+### Nor anything the collector adds after the request leaves
+
+The transport appends **`ip=0`** to the URL it posts to. That is Mixpanel's own
+switch for request-IP geolocation, and left on, the Track API enriches every
+event server-side with `$city`, `$region` and `mp_country_code`.
+
+Those three are the one way to break "shape and outcome, never content" with no
+line of code saying so. They never pass through `PropValue`, so the closed
+vocabulary above does not constrain them and the payload test that walks every
+string in a rendered event cannot see them — the properties are added after the
+request leaves. They are not in the payload this document describes, and they
+amount to the company's approximate location, which is a fact about the customer
+rather than about the product.
+
+A query parameter rather than an `$ip: 0` property on each event, because it
+applies to the batch and cannot be forgotten by a call site added later.
+Appended per send rather than baked into the configured endpoint, so
+`OPENCOMPANY_ANALYTICS_ENDPOINT` stays exactly what the operator wrote — that is
+what the boot line prints and what `loggable_endpoint` redacts, and rewriting it
+would make the two disagree with the setting. A custom collector that already
+carries a query string keeps it, and one that already sets `ip` is left alone:
+an operator who wrote that meant it.
+
 ## Identity
 
 `distinct_id` is opaque and stable, and it is one of two things:
@@ -136,7 +262,9 @@ opaque id, a platform constant, or a word from a hand-written vocabulary.
   `i_` form below rather than emitting a weaker identity. A platform operator who
   omits the key therefore gets per-instance identity and per-instance retention,
   which is a quieter outcome than they may expect — the boot line does not call
-  it out, and this is the place that says so.
+  it out, and this is the place that says so. What the key is worth, and what
+  the platform loses without it, is in
+  [analytics-configuration.md](analytics-configuration.md#tenant-identity-is-keyed-not-merely-hashed).
 - `i_<32 hex>` — this host's **instance id** otherwise: 16 random bytes minted
   on first boot and persisted under the data root
   ([data-root.md](data-root.md)). Random, not derived: `src/app/instance.rs`
@@ -150,147 +278,10 @@ symptom in analytics is inflated install counts, not lost data.
 
 ## Configuration
 
-| Variable | Meaning |
-|---|---|
-| `OPENCOMPANY_DEPLOYMENT` | `desktop` \| `self-hosted` \| `hosted-tenant`. Declared by whoever launches the process. Default and fallback: `self-hosted`, including when the declared value cannot be read. |
-| `OPENCOMPANY_ANALYTICS` | `on` forces reporting; `off` forbids it and outranks everything else. |
-| `OPENCOMPANY_ANALYTICS_TOKEN` | the Mixpanel project token. **Configuration, never a compiled-in constant** — a token baked into a public binary is a token everyone has. |
-| `OPENCOMPANY_ANALYTICS_ENDPOINT` | overrides the collector URL. Must be an absolute `http`/`https` URL with a host; anything else is silence with a reason. |
-| `OPENCOMPANY_ANALYTICS_ID_KEY` | the secret a hosted tenant's analytics id is derived under. Injected by the platform, never given to the collector. Absent means the host is known by its random instance id instead. |
-
-Reporting happens only when **all** of these hold:
-
-1. the binary was built with `--features analytics`;
-2. `OPENCOMPANY_ANALYTICS` is not `off`;
-3. the deployment is `hosted-tenant`, **or** `OPENCOMPANY_ANALYTICS=on`;
-4. a project token is configured;
-5. the collector endpoint is one a client could actually POST to.
-
-The endpoint is validated with `url`, the same parser `reqwest` uses, rather
-than an approximation of the URL grammar. The first attempt hand-rolled the
-check and accepted eight shapes `reqwest` rejects — `http://[::1/track`,
-`:99999`, `:65536`, `:abc`, `host:8080:9090`, `]::1[`, `127.0.0.1.5` and
-`999.999.999.999` — each of which resolved to reporting and then dropped every
-batch, which is the failure the check exists to prevent. Issue #673 had already
-settled this rule for a different call site: it must be *the same* parser
-`reqwest` uses, because a second hand-rolled reader is a bypass waiting to be
-found.
-
-Condition 1 is met in exactly one place in this repository: `TENANT_FEATURES` in
-`.github/workflows/deploy-staging.yml`, the hosted tenant image's feature set.
-Nothing else compiles the feature — not the desktop (`src-tauri/Cargo.toml`),
-not the default build, not any CI lane but the scoped analytics one. A hosted
-image whose feature list drops `analytics` reports nothing however the manager
-configures it, and says so at boot rather than failing quietly.
-
-`OPENCOMPANY_TENANT_ID` implies `hosted-tenant` when `OPENCOMPANY_DEPLOYMENT`
-says **nothing at all** — the control plane injects it and nothing else does.
-That is the only inference taken. A declaration that is present but unusable —
-an unknown slug, or bytes this process cannot decode — is not "nothing": it wins
-over the inference and resolves to `self-hosted`. Reading it through
-`EnvSource::get` rather than `get_os` made a non-UTF-8 value indistinguishable
-from an absent one, so an explicitly-declared shared-single-DB tenant fell
-through to the inference and came back `hosted-tenant` — reporting switched
-**on** by a malformed variable, on the discriminator every other decision here
-rests on. A **blank** declaration is still absent, so a launcher that exports an
-empty variable changes nothing. A discriminator sniffed from something incidental (the
-data dir, the bind address, `harness_in_build`) inverts the day someone changes
-an unrelated setting, silently, and points at the wrong file.
-
-An unrecognised value for either switch resolves to **silence**, never to
-reporting — on a hosted tenant too. Both directions of that typo matter and only
-one is obvious. A typo must not *upgrade* an install into one that reports; it
-must also not fail to *downgrade* one, which is what happened while an
-unreadable value fell through to the deployment default: an operator who meant
-`OPENCOMPANY_ANALYTICS=off` and typed `of` kept reporting, and their boot line
-said "reporting to …" rather than anything that would send them back to look.
-Silence is the answer to "I cannot tell what you asked for", and the boot line
-names the reason. A **blank** value is treated as absent rather than unreadable,
-so a launcher that exports an empty variable changes nothing.
-
-### How to turn it off
-
-Set `OPENCOMPANY_ANALYTICS=off`. It outranks the deployment kind and the token,
-and it is the first thing checked. Boot prints one line either way:
-
-```text
-analytics: off (not a hosted tenant and no explicit opt-in)
-analytics: off (operator opted out)
-analytics: off (the OPENCOMPANY_ANALYTICS value is not recognised)
-analytics: off (the OPENCOMPANY_ANALYTICS_ENDPOINT value is not a usable http(s) URL)
-analytics: off (reporting to https://api.mixpanel.com/track was configured, but this build was compiled without the `analytics` feature)
-analytics: reporting to https://api.mixpanel.com/track
-```
-
-The fourth of those is the endpoint check. `OPENCOMPANY_ANALYTICS_ENDPOINT` is
-validated where the decision is made, not where the send is attempted:
-`collector.internal/track` — a proxy hostname written without a scheme, which is
-how anyone writes one the first time — used to resolve to reporting, so boot
-announced "reporting to collector.internal/track" and every batch then died
-inside `reqwest` behind a `debug!` line no operator has enabled. The product said
-something true-sounding and did nothing. Bytes that are not valid UTF-8 are
-rejected the same way rather than falling back to the default endpoint: a tenant
-that pointed analytics at its own proxy and mistyped it would otherwise have
-reported to Mixpanel instead, which is telemetry sent somewhere nobody
-configured. The reason line never quotes the rejected value, for the reason
-below.
-
-The endpoint is named; the token never is — and the endpoint is named
-**sanitized**. `OPENCOMPANY_ANALYTICS_ENDPOINT` exists so a deployment can front
-Mixpanel with its own proxy, and an authenticated proxy carries its key in the
-two places a URL can hold one: userinfo (`https://user:pass@host/track`) and the
-query string (`?key=…`). Both are stripped before the line is printed, leaving
-scheme, host and path, and the line says `(credentials redacted)` when it
-shortened anything — a silently truncated URL is its own hour of confusion. The
-`ProjectToken` redaction does not cover this; it guards a different string.
-
-The same URL reaches one other log line: the `debug!` the transport writes when
-a send fails. `reqwest::Error` retains the request URL and prints it, so an
-unreachable collector wrote the proxy key into container logs by a path the boot
-line's redaction never touched. Measured against reqwest 0.12.28, userinfo is
-already stripped from what it prints and **the query string is not** — so `?key=…`
-was leaking and `user:pass@` was not. The transport calls `without_url`, which
-removes the URL rather than rewriting it, so neither shape can reach the line
-whatever a future reqwest decides to print; the destination on that same line
-comes from the one `loggable_endpoint` helper the boot line uses, so there is no
-second redaction to fall out of step with the first.
-
-The fourth line is the one worth reading twice. It reports what the process will
-**do**, not what was configured: a build without the `analytics` feature
-resolves to reporting and then gets a `NullTracker`, because there is no
-transport in it to hand back. Saying "reporting to …" there would be the exact
-opposite of the truth, and the `mixpanel::build` line that explains it is a
-`tracing::info!` the CLI's default `EnvFilter` swallows — which is why every
-boot line here is a `println!` in the first place.
-
-### Tenant identity is keyed, not merely hashed
-
-A hosted tenant's `distinct_id` is an HMAC-SHA256 of its slug under
-`OPENCOMPANY_ANALYTICS_ID_KEY`, truncated to 128 bits and prefixed `t_`.
-
-It used to be a plain `SHA-256(slug)`, and that did not deliver what it
-promised. A hash only hides an input that cannot be guessed, and a tenant slug
-is close to the opposite: it is usually the customer's brand, drawn from a
-small, public, enumerable set. Anyone holding the digests — the collector
-itself, or anyone with access to the analytics project — can hash a few thousand
-candidate brands and read `t_<digest>` straight back to the customer. Truncation
-does not help. Nor would a salt compiled into the binary, since this is a
-GPL-3.0 crate and that salt would ship in every copy of the source.
-
-**There is no unkeyed fallback.** When no key is configured the host is known by
-its own random instance id (`i_…`, 128 random bits from `app::instance`), which
-identifies nobody's customer. That is the safe direction: a host that cannot
-identify its tenant privately identifies *itself* rather than identifying its
-customer publicly. Every question the identity exists to serve — uniques,
-funnels, segmentation, retention — is answered by either id, because the
-instance id is persisted in the data root and is therefore stable across
-restarts.
-
-The consequence for the platform: **until the manager injects
-`OPENCOMPANY_ANALYTICS_ID_KEY`, hosted tenants report under instance ids rather
-than tenant digests.** Grouping several instances of one tenant together needs
-the key; the manager can still correlate a digest back to a tenant itself,
-because it holds both the key and the slug. The collector cannot.
+Which installs report, the five conditions that must all hold before anything is
+sent, the environment variables that decide them, why the container image
+compiles the transport, and how to turn reporting off:
+[analytics-configuration.md](analytics-configuration.md).
 
 ## Where it hooks in
 
@@ -298,6 +289,13 @@ because it holds both the key and the slug. The collector cannot.
 |---|---|---|
 | `turn_finished` | `runtime::cycle::CycleRunner::run_bracketed` | The cycle's whole span, including the wait on the per-company serial lock — which is the part an operator experiences as "nothing is happening". |
 | `turn_metered` | `analytics::meter::TrackingUsageMeter`, a decorator over the `UsageMeter` port | Every `metering::record_*` path ends there, on every build. The harness cost hook is richer but `openhuman`-gated, and the cycle-level path deliberately reports zero tokens on that build so spend is not double-counted — so an event at either one is blind on the other half of the fleet. |
+| `approval_parked` | **three** park paths: `runtime::cycle`'s park path, `CompanyRuntime::park_blocker` (a planning blocker), `workflows::delivery::park_and_journal` (a gated delivery) | One emission per path, each **after** that path's journal write commits, so a park that was rolled back reports nothing. This row used to claim the cycle was the only write into the operator's queue; it is only the *cycle's*, and the claim is how `park_blocker` came to be forgotten (review of #1950) — every planning blocker an operator later decided produced an `approval_decided` with no park behind it. |
+| `approval_decided` | `runtime::cycle::decision_event` for `approved`/`denied`; `CompanyRuntime::retire_approval` for `expired` | Both settle paths — plain and amended — build the event from state read before `resolve_outcome` consumes the parked entry, and track it **after** `record_resolved` commits: a decision that failed to journal has not happened, and boot replays the approval as pending, so reporting at the attempt counts one approval twice. `Expired` returns early here and is deliberately **not** reported from this seam; the settle owes the caller a `retire_approval`, which is the single retirement primitive the TTL sweep reaches by the same path — so both the late click and the sweep arrive at one line, after `record_expired` commits, and only for `ExpiryReason::Ttl`. A `CardUnwritable` rollback is a store fault, not a deadline, and reports no verdict at all. |
+| `tool_called` | `harness::built_in::steps::track_tool_call`, from the per-turn progress collector | The collector hands it **every** progress event, so it carries no decision of its own — which events count, and what each may say, is decided in one testable place. |
+| `workflow_run_finished` | `workflows::runner`, at the `WorkflowRunner` port boundary | The one place every run — console, scheduler, an orchestrator's `run_workflow` tool — passes exactly once. Timed from after the roster warms: charging a cold start to the first run makes it look pathological beside every later one. A warm that *fails* is still reported, at zero nodes and zero duration. |
+| `ledger_appended` | `ledger::analytics::track_append`, from `company::ledgers` | After the append, so a refused write is not reported as one that happened, and before the fold, so a republish failure cannot lose the count. The tracker reaches **both** ledger contexts — the routes', built from a whole `CompanyRuntime`, and the agent tools', built per turn in `harness::built_in::build::build_agent` — because agent-authored writes are the primary ledger path and reporting only the routes' would have read as "operators write ledgers, agents do not". |
+| `connection_changed` | `server::ops::connections::track_connection`, from the connections, MCP and Composio routes | After every removal or write half has landed, so a 409 or a 404 is never reported as a disconnect that happened. An MCP mutation whose probe comes back `Error` reports `failed` rather than the transition it attempted. The Composio token route classifies from the credential state **either side** of the write (`token_transition`), so a rotation is `refreshed` rather than a second new connection and a clear over nothing reports nothing at all. |
+| `console_viewed` | `server::ops::console_view` — raised by the **console** | The host cannot see a hash change. See below. |
 | `instance_started` | `analytics::boot::install` | After companies register **and after the port is bound**: the company count and the cognition path are not known before the first, and a host that never took its address never started in any sense worth counting. |
 | cognition relabel | `Tracker::observe_cognition`, from `server::provision` and `runtime::rebuild` | Boot's answer stops being true in two ways. A hosted host provisioned into an empty registry had no runtime to read and recorded `custom`/`unknown`; and a company that configures inference for the first time is rebuilt in place (issue #290), which moves it from `echo` to `harness`. Most recent observation wins. Events already sent are not revised. |
 | `flush` | `src/bin/opencompany.rs`, after the bound host stops serving | The server has already drained, so a last-moment turn's event still leaves — bounded by `shutdown::FLUSH_BUDGET`, below. |
@@ -336,22 +334,77 @@ The buffer is bounded at 500 events — if the collector is unreachable long
 enough to fill it, the right outcome is losing telemetry, not a tenant
 container.
 
+**A 2xx is not an acceptance.** Mixpanel's Track API is non-strict: it answers
+`200` to a refusal and puts the reason in the body — `1` or `{"status": 1}` for
+accepted, `0` or an `error` key for refused. Reading the status alone therefore
+counted an invalid token as a delivery, and a misconfigured project dropped
+every batch while the transport's "the collector refused" line never fired once.
+The body is the only thing that actually says, so the transport reads it.
+
+An unfamiliar answer — a proxy returning its own JSON, an empty body — is given
+the benefit of the doubt. This exists to catch a **stated** refusal; treating
+every 2xx it does not recognise as a failure would fill a working setup's log.
+
+What the log records is a **classified verdict** — `refused`, `status-zero`,
+`error`, `unparsed` — and never the body. The body is the collector's own text
+and can carry the event payload back, so printing it verbatim would put in a log
+line exactly what the vocabulary in this document spends itself avoiding.
+
+### Console views come from the console
+
+`console_viewed` is the one event in this set the host does not raise, because
+the host cannot see it: the console is a single-page app, so moving between
+pages is a hash change and no request reaches the process. Without a route,
+"which surfaces do operators actually use" is a question the product cannot
+answer about itself. `POST /api/v1/companies/{id}/analytics/console-view`
+(`src/server/ops/console_view.rs`) is that route — scoped and authorized like
+every other company route, because recording which page someone opened must not
+become a way to ask whether a company exists. It stores nothing, returns nothing
+and answers `204`.
+
+**The view, never the hash.** `#/chat/dm:ada-1f3k` names a teammate,
+`#/tasks/<uuid>` names a task and `#/ledgers/<slug>` names a business record —
+all of them the company's own content. So the body is one field, the console
+sends the routed view alone, and the second segment is not accepted, not
+trimmed, not read. `AppShell` keys its report on `view` and not on `sub` for the
+same reason, and because re-firing per sub-page would count opening one task as
+visiting Tasks twice.
+
+Both sides fold onto a closed list — `src/analytics/console.rs` on the host,
+`frontend/src/lib/console-routes.ts` in the console — and neither trusts the
+other. The console's `View` union means it cannot be handed a hash by accident;
+the host folds what arrives again anyway, because it arrived over HTTP from a
+client this crate does not control. Anything off the list becomes `other`,
+which is why the two copies have to stay in step: a view added to the console
+and missed on the host reports as `other`, and that reads as "operators do not
+use that page".
+
+The route is registered in **every** build rather than behind the cargo feature.
+A host with analytics off drops the call into the null tracker, and
+`Tracker::track` is synchronous and infallible, so navigation is never slowed by
+telemetry; the console's own call is fire-and-forget with a swallowed rejection,
+because an operator must never see a toast or a blocked render because a
+telemetry write failed.
+
 ## What is deliberately not instrumented yet
 
 Named so the gaps are countable rather than implied. Each is a follow-up, not an
 oversight:
 
-- approvals, tools, workflows, ledgers, connections/MCP, and console views —
-  the surfaces #1739 lists as candidates;
-- **build commit**, which this crate does not stamp at build time;
 - a timed flush shared with `MaintenanceTicker` rather than the transport's own
   30-second loop.
+
+The other two entries this section carried are gone because they landed on
+2026-08-29, not because the list was tidied: the six surfaces #1739 named as
+candidates — approvals, tools, workflows, ledgers, connections/MCP and console
+views — are the seven events in [What is collected](#what-is-collected), and the
+**build commit** is on the envelope.
 
 ## Testing
 
 | Lane | Command |
 |---|---|
-| default build — the decision, the vocabulary, the payload builder, the meter decorator, the cycle hook | `cargo test --locked` |
+| default build — the decision, the vocabulary, every classifier, the payload builder, the meter decorator, and each of the ten seams | `cargo test --locked` |
 | gated — the transport, and the acceptance criteria that need it | `scripts/ci/run-scoped-suite.sh "analytics" analytics analytics` |
 
 `scripts/ci/feature-lanes.txt` records the second as `partial`, per the rule in
@@ -365,3 +418,22 @@ hands the process a token and an endpoint, declares no deployment, and asserts
 positive control against the same collector, the same events and the same code
 path with one variable changed. Without the second, a zero request count would
 be indistinguishable from a test that never sends anything at all.
+
+Two more in the gated lane guard the transport's own two decisions:
+`the_send_url_turns_geolocation_off` asserts `ip=0` is on the posted URL and
+that a collector which already set `ip` is left alone, and
+`a_two_hundred_can_still_be_a_refusal` asserts both that a refusal body is
+classified as one and that the verdict never echoes it.
+
+Each classifier is tested beside the code it protects, and the leak guards there
+are built to one shape — `ledger::analytics`, `server::ops::connections` and
+`analytics::console` each carry one. Two obvious
+assertions (a known input keeps its name; an unknown one becomes `other`) are
+not enough on their own: a classifier that simply echoed its argument would pass
+both on every known value and leak on every unknown one. So each guard pushes a
+distinctive needle through the only door the caller has, asserts it is absent
+from the rendered payload, and then **self-checks** that the same
+case-insensitive search does find that needle in a rendering which carries it.
+Without the second half, an assertion passes because the needle was unfindable
+rather than because it was absent, which is how a redaction test rots into a
+test of nothing.

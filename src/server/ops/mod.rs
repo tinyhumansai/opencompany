@@ -40,6 +40,7 @@ pub mod company_profile;
 pub mod composio;
 pub mod composio_toolkits;
 pub mod connections_read;
+pub mod console_view;
 pub mod deep_trace;
 pub mod domain;
 pub mod finance;
@@ -205,6 +206,7 @@ impl std::fmt::Debug for ConnectionsRuntime {
 pub fn router() -> Router<AppState> {
     let router = Router::new()
         .merge(capabilities::router())
+        .merge(console_view::router())
         .merge(harnesses::router())
         .merge(budget_pause::router())
         .merge(tool_catalog::router())

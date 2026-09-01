@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::AppState;
 use crate::company::McpServer;
 use crate::company::mcp::{
-    self, AuthMaterial, McpHealth, McpSource, clear_auth, clear_health, endpoint_secret_advisory,
-    load_health, load_runtime_index, resolve_effective, save_runtime_index, store_auth,
-    validate_one,
+    self, AuthMaterial, McpHealth, McpSource, McpStatus, clear_auth, clear_health,
+    endpoint_secret_advisory, load_health, load_runtime_index, resolve_effective,
+    save_runtime_index, store_auth, validate_one,
 };
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
@@ -34,6 +34,7 @@ use crate::ports::types::CompanyRecord;
 use crate::runtime::builder::agent_scoped_grants;
 use crate::runtime::tools::grants_cover_server;
 use crate::server::error::ApiError;
+use crate::server::ops::connections::{Transition, track_connection};
 use crate::server::ops::{AdminScopedCompany, ScopedCompany, mcp_registry, scoped};
 
 /// The reminder attached to every mutating response: the effective MCP set is
@@ -566,7 +567,7 @@ async fn add_server(
     }
 
     let warning = endpoint_secret_advisory(&server.endpoint);
-    mutation_response(runtime, &name, warning).await
+    mutation_response(runtime, &name, warning, Transition::Connected).await
 }
 
 /// `PUT …/mcp/servers/{name}` — update a server (enable/disable, tool lists,
@@ -657,7 +658,7 @@ async fn update_server(
             .map_err(ApiError)?;
     }
 
-    mutation_response(runtime, &name, warning).await
+    mutation_response(runtime, &name, warning, Transition::Refreshed).await
 }
 
 /// `DELETE …/mcp/servers/{name}` — remove a server (409 for a manifest or
@@ -742,6 +743,9 @@ async fn delete_server(
     {
         mcp_registry::remove_install(runtime, &install_id).await?;
     }
+    // After every removal half has landed, so a 409 or a 404 above is never
+    // reported as a disconnect that happened.
+    track_connection(runtime, MCP_ANALYTICS_PROVIDER, Transition::Disconnected);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -754,6 +758,7 @@ async fn mutation_response(
     runtime: &CompanyRuntime,
     name: &str,
     warning: Option<String>,
+    transition: Transition,
 ) -> Result<Json<MutationResponse>, ApiError> {
     // Probe first (persists scrubbed health), then read the health back into the
     // DTO so the response and a later `GET` agree.
@@ -773,12 +778,45 @@ async fn mutation_response(
                 "`{name}` not found"
             )))
         })?;
+    // After the row is confirmed to exist, so a mutation that ends in a `400`
+    // is never reported as a connection that happened.
+    track_connection(
+        runtime,
+        MCP_ANALYTICS_PROVIDER,
+        observed_transition(transition, test.as_ref().map(|health| health.status)),
+    );
     Ok(Json(MutationResponse {
         server,
         note: NEXT_TURN_NOTE.to_string(),
         test,
         warning,
     }))
+}
+
+/// What the caller asked for, downgraded to [`Transition::Failed`] when the
+/// probe says the server cannot be used.
+///
+/// Split out from [`mutation_response`] for the reason [`drop_dangling_defaults`]
+/// is: the decision is testable without standing up an MCP server, and the
+/// inputs a test has to invent are exactly the ones the handler was handed.
+///
+/// Reporting a `connected` for a server that answers nothing would make the one
+/// number this event exists to produce — how often connecting a tool server
+/// actually *works* — into the number of times somebody pressed the button.
+///
+/// Two non-failures, deliberately:
+///
+/// * [`McpStatus::NeedsConfig`] is the valid resting state of a just-added
+///   server awaiting its credential. The mutation is not rolled back for it
+///   either (see [`mutation_response`]'s own doc), and calling it a failure
+///   would put every correctly-added OAuth server in the failure bucket.
+/// * `None` is *no probe ran* — a build without the MCP transport — which is
+///   the absence of evidence rather than evidence of failure.
+fn observed_transition(asked: Transition, probe: Option<McpStatus>) -> Transition {
+    match probe {
+        Some(McpStatus::Error) => Transition::Failed,
+        _ => asked,
+    }
 }
 
 /// Probe the named server and persist the (scrubbed) outcome as health, returning
@@ -810,6 +848,17 @@ async fn probe_and_persist(runtime: &CompanyRuntime, name: &str) -> Option<McpHe
 async fn probe_and_persist(_runtime: &CompanyRuntime, _name: &str) -> Option<McpHealth> {
     None
 }
+
+/// What an MCP change reports itself as, before folding.
+///
+/// The bare `mcp:` prefix and **not** `mcp:{name}`: a server's name is typed by
+/// the operator and frequently names a customer or a project, so it is never
+/// built into a string that a payload could carry.
+/// [`provider_slug`](crate::analytics::types::provider_slug) folds anything
+/// under this prefix to the word `mcp` — that a remote tool server changed,
+/// which is the segmentation anyone wants, without the name. Reusing the
+/// metering layer's own constant keeps the two from drifting apart.
+const MCP_ANALYTICS_PROVIDER: &str = crate::metering::MCP_PROVIDER_PREFIX;
 
 /// Rejects an invalid server declaration as a `400`.
 pub(super) fn reject_invalid(label: &str, server: &McpServer) -> Result<(), ApiError> {
@@ -1034,6 +1083,271 @@ mod tests {
     use super::*;
     use crate::company::CompanyManifest;
     use crate::ports::types::{CompanyId, OverlayAgent, OverlayDesk};
+
+    // ---- connection_changed analytics (issue #1739) -----------------------
+
+    use std::sync::Arc;
+
+    use crate::analytics::types::OpaqueId;
+    use crate::analytics::{Envelope, Event, RecordingTracker, payload};
+    use crate::app::deployment::Deployment;
+    use crate::ports::brain::{Cognition, UsageMetering};
+    use crate::runtime::RuntimeBuilder;
+
+    /// **The `failed` arm**: a probe that says the server cannot be used turns
+    /// the caller's `connected`/`refreshed` into `failed`.
+    ///
+    /// This is the whole reason the event is worth sending. Without the
+    /// downgrade the number it produces is "times somebody pressed Connect",
+    /// which nobody needs; with it, it is "connections that work".
+    #[test]
+    fn a_probe_that_failed_downgrades_the_reported_transition() {
+        for asked in [Transition::Connected, Transition::Refreshed] {
+            assert_eq!(
+                observed_transition(asked, Some(McpStatus::Error)),
+                Transition::Failed,
+                "a server that answers nothing was reported as {asked:?}"
+            );
+        }
+    }
+
+    /// **`NeedsConfig` is not a failure.** It is the valid resting state of a
+    /// just-added OAuth server awaiting its credential — the mutation is not
+    /// rolled back for it, and calling it a failure would put every correctly
+    /// added server in the failure bucket and make the rate above meaningless.
+    ///
+    /// `Ok` and `None` pass through for the same reason from the other side:
+    /// `None` is *no probe ran* (a build with no MCP transport), which is the
+    /// absence of evidence rather than evidence of failure.
+    #[test]
+    fn a_server_awaiting_its_credential_is_not_a_failure() {
+        for probe in [
+            Some(McpStatus::NeedsConfig),
+            Some(McpStatus::Ok),
+            Some(McpStatus::Unknown),
+            None,
+        ] {
+            assert_eq!(
+                observed_transition(Transition::Connected, probe),
+                Transition::Connected,
+                "{probe:?} was reported as something other than what the caller asked for"
+            );
+            assert_eq!(
+                observed_transition(Transition::Refreshed, probe),
+                Transition::Refreshed,
+                "{probe:?} was reported as something other than what the caller asked for"
+            );
+        }
+    }
+
+    /// A runtime whose analytics go to a recorder rather than nowhere.
+    async fn recording_runtime() -> (
+        Arc<CompanyRuntime>,
+        Arc<RecordingTracker>,
+        tempfile::TempDir,
+    ) {
+        let home = tempfile::Builder::new()
+            .prefix("oc-mcp-analytics-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest: CompanyManifest =
+            toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n").unwrap();
+        let recorder = Arc::new(RecordingTracker::new());
+        let runtime = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(CompanyId::new("acme"))
+            .with_analytics(recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        (Arc::new(runtime), recorder, home)
+    }
+
+    fn envelope() -> Envelope {
+        Envelope::new(
+            OpaqueId::instance("0123456789abcdef0123456789abcdef"),
+            Deployment::HostedTenant,
+            Cognition {
+                path: "harness",
+                provider: "openrouter",
+                model: None,
+                metering: UsageMetering::PerTurn,
+            },
+        )
+    }
+
+    fn connection_events(recorder: &RecordingTracker) -> Vec<Event> {
+        recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::ConnectionChanged { .. }))
+            .collect()
+    }
+
+    /// A server an operator typed in, in the runtime index the console writes.
+    async fn index_one(runtime: &CompanyRuntime, name: &str, endpoint: &str) {
+        let server = McpServer {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            description: None,
+            command: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            read_only_tools: Vec::new(),
+            timeout_secs: 30,
+            enabled: true,
+            auth_secret: None,
+        };
+        save_runtime_index(runtime.id(), runtime.secrets().as_ref(), &[server])
+            .await
+            .expect("the index saves");
+    }
+
+    /// What `mutation_response` reports for an asked-for transition in **this**
+    /// build.
+    ///
+    /// `probe_and_persist` is compiled only under `openhuman`; without the MCP
+    /// transport there is no probe, `observed_transition` sees `None`, and the
+    /// asked-for word survives. With it, the probe dials the fixture's endpoint
+    /// — an RFC 6761 `.invalid` name, which cannot answer — so the reading is
+    /// `McpStatus::Error` and the transition is downgraded to `failed`. That
+    /// downgrade is the point of the property, not an accident of the fixture.
+    ///
+    /// Stated here rather than worked around: the alternative is an endpoint
+    /// that really answers, which means a live MCP server inside a unit test.
+    /// The downgrade *decision* is pinned in every build by
+    /// [`a_probe_that_failed_downgrades_the_reported_transition`] and
+    /// [`a_server_awaiting_its_credential_is_not_a_failure`], both of which call
+    /// `observed_transition` directly; what the two mutation tests add on top is
+    /// that the emit is attached to the mutation at all — which a unit test of
+    /// the helper would pass with the call site deleted.
+    fn as_this_build_probes(asked: &'static str) -> &'static str {
+        if cfg!(feature = "openhuman") {
+            "failed"
+        } else {
+            asked
+        }
+    }
+
+    /// **The wiring**: the add and update handlers both land here, and this is
+    /// where the event is actually sent. Driven through `mutation_response`
+    /// rather than by calling `track_connection` directly, because the thing
+    /// worth proving is that the emit is attached to the mutation — a unit test
+    /// of the helper alone would pass with the call site deleted.
+    #[tokio::test]
+    async fn a_server_mutation_reports_itself_as_the_folded_plane() {
+        for (asked, expected) in [
+            (Transition::Connected, "connected"),
+            (Transition::Refreshed, "refreshed"),
+        ] {
+            let (runtime, recorder, _home) = recording_runtime().await;
+            // A name that would name a customer if it were ever carried.
+            index_one(
+                &runtime,
+                "acmecorp-holdings-crm",
+                "https://example.invalid/mcp",
+            )
+            .await;
+
+            // The `Json` body is deliberately discarded: `.expect` already
+            // asserts the mutation succeeded, which is all this test needs
+            // from it, and what the DTO *says* is covered by the route tests
+            // in `server::ops::write_test`. What is under test here is the
+            // event the mutation sends.
+            let _ = mutation_response(&runtime, "acmecorp-holdings-crm", None, asked)
+                .await
+                .expect("the mutation response builds");
+
+            assert_eq!(
+                connection_events(&recorder),
+                vec![Event::ConnectionChanged {
+                    provider: "mcp",
+                    transition: as_this_build_probes(expected),
+                }]
+            );
+        }
+    }
+
+    /// A mutation that ends in an error reports nothing: a `400` is not a
+    /// connection that happened, and counting one would inflate the numerator
+    /// of the only rate this event exists to produce.
+    #[tokio::test]
+    async fn a_mutation_that_failed_to_resolve_reports_nothing() {
+        let (runtime, recorder, _home) = recording_runtime().await;
+
+        mutation_response(&runtime, "never-added", None, Transition::Connected)
+            .await
+            .expect_err("no such server");
+
+        assert_eq!(connection_events(&recorder), Vec::new());
+    }
+
+    /// **The guarantee**: the operator-typed server name never reaches the
+    /// payload — only the folded word `mcp`.
+    ///
+    /// Built the way `crate::analytics::test` builds its guard: a distinctive
+    /// needle, searched for case-insensitively, **with a self-check** proving
+    /// the same search finds that needle in a rendering that carries it. An MCP
+    /// server name is frequently a customer's or a project's, and the endpoint
+    /// beside it can carry a credential in its query string — which is why
+    /// `endpoint_secret_advisory` exists — so neither is offered here at all.
+    #[tokio::test]
+    async fn no_server_name_reaches_the_payload() {
+        const HOSTILE: &str = "acmecorp-holdings-crm";
+
+        let (runtime, recorder, _home) = recording_runtime().await;
+        index_one(
+            &runtime,
+            HOSTILE,
+            "https://example.invalid/mcp?token=sk-not-a-real-key",
+        )
+        .await;
+
+        // The body is discarded for the reason given above; the payload is what
+        // this test reads.
+        let _ = mutation_response(&runtime, HOSTILE, None, Transition::Connected)
+            .await
+            .expect("the mutation response builds");
+
+        let events = connection_events(&recorder);
+        // A count, not a value: without this the needle search below could pass
+        // on an event that simply never fired.
+        assert_eq!(events.len(), 1, "the mutation did not report itself");
+
+        let envelope = envelope();
+        for needle in [HOSTILE, "sk-not-a-real-key"] {
+            let needle = needle.to_ascii_lowercase();
+            let rendered = payload(&envelope, &events[0])
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(
+                !rendered.contains(&needle),
+                "a connection_changed payload leaked {needle:?}: {rendered}"
+            );
+            // The self-check, against a payload that really does carry it: the
+            // same search finds the needle in an unredacted rendering, so the
+            // assertion above refuses something findable rather than passing
+            // because it could never have matched.
+            let mut unredacted = payload(&envelope, &events[0]);
+            unredacted["properties"]["provider"] = serde_json::Value::from(needle.as_str());
+            assert!(
+                unredacted
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains(&needle),
+                "the needle must be findable in an unredacted rendering, or the guard above is \
+                 vacuous"
+            );
+        }
+
+        // And, last, the stricter statement: what survived is the folded plane.
+        assert_eq!(
+            events,
+            vec![Event::ConnectionChanged {
+                provider: "mcp",
+                transition: as_this_build_probes("connected"),
+            }]
+        );
+    }
 
     /// A company allowing two MCP families, with one manifest agent that lists
     /// none (so it inherits both).

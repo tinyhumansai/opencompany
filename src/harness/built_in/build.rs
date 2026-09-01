@@ -278,6 +278,13 @@ pub fn build_agent(
     manifest_agent: &ManifestAgent,
     policy: ApprovalPolicy,
     deps: &HarnessDeps,
+    // Issue #1739, raised in review: the pool's tracker, so an agent's own
+    // ledger writes report. An explicit parameter for the same reason
+    // `build_roster` takes one rather than carrying it on `HarnessDeps` — that
+    // struct is built by literal at two dozen sites, and a roster built with
+    // the wrong tracker should be a compile error at the call site rather than
+    // a silence nothing reports.
+    tracker: &Arc<dyn crate::analytics::Tracker>,
     grants: &[String],
     skill_deltas: &[SkillState],
     routed_context: &[(String, String)],
@@ -794,7 +801,15 @@ pub fn build_agent(
         tools.extend(crate::harness::ledger_tools::ledger_tools(
             crate::company::ledgers::Ledgers::new(company.clone(), store.clone())
                 .with_tasks_opt(deps.tasks.clone())
-                .with_workspace_opt(deps.workspace.clone()),
+                .with_workspace_opt(deps.workspace.clone())
+                // Issue #1739, raised in review by two reviewers independently.
+                // Without this the context keeps `Ledgers::new`'s default null
+                // tracker, and every *agent-authored* append — which is the
+                // primary way this product's ledgers are written at all — drops
+                // `ledger_appended` silently. Only writes made through a full
+                // `CompanyRuntime` (the REST routes) were reported, so the
+                // metric read as "operators write ledgers, agents do not".
+                .with_analytics(tracker.clone()),
             manifest_agent.id.clone(),
             manifest_agent.ledgers.clone(),
             manifest_agent.can_declare_ledgers,
@@ -2061,6 +2076,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2113,6 +2129,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2164,6 +2181,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2241,6 +2259,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2340,6 +2359,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2386,6 +2406,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -2809,6 +2830,7 @@ mod tests {
             &manifest_agent,
             ApprovalPolicy::new(&Policy::default(), None),
             &deps,
+            &crate::analytics::null_tracker(),
             &[],
             &[],
             &[],
@@ -3078,6 +3100,7 @@ mod tests {
             &manifest_agent,
             policy,
             &deps,
+            &crate::analytics::null_tracker(),
             &grants,
             &[],
             &[],
@@ -3110,6 +3133,114 @@ mod tests {
         assert!(
             history.contains("checkpoint: after file_write"),
             "{history}"
+        );
+    }
+    /// Issue #1739, raised in review by two reviewers independently: a **ledger
+    /// write made by an agent** reports.
+    ///
+    /// The bug this pins was a silence, which is why it needed a test rather
+    /// than a reading of the code. `Ledgers::new` defaults its tracker to the
+    /// no-op one so that every pre-existing caller keeps compiling, and
+    /// `build_agent` took that default — so `ledger_appended` was emitted only
+    /// for writes made through a whole `CompanyRuntime`, which is the REST
+    /// routes and nothing else. Agent-authored writes are the *primary* ledger
+    /// path in this product, so the metric did not merely undercount: it
+    /// reported the opposite shape, "operators write ledgers, agents do not".
+    ///
+    /// Driven through the tool the agent actually calls rather than through
+    /// `Ledgers` directly, because the defect was entirely in the wiring
+    /// between the two — a test that built its own context would have passed
+    /// against the broken build.
+    #[tokio::test]
+    async fn an_agents_own_ledger_write_reports_to_the_pools_tracker() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(crate::store::FsOps::new(dir.path().join("ledgers")));
+        let mut deps = pin_deps(dir.path().to_path_buf());
+        deps.ledgers = Some(store.clone());
+
+        // A declared ledger, not the native board: `tasks` is projected from
+        // the task store and `record_entry` refuses to write it.
+        let declared = crate::company::ledgers::Ledgers::new(CompanyId::new("acme"), store.clone());
+        crate::company::ledgers::define(
+            &declared,
+            &json!({
+                "slug": "risks",
+                "title": "Risks",
+                "purpose": "What could go wrong.",
+                "fields": [
+                    { "name": "id", "role": "id" },
+                    { "name": "risk", "role": "title" },
+                    { "name": "status", "role": "status" }
+                ],
+                "statuses": [{ "name": "open" }]
+            }),
+        )
+        .await
+        .expect("declared");
+
+        let tracker = Arc::new(crate::analytics::RecordingTracker::new());
+        let manifest_agent = ManifestAgent {
+            global: false,
+            id: "desk".to_string(),
+            role: "Desk Lead".to_string(),
+            name: None,
+            description: None,
+            tier: None,
+            harness: None,
+            tools: None,
+            delegates_to: Vec::new(),
+            context: None,
+            budget_usd_daily: None,
+            prompt: None,
+            prompt_files: Vec::new(),
+            prompt_files_resolved: Vec::new(),
+            classes: Vec::new(),
+            ledgers: None,
+            can_declare_ledgers: true,
+            model: None,
+        };
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            ApprovalPolicy::new(&Policy::default(), None),
+            &deps,
+            &(tracker.clone() as Arc<dyn crate::analytics::Tracker>),
+            &["*".to_string()],
+            &[],
+            &[],
+            None,
+            false,
+        )
+        .expect("agent builds");
+
+        let tools = agent.tools();
+        let record = tools
+            .iter()
+            .find(|tool| tool.name() == crate::harness::ledger_tools::RECORD_ENTRY_TOOL)
+            .expect("the agent holds `record_entry`");
+        let result = record
+            .execute(json!({
+                "ledger": "risks",
+                "id": "r1",
+                "fields": { "risk": "the SSD is the only copy" }
+            }))
+            .await
+            .expect("the tool runs");
+        assert!(
+            !result.is_error,
+            "the write itself must succeed: {result:?}"
+        );
+
+        assert_eq!(
+            tracker.events(),
+            vec![crate::analytics::Event::LedgerAppended {
+                shape: "risks",
+                records: 1,
+            }],
+            "an agent's ledger write must report through the pool's tracker"
         );
     }
 }

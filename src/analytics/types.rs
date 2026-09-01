@@ -261,6 +261,47 @@ impl FailureCode {
     }
 }
 
+/// The commit stamp a payload may carry: an object id, optionally `-dirty`, or
+/// `unknown` (issue #1739, raised in review).
+///
+/// [`crate::BUILD_COMMIT`] is *not* a closed value the way every other envelope
+/// string is. `build_stamp.rs` prefers `OPENCOMPANY_BUILD_COMMIT` over `git`
+/// precisely so a build environment nothing else covers can say what it is, and
+/// it sanitizes rather than validates — `[A-Za-z0-9._-]`, 64 characters. So
+/// `release-2026-08-25`, or a branch name naming a customer, reaches
+/// `crate::BUILD_COMMIT` intact and would then ride **every event this instance
+/// ever sends** as a super-property.
+///
+/// That is one free-form string in a module whose whole claim is that it has
+/// none, so it is folded here on the same terms as every other: a value that is
+/// not the shape it claims to be becomes `unknown`. Losing a builder's label
+/// costs a segmentation nobody has asked for; keeping it costs the claim.
+///
+/// The stamp itself is left alone. `/spec` and the operator-facing surfaces go
+/// on reporting whatever was stamped, because they are read by the person who
+/// stamped it — this narrows only what leaves the process as telemetry.
+///
+/// # The shape
+///
+/// Hex, 7 to 40 digits (`build_stamp` shortens a long id to 12; a shorter
+/// explicit one is still an id), with at most the `-dirty` suffix that same
+/// module appends. Anything else, including the empty string, is `unknown`.
+pub fn commit_slug(raw: &'static str) -> &'static str {
+    /// The stamp for a value that names no commit. Matches
+    /// `build_stamp.rs`'s own `UNKNOWN_COMMIT`, which is what a build with no
+    /// source to ask already reports.
+    const UNKNOWN: &str = "unknown";
+
+    let body = raw.strip_suffix("-dirty").unwrap_or(raw);
+    let looks_like_an_object_id =
+        (7..=40).contains(&body.len()) && body.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if looks_like_an_object_id {
+        raw
+    } else {
+        UNKNOWN
+    }
+}
+
 /// The provider vocabulary an event may name.
 ///
 /// [`UsageSample::provider`](crate::ports::usage::UsageSample::provider) is
@@ -495,6 +536,10 @@ pub struct Envelope {
     pub deployment: Deployment,
     /// The crate version.
     pub app_version: &'static str,
+    /// The commit this binary was built from ([`crate::BUILD_COMMIT`]), folded
+    /// through [`commit_slug`] so it is an object id or `unknown` and never a
+    /// label somebody chose.
+    pub build_commit: &'static str,
     /// The OS this build runs on.
     pub os: &'static str,
     /// The CPU architecture.
@@ -516,6 +561,7 @@ impl Envelope {
             id,
             deployment,
             app_version: env!("CARGO_PKG_VERSION"),
+            build_commit: commit_slug(crate::BUILD_COMMIT),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             cognition_path: cognition.path,
@@ -555,6 +601,17 @@ impl Envelope {
         vec![
             ("deployment", PropValue::Word(self.deployment.as_str())),
             ("app_version", PropValue::Word(self.app_version)),
+            // The commit, not just the version. `app_version` is the crate
+            // version, which moves on a release and not on a deploy — so every
+            // build between two releases is indistinguishable, and "did this
+            // start after Tuesday's rollout?" is exactly the question a
+            // regression asks. #1771 already stamps this into the binary and
+            // `/spec` reports it; it simply never reached the envelope.
+            //
+            // A fixed-shape hex string or `unknown` — enforced by
+            // `commit_slug` at construction rather than assumed, because the
+            // stamp has an escape hatch and an assumption is not a guarantee.
+            ("build_commit", PropValue::Word(self.build_commit)),
             ("os", PropValue::Word(self.os)),
             ("arch", PropValue::Word(self.arch)),
             ("cognition_path", PropValue::Word(self.cognition_path)),
@@ -610,6 +667,73 @@ pub enum Event {
         effects_executed: u64,
         /// How many effects parked for an operator decision.
         approvals_parked: u64,
+    },
+    /// An effect was parked for an operator decision (issue #1739).
+    ///
+    /// The **group**, never the effect's payload: `spend`, `send`, `sign` and
+    /// the rest are the supervised taxonomy, already a closed set, and they are
+    /// what a funnel about oversight is asking about.
+    ApprovalParked {
+        /// The supervised taxonomy group.
+        group: &'static str,
+        /// Whether the effect named an amount at all. Not the amount: a figure
+        /// is a fact about the company's business, not about the product.
+        priced: bool,
+    },
+    /// A parked approval was settled.
+    ApprovalDecided {
+        /// The supervised taxonomy group.
+        group: &'static str,
+        /// Approved, denied, or expired without an answer.
+        verdict: &'static str,
+        /// How long it sat parked. The number the oversight loop is actually
+        /// about — an approval nobody answers is the failure mode.
+        waited_ms: u64,
+    },
+    /// One tool call finished.
+    ToolCalled {
+        /// Where the tool came from: `built-in`, `mcp`, `composio`, `other`.
+        source: &'static str,
+        /// Whether it returned or failed.
+        outcome: Outcome,
+        /// Wall-clock milliseconds.
+        duration_ms: u64,
+    },
+    /// One workflow run reached a terminal state.
+    WorkflowRunFinished {
+        /// How it ended: `completed`, `failed`, `blocked`, `cancelled`.
+        status: &'static str,
+        /// How many nodes ran.
+        nodes: u64,
+        /// Wall-clock milliseconds for the whole run.
+        duration_ms: u64,
+    },
+    /// A ledger record was appended.
+    ///
+    /// The **kind and the count**, never a cell: a ledger holds the company's
+    /// own business data, which is the single richest source of content in the
+    /// product and the last thing that may reach a payload.
+    LedgerAppended {
+        /// The declared record shape, folded onto a closed vocabulary.
+        shape: &'static str,
+        /// How many records the append carried.
+        records: u64,
+    },
+    /// A connection or MCP server changed state.
+    ConnectionChanged {
+        /// The provider, folded onto the same closed vocabulary the envelope
+        /// uses for cognition providers.
+        provider: &'static str,
+        /// `connected`, `disconnected`, `refreshed`, `failed`.
+        transition: &'static str,
+    },
+    /// The operator opened a console view.
+    ///
+    /// The **route**, from a closed list the console cannot add to at runtime —
+    /// never the hash, which carries ids (`#/chat/dm:ada`, `#/tasks/<id>`).
+    ConsoleViewed {
+        /// The routed view, folded onto the closed vocabulary.
+        view: &'static str,
     },
     /// One usage sample was metered — tokens or a counted call.
     TurnMetered {
@@ -674,12 +798,62 @@ impl Event {
             Self::InstanceStarted { .. } => "instance_started",
             Self::TurnFinished { .. } => "turn_finished",
             Self::TurnMetered { .. } => "turn_metered",
+            Self::ApprovalParked { .. } => "approval_parked",
+            Self::ApprovalDecided { .. } => "approval_decided",
+            Self::ToolCalled { .. } => "tool_called",
+            Self::WorkflowRunFinished { .. } => "workflow_run_finished",
+            Self::LedgerAppended { .. } => "ledger_appended",
+            Self::ConnectionChanged { .. } => "connection_changed",
+            Self::ConsoleViewed { .. } => "console_viewed",
         }
     }
 
     /// The event's own properties, excluding the envelope's.
     pub fn props(&self) -> Vec<Prop> {
         match *self {
+            Self::ApprovalParked { group, priced } => vec![
+                ("group", PropValue::Word(group)),
+                ("priced", PropValue::Flag(priced)),
+            ],
+            Self::ApprovalDecided {
+                group,
+                verdict,
+                waited_ms,
+            } => vec![
+                ("group", PropValue::Word(group)),
+                ("verdict", PropValue::Word(verdict)),
+                ("waited_ms", PropValue::Count(waited_ms)),
+            ],
+            Self::ToolCalled {
+                source,
+                outcome,
+                duration_ms,
+            } => vec![
+                ("source", PropValue::Word(source)),
+                ("outcome", PropValue::Word(outcome.as_str())),
+                ("duration_ms", PropValue::Count(duration_ms)),
+            ],
+            Self::WorkflowRunFinished {
+                status,
+                nodes,
+                duration_ms,
+            } => vec![
+                ("status", PropValue::Word(status)),
+                ("nodes", PropValue::Count(nodes)),
+                ("duration_ms", PropValue::Count(duration_ms)),
+            ],
+            Self::LedgerAppended { shape, records } => vec![
+                ("shape", PropValue::Word(shape)),
+                ("records", PropValue::Count(records)),
+            ],
+            Self::ConnectionChanged {
+                provider,
+                transition,
+            } => vec![
+                ("provider", PropValue::Word(provider)),
+                ("transition", PropValue::Word(transition)),
+            ],
+            Self::ConsoleViewed { view } => vec![("view", PropValue::Word(view))],
             Self::InstanceStarted {
                 companies,
                 storage,

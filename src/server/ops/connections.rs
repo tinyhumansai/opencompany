@@ -59,6 +59,73 @@ struct ProviderPath {
 }
 
 // ---------------------------------------------------------------------------
+// Reporting a connection change
+// ---------------------------------------------------------------------------
+
+/// What happened to a connection, as the closed vocabulary
+/// [`Event::ConnectionChanged`](crate::analytics::Event::ConnectionChanged)
+/// declares it.
+///
+/// An enum rather than a `&str` argument at each call site, for the reason
+/// [`Outcome`](crate::analytics::Outcome) and [`Trigger`](crate::analytics::Trigger)
+/// are enums: a call site that can pass a string is a call site that can one day
+/// pass an error message, and the four words below are the whole of what this
+/// event is allowed to say about *what happened*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Transition {
+    /// A credential or a tool server was wired up.
+    Connected,
+    /// One was released, revoked or removed.
+    Disconnected,
+    /// An existing one was re-checked, rotated or edited in place.
+    Refreshed,
+    /// The attempt did not leave a working connection behind.
+    Failed,
+}
+
+impl Transition {
+    /// The stable slug.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Disconnected => "disconnected",
+            Self::Refreshed => "refreshed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Reports one connection change: the folded provider and the transition.
+///
+/// The **only** constructor of
+/// [`Event::ConnectionChanged`](crate::analytics::Event::ConnectionChanged) in
+/// the crate, so no route can choose to pass its own provider string through.
+/// That matters more here than almost anywhere: the values in reach of these
+/// handlers are an OAuth access token, a Composio connection id, an MCP server
+/// name the operator typed (frequently a customer's or a project's), and a
+/// provider error message. `raw_provider` is folded through
+/// [`provider_slug`](crate::analytics::types::provider_slug) — the same closed
+/// vocabulary the envelope uses for cognition providers, so there is one list
+/// rather than two that drift — and anything it does not recognise becomes
+/// `other`. Nothing else about the connection is offered at all.
+///
+/// Synchronous and infallible, like every
+/// [`Tracker::track`](crate::analytics::Tracker::track): a disconnect must
+/// never be delayed by, or fail because of, telemetry.
+pub(super) fn track_connection(
+    runtime: &CompanyRuntime,
+    raw_provider: &str,
+    transition: Transition,
+) {
+    runtime
+        .tracker
+        .track(crate::analytics::Event::ConnectionChanged {
+            provider: crate::analytics::types::provider_slug(raw_provider),
+            transition: transition.as_str(),
+        });
+}
+
+// ---------------------------------------------------------------------------
 // Historical credential revocation
 // ---------------------------------------------------------------------------
 
@@ -272,6 +339,13 @@ async fn do_disconnect(
             SecretValue(String::new()),
         )
         .await?;
+    // After the store write, so a failed disconnect is never reported as one
+    // that happened. The path segment is folded, not carried: `{provider}` is
+    // whatever the caller put in the URL.
+    // After the store write, so a failed disconnect is never reported as one
+    // that happened. The path segment is folded, not carried: `{provider}` is
+    // whatever the caller put in the URL.
+    track_connection(&runtime, provider, Transition::Disconnected);
     Ok(Json(json!({ "connected": false, "provider": provider })))
 }
 
@@ -294,6 +368,7 @@ async fn do_disconnect_from(
             SecretValue(String::new()),
         )
         .await?;
+    track_connection(&runtime, provider, Transition::Disconnected);
     Ok(Json(json!({ "connected": false, "provider": provider })))
 }
 
@@ -525,6 +600,159 @@ mod test {
         );
         drop(received);
         assert!(is_blanked(&runtime, &provider).await, "secret not blanked");
+    }
+
+    // ---- connection_changed analytics (issue #1739) -----------------------
+
+    use crate::analytics::types::OpaqueId;
+    use crate::analytics::{Envelope, Event, RecordingTracker, payload};
+    use crate::app::deployment::Deployment;
+    use crate::ports::brain::{Cognition, UsageMetering};
+
+    /// A runtime whose analytics go to a recorder rather than nowhere.
+    async fn recording_runtime() -> (
+        Arc<CompanyRuntime>,
+        Arc<RecordingTracker>,
+        tempfile::TempDir,
+    ) {
+        let home = tempfile::Builder::new()
+            .prefix("oc-disc-analytics-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest: CompanyManifest =
+            toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n").unwrap();
+        let recorder = Arc::new(RecordingTracker::new());
+        let runtime = RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+            .with_id(CompanyId::new("acme"))
+            .with_analytics(recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        (Arc::new(runtime), recorder, home)
+    }
+
+    fn envelope() -> Envelope {
+        Envelope::new(
+            OpaqueId::instance("0123456789abcdef0123456789abcdef"),
+            Deployment::HostedTenant,
+            Cognition {
+                path: "harness",
+                provider: "openrouter",
+                model: None,
+                metering: UsageMetering::PerTurn,
+            },
+        )
+    }
+
+    /// Only the connection events, so a runtime that reports something else
+    /// during build cannot make these assertions read on the wrong row.
+    fn connection_events(recorder: &RecordingTracker) -> Vec<Event> {
+        recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::ConnectionChanged { .. }))
+            .collect()
+    }
+
+    /// A disconnect reports the folded provider and the word `disconnected`.
+    #[tokio::test]
+    async fn a_disconnect_reports_its_provider_and_transition() {
+        let (runtime, recorder, _home) = recording_runtime().await;
+        store_token(&runtime, "github", "test-token").await;
+
+        // The `Json` body is deliberately discarded: `.unwrap()` already
+        // asserts the disconnect succeeded, and what the body says is the
+        // subject of `disconnect_blanks_secret_without_revoke_config` above.
+        // This test is about the event that the disconnect sends.
+        let _ = do_disconnect(runtime.clone(), "github").await.unwrap();
+
+        assert_eq!(
+            connection_events(&recorder),
+            vec![Event::ConnectionChanged {
+                provider: "github",
+                transition: "disconnected",
+            }]
+        );
+        let rendered = payload(&envelope(), &connection_events(&recorder)[0]);
+        assert_eq!(rendered["event"], "connection_changed");
+        assert_eq!(rendered["properties"]["provider"], "github");
+        assert_eq!(rendered["properties"]["transition"], "disconnected");
+    }
+
+    /// Each of the four transitions is its own compiled-in word, and there are
+    /// only four. A fifth would be a word nobody reviewed.
+    #[test]
+    fn every_transition_is_a_compiled_in_word() {
+        assert_eq!(Transition::Connected.as_str(), "connected");
+        assert_eq!(Transition::Disconnected.as_str(), "disconnected");
+        assert_eq!(Transition::Refreshed.as_str(), "refreshed");
+        assert_eq!(Transition::Failed.as_str(), "failed");
+    }
+
+    /// **The guarantee**: nothing this route touches — the stored access token,
+    /// the provider name the caller put in the URL — reaches the payload.
+    ///
+    /// Built the way `crate::analytics::test` builds its guard: a distinctive
+    /// needle, searched for case-insensitively, **with a self-check** proving
+    /// the same search does find that needle in a rendering that carries it.
+    /// Without the second half the assertion could pass because the needle was
+    /// unfindable rather than because it was absent, which is how a redaction
+    /// test rots into a test of nothing.
+    #[tokio::test]
+    async fn no_credential_or_provider_string_reaches_the_payload() {
+        // The two kinds of content in reach here: the credential, and the
+        // caller-chosen provider segment, which is frequently a customer name.
+        const HOSTILE: &[&str] = &["sk-not-a-real-key", "acmecorp-holdings-crm"];
+
+        let (runtime, recorder, _home) = recording_runtime().await;
+        store_token(&runtime, "acmecorp-holdings-crm", "sk-not-a-real-key").await;
+
+        // The body is discarded for the reason given above; the payload is
+        // what this test reads.
+        let _ = do_disconnect(runtime.clone(), "acmecorp-holdings-crm")
+            .await
+            .unwrap();
+
+        let events = connection_events(&recorder);
+        // A count, not a value: without this the needle search below could pass
+        // on an event that simply never fired. The value is asserted at the end
+        // — the tighter check must not run first and mask the guard a leak has
+        // to get past.
+        assert_eq!(events.len(), 1, "the disconnect did not report itself");
+
+        let envelope = envelope();
+        let rendered = payload(&envelope, &events[0])
+            .to_string()
+            .to_ascii_lowercase();
+        for hostile in HOSTILE {
+            let needle = hostile.to_ascii_lowercase();
+            assert!(
+                !rendered.contains(&needle),
+                "a connection_changed payload leaked {needle:?}: {rendered}"
+            );
+            // The self-check, against a payload that really does carry it.
+            let mut unredacted = payload(&envelope, &events[0]);
+            unredacted["properties"]["provider"] = serde_json::Value::from(*hostile);
+            assert!(
+                unredacted
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains(&needle),
+                "the needle must be findable in an unredacted rendering, or the guard above is \
+                 vacuous"
+            );
+        }
+
+        // And, last, the stricter statement: the unrecognised provider reached
+        // the catch-all rather than being carried, and the transition is one of
+        // the four compiled-in words.
+        assert_eq!(
+            events,
+            vec![Event::ConnectionChanged {
+                provider: crate::analytics::types::OTHER,
+                transition: "disconnected",
+            }]
+        );
     }
 
     /// A revoke endpoint that refuses the connection must not fail the

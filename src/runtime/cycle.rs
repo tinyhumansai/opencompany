@@ -1258,6 +1258,80 @@ approval.]"
         }
     }
 
+    /// Reports one settled approval to analytics (issue #1739).
+    ///
+    /// Both settle paths call this **after their `NotParked` guard**, and that
+    /// placement is load-bearing: a double-submit — a double-click, a retried
+    /// request, two operators on one queue — decided nothing. Counting it would
+    /// inflate the numerator of the only ratio this event exists to compute
+    /// ("how many parked approvals actually get answered") with decisions that
+    /// never happened, and inflate it most for the flakiest consoles.
+    ///
+    /// Only `approved` and `denied` are reported here. An approval that ran out
+    /// of time is reported by
+    /// [`CompanyRuntime::retire_approval`](crate::runtime::CompanyRuntime)
+    /// instead — see the `Expired` arm below for why that has to be the one
+    /// seam rather than this one as well.
+    ///
+    /// Nothing is awaited and nothing is branched on: [`Tracker::track`] is
+    /// synchronous and infallible, so an operator's decision is never delayed
+    /// by, and can never fail because of, analytics.
+    ///
+    /// [`Tracker::track`]: crate::analytics::Tracker::track
+    /// Split from the emit itself so the two can sit on opposite sides of the
+    /// durable write (raised in review of #1950). The inputs are all read
+    /// *before* `resolve_outcome` consumes the parked entry, and the amended
+    /// path partially moves `outcome` into its own `executed` binding on the way
+    /// to `record_resolved` — so the event has to be built early and sent late,
+    /// which is exactly what returning it rather than tracking it allows.
+    fn decision_event(
+        &self,
+        group: Option<crate::ports::types::EffectGroup>,
+        parked_at_millis: Option<u64>,
+        decided_at_millis: u64,
+        outcome: &ResolveOutcome,
+    ) -> Option<crate::analytics::Event> {
+        let verdict = match outcome {
+            ResolveOutcome::Approved(_) => "approved",
+            ResolveOutcome::Denied(_) => "denied",
+            // An expiry is NOT reported from here (issue #1739).
+            //
+            // `Expired` means the gate has already default-denied the entry and
+            // the caller owes it
+            // [`CompanyRuntime::retire_approval`](crate::runtime::CompanyRuntime)
+            // — the single retirement primitive, which the TTL sweeper reaches
+            // by the identical path and which is where `expired` is reported.
+            // Reporting here as well would count the operator-clicked-too-late
+            // case **twice** (this seam, then the retirement it owes) while the
+            // sweeper's case — an approval nobody answered at all, which is the
+            // population the verdict exists to measure — stayed counted zero
+            // times. One seam, both ways in.
+            ResolveOutcome::Expired => return None,
+            // Nothing was decided. Both callers return before reaching here, so
+            // this arm is unreachable in practice; it is a `return` rather than
+            // an `unreachable!` because a telemetry seam is the last place that
+            // may panic a settle.
+            ResolveOutcome::NotParked => return None,
+        };
+        // Both halves are read off the entry as it stood *before* the resolve
+        // popped it. A missing one therefore means the entry vanished between
+        // the two reads — a concurrent resolve won the race — and that call is
+        // the one reporting this decision. Staying silent here is the difference
+        // between one event and two for a single settled approval.
+        let (Some(group), Some(parked_at)) = (group, parked_at_millis) else {
+            return None;
+        };
+        Some(crate::analytics::Event::ApprovalDecided {
+            group: crate::policy::gate::group_slug(group),
+            verdict,
+            // Saturating because the two instants are separate wall-clock
+            // reads: an NTP step backwards between park and decision would
+            // otherwise wrap a short wait into eighteen quintillion
+            // milliseconds and drag every average with it forever.
+            waited_ms: decided_at_millis.saturating_sub(parked_at),
+        })
+    }
+
     /// Settles a parked approval's verdict — the **fast half** of resolving one.
     ///
     /// Records the outcome on the gate, journals it durably, and settles the
@@ -1317,28 +1391,38 @@ approval.]"
         if let GrantScope::Tool { .. } = scope {
             self.check_broadly_scoped(id, verdict)?;
         }
-        if self
-            .rt
-            .approval_gate
-            .parked_effect(id)
-            .is_some_and(|effect| {
-                effect.kind == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND
-                    && effect.agent.is_none()
-            })
-        {
+        let parked = self.rt.approval_gate.parked_effect(id);
+        if parked.as_ref().is_some_and(|effect| {
+            effect.kind == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND
+                && effect.agent.is_none()
+        }) {
             return Err(OpenCompanyError::InvalidRequest(
                 "the explicit approval request is missing its requesting agent and cannot be \
                  resumed; the card remains pending"
                     .to_string(),
             ));
         }
+        // Issue #1739: both halves of "how long did this sit?" are read BEFORE
+        // the resolve, because `resolve_outcome` removes the entry inside its own
+        // critical section — read afterwards the group and the park instant are
+        // both gone, and the wait would have to be invented.
+        //
+        // `decided_at` is bound once and handed to the gate rather than being a
+        // second `now_millis()` read, so the instant the gate judges the deadline
+        // against is exactly the instant the reported wait ends. Two reads would
+        // let a slow scheduler report a decision as answered a few milliseconds
+        // before the deadline it was actually refused for.
+        let parked_group = parked.as_ref().map(|effect| effect.group);
+        let parked_at_millis = self.rt.approval_gate.parked_at_millis(id);
+        let decided_at = now_millis();
         let outcome = self
             .rt
             .approval_gate
-            .resolve_outcome(id, verdict, by.clone(), now_millis());
+            .resolve_outcome(id, verdict, by.clone(), decided_at);
         if outcome == ResolveOutcome::NotParked {
             return Ok(ResolveReceipt::AlreadyResolved);
         }
+        let decided = self.decision_event(parked_group, parked_at_millis, decided_at, &outcome);
         // Issue #1449: past its deadline is NOT this operator's verdict.
         //
         // The gate has already default-denied it — that is what `Expired`
@@ -1365,6 +1449,16 @@ approval.]"
         // deny nothing does, so its held checkout becomes sweepable.
         self.rt.grants.clear_pending(id);
         self.rt.journal.record_resolved(id).await?;
+        // Reported **after** the durable write, not before (raised in review).
+        // `resolve_outcome` above has already settled the gate in memory, but
+        // until `record_resolved` lands there is no durable resolution: this
+        // returns `Err`, boot replays the approval as still pending, and the
+        // operator decides it again. A report sent above the write would then
+        // be counted twice for one approval — and only on a host whose store is
+        // failing, which is exactly when the oversight numbers get read.
+        if let Some(event) = decided {
+            self.rt.tracker.track(event);
+        }
         match outcome {
             ResolveOutcome::Approved(effect)
                 if effect.kind == crate::ports::types::REQUEST_APPROVAL_EFFECT_KIND =>
@@ -1998,6 +2092,13 @@ approval.]"
             original.payload = overlay_payload(original.payload, amended_payload);
             original
         });
+        // Issue #1739: captured before the resolve pops the entry, on the same
+        // terms as the plain path. The group comes off the amended copy because
+        // an overlay edits `payload` and only `payload` — the taxonomy an
+        // operator was shown is the taxonomy that gets reported, and an amend
+        // cannot move an effect between groups.
+        let parked_group = amended.as_ref().map(|effect| effect.group);
+        let parked_at_millis = self.rt.approval_gate.parked_at_millis(id);
         let outcome = match amended {
             Some(effect) => {
                 self.rt
@@ -2015,6 +2116,7 @@ approval.]"
         if outcome == ResolveOutcome::NotParked {
             return Ok(ResolveReceipt::AlreadyResolved);
         }
+        let decided = self.decision_event(parked_group, parked_at_millis, now, &outcome);
         // Issue #1449, the amend half of the same defect. An edit applied to a
         // card past its deadline is still not a decision — and it is the worse
         // half of the bug, because the fall-through recorded an `ApprovalAmended`
@@ -2038,6 +2140,16 @@ approval.]"
             self.rt.journal.record_amended(id, effect, now).await?;
         }
         self.rt.journal.record_resolved(id).await?;
+        // Reported **after** the durable write, not before (raised in review).
+        // `resolve_outcome` above has already settled the gate in memory, but
+        // until `record_resolved` lands there is no durable resolution: this
+        // returns `Err`, boot replays the approval as still pending, and the
+        // operator decides it again. A report sent above the write would then
+        // be counted twice for one approval — and only on a host whose store is
+        // failing, which is exactly when the oversight numbers get read.
+        if let Some(event) = decided {
+            self.rt.tracker.track(event);
+        }
 
         // Issue #243: same fork as the plain approve — a harness tool call mints
         // a grant instead of executing. Crucially the grant is minted against the
@@ -3070,6 +3182,37 @@ impl<'a> CycleHostImpl<'a> {
             .lock()
             .expect("parked poisoned")
             .push(approval_id.clone());
+        // Issue #1739: one `approval_parked`, reported as taxonomy and nothing
+        // else.
+        //
+        // Emitted from here because this is the single write path into the
+        // operator's queue **from a cycle** (see this function's own doc
+        // comment) — a second emission site beside the journal write is a
+        // second thing that can be forgotten, and the count would then silently
+        // disagree with the queue it claims to describe.
+        //
+        // It is not the only park path in the tree, and saying so here used to
+        // read as though it were. `CompanyRuntime::park_blocker` (a planning
+        // blocker) and `workflows::delivery` (a gated delivery) are the other
+        // two, each reporting at its own commit point. Review of #1950 found
+        // the planning one silent, which put every blocker an operator later
+        // decided into the numerator of this pair's rate with nothing in the
+        // denominator.
+        //
+        // `priced` is `is_some()` and NOT the figure: an amount is a fact about
+        // this company's business, and the whole point of the module is that no
+        // such fact reaches a payload. The kind, the payload and the thread are
+        // absent for the same reason — `effect.kind` is an operator- and
+        // MCP-supplied string, and the payload is the effect's arguments.
+        //
+        // Nothing is awaited: `Tracker::track` is synchronous and infallible, so
+        // a park is never delayed by, and can never fail because of, analytics.
+        self.rt
+            .tracker
+            .track(crate::analytics::Event::ApprovalParked {
+                group: crate::policy::gate::group_slug(effect.group),
+                priced: effect.amount_usd.is_some(),
+            });
         tracing::debug!(
             kind = %effect.kind,
             group = ?effect.group,
@@ -10029,6 +10172,813 @@ members = ["writer"]
                     "the cycle's one effect must be counted, executed or parked: {:?}",
                     turns[0]
                 );
+            }
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    /// A spend effect the operator has to sign off on, priced and distinctively
+    /// worded, for the two approval-reporting tests below.
+    fn priced_spend_effect() -> Effect {
+        Effect {
+            kind: "wire_transfer".into(),
+            group: EffectGroup::Spend,
+            amount_usd: Some(4_200_000.0),
+            established_thread: false,
+            first_time_counterparty: true,
+            payload: serde_json::json!({ "to": "Northwind Traders", "memo": "acquisition" }),
+            agent: None,
+            run_id: None,
+        }
+    }
+
+    /// **Issue #1739.** Parking an effect reports one `approval_parked`, and it
+    /// carries the taxonomy group and whether a price was named — never the
+    /// price, the counterparty, or the effect's own kind.
+    ///
+    /// The counterparty and the figure here are deliberately distinctive, and
+    /// the last assertion is a substring search over the whole rendered event:
+    /// it fails the day any field of this variant starts holding free-form text,
+    /// not only if today's fields are filled in wrongly.
+    #[tokio::test]
+    async fn a_parked_effect_reports_its_group_and_that_it_was_priced() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let rt = RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+            .with_brain(Arc::new(ParkingBrain {
+                effect: priced_spend_effect(),
+            }))
+            .with_analytics(recorder.clone())
+            .build()
+            .await
+            .unwrap();
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "wire the deposit to Northwind Traders".into(),
+                by: None,
+                chat: None,
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(report.parked.len(), 1, "the cycle parked its one effect");
+
+        let parked: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalParked { .. }))
+            .collect();
+        assert_eq!(parked.len(), 1, "one park, one event: {parked:?}");
+
+        match parked[0] {
+            crate::analytics::Event::ApprovalParked { group, priced } => {
+                assert_eq!(group, "spend", "the supervised taxonomy group, as a slug");
+                assert!(priced, "the effect named an amount");
+            }
+            ref other => panic!("{other:?}"),
+        }
+
+        let rendered = format!("{:?}", parked[0]);
+        for leak in [
+            "Northwind",
+            "4200000",
+            "4.2",
+            "wire_transfer",
+            "acquisition",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "{leak:?} reached the payload: {rendered}"
+            );
+        }
+    }
+
+    /// **Issue #1739.** Settling a parked approval reports one
+    /// `approval_decided`, carrying the verdict and how long the card actually
+    /// sat there.
+    ///
+    /// The park instant is backdated with
+    /// [`rehydrate`](crate::policy::ManifestApprovalGate::rehydrate) — the same
+    /// entry, re-parked under its own id at a chosen instant, which is exactly
+    /// what boot replay does. Without it `waited_ms` is a couple of
+    /// milliseconds and every wrong implementation (a hardcoded zero, the
+    /// decision instant, the TTL) passes just as well. Backdated a full minute,
+    /// only a reading of the real park instant clears the bound.
+    #[tokio::test]
+    async fn a_settled_approval_reports_its_verdict_and_how_long_it_waited() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_brain(Arc::new(ParkingBrain {
+                    effect: priced_spend_effect(),
+                }))
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "wire the deposit to Northwind Traders".into(),
+                by: None,
+                chat: None,
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let id = report.parked[0].clone();
+
+        // Re-park the same entry a minute in the past, so the wait this settle
+        // reports is a number no constant could be mistaken for.
+        let waited = 60_000;
+        rt.approval_gate.rehydrate(
+            id.clone(),
+            priced_spend_effect(),
+            now_millis().saturating_sub(waited),
+        );
+
+        CycleRunner::new(&rt)
+            .settle_approval(&id, Verdict::Deny, operator(), GrantScope::Once)
+            .await
+            .unwrap();
+
+        let decided: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+            .collect();
+        assert_eq!(decided.len(), 1, "one decision, one event: {decided:?}");
+
+        match decided[0] {
+            crate::analytics::Event::ApprovalDecided {
+                group,
+                verdict,
+                waited_ms,
+            } => {
+                assert_eq!(group, "spend");
+                assert_eq!(verdict, "denied", "the operator denied it");
+                // Bounded on BOTH sides. `>=` alone is satisfied by any large
+                // number, including the park instant reported raw as epoch
+                // millis — a wrong answer that reads as a plausible wait on a
+                // dashboard and is off by fifty-six years. The upper bound is
+                // what makes this a reading of the elapsed time rather than of
+                // a clock.
+                assert!(
+                    (waited..waited * 2).contains(&waited_ms),
+                    "the wait is the elapsed time since the park instant, not the settle instant \
+                     and not a raw clock: {waited_ms}ms"
+                );
+            }
+            ref other => panic!("{other:?}"),
+        }
+
+        let rendered = format!("{:?}", decided[0]);
+        for leak in ["Northwind", "4200000", "wire_transfer", "owner"] {
+            assert!(
+                !rendered.contains(leak),
+                "{leak:?} reached the payload: {rendered}"
+            );
+        }
+    }
+
+    // Gated on `openhuman`, because `CompanyRuntime::park_blocker` and
+    // `unpark_blocker` are: the planning pass is their only caller and it does
+    // not exist in a default build. `scripts/ci/feature-lanes.txt` records
+    // `openhuman` as `tested`, so the gated lane runs these rather than issue
+    // #770's silence.
+    #[cfg(feature = "openhuman")]
+    /// A planning blocker, in the shape `planning.rs` parks.
+    fn blocker_payload() -> crate::ports::blockers::BlockerPayload {
+        crate::ports::blockers::BlockerPayload {
+            kind: crate::ports::blockers::BlockerKind::Information,
+            source: crate::ports::blockers::BlockerSource::Prereq,
+            step: None,
+            reason: "the brief names two contradictory launch dates".to_string(),
+            needed: "which date is current".to_string(),
+        }
+    }
+
+    /// **Issue #1739, raised in review of #1950.** A planning blocker is a park,
+    /// and it reports as one.
+    ///
+    /// `CycleRunner::park_for_approval` is the cycle's only write into the
+    /// operator's queue, but it is not the tree's: `CompanyRuntime::park_blocker`
+    /// is a second and `workflows::delivery` a third. Only the other two
+    /// reported. An operator who later approves or denies a planning blocker
+    /// still reaches the settle seam, so every blocker contributed an
+    /// `approval_decided` with no `approval_parked` behind it — decisions
+    /// exceeding parks, in the one pair whose whole purpose is the ratio between
+    /// them.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_planning_blocker_reports_its_park() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let id = rt
+            .park_blocker(&blocker_payload(), "task-1")
+            .await
+            .expect("the blocker parks");
+
+        let parked: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalParked { .. }))
+            .collect();
+        assert_eq!(parked.len(), 1, "one park, one event: {parked:?}");
+        assert_eq!(
+            parked[0],
+            crate::analytics::Event::ApprovalParked {
+                // A blocker is a question about a card, not a consequence with a
+                // taxonomy, so it carries `EffectGroup::Other` and no amount.
+                group: "other",
+                priced: false,
+            }
+        );
+
+        // And nothing of the operator's own words travelled with it. The reason
+        // and the needed-answer above are free-form text an agent wrote.
+        let rendered = format!("{parked:?}");
+        for leak in ["contradictory", "launch dates", "which date", "task-1"] {
+            assert!(
+                !rendered.contains(leak),
+                "{leak:?} reached the payload: {rendered}"
+            );
+        }
+        assert!(!id.to_string().is_empty());
+    }
+
+    /// **Issue #1739, raised in review of #1950.** A blocker withdrawn because
+    /// its card could not be written is **not** an expiry.
+    ///
+    /// `unpark_blocker` compensates for a task-card write that failed seconds
+    /// after its blocker was parked, and it routes through `retire_approval` —
+    /// the single retirement primitive — so it shares the seam the TTL sweep
+    /// reports `expired` from. The journal already keeps the two apart by name
+    /// (`ExpiryReason::CardUnwritable` against `Ttl`) precisely because "we
+    /// could not write the card" and "the deadline passed" are different things
+    /// to have happened; reporting the rollback as `expired` would put a store
+    /// fault in the bucket that means *nobody answered*, which is the one
+    /// reading this verdict exists to produce.
+    ///
+    /// # Why the withdrawal is walked through a settle first
+    ///
+    /// `retire_approval` reads the wait and the group out of the gate's
+    /// **expired** map, and a blocker withdrawn seconds after it was parked is
+    /// still in the *parked* map — so both reads answer `None` and the seam is
+    /// silent whatever reason it was handed. Asserting on a bare
+    /// `park` → `unpark` pair therefore proves nothing about the reason at all:
+    /// it passes just as well with the guard deleted, which is what a mutation
+    /// run showed.
+    ///
+    /// So the entry is moved into the expired map first, the way production
+    /// moves it — a `settle_approval` that arrives past the deadline, which
+    /// returns `Expired`, reports nothing itself, and leaves the retirement to
+    /// its caller. From there the reason is the **only** thing standing between
+    /// `unpark_blocker` and an `expired` verdict, which is the claim.
+    ///
+    /// The ordering is constructed rather than observed — in production a card
+    /// write fails seconds after the park, not hours after its deadline. It is
+    /// the structural case the guard defends, and defending it is cheap; the
+    /// alternative is a guard nothing can fail.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_withdrawn_blocker_is_not_reported_as_an_expiry() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let decided = |recorder: &crate::analytics::RecordingTracker| {
+            recorder
+                .events()
+                .into_iter()
+                .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+                .collect::<Vec<_>>()
+        };
+        // Comfortably past any `approval_ttl_hours` a manifest can carry.
+        let long_past = 1_000 * 60 * 60 * 24 * 30;
+
+        let withdrawn = rt
+            .park_blocker(&blocker_payload(), "task-1")
+            .await
+            .expect("the blocker parks");
+        let effect = rt
+            .approval_gate
+            .parked_effect(&withdrawn)
+            .expect("the entry is parked");
+        rt.approval_gate.rehydrate(
+            withdrawn.clone(),
+            effect,
+            now_millis().saturating_sub(long_past),
+        );
+        // Past its deadline: the gate default-denies, moves the entry into the
+        // expired map, and reports nothing — the retirement is the caller's.
+        let receipt = CycleRunner::new(&rt)
+            .settle_approval(&withdrawn, Verdict::Approve, operator(), GrantScope::Once)
+            .await
+            .expect("the settle returns");
+        assert!(
+            matches!(receipt, ResolveReceipt::Expired),
+            "the fixture must leave the entry in the gate's expired map: {receipt:?}"
+        );
+        assert!(
+            decided(&recorder).is_empty(),
+            "the settle seam owes the retirement and reports nothing itself: {:?}",
+            decided(&recorder)
+        );
+
+        // Now the withdrawal, with everything the report needs available to it.
+        rt.unpark_blocker(&withdrawn)
+            .await
+            .expect("the withdrawal commits");
+        assert!(
+            decided(&recorder).is_empty(),
+            "a card-write rollback is not a decision anybody made: {:?}",
+            decided(&recorder)
+        );
+
+        // The other arm: the same seam, the same shape of entry, reached with
+        // `ExpiryReason::Ttl` — and it does report. Without this the silence
+        // above would be satisfied by a seam that reports nothing at all.
+        let swept = rt
+            .park_blocker(&blocker_payload(), "task-2")
+            .await
+            .expect("the second blocker parks");
+        let effect = rt
+            .approval_gate
+            .parked_effect(&swept)
+            .expect("the entry is parked");
+        rt.approval_gate.rehydrate(
+            swept.clone(),
+            effect,
+            now_millis().saturating_sub(long_past),
+        );
+        let expired = rt.sweep_expired_approvals().await.expect("the sweep runs");
+        assert!(
+            expired.contains(&swept),
+            "the sweep retired it: {expired:?}"
+        );
+
+        let events = decided(&recorder);
+        assert_eq!(events.len(), 1, "only the TTL arm reports: {events:?}");
+        assert!(
+            matches!(
+                events[0],
+                crate::analytics::Event::ApprovalDecided {
+                    verdict: "expired",
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// A journal store that can be switched to refuse every append.
+    ///
+    /// Wraps the in-memory one so a test can let the setup writes land and then
+    /// fail exactly the write under examination — which is what separates
+    /// "reported before the commit" from "reported after it".
+    #[cfg(feature = "openhuman")]
+    struct RefusingJournalStore {
+        inner: crate::ports::journal::MemoryJournalStore,
+        refusing: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "openhuman")]
+    impl RefusingJournalStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::ports::journal::MemoryJournalStore::default(),
+                refusing: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn refuse(&self, refusing: bool) {
+            self.refusing
+                .store(refusing, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "openhuman")]
+    #[async_trait::async_trait]
+    impl crate::ports::journal::JournalStore for RefusingJournalStore {
+        async fn append_journal(
+            &self,
+            id: &CompanyId,
+            line: &str,
+            durability: crate::ports::journal::Durability,
+        ) -> crate::Result<()> {
+            if self.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::error::OpenCompanyError::Store(
+                    "RefusingJournalStore: the durable write failed".to_string(),
+                ));
+            }
+            self.inner.append_journal(id, line, durability).await
+        }
+
+        async fn read_journal(&self, id: &CompanyId) -> crate::Result<Vec<String>> {
+            self.inner.read_journal(id).await
+        }
+
+        async fn journal_imported(&self, id: &CompanyId) -> crate::Result<bool> {
+            self.inner.journal_imported(id).await
+        }
+
+        async fn complete_import(&self, id: &CompanyId, lines: Vec<String>) -> crate::Result<()> {
+            self.inner.complete_import(id, lines).await
+        }
+    }
+
+    /// **Issue #1739, raised in review of #1950.** A decision is reported only
+    /// once it is durable.
+    ///
+    /// `resolve_outcome` settles the gate in memory, and `record_resolved`
+    /// writes it down. Reporting between the two counts a decision that, on the
+    /// next boot, has not happened: the journal still holds the approval as
+    /// pending, replay re-parks it, and the operator decides it again — so one
+    /// approval produces two `approval_decided` events. The over-count lands on
+    /// hosts whose store is failing, which is precisely when the oversight
+    /// numbers are being read.
+    ///
+    /// Driven by refusing the durable write rather than by reading the source,
+    /// because the ordering is the entire fix and reading cannot fail.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_decision_whose_journal_write_failed_reports_nothing() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let journal = RefusingJournalStore::new();
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_journal_store(journal.clone())
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let decided = |recorder: &crate::analytics::RecordingTracker| {
+            recorder
+                .events()
+                .into_iter()
+                .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+                .collect::<Vec<_>>()
+        };
+
+        // Parked while the store still works, so the failure below is the
+        // resolution's write and nothing else.
+        let doomed = rt
+            .park_blocker(&blocker_payload(), "task-1")
+            .await
+            .expect("the blocker parks");
+
+        journal.refuse(true);
+        let settled = CycleRunner::new(&rt)
+            .settle_approval(&doomed, Verdict::Deny, operator(), GrantScope::Once)
+            .await;
+        assert!(
+            settled.is_err(),
+            "the fixture must actually fail the durable write: {settled:?}"
+        );
+        assert!(
+            decided(&recorder).is_empty(),
+            "a decision that never reached the journal must not be reported: {:?}",
+            decided(&recorder)
+        );
+
+        // The self-check, on a second approval with the store working again:
+        // the same seam DOES report, so the silence above is the ordering and
+        // not a tracker that never records.
+        journal.refuse(false);
+        let settles = rt
+            .park_blocker(&blocker_payload(), "task-2")
+            .await
+            .expect("the second blocker parks");
+        CycleRunner::new(&rt)
+            .settle_approval(&settles, Verdict::Deny, operator(), GrantScope::Once)
+            .await
+            .expect("the settle commits");
+        let events = decided(&recorder);
+        assert_eq!(
+            events.len(),
+            1,
+            "one durable decision, one event: {events:?}"
+        );
+        assert!(
+            matches!(
+                events[0],
+                crate::analytics::Event::ApprovalDecided {
+                    verdict: "denied",
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+
+        // And the same rule on the expiry seam, which reaches its verdict
+        // through `CompanyRuntime::retire_approval` rather than through the
+        // settle. `record_expired` is that path's commit point, and an expiry
+        // reported above it is counted a second time by whichever retirement
+        // finally succeeds after a restart replays the approval as pending.
+        let never_retired = rt
+            .park_blocker(&blocker_payload(), "task-3")
+            .await
+            .expect("the third blocker parks");
+        let effect = rt
+            .approval_gate
+            .parked_effect(&never_retired)
+            .expect("the entry is parked");
+        rt.approval_gate.rehydrate(
+            never_retired.clone(),
+            effect,
+            now_millis().saturating_sub(1_000 * 60 * 60 * 24 * 30),
+        );
+        journal.refuse(true);
+        let swept = rt.sweep_expired_approvals().await;
+        assert!(
+            swept.as_ref().map(Vec::is_empty).unwrap_or(true),
+            "the fixture must not let the retirement commit: {swept:?}"
+        );
+        assert_eq!(
+            decided(&recorder).len(),
+            1,
+            "an expiry whose journal write failed added a second event: {:?}",
+            decided(&recorder)
+        );
+
+        // And the amend path, which is the same build-early/send-late shape in
+        // a second function: `resolve_amended_outcome` settles in memory, then
+        // `record_amended` and `record_resolved` make it durable. Covered here
+        // rather than left implied, because "the identical structure" is what
+        // every uncovered second copy of a fix is called.
+        journal.refuse(false);
+        let amended = rt
+            .park_blocker(&blocker_payload(), "task-4")
+            .await
+            .expect("the fourth blocker parks");
+        journal.refuse(true);
+        let failed = CycleRunner::new(&rt)
+            .settle_approval_amended(
+                &amended,
+                serde_json::json!({ "needed": "the later date" }),
+                operator(),
+            )
+            .await;
+        assert!(
+            failed.is_err(),
+            "the fixture must fail the amend's durable write: {failed:?}"
+        );
+        assert_eq!(
+            decided(&recorder).len(),
+            1,
+            "an amend whose journal write failed was reported: {:?}",
+            decided(&recorder)
+        );
+
+        // Self-check on the same path: with the store working it does report.
+        journal.refuse(false);
+        let commits = rt
+            .park_blocker(&blocker_payload(), "task-5")
+            .await
+            .expect("the fifth blocker parks");
+        CycleRunner::new(&rt)
+            .settle_approval_amended(
+                &commits,
+                serde_json::json!({ "needed": "the later date" }),
+                operator(),
+            )
+            .await
+            .expect("the amend commits");
+        assert_eq!(
+            decided(&recorder).len(),
+            2,
+            "a durable amend must report: {:?}",
+            decided(&recorder)
+        );
+    }
+
+    /// **Issue #1739.** A decision that decided nothing reports nothing.
+    ///
+    /// A double-submit — a double-click, a retried request, two operators on one
+    /// queue — hits `ResolveOutcome::NotParked` and settles no approval. Counted,
+    /// it would inflate the numerator of the only ratio this event exists to
+    /// compute, and inflate it hardest for the flakiest consoles, which is the
+    /// opposite of what the number is for.
+    #[tokio::test]
+    async fn a_double_submit_reports_no_second_decision() {
+        let home_dir = tmp_home();
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let rt = Arc::new(
+            RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest("supervised"))
+                .with_brain(Arc::new(ParkingBrain {
+                    effect: priced_spend_effect(),
+                }))
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "wire the deposit".into(),
+                by: None,
+                chat: None,
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let id = report.parked[0].clone();
+
+        for _ in 0..3 {
+            CycleRunner::new(&rt)
+                .settle_approval(&id, Verdict::Approve, operator(), GrantScope::Once)
+                .await
+                .unwrap();
+        }
+
+        let decided = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+            .count();
+        assert_eq!(
+            decided, 1,
+            "three submits, one approval, one decision reported"
+        );
+    }
+
+    /// A runtime whose approvals are past their deadline the instant they park,
+    /// with a recorder attached — the scaffolding for both expiry tests below.
+    ///
+    /// The parked entry is then **backdated a full minute** with `rehydrate`,
+    /// the same call boot replay rebuilds the queue with. Without it every wait
+    /// here is a couple of milliseconds and a hardcoded zero passes as readily
+    /// as a real reading.
+    async fn park_one_past_its_deadline_tracked(
+        home: std::path::PathBuf,
+        waited: u64,
+    ) -> (
+        Arc<CompanyRuntime>,
+        ApprovalId,
+        Arc<crate::analytics::RecordingTracker>,
+    ) {
+        let recorder = Arc::new(crate::analytics::RecordingTracker::new());
+        let gate = Arc::new(
+            ManifestApprovalGate::new(manifest("supervised").policy.clone()).with_ttl_millis(0),
+        );
+        let rt = Arc::new(
+            RuntimeBuilder::new(home, manifest("supervised"))
+                .with_brain(Arc::new(ParkingBrain {
+                    effect: priced_spend_effect(),
+                }))
+                .with_approvals(gate)
+                .with_analytics(recorder.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "wire the deposit".into(),
+                by: None,
+                chat: None,
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let id = report.parked[0].clone();
+        rt.approval_gate.rehydrate(
+            id.clone(),
+            priced_spend_effect(),
+            now_millis().saturating_sub(waited),
+        );
+        (rt, id, recorder)
+    }
+
+    /// **Issue #1739.** The TTL sweep reports its default-deny as an
+    /// `approval_decided` with verdict `expired`.
+    ///
+    /// This is the case the event exists for. `approval_decided` answers "does
+    /// the oversight loop close, and how fast" — and a sweep IS the loop failing
+    /// to close. Reporting only the verdicts an operator actually clicked would
+    /// make `expired` systematically undercount exactly the population worth
+    /// looking at, and a dashboard of promptly-answered cards would read as
+    /// healthy while the queue rotted behind its deadline.
+    #[tokio::test]
+    async fn the_ttl_sweep_reports_its_default_deny_as_an_expiry() {
+        let home_dir = tmp_home();
+        let waited = 60_000;
+        let (rt, _id, recorder) =
+            park_one_past_its_deadline_tracked(home_dir.path().to_path_buf(), waited).await;
+
+        let expired = rt.sweep_expired_approvals().await.unwrap();
+        assert_eq!(expired.len(), 1, "the sweep retired the one parked card");
+
+        let decided: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+            .collect();
+        assert_eq!(decided.len(), 1, "one retirement, one event: {decided:?}");
+
+        match decided[0] {
+            crate::analytics::Event::ApprovalDecided {
+                group,
+                verdict,
+                waited_ms,
+            } => {
+                assert_eq!(group, "spend");
+                assert_eq!(verdict, "expired", "nobody answered it");
+                // Bounded above as well as below — see the settle test: a raw
+                // epoch instant also clears `>= waited`.
+                assert!(
+                    (waited..waited * 2).contains(&waited_ms),
+                    "the wait is the elapsed time since the park instant the expiry stash kept, \
+                     not the retirement instant and not a raw clock: {waited_ms}ms"
+                );
+            }
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    /// **Issue #1739.** A click that lands after the deadline reports `expired`
+    /// exactly **once** — not twice, and not as an approve.
+    ///
+    /// The late click passes through two seams that both know the approval ran
+    /// out: `settle_approval` returns [`ResolveReceipt::Expired`], and the
+    /// retirement it owes then runs
+    /// [`retire_approval`](CompanyRuntime::retire_approval). Only the second
+    /// reports, so that the sweep — which reaches the identical retirement — is
+    /// counted on the same terms. Reporting at both would have made every late
+    /// click worth two expiries and skewed the one ratio the event is for.
+    ///
+    /// The verdict assertion is the other half of issue #1449's defect in
+    /// telemetry form: the operator asked to *approve*, and an `approved` here
+    /// would tell the funnel a decision happened that the host refused.
+    #[tokio::test]
+    async fn a_click_after_the_deadline_reports_one_expiry_and_not_an_approve() {
+        let home_dir = tmp_home();
+        let waited = 60_000;
+        let (rt, id, recorder) =
+            park_one_past_its_deadline_tracked(home_dir.path().to_path_buf(), waited).await;
+
+        let (receipt, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Approve, operator(), GrantScope::Once)
+            .await
+            .unwrap();
+        assert!(receipt.expired(), "the click was too late");
+        follow_up.await.unwrap().unwrap();
+
+        let decided: Vec<_> = recorder
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, crate::analytics::Event::ApprovalDecided { .. }))
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "two seams know it expired; exactly one reports: {decided:?}"
+        );
+
+        match decided[0] {
+            crate::analytics::Event::ApprovalDecided {
+                group,
+                verdict,
+                waited_ms,
+            } => {
+                assert_eq!(group, "spend");
+                assert_eq!(
+                    verdict, "expired",
+                    "the operator asked to approve, and the host refused"
+                );
+                assert!((waited..waited * 2).contains(&waited_ms), "{waited_ms}ms");
             }
             ref other => panic!("{other:?}"),
         }

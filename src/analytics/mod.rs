@@ -54,6 +54,7 @@ use async_trait::async_trait;
 
 pub mod boot;
 pub mod config;
+pub mod console;
 pub mod meter;
 pub mod mixpanel;
 pub mod types;
