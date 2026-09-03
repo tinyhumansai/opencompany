@@ -123,6 +123,22 @@ impl Entries {
         self.entries.iter().find(|entry| entry.id == id)
     }
 
+    /// The row `id` becomes if `fields` are recorded against it now.
+    ///
+    /// A write is a merge, so what a check must judge is the resulting row and
+    /// not the event: a field already on the row is still there afterwards, and
+    /// an event supplying only the rest is complete. Built with the same merge
+    /// [`fold`] applies, so a write-time check sees the row a later read folds.
+    pub fn preview(&self, id: &str, fields: &BTreeMap<String, Option<String>>) -> Entry {
+        let id = id.trim();
+        let mut entry = self.find(id).cloned().unwrap_or_else(|| Entry {
+            id: id.to_string(),
+            ..Entry::default()
+        });
+        merge_fields(&mut entry, fields);
+        entry
+    }
+
     /// How many entries are in a status the spec calls closed.
     pub fn closed_count(&self, spec: &LedgerSpec) -> usize {
         self.entries
@@ -174,19 +190,50 @@ pub fn fold(spec: &LedgerSpec, events: &[LedgerEvent]) -> Entries {
         // `Order::Recent` reads, which is what lets a writer raise an existing
         // row by recording against it.
         entry.touched = position;
-        for (name, value) in &event.fields {
-            match value {
-                Some(text) => {
-                    entry.fields.insert(name.clone(), text.clone());
-                }
-                None => {
-                    entry.fields.remove(name);
-                }
-            }
-        }
+        merge_fields(entry, &event.fields);
     }
     check(&mut out, spec);
     out
+}
+
+/// Applies one event's fields to a row: a value sets, a null clears.
+fn merge_fields(entry: &mut Entry, fields: &BTreeMap<String, Option<String>>) {
+    for (name, value) in fields {
+        match value {
+            Some(text) => {
+                entry.fields.insert(name.clone(), text.clone());
+            }
+            None => {
+                entry.fields.remove(name);
+            }
+        }
+    }
+}
+
+/// The required fields a row leaves unfilled, in declaration order.
+///
+/// Shared by the read-time fault list and the write-time refusal: a ledger that
+/// would report a row unreadable is the same ledger that must not accept the
+/// write, and two implementations of "required" would eventually disagree about
+/// which rows those are.
+pub fn missing_required<'a>(entry: &Entry, spec: &'a LedgerSpec) -> Vec<&'a str> {
+    spec.fields
+        .iter()
+        .filter(|field| field.required)
+        .filter(|field| {
+            // The id lives *beside* the fields, not inside them: every event
+            // names it at the top level. Looking for it in `fields` fails for
+            // every well-formed entry, so a spec declaring its id required
+            // would call each of its own rows unreadable.
+            let present = if field.role == FieldRole::Id {
+                !entry.id.trim().is_empty()
+            } else {
+                !entry.get(&field.name).trim().is_empty()
+            };
+            !present
+        })
+        .map(|field| field.name.as_str())
+        .collect()
 }
 
 /// Runs the declared checks, appending what they find to the fault list.
@@ -196,27 +243,11 @@ fn check(entries: &mut Entries, spec: &LedgerSpec) {
         for declared in &spec.checks {
             match declared {
                 Check::RequiredField => {
-                    for field in spec.fields.iter().filter(|field| field.required) {
-                        // The id lives *beside* the fields, not inside them:
-                        // every event names it at the top level and an event
-                        // without one never reaches here. Looking for it in
-                        // `fields` therefore fails for every well-formed entry,
-                        // and a spec declaring its id field required would
-                        // report each of its own rows unreadable — which is
-                        // exactly the failure riemann hit, where a workspace
-                        // showed all eight of its open tasks as "could not be
-                        // read" while the log was perfectly valid.
-                        let present = if field.role == FieldRole::Id {
-                            !entry.id.trim().is_empty()
-                        } else {
-                            !entry.get(&field.name).trim().is_empty()
-                        };
-                        if !present {
-                            faults.push(format!(
-                                "`{}` has no `{}`, which this ledger requires",
-                                entry.id, field.name
-                            ));
-                        }
+                    for name in missing_required(entry, spec) {
+                        faults.push(format!(
+                            "`{}` has no `{}`, which this ledger requires",
+                            entry.id, name
+                        ));
                     }
                 }
                 Check::KnownStatus => {
