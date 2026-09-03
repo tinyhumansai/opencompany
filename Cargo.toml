@@ -169,6 +169,20 @@ tinyinference = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinferenc
 # module: `tinyhosts` is linked as a library, so nothing here loads a cdylib.
 openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = true, default-features = false, features = ["skills", "mcp", "hosting"] }
 
+# Desks, rosters, mentions and shared session transcripts — the pure algebra
+# behind a group chat several teammates share (`vendor/tinyhivemind`). It is the
+# one place conversation identity is decided, so the history fold, thread
+# resumption and an agent's context seed cannot drift apart about which stored
+# chat id names which conversation.
+#
+# NOT optional, unlike every other vendored crate here. Conversation identity is
+# read on the default build — `ports::types` and `server::chat_history` both
+# need it with no feature enabled — so gating it would break the offline build
+# rather than trim it. It costs almost nothing to carry: no async runtime, no
+# transport, no HTTP client, no web framework — its own CI asserts that — and
+# its only dependencies, `serde` and `thiserror`, are already in this lockfile.
+tinyhivemind-core = { path = "vendor/tinyhivemind/crates/tinyhivemind-core" }
+
 # The MCP client, extracted out of OpenHuman into its own crate. OpenHuman's
 # `oh::mcp::http_client` facade still re-exports the transport and the payload
 # types under their old spellings, but not `tinymcp::Error` — and the typed 401

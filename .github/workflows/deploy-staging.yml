@@ -110,9 +110,18 @@ jobs:
       # Recursing from the repo root instead would also drag in openhuman's
       # desktop-only submodules (tauri-cef is a heavy CEF checkout) that no
       # server build compiles.
+      #
+      # `vendor/tinyhivemind` is NOT optional and is not feature-gated: cargo reads
+      # every path dependency's manifest during resolution whatever the feature
+      # selection, so a missing checkout fails the DEFAULT build here, not just
+      # `--features openhuman`. This job is the only one in the repository that
+      # sets `submodules: false`, and it does not run on pull requests — so a
+      # vendored path dependency left out of this list breaks a deploy rather
+      # than a check. `scripts/ci/assert-vendored-deps-checked-out.sh` is what
+      # stops the next one being found that way.
       - name: Fetch build vendor submodules
         run: |
-          git submodule update --init vendor/openhuman
+          git submodule update --init vendor/openhuman vendor/tinyhivemind
           scripts/ci/init-vendored-submodules.sh
 
       - name: Configure AWS credentials
