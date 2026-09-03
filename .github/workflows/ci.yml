@@ -628,6 +628,15 @@ jobs:
       - name: Test the export bundle
         run: scripts/ci/run-scoped-suite.sh "export bundle" export store::export
 
+      # `hivemind`: the `tinyhivemind` session adapter (`runtime::hivemind`).
+      # The feature gates one module and its tests, and nothing on the default
+      # path enables it — which is exactly the shape #770 was filed about, so it
+      # gets its lane in the same breath as the code rather than after somebody
+      # notices. Offline and dependency-free at this job's expense: the crate is
+      # already vendored and pure, so this costs one recompile of the lib.
+      - name: Test the hivemind session adapter
+        run: scripts/ci/run-scoped-suite.sh "hivemind adapter" hivemind runtime::hivemind
+
       # `imap`/`smtp`: the mail surface. One gated test runs here today — the
       # RFC822 parser — and it is a parser, which is precisely the kind of code
       # that rots silently. `smtp` is compiled alongside deliberately: it carries

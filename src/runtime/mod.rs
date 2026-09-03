@@ -80,6 +80,13 @@ pub mod grants;
 /// harness pool, the MCP runtime, and the two serialising mutexes). See
 /// [`handover`].
 pub mod handover;
+/// The `tinyhivemind` session adapter: this company's journal read as the
+/// vendored library's [`SessionLog`](tinyhivemind::session::SessionLog) port,
+/// so a turn's transcript can be projected **attributed** rather than collapsed
+/// into the reader's own voice. Off by default and wired to nothing yet; see
+/// [`hivemind`].
+#[cfg(feature = "hivemind")]
+pub mod hivemind;
 pub mod journal;
 /// Issue #1845: [`LifecycleScheduler`] — the process-wide daily tick that
 /// nudges a signup who hit their day-7 boundary without saving a workflow,

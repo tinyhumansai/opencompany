@@ -183,6 +183,14 @@ openhuman_core = { package = "openhuman", path = "vendor/openhuman", optional = 
 # its only dependencies, `serde` and `thiserror`, are already in this lockfile.
 tinyhivemind-core = { path = "vendor/tinyhivemind/crates/tinyhivemind-core" }
 
+# The session-runtime half of the same vendored library: the `SessionLog` paging
+# port, and the **attributed** transcript projection over it. Optional, and off
+# by default, unlike `tinyhivemind-core` above — nothing on the default path
+# calls it yet. The adapter that implements the port lives in
+# `runtime::hivemind` behind the `hivemind` feature, and no turn is wired to it;
+# vendoring it enabled would claim a behavior change this build does not make.
+tinyhivemind = { path = "vendor/tinyhivemind/crates/tinyhivemind", optional = true }
+
 # The MCP client, extracted out of OpenHuman into its own crate. OpenHuman's
 # `oh::mcp::http_client` facade still re-exports the transport and the payload
 # types under their old spellings, but not `tinymcp::Error` — and the typed 401
@@ -481,6 +489,11 @@ medulla = ["dep:reqwest"]
 # second one, which is the outcome worth avoiding: two curves, or two base58
 # key parsers, is how a signature check comes to differ between two callers.
 tinyplace = ["dep:reqwest"]
+
+# The `tinyhivemind` session adapter (`runtime::hivemind`). Off by default and
+# wired to nothing: it compiles the port implementation and runs its tests, so
+# the projection can be adopted by a later change that is only about adoption.
+hivemind = ["dep:tinyhivemind"]
 # The Agent Client Protocol: the `/acp` endpoint's session/permission surface
 # and the `RunTurn` implementation over an ACP agent.
 #
