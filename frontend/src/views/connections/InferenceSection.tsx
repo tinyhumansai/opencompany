@@ -151,16 +151,27 @@ const METERING_NOTES: Record<UsageMetering, string> = {
 function presetFor(
   provider: InferenceProvider,
   defaultTierModels?: Partial<Record<Tier, string>>,
+  catalogTierDefaults?: Partial<Record<Tier, string>>,
 ): {
   baseUrl: string;
   models: Partial<Record<Tier, string>>;
 } {
   const preset = PROVIDERS[provider].preset;
-  // The host's own `defaultTierModels` (from `GET …/inference`) is the source
-  // of truth once it has loaded; `PROVIDERS.openrouter.preset.models` is only
-  // the fallback used before that first status read resolves, so switching to
-  // OpenRouter still has something to prefill with immediately.
-  if (provider === "openrouter" && defaultTierModels && Object.keys(defaultTierModels).length > 0) {
+  if (provider !== "openrouter") return preset;
+  // The *endpoint's own* defaults win when a catalog has actually been read.
+  // `status.defaultTierModels` is OpenRouter's vocabulary and nothing wider, so
+  // prefilling from it against an endpoint that publishes `chat-v1` writes four
+  // ids that endpoint has already told us it does not serve — an explicit,
+  // saved, silently unusable mapping, which is worse than the unmapped case the
+  // host now resolves correctly on its own.
+  if (catalogTierDefaults && Object.keys(catalogTierDefaults).length > 0) {
+    return { ...preset, models: catalogTierDefaults };
+  }
+  // No catalog yet: the host's own `defaultTierModels` (from `GET …/inference`)
+  // beats `PROVIDERS.openrouter.preset.models`, which is only the fallback used
+  // before that first status read resolves, so switching to OpenRouter still
+  // has something to prefill with immediately.
+  if (defaultTierModels && Object.keys(defaultTierModels).length > 0) {
     return { ...preset, models: defaultTierModels };
   }
   return preset;
@@ -173,14 +184,26 @@ type TestState =
   | { kind: "ok"; note: string }
   | { kind: "error"; message: string };
 
+/**
+ * `baseUrl` and `message` travel with the state because the catalog is now the
+ * *configured endpoint's*, not a vendor registry: "could not be loaded" has to
+ * name which endpoint could not be loaded, or the operator has no idea what to
+ * go and look at.
+ */
 type ModelCatalogState =
   | { kind: "idle" }
   | { kind: "loading" }
-  | { kind: "ready"; models: InferenceModel[] }
-  | { kind: "empty" }
-  | { kind: "error" };
+  | {
+      kind: "ready";
+      models: InferenceModel[];
+      baseUrl: string;
+      /** The tier → model mapping this endpoint's own vocabulary implies. */
+      tierDefaults: Record<string, string>;
+    }
+  | { kind: "empty"; baseUrl: string }
+  | { kind: "error"; message: string };
 
-/** Keep a stored custom id selectable even after the registry no longer lists it. */
+/** Keep a stored custom id selectable even after the catalog no longer lists it. */
 function optionsForTier(catalog: InferenceModel[], current: string): InferenceModel[] {
   if (!current || catalog.some((model) => model.id === current)) return catalog;
   return [{ id: current, name: "Current custom model" }, ...catalog];
@@ -348,6 +371,16 @@ export function InferenceSection({
   >(null);
   const [test, setTest] = useState<TestState>({ kind: "idle" });
   const [modelCatalog, setModelCatalog] = useState<ModelCatalogState>({ kind: "idle" });
+  /**
+   * The last tier → model mapping a *read* catalog implied, kept apart from
+   * `modelCatalog` on purpose: switching the provider select away from
+   * OpenRouter resets that state to `idle`, and `pickProvider` runs before the
+   * effect has had a chance to re-read anything — so a form that reads the
+   * defaults straight off `modelCatalog` would fall back to OpenRouter's ids on
+   * exactly the switch-away-and-back path an operator takes while comparing
+   * providers.
+   */
+  const [catalogTierDefaults, setCatalogTierDefaults] = useState<Record<string, string>>({});
 
   // Switch form.
   const [provider, setProvider] = useState<InferenceProvider>("managed");
@@ -451,10 +484,32 @@ export function InferenceSection({
     void listInferenceModels(client, company)
       .then((catalog) => {
         if (!current) return;
-        setModelCatalog(catalog.length ? { kind: "ready", models: catalog } : { kind: "empty" });
+        // The host reports an unreadable catalog as a 200 carrying `error`, so
+        // the console can say what went wrong instead of rendering an empty
+        // picker that reads as "this provider has no models".
+        if (catalog.error) {
+          setModelCatalog({ kind: "error", message: catalog.error });
+          return;
+        }
+        setCatalogTierDefaults(catalog.tierDefaults ?? {});
+        setModelCatalog(
+          catalog.models.length
+            ? {
+                kind: "ready",
+                models: catalog.models,
+                baseUrl: catalog.baseUrl,
+                tierDefaults: catalog.tierDefaults ?? {},
+              }
+            : { kind: "empty", baseUrl: catalog.baseUrl },
+        );
       })
       .catch(() => {
-        if (current) setModelCatalog({ kind: "error" });
+        if (current) {
+          setModelCatalog({
+            kind: "error",
+            message: "The provider's model list could not be loaded. Enter model ids directly.",
+          });
+        }
       });
 
     return () => {
@@ -575,7 +630,7 @@ export function InferenceSection({
 
   function pickProvider(next: InferenceProvider) {
     setProvider(next);
-    const preset = presetFor(next, status?.defaultTierModels);
+    const preset = presetFor(next, status?.defaultTierModels, catalogTierDefaults);
     setBaseUrl(preset.baseUrl);
     setModels(preset.models);
     setBaseline({ baseUrl: preset.baseUrl, models: preset.models });
@@ -1045,7 +1100,7 @@ export function InferenceSection({
                         className="text-xs text-muted-foreground"
                         data-testid="inference-model-catalog-fallback"
                       >
-                        OpenRouter&apos;s model list could not be loaded. Enter model ids directly.
+                        {modelCatalog.message}
                       </p>
                     )}
                     {provider === "openrouter" && modelCatalog.kind === "empty" && (
@@ -1053,7 +1108,23 @@ export function InferenceSection({
                         className="text-xs text-muted-foreground"
                         data-testid="inference-model-catalog-empty"
                       >
-                        OpenRouter returned no models. Enter model ids directly.
+                        {modelCatalog.baseUrl} returned no models. Enter model ids directly.
+                      </p>
+                    )}
+                    {/*
+                      Which endpoint these options came from. The list is the
+                      *configured* provider's catalog, not a vendor registry —
+                      and the form's provider select can be pointed somewhere
+                      else than the saved config while an operator is mid-edit,
+                      so naming the endpoint is the difference between a list
+                      the operator can trust and one they have to guess at.
+                    */}
+                    {provider === "openrouter" && modelCatalog.kind === "ready" && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="inference-model-catalog-source"
+                      >
+                        Models listed by {modelCatalog.baseUrl}.
                       </p>
                     )}
                     {/*
@@ -1137,7 +1208,7 @@ export function InferenceSection({
                                       })
                                     }
                                   >
-                                    Choose from the OpenRouter catalog instead
+                                    Choose from the provider&apos;s catalog instead
                                   </button>
                                 )}
                               </div>
@@ -1167,7 +1238,7 @@ export function InferenceSection({
                                   <SelectValue
                                     placeholder={
                                       modelCatalog.kind === "loading"
-                                        ? "Loading OpenRouter models…"
+                                        ? "Loading models…"
                                         : "Choose a model"
                                     }
                                   />

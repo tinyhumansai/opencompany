@@ -1543,11 +1543,14 @@ pub async fn request_plan(
     tools: Vec<serde_json::Value>,
     tool_choice: &ToolChoice,
 ) -> anyhow::Result<RequestPlan> {
-    // Tier -> what this endpoint understands. The direct path talks to
-    // OpenRouter, which has never heard of `chat-v1`, so the tier is resolved
-    // here; the proxied path keeps the tier, which is what the platform's
-    // registry routes on.
-    let model = inference::model_for_tier(abstract_model, &decl.models, decl.is_proxied());
+    // Tier -> what this endpoint understands, read off the endpoint's own
+    // published catalog rather than off who is paying for it. `is_proxied()`
+    // used to stand in for this and is now only the fallback inside
+    // `vocabulary()`: a tenant-keyed config pointed at a tier-native endpoint is
+    // not proxied, and rewriting `chat-v1` to an OpenRouter slug for it is what
+    // produced `Model 'anthropic/claude-sonnet-5' is not available` against an
+    // endpoint that publishes `chat-v1` itself.
+    let model = inference::model_for_tier(abstract_model, &decl.models, decl.vocabulary());
     let url = format!("{}/chat/completions", decl.base_url.trim_end_matches('/'));
     let bearer = decl
         .bearer()
@@ -1847,7 +1850,20 @@ impl TenantProvider {
         .map_err(|e| anyhow::anyhow!("resolving inference config: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no inference provider is configured for this company"))?;
         *self.slug.write().unwrap() = decl.telemetry_slug();
-        Ok(decl)
+        // Ask the endpoint what vocabulary it speaks before deciding whether to
+        // rewrite this turn's tier. Cached per endpoint for an hour (and per
+        // failure for a minute), so this is one extra request per provider per
+        // hour rather than one per turn — and it is a request to the same host
+        // the turn is about to call anyway. A catalog we cannot read leaves the
+        // decl on its pre-discovery fallback, i.e. exactly the behaviour that
+        // shipped before, rather than changing how turns resolve on a blip.
+        let bearer = decl.bearer().await.ok().flatten();
+        let vocabulary = crate::server::inference_models::discovered_vocabulary(
+            &decl.base_url,
+            bearer.as_deref(),
+        )
+        .await;
+        Ok(decl.with_vocabulary(vocabulary))
     }
 }
 
@@ -4011,6 +4027,72 @@ mod tests {
         .await
         .expect("plan");
         assert_eq!(explicit.model, "anthropic/claude-sonnet-4.5");
+    }
+
+    /// The live defect, at the layer that puts the string on the wire.
+    ///
+    /// A company on `provider = "openrouter"` with its own key against a
+    /// tier-native endpoint is **not proxied** — the tenant pays. The old rule
+    /// read the vocabulary off exactly that bit, so every tier was rewritten to
+    /// an OpenRouter slug and the endpoint answered `Model
+    /// 'anthropic/claude-sonnet-5' is not available`, naming an id nobody had
+    /// chosen. With the endpoint's own catalog consulted, the tier reaches it
+    /// intact — and who is billed is unchanged, because that was never the same
+    /// question.
+    #[tokio::test]
+    async fn request_plan_keeps_the_tier_for_a_tier_native_endpoint_on_a_tenant_key() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let mut manifest = manifest_inference("openrouter");
+        manifest.base_url = Some(crate::company::inference::PLATFORM_BASE_URL.into());
+        inference::store_key(&company, &secrets, "test-token")
+            .await
+            .unwrap();
+        let decl = inference::resolve_effective(&company, &manifest, None, &secrets)
+            .await
+            .unwrap()
+            .expect("a keyed openrouter config resolves");
+        assert!(!decl.is_proxied(), "a tenant key means the tenant pays");
+
+        // Pre-discovery: the payer-derived guess, which is what shipped.
+        let guessed = request_plan(
+            &decl,
+            "agentic-v1",
+            Vec::new(),
+            0.0,
+            None,
+            Vec::new(),
+            &ToolChoice::Auto,
+        )
+        .await
+        .expect("plan");
+        assert_eq!(
+            guessed.model, "anthropic/claude-opus-5",
+            "unchanged fallback when no catalog could be read"
+        );
+
+        // The endpoint published `agentic-v1`, so it resolves tiers itself.
+        let discovered =
+            decl.with_vocabulary(Some(crate::company::inference::TierVocabulary::Tiers));
+        let plan = request_plan(
+            &discovered,
+            "agentic-v1",
+            Vec::new(),
+            0.0,
+            None,
+            Vec::new(),
+            &ToolChoice::Auto,
+        )
+        .await
+        .expect("plan");
+        assert_eq!(
+            plan.model, "agentic-v1",
+            "the tier the provider publishes goes out as the tier"
+        );
+        assert!(
+            !discovered.is_proxied(),
+            "discovering the vocabulary must not re-bill the company"
+        );
     }
 
     #[tokio::test]

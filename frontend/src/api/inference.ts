@@ -46,12 +46,17 @@ export interface InferenceStatus {
   /** Abstract-tier → concrete model id. */
   models: Record<string, string>;
   /**
-   * The shipped tier → model defaults, independent of `provider`/`models`
-   * above. The console's OpenRouter preset used to hard-code its own copy of
-   * these ids so the form had something to prefill before an operator typed
-   * an override; that duplicate could silently drift from what the host
+   * The shipped tier → model defaults — **OpenRouter's vocabulary**, and
+   * nothing wider. The console's OpenRouter preset used to hard-code its own
+   * copy of these ids so the form had something to prefill before an operator
+   * typed an override; that duplicate could silently drift from what the host
    * actually defaults to. This is read off the host on every status load, so
    * the preset is never more than one request stale.
+   *
+   * It is only that preset. These are OpenRouter catalog ids and mean nothing
+   * at another endpoint; what the *configured* endpoint wants is
+   * `InferenceModelCatalog.tierDefaults`, derived from that endpoint's own
+   * published catalog.
    */
   defaultTierModels: Record<string, string>;
   /** Provenance badge. */
@@ -116,11 +121,57 @@ export interface InferenceMutation {
   note: string;
 }
 
-/** One model published by the OpenRouter registry. */
+/** One model published by the configured provider's catalog. */
 export interface InferenceModel {
   id: string;
   name?: string;
   contextLength?: number;
+}
+
+/**
+ * How the configured endpoint spells a tier.
+ *
+ * - `tiers` — it publishes the tier names themselves (`chat-v1`, `agentic-v1`)
+ *   and resolves them against its own registry, so a tier is what it wants.
+ * - `concrete` — it publishes the ids `defaultTierModels` names, so a bare tier
+ *   would be rejected and the shipped mapping is the right default.
+ * - `unknown` — its catalog publishes neither, so there is no default anyone can
+ *   supply and the operator has to name a model per tier.
+ *
+ * Absent (`undefined`) means the catalog could not be read at all, which is a
+ * different thing from `unknown` and must not be shown as one.
+ */
+export type TierVocabulary = "tiers" | "concrete" | "unknown";
+
+/**
+ * The catalog of the endpoint **this company is configured against**.
+ *
+ * This route used to answer with a bare array that was always OpenRouter's
+ * public registry, whatever endpoint the company had been pointed at: the
+ * console listed 421 models to a company whose provider published eleven, the
+ * operator picked one the console had offered, and the provider rejected it.
+ * Discovery follows the configured base URL now, and the response says which
+ * endpoint answered so the console can name it rather than imply a vendor.
+ */
+export interface InferenceModelCatalog {
+  /** The endpoint the catalog was read from. */
+  baseUrl: string;
+  /** Every model that endpoint publishes, sorted. Empty when `error` is set. */
+  models: InferenceModel[];
+  /** How this endpoint spells a tier; absent when the catalog is unreadable. */
+  tierVocabulary?: TierVocabulary;
+  /**
+   * The tier → model mapping this endpoint's vocabulary implies. Empty for
+   * `unknown` and for an unreadable catalog: prefilling ids the endpoint has
+   * already told us it does not publish is the defect this field replaces.
+   */
+  tierDefaults: Record<string, string>;
+  /**
+   * Why the catalog is empty, naming the endpoint — a 200 rather than a 5xx,
+   * because an empty picker with no explanation reads as "this provider has no
+   * models", which nobody established.
+   */
+  error?: string;
 }
 
 /** The live-probe result. */
@@ -140,12 +191,12 @@ export function getInferenceStatus(
   return client.get<InferenceStatus>(`${client.scopeFor(company)}/inference`);
 }
 
-/** The cached OpenRouter model catalog exposed by the company host. */
+/** The model catalog of the endpoint this company is configured against. */
 export function listInferenceModels(
   client: OpenCompanyClient,
   company: string | null,
-): Promise<InferenceModel[]> {
-  return client.get<InferenceModel[]>(`${client.scopeFor(company)}/inference/models`);
+): Promise<InferenceModelCatalog> {
+  return client.get<InferenceModelCatalog>(`${client.scopeFor(company)}/inference/models`);
 }
 
 /** Set (or replace) the runtime provider override, optionally rotating the key. */

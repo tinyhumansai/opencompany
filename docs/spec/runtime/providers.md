@@ -131,19 +131,40 @@ Agents address workloads by abstract **tier** — `chat-v1`, `reasoning-v1`,
 a workload, never a model, which is what lets an agent keep its tier while
 moving between harnesses.
 
-What goes on the wire differs by path, and sending the wrong one fails
-(`inference::model_for_tier`):
+What goes on the wire differs by **what the endpoint publishes**, and sending
+the wrong one fails (`inference::model_for_tier`, `inference::TierVocabulary`):
 
-| path | wire value | why |
+| vocabulary | wire value | why |
 |---|---|---|
-| proxied | the tier name (`chat-v1`) | the platform's registry routes on it, pinning each tier to a sub-provider so its rate card stays exact |
-| direct | a concrete slug (`anthropic/claude-sonnet-5`) | OpenRouter has never heard of `chat-v1` |
+| `tiers` | the tier name (`chat-v1`) | the endpoint publishes the tier ids and resolves them itself, pinning each tier to a sub-provider so its rate card stays exact |
+| `concrete` | a concrete slug (`anthropic/claude-sonnet-5`) | the endpoint publishes OpenRouter's catalog and has never heard of `chat-v1` |
+| `unknown` | the tier name, unchanged | the catalog was read and publishes neither, so `DEFAULT_TIER_MODELS` are ids we already know are absent. Both answers fail; only one names a string the operator configured |
 
-On the direct path an unmapped tier takes `DEFAULT_TIER_MODELS`, which mirrors
-the platform's own OpenRouter bindings — so both paths reach the same models and
-adding a key does not silently move a company onto different ones.
+The vocabulary is **discovered, not assumed**. Every OpenAI-compatible endpoint
+publishes `GET {base_url}/models`, so a catalog containing `agentic-v1` is the
+endpoint telling us it resolves tiers. Nothing keys off a hostname.
 
-A harness's own `models` entry is honoured **verbatim on both paths**: the
+It used to be read off `is_proxied()` — true only for the `openrouter` kind with
+no tenant key. That conflated **who pays** with **what vocabulary is spoken**,
+and the two come apart the moment a tenant points its own key at a tier-native
+endpoint: every tier was rewritten to an OpenRouter slug and the provider
+answered `Model 'anthropic/claude-sonnet-5' is not available`, naming an id
+neither the operator nor the provider had ever mentioned. `is_proxied()` still
+decides billing and the product header; it no longer decides the model id.
+
+`is_proxied()` remains the **pre-discovery fallback** inside
+`InferenceDecl::vocabulary()`, used when the catalog cannot be read at all — so
+an unreachable provider behaves exactly as it did before rather than changing
+how turns resolve on a network blip. `InferenceDecl::vocabulary_confirmed()`
+tells the two apart.
+
+`DEFAULT_TIER_MODELS` is the `concrete` mapping and **only** that: four
+OpenRouter catalog ids, mirroring the platform's own OpenRouter bindings so a
+proxied tier and a direct substitution reach the same models. It is not a
+universal default and applying it to an endpoint whose vocabulary has not been
+established is the defect above.
+
+A harness's own `models` entry is honoured **verbatim in every vocabulary**: the
 operator named a specific model, and rewriting it is not ours to do.
 
 ### Naming a specific model on the proxied path
@@ -162,27 +183,56 @@ wants a specific model through the proxy writes the `openrouter/…` form into
 
 ## Model catalog
 
-`GET {scope}/inference/models` lists OpenRouter's public model registry for
-the console's picker — the operator-facing complement to `DEFAULT_TIER_MODELS`
-above, used when an operator wants to pick a *specific* model rather than
-accept a tier default.
+`GET {scope}/inference/models` lists the catalog of **the endpoint this company
+is configured against**, resolved exactly as `baseUrl` on the status route is
+(so a `managed`/keyless company reads the platform endpoint it inherits). The
+company's stored key is presented as the bearer: it is write-only to the console
+(`keyConfigured` is all the console ever sees), so this route is the only thing
+that can ask an authenticated endpoint what it serves.
 
-The route is authenticated like the rest of `{scope}/inference/*` but does not
-read the calling company's own config: the registry is a public, per-process
-resource shared by every tenant on the host, not something scoped per company.
+It used to answer with OpenRouter's public registry unconditionally, ignoring
+the calling company entirely — the console listed 421 models to a company whose
+provider published eleven, the operator picked one the console had offered, and
+the provider rejected it. It also hid the one signal that answers which
+vocabulary the endpoint speaks.
+
+The response carries the vocabulary alongside the catalog, so the picker and the
+tier prefill can never disagree about the same provider:
+
+| field | meaning |
+|---|---|
+| `baseUrl` | the endpoint the catalog came from — the console names it rather than implying a vendor |
+| `models` | every id the endpoint publishes, sorted |
+| `tierVocabulary` | `tiers` / `concrete` / `unknown`, or **absent** when the catalog could not be read — which is not the same as `unknown` and must not be shown as one |
+| `tierDefaults` | the tier → model mapping this endpoint's vocabulary implies. Empty for `unknown` and for an unreadable catalog: there is no mapping we can honestly supply |
+| `error` | why the catalog is empty, naming the endpoint |
+
+A fetch failure (timeout, non-2xx, an empty catalog) is a **200 carrying
+`error`**, not a 5xx. An empty picker with no explanation reads as "this
+provider has no models", which is a claim nobody established; "could not list
+models from `<endpoint>`" is true and leaves the operator able to type an id by
+hand.
+
+The cache is a registry keyed on the normalized base URL — one entry per
+endpoint, each with its own single-flight lock, so two tenants on two providers
+neither share a catalog nor queue behind each other. It is **not** keyed on the
+credential: a catalog is a public property of an endpoint, and hashing a
+credential to key a cache would put a derivative of it in process memory for a
+partition nothing needs.
 
 | property | value |
 |---|---|
 | cache lifetime | 1 hour (`MODEL_CATALOG_TTL`) |
+| failure lifetime | 1 minute (`MODEL_CATALOG_FAILURE_TTL`) — a failure used to store nothing, so an unreachable provider cost a fresh timeout on every status read and every turn that consulted the vocabulary |
 | fetch timeout | 10 seconds (`MODEL_CATALOG_TIMEOUT`) — a console page-load waits at most this long on a cold cache, whatever its position in a `fetch_lock` queue |
-| concurrent misses | coalesced onto a single upstream fetch (`ModelCatalogCache::fetch_lock`) — after startup or a TTL expiry, several console requests arriving together do not each fire their own OpenRouter call. The lock wait and the fetch share one timeout budget per caller, so a caller queued behind others during an outage is not left waiting `N × MODEL_CATALOG_TIMEOUT` for its turn to fail too |
-| malformed entries | skipped individually rather than failing the whole response, so one bad record does not hide every valid model the registry returned |
+| concurrent misses | coalesced onto a single upstream fetch (`ModelCatalogCache::fetch_lock`), per endpoint. The lock wait and the fetch share one timeout budget per caller, so a caller queued behind others during an outage is not left waiting `N × MODEL_CATALOG_TIMEOUT` for its turn to fail too |
+| malformed entries | skipped individually rather than failing the whole response, so one bad record does not hide every valid model the endpoint returned |
 | response ordering | sorted by model id, distinct from the provider order `discover_models` preserves for the local/custom setup probe |
 
-A registry fetch failure (timeout, non-2xx, an empty catalog) surfaces as an
-error on this route rather than silently returning stale or empty data — the
-picker shows a failure state instead of an incomplete list that looks
-complete.
+The turn path (`TenantProvider::resolve`) and the console probe
+(`POST {scope}/inference/test`) read the same cache, so consulting the
+vocabulary costs one request per endpoint per hour rather than one per turn —
+and it is a request to the host the turn is about to call anyway.
 
 ---
 

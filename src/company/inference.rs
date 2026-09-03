@@ -137,14 +137,17 @@ pub const LEGACY_MANAGED: &str = "managed";
 /// The provider a company gets when nothing names one.
 pub const DEFAULT_PROVIDER: &str = "openrouter";
 
-/// Default concrete OpenRouter model id per abstract tier.
+/// The concrete model id per abstract tier **in OpenRouter's vocabulary**.
 ///
-/// Used on the **direct** path only. A tier names a workload, and something has
-/// to turn it into a model id before the request leaves this process — but only
-/// when the endpoint would not do it. See [`model_for_tier`].
+/// Not a universal default, and the name is the only thing about it that ever
+/// suggested otherwise. These four strings are OpenRouter catalog ids: they are
+/// meaningful at an endpoint that publishes OpenRouter's catalog and meaningless
+/// anywhere else, so applying them is only ever correct once
+/// [`TierVocabulary::Concrete`] has been established for the endpoint the
+/// request is about to travel to. See [`model_for_tier`].
 ///
-/// The slugs mirror the platform's own OpenRouter bindings, so proxied and
-/// direct resolve to the same models by default.
+/// The slugs mirror the platform's own OpenRouter bindings, so a proxied tier
+/// and a direct substitution resolve to the same models by default.
 pub const DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
     ("chat-v1", "anthropic/claude-sonnet-5"),
     ("reasoning-v1", "openai/gpt-5.6-sol-pro"),
@@ -152,37 +155,135 @@ pub const DEFAULT_TIER_MODELS: &[(&str, &str)] = &[
     ("vision-v1", "qwen/qwen3.8-max"),
 ];
 
-/// The concrete model id to put on the wire for `tier`.
+/// Which model vocabulary an endpoint speaks — the question that has to be
+/// answered before [`model_for_tier`] can decide whether to substitute anything.
 ///
-/// **The two paths need different answers, and sending the wrong one fails.**
+/// **This is a property of the endpoint, not of who pays for it.** It used to be
+/// read off [`InferenceDecl::is_proxied`], which is true only for the `openrouter`
+/// kind with no tenant key; every other config was assumed to want OpenRouter
+/// catalog ids. That conflated the payer with the vocabulary and broke the
+/// moment the two came apart: a company pointing `provider = "openrouter"` at
+/// `https://api.tinyhumans.ai/openai/v1` **with its own key** is not proxied, so
+/// every tier was rewritten to `anthropic/claude-opus-5` and friends and the
+/// endpoint answered `Model 'anthropic/claude-sonnet-5' is not available` — for
+/// an endpoint whose catalog publishes `chat-v1` and `agentic-v1` directly.
 ///
-/// * **Proxied** — the platform endpoint resolves tier names itself, against a
-///   curated registry that pins each tier to a sub-provider so its rate card
-///   stays exact. A bare tier is exactly what it wants. It also accepts a
-///   concrete model, but only under its own `openrouter/<author>/<slug>`
-///   namespace, and only when passthrough is switched on there — which it is
-///   not by default. So a tier is the only thing that always works.
-/// * **Direct** — OpenRouter has never heard of `chat-v1`, so a tier must be
-///   resolved here or the request 400s.
+/// Every OpenAI-compatible endpoint publishes its catalog at `GET
+/// {base_url}/models`, so the vocabulary is *discoverable* rather than
+/// guessable: see [`TierVocabulary::from_catalog_ids`]. Nothing here keys off a
+/// hostname — a provider that publishes `agentic-v1` is telling us it resolves
+/// tiers itself, whoever it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierVocabulary {
+    /// The endpoint publishes the tier names themselves, so it resolves a tier
+    /// against its own registry. Send the tier verbatim — substituting a
+    /// concrete id bypasses that routing and, on the platform proxy, is
+    /// rejected outright unless passthrough is switched on.
+    Tiers,
+    /// The endpoint publishes the concrete ids [`DEFAULT_TIER_MODELS`] names, so
+    /// a bare tier would 400 and the shipped mapping is the right default.
+    Concrete,
+    /// The endpoint's catalog was read and publishes neither vocabulary. We know
+    /// the shipped ids are *absent* from it, so applying them would be a guess
+    /// already contradicted by evidence.
+    Unknown,
+}
+
+impl TierVocabulary {
+    /// Classify an endpoint from the ids it publishes at `{base_url}/models`.
+    ///
+    /// Tiers win when present: a catalog containing `agentic-v1` resolves tiers
+    /// server-side, and that stays true even if it also lists concrete models.
+    /// `any` rather than `all` on purpose — a provider that publishes three of
+    /// the four tiers still speaks tiers, and demanding a complete set would
+    /// silently fall back to substitution for it.
+    pub fn from_catalog_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let ids: std::collections::HashSet<&str> = ids.into_iter().collect();
+        if crate::company::types::INFERENCE_TIERS
+            .iter()
+            .any(|tier| ids.contains(tier))
+        {
+            return Self::Tiers;
+        }
+        if DEFAULT_TIER_MODELS
+            .iter()
+            .any(|(_, model)| ids.contains(model))
+        {
+            return Self::Concrete;
+        }
+        Self::Unknown
+    }
+
+    /// The wire/console label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tiers => "tiers",
+            Self::Concrete => "concrete",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The tier → model mapping to offer as *this endpoint's* defaults.
+    ///
+    /// Empty for [`Self::Unknown`], and that emptiness is the point: an endpoint
+    /// whose catalog publishes neither vocabulary has no default we can honestly
+    /// supply, so the console must ask the operator for a model id per tier
+    /// rather than prefill four ids the catalog has already told us are not
+    /// there. Handing over a mapping we know is unusable is the failure this
+    /// whole type exists to stop.
+    pub fn tier_defaults(self) -> BTreeMap<String, String> {
+        match self {
+            Self::Tiers => crate::company::types::INFERENCE_TIERS
+                .iter()
+                .map(|tier| ((*tier).to_string(), (*tier).to_string()))
+                .collect(),
+            Self::Concrete => DEFAULT_TIER_MODELS
+                .iter()
+                .map(|(tier, model)| ((*tier).to_string(), (*model).to_string()))
+                .collect(),
+            Self::Unknown => BTreeMap::new(),
+        }
+    }
+}
+
+/// The concrete model id to put on the wire for `tier`, given what the endpoint
+/// this request is about to reach actually publishes.
 ///
-/// An operator's own `models` entry is honoured verbatim on both paths: they
-/// named a specific model and it is not this function's place to rewrite it
-/// (on the proxied path they can write the `openrouter/…` form themselves).
-pub fn model_for_tier(tier: &str, overrides: &BTreeMap<String, String>, proxied: bool) -> String {
+/// An operator's own `models` entry is honoured verbatim in every vocabulary:
+/// they named a specific model and it is not this function's place to rewrite
+/// it.
+///
+/// With no override, the vocabulary decides:
+///
+/// * [`TierVocabulary::Concrete`] — the endpoint publishes OpenRouter catalog
+///   ids and has never heard of `chat-v1`, so the tier is resolved here or the
+///   request 400s.
+/// * [`TierVocabulary::Tiers`] — the endpoint resolves the tier itself against
+///   its own registry, which is exactly what it wants; substituting would bypass
+///   its per-tier provider pinning.
+/// * [`TierVocabulary::Unknown`] — the tier goes out unchanged. Both answers are
+///   wrong at an endpoint that publishes neither vocabulary, but only one of
+///   them is *honest*: the provider's 400 then names a string the operator
+///   configured and can find, next to advice pointing at `GET
+///   {base_url}/models`, instead of an `anthropic/…` id they never typed and
+///   cannot locate in their own catalog.
+pub fn model_for_tier(
+    tier: &str,
+    overrides: &BTreeMap<String, String>,
+    vocabulary: TierVocabulary,
+) -> String {
     if let Some(mapped) = overrides.get(tier) {
         return mapped.clone();
     }
-    if proxied {
-        // Let the platform resolve it. Substituting a concrete slug here would
-        // bypass its per-tier provider pinning and, with passthrough off, be
-        // rejected outright.
-        return tier.to_string();
+    match vocabulary {
+        TierVocabulary::Concrete => DEFAULT_TIER_MODELS
+            .iter()
+            .find(|(name, _)| *name == tier)
+            .map(|(_, model)| (*model).to_string())
+            .unwrap_or_else(|| tier.to_string()),
+        TierVocabulary::Tiers | TierVocabulary::Unknown => tier.to_string(),
     }
-    DEFAULT_TIER_MODELS
-        .iter()
-        .find(|(name, _)| *name == tier)
-        .map(|(_, model)| (*model).to_string())
-        .unwrap_or_else(|| tier.to_string())
 }
 
 /// Normalizes a provider kind: blank and the legacy `managed` both become
@@ -283,6 +384,15 @@ pub struct InferenceDecl {
     /// Whether this rides the platform's subscription proxy. Read through
     /// [`is_proxied`](Self::is_proxied).
     proxied: bool,
+    /// The endpoint's model vocabulary, **once discovered from its catalog**.
+    ///
+    /// `None` means nobody has read `{base_url}/models` for this decl yet, not
+    /// that the endpoint speaks nothing — [`vocabulary`](Self::vocabulary)
+    /// supplies the pre-discovery guess. Discovery is a network read, so it is
+    /// attached by the callers that can afford one and can cache it
+    /// (`crate::server::inference_models::discovered_vocabulary`) rather than
+    /// performed inside this resolve, which runs on every turn.
+    vocabulary: Option<TierVocabulary>,
 }
 
 impl InferenceDecl {
@@ -317,6 +427,40 @@ impl InferenceDecl {
     /// base URL by every caller that cares.
     pub fn is_proxied(&self) -> bool {
         self.proxied
+    }
+
+    /// The model vocabulary to resolve tiers against for this config.
+    ///
+    /// The discovered answer when one is attached; otherwise the pre-discovery
+    /// guess, which is the rule this code used to apply unconditionally:
+    /// proxied endpoints resolve tiers, everything else is assumed to publish
+    /// OpenRouter catalog ids. That guess is wrong for a tier-native endpoint a
+    /// tenant reaches with its own key, which is precisely why discovery
+    /// exists — but keeping it as the fallback means an endpoint whose catalog
+    /// cannot be read behaves exactly as it did before, rather than changing
+    /// behaviour on a network failure.
+    pub fn vocabulary(&self) -> TierVocabulary {
+        self.vocabulary.unwrap_or(if self.proxied {
+            TierVocabulary::Tiers
+        } else {
+            TierVocabulary::Concrete
+        })
+    }
+
+    /// Whether [`vocabulary`](Self::vocabulary) is the endpoint's published
+    /// answer rather than the pre-discovery guess. The console needs the
+    /// difference: "this provider publishes no mapping we recognise" and "we
+    /// could not reach this provider's catalog" are different things to tell an
+    /// operator.
+    pub fn vocabulary_confirmed(&self) -> bool {
+        self.vocabulary.is_some()
+    }
+
+    /// Attach a discovered vocabulary (or clear it back to the guess).
+    #[must_use]
+    pub fn with_vocabulary(mut self, vocabulary: Option<TierVocabulary>) -> Self {
+        self.vocabulary = vocabulary;
+        self
     }
 
     /// The stable telemetry slug for this config
@@ -466,6 +610,7 @@ pub fn decl_for_probe(
         source: InferenceSource::Runtime,
         credential,
         proxied,
+        vocabulary: None,
     }
 }
 
@@ -712,6 +857,7 @@ pub async fn resolve_effective_scoped(
             source: InferenceSource::Runtime,
             credential,
             proxied,
+            vocabulary: None,
         }));
     }
 
@@ -731,6 +877,7 @@ pub async fn resolve_effective_scoped(
             source: InferenceSource::Manifest,
             credential,
             proxied,
+            vocabulary: None,
         }));
     }
 
@@ -755,6 +902,7 @@ pub async fn resolve_effective_scoped(
             source: InferenceSource::Default,
             credential,
             proxied,
+            vocabulary: None,
         }));
     }
 
@@ -1519,7 +1667,7 @@ mod tests {
     fn every_tier_resolves_to_a_concrete_model_id_on_the_direct_path() {
         let none = BTreeMap::new();
         for tier in crate::company::types::INFERENCE_TIERS {
-            let resolved = model_for_tier(tier, &none, false);
+            let resolved = model_for_tier(tier, &none, TierVocabulary::Concrete);
             assert_ne!(
                 &resolved, tier,
                 "`{tier}` must map to a concrete slug, not pass through"
@@ -1548,7 +1696,7 @@ mod tests {
             ("vision-v1", "qwen/qwen3.8-max"),
         ] {
             assert_eq!(
-                model_for_tier(tier, &none, false),
+                model_for_tier(tier, &none, TierVocabulary::Concrete),
                 expected,
                 "`{tier}` must resolve to the documented default `{expected}`"
             );
@@ -1561,34 +1709,167 @@ mod tests {
             BTreeMap::from([("chat-v1".to_string(), "anthropic/claude-haiku".to_string())]);
         // An operator's own entry is honoured verbatim on BOTH paths — they
         // named a specific model, and rewriting it is not this function's call.
-        for proxied in [false, true] {
+        for vocabulary in [
+            TierVocabulary::Concrete,
+            TierVocabulary::Tiers,
+            TierVocabulary::Unknown,
+        ] {
             assert_eq!(
-                model_for_tier("chat-v1", &overrides, proxied),
+                model_for_tier("chat-v1", &overrides, vocabulary),
                 "anthropic/claude-haiku"
             );
         }
         // An unmapped tier still takes the shipped default on the direct path.
         assert_eq!(
-            model_for_tier("reasoning-v1", &overrides, false),
+            model_for_tier("reasoning-v1", &overrides, TierVocabulary::Concrete),
             "openai/gpt-5.6-sol-pro"
         );
         // A caller naming a concrete slug is not treated as an unknown tier.
         assert_eq!(
-            model_for_tier("anthropic/claude-sonnet-4.5", &BTreeMap::new(), false),
+            model_for_tier(
+                "anthropic/claude-sonnet-4.5",
+                &BTreeMap::new(),
+                TierVocabulary::Concrete
+            ),
             "anthropic/claude-sonnet-4.5"
         );
     }
 
-    /// The proxied path keeps the tier name. The platform's registry routes on
-    /// it and pins each tier to a sub-provider; substituting a concrete slug
-    /// would bypass that pinning, and its passthrough namespace is opt-in and
-    /// off by default, so the slug would simply be rejected.
+    /// A tier-native endpoint keeps the tier name. The platform's registry
+    /// routes on it and pins each tier to a sub-provider; substituting a
+    /// concrete slug would bypass that pinning, and its passthrough namespace
+    /// is opt-in and off by default, so the slug would simply be rejected.
     #[test]
-    fn the_proxied_path_keeps_the_tier_name() {
+    fn a_tier_native_endpoint_keeps_the_tier_name() {
         let none = BTreeMap::new();
         for tier in crate::company::types::INFERENCE_TIERS {
-            assert_eq!(&model_for_tier(tier, &none, true), tier);
+            assert_eq!(&model_for_tier(tier, &none, TierVocabulary::Tiers), tier);
         }
+    }
+
+    /// The signal that answers "which of these is this provider?" — a catalog
+    /// publishing `agentic-v1` is telling us it resolves tiers itself. Nothing
+    /// here looks at a hostname: the same catalog served from anywhere
+    /// classifies the same way.
+    #[test]
+    fn a_catalog_publishing_tier_names_classifies_as_tier_native() {
+        assert_eq!(
+            TierVocabulary::from_catalog_ids([
+                "reasoning-v1",
+                "vision-v1",
+                "chat-v1",
+                "burst-v1",
+                "agentic-v1",
+                "coding-v1",
+                "whisper-v1",
+                "embedding-v1",
+            ]),
+            TierVocabulary::Tiers
+        );
+        // Three of four is still a tier-native provider — demanding a complete
+        // set would silently fall back to substitution for it.
+        assert_eq!(
+            TierVocabulary::from_catalog_ids(["chat-v1", "agentic-v1", "reasoning-v1"]),
+            TierVocabulary::Tiers
+        );
+    }
+
+    /// OpenRouter's catalog publishes the concrete ids and none of the tiers,
+    /// so it keeps the shipped substitution.
+    #[test]
+    fn a_catalog_publishing_the_shipped_ids_classifies_as_concrete() {
+        assert_eq!(
+            TierVocabulary::from_catalog_ids([
+                "anthropic/claude-opus-5",
+                "anthropic/claude-sonnet-5",
+                "openai/gpt-5.6-sol-pro",
+                "qwen/qwen3.8-max",
+                "meta-llama/llama-4",
+            ]),
+            TierVocabulary::Concrete
+        );
+    }
+
+    /// A catalog that publishes neither is `Unknown`, and `Unknown` supplies no
+    /// defaults at all. This is the half that broke the probe: the shipped ids
+    /// used to be applied to *every* non-proxied endpoint, so an operator ended
+    /// up with a four-entry mapping their provider had already told us it does
+    /// not publish.
+    #[test]
+    fn a_catalog_publishing_neither_vocabulary_offers_no_defaults() {
+        let vocabulary = TierVocabulary::from_catalog_ids(["llama3.1", "mistral-small"]);
+        assert_eq!(vocabulary, TierVocabulary::Unknown);
+        assert!(
+            vocabulary.tier_defaults().is_empty(),
+            "an endpoint whose catalog names none of our ids has no default we can honestly supply"
+        );
+        let none = BTreeMap::new();
+        assert_eq!(
+            model_for_tier("agentic-v1", &none, vocabulary),
+            "agentic-v1",
+            "the tier goes out unchanged, so the provider's 400 names a string the operator \
+             configured rather than an `anthropic/…` id they never typed"
+        );
+    }
+
+    /// The defaults each vocabulary implies, asserted against hardcoded values
+    /// rather than read back from the tables they come from — asserting a table
+    /// against itself would pass whatever the table said.
+    #[test]
+    fn tier_defaults_follow_the_vocabulary() {
+        assert_eq!(
+            TierVocabulary::Tiers.tier_defaults(),
+            BTreeMap::from([
+                ("chat-v1".to_string(), "chat-v1".to_string()),
+                ("reasoning-v1".to_string(), "reasoning-v1".to_string()),
+                ("agentic-v1".to_string(), "agentic-v1".to_string()),
+                ("vision-v1".to_string(), "vision-v1".to_string()),
+            ]),
+            "a tier-native provider resolves the tier itself, so identity is the mapping"
+        );
+        assert_eq!(
+            TierVocabulary::Concrete
+                .tier_defaults()
+                .get("agentic-v1")
+                .map(String::as_str),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    /// The pre-discovery fallback, and the reason discovery has to exist: a
+    /// tenant-keyed config is not proxied, so without a discovered answer it is
+    /// still guessed as `Concrete` — which is exactly the guess that failed
+    /// against a tier-native endpoint. Attaching the endpoint's own answer is
+    /// what changes it, and `is_proxied()` is untouched by that, because who
+    /// pays and what vocabulary is spoken are different facts.
+    #[test]
+    fn a_discovered_vocabulary_overrides_the_payer_derived_guess() {
+        let decl = decl_for_probe(
+            "openrouter",
+            Some(PLATFORM_BASE_URL),
+            Some("test-token"),
+            None,
+        );
+        assert!(!decl.is_proxied(), "a tenant key means the tenant pays");
+        assert_eq!(
+            decl.vocabulary(),
+            TierVocabulary::Concrete,
+            "the pre-discovery guess"
+        );
+        assert!(!decl.vocabulary_confirmed());
+
+        let decl = decl.with_vocabulary(Some(TierVocabulary::Tiers));
+        assert!(decl.vocabulary_confirmed());
+        assert_eq!(decl.vocabulary(), TierVocabulary::Tiers);
+        assert!(
+            !decl.is_proxied(),
+            "discovering the vocabulary must not move who is billed"
+        );
+        assert_eq!(
+            model_for_tier("agentic-v1", &decl.models, decl.vocabulary()),
+            "agentic-v1",
+            "the tier reaches a tier-native endpoint intact"
+        );
     }
 
     #[test]

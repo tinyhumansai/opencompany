@@ -81,19 +81,122 @@ pub fn router() -> Router<AppState> {
     .merge(scoped("/inference/restart", post(restart_runtime)))
 }
 
-/// `GET …/inference/models` — the cached public OpenRouter model registry.
-async fn list_models(
-    company: ScopedCompany,
-) -> Result<Json<Vec<crate::server::inference_models::InferenceModel>>, ApiError> {
-    let _ = company;
-    crate::server::inference_models::openrouter_models()
+/// What `GET …/inference/models` answers: the catalog **this company's endpoint**
+/// publishes, and what that catalog says about how tiers must be spelled for it.
+///
+/// The route used to answer with a bare array, and that array was always
+/// OpenRouter's public registry — whatever endpoint the company had been pointed
+/// at. An operator on a TinyHumans base URL was shown 421 OpenRouter models,
+/// picked `anthropic/claude-sonnet-5` from them because the console offered it,
+/// and got `Model 'anthropic/claude-sonnet-5' is not available` from a provider
+/// that publishes `chat-v1` and `agentic-v1` instead.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCatalogDto {
+    /// The endpoint the catalog was read from — the same URL
+    /// [`InferenceStatusDto::base_url`] reports, so the console can say *whose*
+    /// list this is instead of implying a vendor.
+    base_url: String,
+    /// Every model the endpoint publishes, sorted. Empty when `error` is set.
+    models: Vec<crate::server::inference_models::InferenceModel>,
+    /// How this endpoint spells a tier: `tiers` (it publishes the tier names and
+    /// resolves them itself), `concrete` (it publishes the ids
+    /// [`inference::DEFAULT_TIER_MODELS`] names), or `unknown` (neither).
+    /// `null` when the catalog could not be read, which is not the same as
+    /// `unknown` and must not be shown as one.
+    tier_vocabulary: Option<&'static str>,
+    /// The tier → model mapping this endpoint's own vocabulary implies, for the
+    /// console to prefill with. Empty for `unknown` and for an unreadable
+    /// catalog: there is no mapping we can honestly supply, and prefilling one
+    /// we already know the endpoint does not publish is the bug this route was
+    /// on the wrong side of.
+    tier_defaults: BTreeMap<String, String>,
+    /// Why the catalog is empty, in the operator's words, or `null` on success.
+    ///
+    /// Carried in a 200 rather than raised as a 500 on purpose: an empty picker
+    /// with no explanation reads as "this provider has no models", which is a
+    /// claim we have not established. "Could not list models from
+    /// `<endpoint>`" is a true statement and leaves the operator able to type an
+    /// id by hand, which is exactly what they should do next.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// The endpoint a company's requests actually travel to, and the credential they
+/// carry — resolved the same way [`effective_status_with`] resolves `base_url`,
+/// so the catalog is read from the endpoint the turns use.
+///
+/// Resolved *with* the platform default in place: a `managed`/keyless
+/// `openrouter` company inherits the platform endpoint and its credential, and
+/// reading the catalog without them would list the wrong endpoint's models on
+/// exactly the companies that never configured anything.
+async fn resolved_endpoint(
+    runtime: &CompanyRuntime,
+) -> Result<Option<(String, Option<String>)>, ApiError> {
+    let (manifest, _harness_id) = manifest_inference(runtime).await?;
+    let secrets = runtime.secrets().as_ref();
+    let platform = platform_default(&crate::app::config::ProcessEnv);
+    let Some(decl) = resolve_effective(runtime.id(), &manifest, platform.as_ref(), secrets)
         .await
-        .map(Json)
-        .map_err(|error| {
-            ApiError(OpenCompanyError::Store(format!(
-                "OpenRouter model registry unavailable: {error}"
-            )))
-        })
+        .map_err(ApiError)?
+    else {
+        return Ok(None);
+    };
+    let bearer = decl.bearer().await.map_err(ApiError)?;
+    Ok(Some((decl.base_url.clone(), bearer)))
+}
+
+/// `GET …/inference/models` — the model catalog of the endpoint **this company**
+/// is configured against, cached per endpoint.
+///
+/// Every OpenAI-compatible provider publishes `GET {base_url}/models`, so
+/// discovery follows the configured base URL rather than assuming a vendor. The
+/// company's stored key is read host-side and presented as the bearer: it is
+/// write-only to the console (`keyConfigured` is all the console ever sees), so
+/// this route is the only place that can ask an authenticated endpoint what it
+/// serves.
+async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, ApiError> {
+    let runtime = company.runtime.as_ref();
+    let Some((base_url, bearer)) = resolved_endpoint(runtime).await? else {
+        // Nothing resolves — not even a platform default on this host. There is
+        // no endpoint to ask, and saying so beats listing some other vendor's
+        // catalog as if it were this company's.
+        return Ok(Json(ModelCatalogDto {
+            base_url: String::new(),
+            models: Vec::new(),
+            tier_vocabulary: None,
+            tier_defaults: BTreeMap::new(),
+            error: Some(
+                "No inference endpoint is configured for this company, so there is no model \
+                 catalog to list. Save a provider first."
+                    .to_string(),
+            ),
+        }));
+    };
+
+    match crate::server::inference_models::catalog_models(&base_url, bearer.as_deref()).await {
+        Ok(models) => {
+            let vocabulary = inference::TierVocabulary::from_catalog_ids(
+                models.iter().map(|model| model.id.as_str()),
+            );
+            Ok(Json(ModelCatalogDto {
+                base_url,
+                models,
+                tier_vocabulary: Some(vocabulary.as_str()),
+                tier_defaults: vocabulary.tier_defaults(),
+                error: None,
+            }))
+        }
+        Err(error) => Ok(Json(ModelCatalogDto {
+            error: Some(format!(
+                "Could not list models from {base_url}: {error}. Enter model ids directly."
+            )),
+            base_url,
+            models: Vec::new(),
+            tier_vocabulary: None,
+            tier_defaults: BTreeMap::new(),
+        })),
+    }
 }
 
 /// The company's effective inference status as the console renders it. **Never**
@@ -113,8 +216,8 @@ struct InferenceStatusDto {
     base_url: String,
     /// Abstract-tier → concrete model id.
     models: BTreeMap<String, String>,
-    /// The shipped tier → model defaults ([`inference::DEFAULT_TIER_MODELS`]),
-    /// independent of `provider`/`models` above.
+    /// The shipped tier → model defaults ([`inference::DEFAULT_TIER_MODELS`]) —
+    /// **OpenRouter's vocabulary**, and nothing wider.
     ///
     /// The console's OpenRouter preset used to hard-code its own copy of these
     /// four ids so switching to OpenRouter had something to prefill the form
@@ -123,6 +226,14 @@ struct InferenceStatusDto {
     /// `DEFAULT_TIER_MODELS` changed. Carrying the live values on every status
     /// read means the preset is never more than one request stale, on a route
     /// the console already polls.
+    ///
+    /// It is *only* that preset. These are OpenRouter catalog ids, so they are
+    /// the right prefill for the OpenRouter provider and meaningless for any
+    /// other endpoint. What the **configured** endpoint wants is a different
+    /// question, answered from that endpoint's own catalog by
+    /// [`ModelCatalogDto::tier_defaults`] on `GET …/inference/models`; treating
+    /// this field as a universal default is what put four OpenRouter ids into a
+    /// TinyHumans company's tier mapping.
     default_tier_models: BTreeMap<String, String>,
     /// Where the effective config came from: `default` / `manifest` / `runtime`,
     /// or `managed` when nothing tenant-specific is configured.
@@ -714,12 +825,17 @@ async fn unauthenticated_reason(
     if decl.bearer().await?.is_some() {
         return Ok(None);
     }
+    // The endpoint is named rather than the vendor. The `openrouter` *kind* no
+    // longer implies OpenRouter's endpoint — the same kind carrying a
+    // tenant `base_url` reaches whatever that URL points at — so "save an
+    // OpenRouter key" is advice that sends the operator of a differently-pointed
+    // company to buy a credential their provider will never see.
     Ok(Some(format!(
         "No inference key is stored for this company, and this host has no platform credential to \
-         fall back on — a request to {} would carry no Authorization header and be rejected, so \
-         none was sent. Save an OpenRouter key above, or point this company at an endpoint that \
-         needs none.",
-        decl.base_url
+         fall back on — a request to {base} would carry no Authorization header and be rejected, \
+         so none was sent. Save a key that {base} accepts above, or point this company at an \
+         endpoint that needs none.",
+        base = decl.base_url
     )))
 }
 
@@ -825,6 +941,24 @@ async fn test_config(company: ScopedCompany) -> Response {
                 }
                 Ok(None) => {}
             }
+            // Ask the endpoint what vocabulary it speaks before the probe
+            // chooses a model for it. Without this the probe resolves tiers by
+            // the pre-discovery guess, which is what made a perfectly good
+            // TinyHumans config fail Test with `Model
+            // 'anthropic/claude-sonnet-5' is not available` — an id neither the
+            // operator nor the provider ever named.
+            let decl = {
+                let bearer = match decl.bearer().await {
+                    Ok(bearer) => bearer,
+                    Err(err) => return ApiError(err).into_response(),
+                };
+                let vocabulary = crate::server::inference_models::discovered_vocabulary(
+                    &decl.base_url,
+                    bearer.as_deref(),
+                )
+                .await;
+                decl.with_vocabulary(vocabulary)
+            };
             // The default harness's real id, whether or not it declares its own
             // `[harness.inference]` — `model_unavailable_advice` names the same
             // table either way (its own, or the company's as the harness's
@@ -1239,26 +1373,175 @@ base_url = "https://byo.example/v1"
         (status, value, raw)
     }
 
-    #[tokio::test]
-    async fn model_catalog_route_returns_cached_openrouter_models() {
-        let home_dir = home();
-        let state = state_with_company(home_dir.path()).await;
-        crate::server::inference_models::openrouter_cache().store(
-            vec![crate::server::inference_models::InferenceModel {
-                id: "provider/real-model".to_string(),
-                name: Some("Real Model".to_string()),
-                context_length: Some(128_000),
-            }],
+    /// Seed one endpoint's catalog cache so the route answers offline, and
+    /// deterministically: each test uses a base URL of its own, because the
+    /// registry is process-wide and a shared key would let one test's positive
+    /// entry decide another's outcome.
+    fn seed_catalog(base_url: &str, ids: &[&str]) {
+        crate::server::inference_models::catalog_cache(base_url).store(
+            ids.iter()
+                .map(|id| crate::server::inference_models::InferenceModel {
+                    id: (*id).to_string(),
+                    name: Some(format!("{id} (display)")),
+                    context_length: Some(128_000),
+                })
+                .collect(),
             std::time::Instant::now(),
         );
+    }
+
+    /// The catalog is read from the endpoint **this company** is configured
+    /// against, not from OpenRouter's public registry.
+    ///
+    /// This is the defect in one assertion. The route used to call
+    /// `openrouter_models()` with no reference to the company at all, so a
+    /// company pointed at a TinyHumans base URL was shown OpenRouter's 421
+    /// models — `anthropic/claude-sonnet-5` among them — and the endpoint then
+    /// answered `Model 'anthropic/claude-sonnet-5' is not available`.
+    #[tokio::test]
+    async fn model_catalog_route_lists_the_configured_endpoints_own_catalog() {
+        const ENDPOINT: &str = "http://127.0.0.1:9/tier-native/v1";
+        let home_dir = home();
+        let state = state_with_company(home_dir.path()).await;
+        seed_catalog(
+            ENDPOINT,
+            &["agentic-v1", "chat-v1", "reasoning-v1", "vision-v1"],
+        );
+
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({
+                "provider": "openai_compatible",
+                "baseUrl": ENDPOINT,
+                "key": "test-token",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
 
         let (status, body, raw) =
             send(&state, "GET", "/api/v1/company/inference/models", None).await;
 
         assert_eq!(status, StatusCode::OK, "{raw}");
-        assert_eq!(body[0]["id"], "provider/real-model");
-        assert_eq!(body[0]["name"], "Real Model");
-        assert_eq!(body[0]["contextLength"], 128_000);
+        assert_eq!(
+            body["baseUrl"], ENDPOINT,
+            "the catalog names the endpoint it came from: {raw}"
+        );
+        let ids: Vec<&str> = body["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["agentic-v1", "chat-v1", "reasoning-v1", "vision-v1"],
+            "the configured endpoint's own ids, not OpenRouter's: {raw}"
+        );
+        assert_eq!(
+            body["tierVocabulary"], "tiers",
+            "an endpoint publishing the tier names is telling us it resolves them: {raw}"
+        );
+        assert_eq!(
+            body["tierDefaults"]["agentic-v1"], "agentic-v1",
+            "so the default mapping for it is identity, not an OpenRouter slug: {raw}"
+        );
+    }
+
+    /// The other vocabulary: an endpoint publishing the concrete ids
+    /// [`inference::DEFAULT_TIER_MODELS`] names still gets the shipped mapping.
+    #[tokio::test]
+    async fn model_catalog_route_keeps_concrete_defaults_for_a_concrete_catalog() {
+        const ENDPOINT: &str = "http://127.0.0.1:9/concrete/v1";
+        let home_dir = home();
+        let state = state_with_company(home_dir.path()).await;
+        seed_catalog(
+            ENDPOINT,
+            &[
+                "anthropic/claude-opus-5",
+                "anthropic/claude-sonnet-5",
+                "openai/gpt-5.6-sol-pro",
+                "qwen/qwen3.8-max",
+            ],
+        );
+
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({
+                "provider": "openai_compatible",
+                "baseUrl": ENDPOINT,
+                "key": "test-token",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (status, body, raw) =
+            send(&state, "GET", "/api/v1/company/inference/models", None).await;
+
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(body["tierVocabulary"], "concrete", "{raw}");
+        assert_eq!(
+            body["tierDefaults"]["agentic-v1"], "anthropic/claude-opus-5",
+            "{raw}"
+        );
+    }
+
+    /// A provider that cannot be reached must say so. An empty list is not a
+    /// true statement about a catalog nobody managed to read, and the picker
+    /// blanking with no explanation is how an operator concludes their provider
+    /// serves no models.
+    #[tokio::test]
+    async fn model_catalog_route_reports_an_unreachable_provider_rather_than_blanking() {
+        // The discard port: refuses fast, offline, and deterministically.
+        const ENDPOINT: &str = "http://127.0.0.1:9/unreachable/v1";
+        let home_dir = home();
+        let state = state_with_company(home_dir.path()).await;
+
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({
+                "provider": "openai_compatible",
+                "baseUrl": ENDPOINT,
+                "key": "test-token",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (status, body, raw) =
+            send(&state, "GET", "/api/v1/company/inference/models", None).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the console needs a body it can render, not a bare 5xx: {raw}"
+        );
+        assert!(
+            body["models"].as_array().is_some_and(|m| m.is_empty()),
+            "{raw}"
+        );
+        assert!(
+            body["tierVocabulary"].is_null(),
+            "unreadable is not `unknown`: {raw}"
+        );
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("Could not list models from") && error.contains(ENDPOINT),
+            "the failure names the endpoint it could not reach: {raw}"
+        );
+        assert!(
+            body["tierDefaults"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty),
+            "no catalog means no defaults we can honestly prefill: {raw}"
+        );
     }
 
     // ---------------------------------------------------------------------
