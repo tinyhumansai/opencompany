@@ -4151,8 +4151,8 @@ impl OverlayBlob {
 /// [`CONFINED_AGENT_ID`](crate::ports::CONFINED_AGENT_ID), unmintable by
 /// construction because slugs never emit a hyphen.
 ///
-/// [`MAIN_THREAD_ID`](crate::server::chat_history::MAIN_THREAD_ID) and
-/// [`DEFAULT_DESK`](crate::server::ops::language::DEFAULT_DESK) join them for
+/// [`MAIN_THREAD_ID`](tinyhivemind_core::chat::MAIN_THREAD_ID) and
+/// [`GENERAL_DESK`](tinyhivemind_core::chat::GENERAL_DESK) join them for
 /// issue #1743, and both are ordinary slugs — a teammate named "Main" or
 /// "General" mints straight onto one. That id is a chat address: `responder_for`
 /// checks roster ids before it falls back to the orchestrator, so the teammate
@@ -4160,13 +4160,22 @@ impl OverlayBlob {
 /// console would render the line's transcript as that teammate's DM. Desk ids
 /// and names are already excluded a few lines below; these are the two keys
 /// that route like a desk without being one.
+///
+/// The General entry is the **identity** constant, not
+/// `server::ops::language::DEFAULT_DESK`, the operator-facing glossary word
+/// that happens to be the same literal. What is reserved here is a chat
+/// address, and this is the port layer: a port naming a server constant is the
+/// upward reach the shared crate exists to remove. The two cannot drift — a
+/// `const` assertion in [`crate::server::chat_history`] pins them together at
+/// compile time — so the reservation still covers a teammate named "General"
+/// however the host chooses to spell that word.
 pub const RESERVED_AGENT_IDS: [&str; 6] = [
     crate::runtime::OPERATOR_CHANNEL,
     crate::company::workspace_scaffold::AGENTS_ROOT,
     crate::company::workspace_scaffold::DESKS_ROOT,
     crate::ports::SYSTEM_AUTHOR,
-    crate::server::chat_history::MAIN_THREAD_ID,
-    crate::server::ops::language::DEFAULT_DESK,
+    tinyhivemind_core::chat::MAIN_THREAD_ID,
+    tinyhivemind_core::chat::GENERAL_DESK,
 ];
 
 /// A durable company record: charter/roster (manifest) plus ledger and
@@ -4583,11 +4592,11 @@ impl CompanyRecord {
         if let Some(exact) = self.manifest.group_chats.iter().find(|c| c.id == key) {
             return Some(exact.id.clone());
         }
-        if !crate::server::chat_history::is_general_chat(Some(key))
+        if !tinyhivemind_core::chat::is_general_chat(Some(key))
             && let Some(exact) = self
                 .overlay_desks
                 .iter()
-                .filter(|d| !crate::server::chat_history::is_general_chat(Some(&d.id)))
+                .filter(|d| !tinyhivemind_core::chat::is_general_chat(Some(&d.id)))
                 .find(|d| d.id == key)
         {
             return Some(exact.id.clone());
@@ -4599,7 +4608,7 @@ impl CompanyRecord {
             .find(|c| c.id == key || c.name.eq_ignore_ascii_case(key))
             .map(|c| c.id.clone())
             .or_else(|| {
-                if crate::server::chat_history::is_general_chat(Some(key)) {
+                if tinyhivemind_core::chat::is_general_chat(Some(key)) {
                     return None;
                 }
                 self.overlay_desks
@@ -4612,7 +4621,7 @@ impl CompanyRecord {
                     // that every desk mutation refuses. Its lead would answer,
                     // and the reply would be journaled under a thread the
                     // console renders no channel for.
-                    .filter(|d| !crate::server::chat_history::is_general_chat(Some(&d.id)))
+                    .filter(|d| !tinyhivemind_core::chat::is_general_chat(Some(&d.id)))
                     .find(|d| d.id == key || d.name.eq_ignore_ascii_case(key))
                     .map(|d| d.id.clone())
             })
@@ -4639,10 +4648,11 @@ impl CompanyRecord {
     /// overlay tier only when the manifest has no match at all.
     pub fn desk_alias_is_ambiguous(&self, key: &str) -> bool {
         if self.manifest.group_chats.iter().any(|c| c.id == key)
-            || (!crate::server::chat_history::is_general_chat(Some(key))
-                && self.overlay_desks.iter().any(|d| {
-                    d.id == key && !crate::server::chat_history::is_general_chat(Some(&d.id))
-                }))
+            || (!tinyhivemind_core::chat::is_general_chat(Some(key))
+                && self
+                    .overlay_desks
+                    .iter()
+                    .any(|d| d.id == key && !tinyhivemind_core::chat::is_general_chat(Some(&d.id))))
         {
             return false;
         }
@@ -4655,12 +4665,12 @@ impl CompanyRecord {
         if manifest_matches > 0 {
             return manifest_matches > 1;
         }
-        if crate::server::chat_history::is_general_chat(Some(key)) {
+        if tinyhivemind_core::chat::is_general_chat(Some(key)) {
             return false;
         }
         self.overlay_desks
             .iter()
-            .filter(|d| !crate::server::chat_history::is_general_chat(Some(&d.id)))
+            .filter(|d| !tinyhivemind_core::chat::is_general_chat(Some(&d.id)))
             .filter(|d| d.name.eq_ignore_ascii_case(key))
             .count()
             > 1
