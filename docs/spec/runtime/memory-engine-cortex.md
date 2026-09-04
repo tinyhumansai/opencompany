@@ -18,21 +18,17 @@ argument retracted**; see [Correction](#correction-2026-09-04) below.
 
 ## Correction (2026-09-04)
 
-**Finding 3 below is withdrawn. It was measured on a server with enrichment
-switched off, and nothing on the wire said so.**
+**Finding 3 below is overturned, not merely withdrawn. The derived fact and
+belief tier works.** It was measured on a server with enrichment switched off,
+and on v0.9.8 nothing on the wire said so.
 
 CortexDB v0.9.9 (released 2026-09-03, after this record was written) adds
 `embeddings`, `enrichment` and `content_processors` checks to
 `GET /v1/admin/ready`, precisely because a server could report
-`{"status":"healthy"}` and `degraded: false` while underdelivering. Run against
-our deployment it answered immediately:
+`{"status":"healthy"}` and `degraded: false` while underdelivering. Ours
+answered `enrichment: { "enabled": false, "mode": "off" }`.
 
-```text
-"enrichment": { "enabled": false, "mode": "off",
-  "detail": "enrichment OFF: facts, beliefs and concepts will stay empty" }
-```
-
-Three prerequisites were unset, none of them discoverable on v0.9.8:
+Three prerequisites were unset, none discoverable on v0.9.8:
 
 1. `CORTEX_ENRICHMENT_URL` / `_API_KEY` — the enrichment router is a separate
    lane from `CORTEX_LLM_*`. `_MODEL` alone gives it a model with no endpoint.
@@ -42,21 +38,34 @@ Three prerequisites were unset, none of them discoverable on v0.9.8:
 3. `CORTEX_ENRICHMENT_DELAY_SECONDS` — **the on/off gate**. Unset means
    enrichment is off entirely: "events/episodes/recall only".
 
-With all three wired, enrichment reports `mode: "deferred:5s"`, both routers
-start, and 600 events drain through the pipeline. Facts still indexed 0 — but
-that run is void too: the embedding provider was returning `402 Insufficient
-credits` (0 ok / 622 failed, resident vectors 2009 -> 0). No embeddings means no
-vectors, no LLM lanes and no facts, so it measures our billing, not Cortex.
+A first re-run still indexed 0 facts, because the embedding provider was
+answering `402 Insufficient credits`. With that fixed — 120 embedding calls,
+0 failures — **10 events produced 19 facts and 9 beliefs**, as
+subject/predicate/object triples with resolved entities and confidence:
 
-**Status: the derived tier is unproven in both directions.** Re-measurement is
-pending provider credit. What survives unchanged is finding 2 — the isolation
-leak — which *forces* instance-per-tenant rather than blocking it: it removes
-the shared-instance-with-per-tenant-credentials row from the topology table, and
-instance-per-tenant needs no token scoping at all. The concepts lane also still
-fails, with both routers verifiably up. So the architecture conclusion is
-untouched; what is suspended is the "nothing over the incumbents" leg, which is
-the part that made declining look obvious rather than merely defensible.
-Tracked on [#2072](https://github.com/tinyhumansai/opencompany/issues/2072).
+```text
+ent_Aniketh                  prefers  "evidence over product-page claims"
+ent_tinymemory_cortex_driver folds    "newest-per-key on read"     conf 1.0
+```
+
+So the commercial argument against Cortex — that it offers nothing the
+incumbents do not — does not hold. It offers this.
+
+**What replaces it is narrower and sharper: beliefs build but never revise.**
+Three events establishing "Priya Raman owns billing", then two handing it to
+Marcus Webb, leaves *both* owners live at `confidence: 1.0` with `valid_to:
+null`, and `/v1/recall` returns them undifferentiated. The section below was
+right about the consequence and wrong about the cause (its heading is now
+corrected too): a `FactStore` consumer
+reads live and superseded claims with nothing marking which is which. Filed as
+[#2089](https://github.com/tinyhumansai/opencompany/issues/2089). Understanding
+stays empty and concepts stay broken.
+
+Finding 2 is untouched, and it *forces* instance-per-tenant rather than blocking
+it: it removes the shared-instance-with-per-tenant-credentials row from the
+topology table, while instance-per-tenant needs no token scoping at all. The
+decision taken on [#2072](https://github.com/tinyhumansai/opencompany/issues/2072)
+is to adopt at that topology.
 
 ## Findings first
 
@@ -82,11 +91,12 @@ question, and the recommendation follows from them.
    `cortex-auth-ref` issuer — which is absent from the v0.9.8 assets, has no
    public repository, and no published contract. So the reachable minter does
    not isolate, and the isolating one is not reachable.
-3. ~~**The derived fact and belief tier does not work.**~~ **Withdrawn — see
-   [Correction](#correction-2026-09-04).** Facts, Beliefs and Understanding were
-   empty, but enrichment was off and the server had no way to report it. What
-   still holds is the structural half: these are Cortex *layers*, not contract
-   capability families, so the audit cannot fire on them however empty they are.
+3. ~~**The derived fact and belief tier does not work.**~~ **Overturned — see
+   [Correction](#correction-2026-09-04).** The run below had enrichment off and
+   no way to report it; configured, and on a funded provider account, Facts and
+   Beliefs do build. What still holds is the structural half: these are Cortex
+   *layers*, not contract capability families, so the audit cannot fire on them
+   however empty they are.
 4. **Retrieval quality is real, and comes from embeddings alone.** Ranked recall
    over the Events layer is good and needs no LLM lanes at all.
 5. **The contract's upsert has no direct mapping, but a conformant driver is
@@ -222,7 +232,7 @@ alone would not make Cortex cheap**: keyed reads would still scan and writes
 would still wait, because those need a metadata filter and a readiness signal
 that are separate asks.
 
-## Belief revision is not reachable
+## Belief revision is reachable, and silently wrong
 
 Worth stating separately because it is much of what would justify preferring
 Cortex over the drivers we already have. Tested directly: three events
@@ -234,10 +244,12 @@ POST /v1/beliefs/build
  "reasons":{"no_belief_shaped_events":1,"no_facts_in_scope":1}}
 ```
 
-Beliefs are gated on Facts; Facts did not extract; beliefs did not build. **This
-run is subject to the [Correction](#correction-2026-09-04) too** — `no_facts_in_scope`
-is exactly what an enrichment-off server reports, so this tests the same
-misconfiguration rather than belief revision.
+`no_facts_in_scope` is exactly what an enrichment-off server reports, so this run
+tested the [misconfiguration](#correction-2026-09-04), not belief revision. Re-run
+correctly, beliefs **do** build — and still do not revise: the contradicted owner
+stays live at equal confidence beside the correction, `valid_to: null` on both.
+The conclusion below therefore stands, and is worse than "not reachable": it is
+reachable, silently wrong, and filed as #2089.
 
 What recall does with the contradiction is adequate *by accident*: the correction
 ranks first on semantic similarity, while the superseded claim is still returned
