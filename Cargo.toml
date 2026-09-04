@@ -316,7 +316,7 @@ hmac = "0.12"
 # liability — so `calamine` reads that one.
 pdf-extract = { version = "0.12", optional = true }
 calamine = { version = "0.36", optional = true }
-quick-xml = { version = "0.41", optional = true }
+quick-xml = { version = "0.42", optional = true }
 zip = { version = "7", default-features = false, features = ["deflate"], optional = true }
 
 sha2 = "0.10"
