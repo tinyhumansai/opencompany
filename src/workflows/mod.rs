@@ -58,6 +58,10 @@ mod publish_refusal_notice_test;
 /// Issue #846: a continuation replays the outward calls its lineage already
 /// made, instead of making them a second time.
 pub mod replay;
+/// Defect B-072: one host-side answer to "what does deciding these cards do?",
+/// so the run's notice and the Observatory's diagnosis cannot contradict each
+/// other in the same panel.
+pub mod resume_claim;
 pub mod runner;
 pub mod translate;
 /// Issue #1098: a scheduled workflow granted a standing permission stops

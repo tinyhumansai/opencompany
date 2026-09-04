@@ -429,7 +429,13 @@ export function TaskDetailView({
   deciding?: ReadonlyMap<string, Verdict>;
   decided?: Readonly<Record<string, DecidedApproval>>;
   failed?: Record<string, string>;
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
   /**
    * What the address asked this screen to open (issue #339): a pinned artifact
    * or an attempt's trace. Empty — the ordinary "open the card" navigation —
@@ -2086,7 +2092,13 @@ export function AwaitingApprovalRow({
   deciding: ReadonlyMap<string, Verdict>;
   decided: Readonly<Record<string, DecidedApproval>>;
   failed: Record<string, string>;
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
 }) {
   const pending = pendingApprovalWait(approvals, now);
   /**

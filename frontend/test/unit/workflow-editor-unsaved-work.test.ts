@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { ApiError } from "@/api/types";
 import type { WorkflowGraph } from "@/api/workflows";
 import { WorkflowCreateDialog } from "@/views/WorkflowCreateDialog";
 
@@ -93,8 +94,23 @@ if (!Element.prototype.scrollIntoView) {
 
 let container: HTMLDivElement;
 let root: Root;
-let confirmed: boolean;
 let confirms: string[];
+
+/**
+ * The discard confirm, or `null` when the dialog is not asking (defect B-081).
+ *
+ * Looked up by test id rather than by button label so a reworded prompt does
+ * not silently stop testing the guard.
+ */
+function discardAsk(): HTMLElement | null {
+  return document.body.querySelector<HTMLElement>('[data-testid="workflow-discard-confirm"]');
+}
+
+/** Answer the discard confirm. */
+async function answerDiscard(answer: "leave" | "keep") {
+  expect(discardAsk(), "the discard confirm is not open").toBeTruthy();
+  await click(find(`[data-testid="workflow-discard-${answer === "leave" ? "leave" : "keep"}"]`));
+}
 
 /** The dialog portals into `document.body`, not into the mount container. */
 function find<T extends Element>(selector: string): T {
@@ -130,7 +146,12 @@ async function click(el: HTMLElement) {
   });
 }
 
-async function open(client: OpenCompanyClient, onOpenChange: (o: boolean) => void) {
+/** `workflow` defaults to a saved graph (edit mode); pass `null` for create. */
+async function open(
+  client: OpenCompanyClient,
+  onOpenChange: (o: boolean) => void,
+  workflow: WorkflowGraph | null = savedGraph(),
+) {
   await act(async () => {
     root.render(
       createElement(WorkflowCreateDialog, {
@@ -138,7 +159,7 @@ async function open(client: OpenCompanyClient, onOpenChange: (o: boolean) => voi
         company: "acme",
         open: true,
         onOpenChange,
-        workflow: savedGraph(),
+        workflow,
       }),
     );
   });
@@ -150,11 +171,17 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
-  confirmed = true;
   confirms = [];
+  // Defect B-081: the trapping environment, made the default for every test in
+  // this file. A `window.confirm` that answers `false` without asking anybody
+  // is what Chrome does after "prevent this page from creating additional
+  // dialogs", what an automation-driven browser does, and what the `src-tauri`
+  // webview does — and under it every exit from this dialog silently did
+  // nothing. Stubbing it to `true`, as this file used to, is a world in which
+  // the bug cannot happen; the guard has to hold in the world where it can.
   vi.stubGlobal("confirm", (message: string) => {
     confirms.push(message);
-    return confirmed;
+    return false;
   });
 });
 
@@ -202,16 +229,21 @@ describe("unsaved graph edits are not thrown away silently (#1006)", () => {
     const name = find<HTMLInputElement>('input[id$="-name"]');
     await type(name, "Weekly report v2");
 
-    confirmed = false;
     await click(button("Cancel"));
 
-    expect(confirms).toHaveLength(1);
-    // Not closed — and the edit is still in the form, which is the whole point.
+    // The ask is the console's own, so it is on screen and answerable.
+    expect(discardAsk()).toBeTruthy();
+    expect(closes).toEqual([]);
+
+    await answerDiscard("keep");
+    // Declined: not closed, the ask is gone, and the edit is still in the
+    // form, which is the whole point.
+    expect(discardAsk()).toBeNull();
     expect(closes).toEqual([]);
     expect(find<HTMLInputElement>('input[id$="-name"]').value).toBe("Weekly report v2");
 
-    confirmed = true;
     await click(button("Cancel"));
+    await answerDiscard("leave");
     expect(closes).toEqual([false]);
   });
 
@@ -220,7 +252,6 @@ describe("unsaved graph edits are not thrown away silently (#1006)", () => {
     await open(stubClient(), (o) => closes.push(o));
     await type(find<HTMLTextAreaElement>('textarea[id$="-desc"]'), "changed");
 
-    confirmed = false;
     await act(async () => {
       document.body
         .querySelector('[data-slot="dialog-content"]')!
@@ -229,8 +260,11 @@ describe("unsaved graph edits are not thrown away silently (#1006)", () => {
         );
     });
 
-    expect(confirms).toHaveLength(1);
+    expect(discardAsk()).toBeTruthy();
     expect(closes).toEqual([]);
+
+    await answerDiscard("leave");
+    expect(closes).toEqual([false]);
   });
 
   it("guards a reload while dirty, and stops guarding once it is not", async () => {
@@ -275,8 +309,105 @@ describe("a serialisation failure leaves the dialog closable (#1006)", () => {
     const cancel = button("Cancel");
     expect(cancel.disabled).toBe(false);
 
-    confirmed = true;
     await click(cancel);
+    await answerDiscard("leave");
     expect(closes).toEqual([false]);
+  });
+});
+
+/**
+ * Defect B-081: a rejected save must not leave the dialog inescapable.
+ *
+ * The reported repro is a 409 on a duplicate workflow id, but the 409 leaves no
+ * state of its own — it lands in the same generic error branch a 500 does. What
+ * it does is force an operator who has necessarily typed something (so: dirty)
+ * to reach for Cancel, which is the first moment anyone meets the guard. So the
+ * property under test is the one that actually failed: **on a dirty form, in an
+ * environment whose `window.confirm` answers nobody, every exit still works.**
+ *
+ * `beforeEach` stubs `confirm` to return `false` for the whole file, which is
+ * that environment. Before the fix, each assertion below found the dialog still
+ * open with nothing drawn and nothing logged.
+ */
+describe("a dirty dialog is escapable without window.confirm (B-081)", () => {
+  /** Dirty a New-workflow form and answer the host's create with a 409. */
+  async function afterRejectedSave(closes: boolean[]) {
+    const client = stubClient();
+    const preflight = client.post.bind(client);
+    // The create POST, not the `/workflows/validate` preflight beside it.
+    (client as { post: unknown }).post = async (path: string, body: unknown) =>
+      path.endsWith("/workflows")
+        ? Promise.reject(
+            new ApiError(409, "conflict", "a workflow with this ID already exists", true),
+          )
+        : preflight(path, body);
+
+    await open(client, (o) => closes.push(o), null);
+    await type(find<HTMLInputElement>('input[id$="-name"]'), "Weekly report");
+    await click(find<HTMLButtonElement>('[data-testid="workflow-dialog-submit"]'));
+    // Create mode asks the operator to confirm the permanent id first (#1808).
+    if (document.body.querySelector('[data-testid="workflow-id-confirm"]')) {
+      await click(find('[data-testid="workflow-id-confirm-create"]'));
+    }
+    expect(find('[data-testid="create-error"]').textContent).toContain("already exists");
+  }
+
+  it("never consults window.confirm for the discard question at all", async () => {
+    const closes: boolean[] = [];
+    await afterRejectedSave(closes);
+
+    await click(button("Cancel"));
+
+    // The whole defect in one line: the answer is asked for in the console,
+    // where it can be given, not through a primitive that answers `false` on
+    // the operator's behalf.
+    expect(confirms).toEqual([]);
+    expect(discardAsk()).toBeTruthy();
+  });
+
+  it.each([
+    ["Cancel", async () => void (await click(button("Cancel")))],
+    [
+      "Escape",
+      async () =>
+        void (await act(async () => {
+          document.body
+            .querySelector('[data-slot="dialog-content"]')!
+            .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        })),
+    ],
+  ])("lets %s out after a 409", async (_label, exit) => {
+    const closes: boolean[] = [];
+    await afterRejectedSave(closes);
+
+    await exit();
+    await answerDiscard("leave");
+
+    expect(closes).toEqual([false]);
+  });
+
+  it("keeps the draft when the operator decides to stay", async () => {
+    const closes: boolean[] = [];
+    await afterRejectedSave(closes);
+
+    await click(button("Cancel"));
+    await answerDiscard("keep");
+
+    expect(closes).toEqual([]);
+    expect(find<HTMLInputElement>('input[id$="-name"]').value).toBe("Weekly report");
+  });
+
+  it("reads a dismissed ask as 'keep editing', never as consent to discard", async () => {
+    const closes: boolean[] = [];
+    await afterRejectedSave(closes);
+
+    await click(button("Cancel"));
+    await act(async () => {
+      discardAsk()!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+
+    // Escaping the *question* is not answering it. The graph survives.
+    expect(closes).toEqual([]);
+    expect(find<HTMLInputElement>('input[id$="-name"]').value).toBe("Weekly report");
   });
 });

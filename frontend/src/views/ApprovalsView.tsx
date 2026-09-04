@@ -15,10 +15,12 @@ import {
 } from "@/api/types";
 import {
   ApprovalHeadline,
+  BlockerAnswerControl,
   DeclineScopeControl,
   ApprovalMeta,
   ApprovalPayload,
   ApprovalScopeControl,
+  isAnswerOnlyBlocker,
   useAskerNames,
   useApprovalThreadLinks,
 } from "@/components/approval-card";
@@ -29,6 +31,7 @@ import { useApprovalDeadline } from "@/hooks/use-approval-deadline";
 import type { CompanyFeed } from "@/hooks/use-company";
 import { useStableList } from "@/hooks/use-stable-list";
 import {
+  answerRecordedLine,
   approvedByRuntimeLine,
   approvedLine,
   batchPositions,
@@ -37,7 +40,7 @@ import {
 import { approvalsByDeadline } from "@/lib/approval-order";
 import {
   approvalSummary,
-  decisionLabel,
+  decideButtonLabel,
   grantHeadline,
   grantSubject,
   timeAgo,
@@ -269,6 +272,17 @@ export function ApprovalsView({
     a: ApprovalSummary,
     verdict: Verdict,
     scope: GrantScope,
+    /**
+     * The operator's reply to a blocker's question (B-046, 2026-09-02).
+     *
+     * This page is the full decision surface, so it is the one that must be
+     * able to send one: the board card's "View details" and the transcript
+     * row's "Read it first" both land here. Passed through untouched —
+     * `resolveApproval` drops an empty or whitespace-only one rather than
+     * putting a key on the wire, so the bulk Approve below, which has no box
+     * and passes nothing, keeps sending exactly the request it always has.
+     */
+    answer?: string,
   ) {
     // Per-row guard: only a double-press on THIS card is ignored. The global
     // early return that used to live here made every other card inert too.
@@ -277,10 +291,10 @@ export function ApprovalsView({
     markInFlight(a.id, verdict);
     const startedAt = Date.now();
     try {
-      const answer = await client.resolveApproval(
+      const reply = await client.resolveApproval(
         a.id,
         verdict,
-        undefined,
+        answer,
         company,
         { scope },
       );
@@ -304,7 +318,7 @@ export function ApprovalsView({
       // so approving one of several releases nothing — and saying otherwise is
       // the one part of this flow that actively misleads.
       const stillAwaiting =
-        "stillAwaiting" in answer ? answer.stillAwaiting : undefined;
+        "stillAwaiting" in reply ? reply.stillAwaiting : undefined;
       // Issue #1449, and it comes FIRST because everything below it is written
       // for a decision that actually happened. The host answers `200` to a click
       // on a card whose deadline has passed — it has to, nothing failed — and
@@ -315,7 +329,7 @@ export function ApprovalsView({
       // `null` means the host said `settled`, or is too old to say. Both keep
       // the pre-#1449 wording: guessing is the defect, in either direction.
       const stale = staleDecisionLine(
-        "outcome" in answer ? answer.outcome : undefined,
+        "outcome" in reply ? reply.outcome : undefined,
         approvalSummary(a),
       );
       if (stale) {
@@ -336,9 +350,14 @@ export function ApprovalsView({
           ? `Declined: ${approvalSummary(a)}`
           : scope.kind === "tool"
             ? `Approved — ${toolAction(a.kind).toLowerCase()} won't ask again until this permission expires. Take it back under Standing permissions.`
-            : a.agent
-              ? approvedLine(stillAwaiting, approvalSummary(a))
-              : approvedByRuntimeLine(stillAwaiting, approvalSummary(a));
+            : // Defect B-070: a question with nothing behind it is recorded,
+              // not carried out — and it is checked before the two lines that
+              // would otherwise promise a resume.
+              isAnswerOnlyBlocker(a)
+              ? answerRecordedLine(Boolean(answer?.trim()), approvalSummary(a))
+              : a.agent
+                ? approvedLine(stillAwaiting, approvalSummary(a))
+                : approvedByRuntimeLine(stillAwaiting, approvalSummary(a));
       onResolved(line);
       toast.success(line);
       // The agent's reply arrives as a journaled `AgentReply` on its own thread,
@@ -437,6 +456,18 @@ export function ApprovalsView({
   // terminal and lighter.
   const [bulkInFlight, setBulkInFlight] = useState(false);
 
+  /**
+   * The latest text typed into each row's blocker-answer box, mirrored here
+   * from `ApprovalCard.onAnswerChange` on every keystroke.
+   *
+   * A ref, not state: nothing on this page ever redraws from it, it is only
+   * read once a bulk decision actually fires below. Without this map,
+   * `decideAll` had no way to reach an answer that lives entirely inside a
+   * card's own `useState` — see `ApprovalCard`'s `onAnswerChange` doc for the
+   * re-ask-and-re-bill bug that gap left open.
+   */
+  const bulkAnswersRef = useRef<Map<string, string>>(new Map());
+
   async function decideAll(verdict: Verdict) {
     if (bulkInFlight || rows.length === 0) return;
     const n = rows.length;
@@ -449,7 +480,11 @@ export function ApprovalsView({
     try {
       for (const a of [...rows]) {
         if (inFlight.has(a.id)) continue;
-        await decide(a, verdict, { kind: "once" });
+        // Only on approve: a decline's words are a reason, not an answer, and
+        // the single-row path (`ApprovalCard`'s own Approve button) makes the
+        // same choice.
+        const answer = verdict === "approve" ? bulkAnswersRef.current.get(a.id) : undefined;
+        await decide(a, verdict, { kind: "once" }, answer);
       }
     } finally {
       setBulkInFlight(false);
@@ -596,11 +631,12 @@ export function ApprovalsView({
                     deciding={inFlight.get(a.id) ?? null}
                     batchIndex={batchPos.get(a.id)?.index ?? 1}
                     batchTotal={batchPos.get(a.id)?.total ?? 1}
-                    onDecide={(verdict, scope) =>
-                      void decide(a, verdict, scope)
+                    onDecide={(verdict, scope, answer) =>
+                      void decide(a, verdict, scope, answer)
                     }
                     extending={extending.has(a.id)}
                     onExtend={() => void extendDeadline(a)}
+                    onAnswerChange={(value) => bulkAnswersRef.current.set(a.id, value)}
                   />
                 ))}
               </div>
@@ -898,6 +934,7 @@ export function ApprovalCard({
   onDecide,
   extending = false,
   onExtend,
+  onAnswerChange,
 }: {
   approval: ApprovalSummary;
   now: number;
@@ -917,12 +954,31 @@ export function ApprovalCard({
    * (#842). `1` — the default for an approval with no batch — says nothing.
    */
   batchTotal: number;
-  onDecide: (verdict: Verdict, scope: GrantScope) => void;
+  /**
+   * Decide this card. `answer` is the operator's reply to a blocker's question
+   * (B-046, 2026-09-02) — carried only on an `approve`, and only by a blocker
+   * card, which is the only kind that renders a box to write one in.
+   */
+  onDecide: (verdict: Verdict, scope: GrantScope, answer?: string) => void;
   /** Whether this card's deadline extension is in flight (#1805). */
   extending?: boolean;
   /** Push this approval's deadline out to a fresh window (#1805). Absent in
    * read-only render contexts (some tests), where the button is inert. */
   onExtend?: () => void;
+  /**
+   * Mirrors this card's own answer box up to whoever rendered the card, on
+   * every keystroke. Optional and additive — the card stays the source of
+   * truth for its own state either way.
+   *
+   * `decideAll` below is the reason this exists: the answer typed here lives
+   * only in this component's own `useState`, and a page-level bulk action has
+   * no card to read it off. Without this mirror, "Approve all" sent every
+   * blocker in the batch as a wordless retry regardless of what was typed —
+   * the host re-ran the stopped step unchanged and could re-ask and re-bill
+   * for a question the operator had just answered, silently, because nothing
+   * on screen said the box's contents were about to be dropped.
+   */
+  onAnswerChange?: (value: string) => void;
 }) {
   // Per-card, like the in-flight verdict and for the same reason: two cards can
   // be open at once and each carries its own decision. Defaults to `once`, so a
@@ -932,6 +988,10 @@ export function ApprovalCard({
   const [declineScope, setDeclineScope] = useState<GrantScope>({
     kind: "once",
   });
+  // The operator's reply to a blocker's question (B-046, 2026-09-02). Per-card
+  // like the two scopes above, and empty by default: a card approved without
+  // touching the box sends the request this page has always sent.
+  const [answer, setAnswer] = useState("");
 
   // No cross-card dimming: another card being decided is not this card's
   // business, and treating it as such is the visual half of the #373 bug.
@@ -995,6 +1055,22 @@ export function ApprovalCard({
           }
         />
 
+        {/* B-046, 2026-09-02: the box the operator answers the question in.
+            Directly above the footer, on #1406's own reasoning — a card is read
+            top to bottom and commits at the bottom, so the last thing before
+            Approve should be the last thing Approve carries. `ApprovalPayload`
+            and the two scope controls above all self-gate; this one does too,
+            and renders nothing at all for a kind that asked no question. */}
+        <BlockerAnswerControl
+          approval={a}
+          value={answer}
+          onChange={(value) => {
+            setAnswer(value);
+            onAnswerChange?.(value);
+          }}
+          disabled={deciding !== null}
+        />
+
         {/* The decide footer (#1406) — deliberately the LAST thing in the card,
             after the scope control it depends on. Disabled on THIS card's own
             state only; a decision in flight on another card leaves these live,
@@ -1012,7 +1088,7 @@ export function ApprovalCard({
             <Button
               variant="outline"
               size="sm"
-              aria-label={`Extend the deadline: ${decisionLabel(a, askerNames, now)}`}
+              aria-label={decideButtonLabel("Extend the deadline", [a], askerNames, now)}
               disabled={deciding !== null || extending}
               onClick={onExtend}
             >
@@ -1030,16 +1106,20 @@ export function ApprovalCard({
             /* `decisionLabel`, not `approvalAction`: two same-kind cards read
                identically from the kind alone, and button-only screen-reader
                navigation never hears the card body (#1411). */
-            aria-label={`Decline: ${decisionLabel(a, askerNames, now)} — ${
+            /* Defect B-076: no ` — request <epoch>` tail. The id was appended
+               only when the contents were NOT hidden — that is, exactly when
+               `decisionLabel` already carries the request's own words, the
+               amount, the method and (below) the batch position, every one of
+               them a discriminator a person can use. On a hidden card, where
+               those are absent and an opaque number would be the only thing
+               telling two buttons apart, it was omitted and `decisionLabel`'s
+               "composed … (…)" did the job instead. So it was present only
+               where it added nothing, and it was the tail of the four hundred
+               characters a screen-reader user heard. */
+            aria-label={`${decideButtonLabel("Decline", [a], askerNames, now)} — ${
               declineScope.kind === "tool"
                 ? `don't ask again for this tool for ${grantDurationLabel(declineScope.expiresInMillis)}`
                 : "just this once"
-            }${
-              // Redacted cards already carry the exact timestamp in
-              // `decisionLabel`'s "composed … (…)"; appending the usual
-              // `request <timestamp>` suffix here too would announce the opaque
-              // epoch twice on every hidden card.
-              a.contents_hidden ? "" : ` — request ${a.at_millis}`
             }${
               batchTotal > 1 ? ` — approval ${batchIndex} of ${batchTotal}` : ""
             }`}
@@ -1057,17 +1137,15 @@ export function ApprovalCard({
           </Button>
           <Button
             size="sm"
-            aria-label={`Approve: ${decisionLabel(a, askerNames, now)} — ${
+            aria-label={`${decideButtonLabel("Approve", [a], askerNames, now)} — ${
               scope.kind === "tool"
                 ? `let this ${
                     a.workflow_id ? "workflow" : "teammate"
                   } use this tool for ${grantDurationLabel(scope.expiresInMillis)}`
                 : "just this once"
-            }${a.contents_hidden ? "" : ` — request ${a.at_millis}`}${
-              batchTotal > 1 ? ` — approval ${batchIndex} of ${batchTotal}` : ""
-            }`}
+            }${batchTotal > 1 ? ` — approval ${batchIndex} of ${batchTotal}` : ""}`}
             disabled={deciding !== null}
-            onClick={() => onDecide("approve", scope)}
+            onClick={() => onDecide("approve", scope, answer)}
           >
             {deciding === "approve" ? (
               <Loader2 className="size-4 animate-spin" />

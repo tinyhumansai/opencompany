@@ -15,7 +15,18 @@ const chatView = readFileSync(resolve(here, "../../src/views/ChatView.tsx"), "ut
 
 describe("chat channel history polling", () => {
   it("wires each resolved channel fan-out to a disposable 5s visible-tab poll", () => {
-    expect(appShell.match(/startVisiblePolling\(rehydrateAll, 5000\)/g)).toHaveLength(2);
+    // Two poll sites, one per leg of the hydration pass, and they take
+    // different callbacks on purpose (issue B-030).
+    //
+    // The resolved leg polls `refreshAll`, which re-reads the roster before
+    // rehydrating: its target list is derived from `/team`, and a teammate
+    // hired after this effect ran must join it or their DM is polled by
+    // nothing. The last-resort leg polls `rehydrateAll` directly, because it is
+    // reached only when something threw inside the resolved leg — it has no
+    // roster at all, only `defaultDesks()`, so there is nothing there to
+    // refresh.
+    expect(appShell.match(/startVisiblePolling\(refreshAll, 5000\)/g)).toHaveLength(1);
+    expect(appShell.match(/startVisiblePolling\(rehydrateAll, 5000\)/g)).toHaveLength(1);
     expect(appShell).toContain("disposeRehydratePolling?.();");
   });
 

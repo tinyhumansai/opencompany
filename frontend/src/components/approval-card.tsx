@@ -14,7 +14,7 @@
 // would put one continuation into the channel twice. Same content, different
 // verbs — so the verbs stay with their owners.
 
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useEffect, useId, useMemo, useState, useRef } from "react";
 import {
   AtSign,
   ChevronDown,
@@ -44,11 +44,13 @@ import {
   type ApprovalSummary,
   type GrantScope,
 } from "@/api/types";
+import { Textarea } from "@/components/ui/textarea";
 import { MAIN_THREAD_ID } from "@/lib/chat";
 import { GENERAL_CHANNEL, type Desk } from "@/lib/desks";
 import {
   approvalAction,
   approvalDeadline,
+  approvalHeadline,
   type DeadlineTone,
   money,
   payloadAge,
@@ -179,6 +181,47 @@ export function isBlockerKind(kind: string): boolean {
 }
 
 /**
+ * Whether deciding this card only records an answer, with no step behind it
+ * for the answer to re-enter (defect B-070).
+ *
+ * A blocker parks three quite different things under one `unlinked` task
+ * link — the link alone cannot tell them apart, which is why
+ * {@link ApprovalSummary.workflow_run_id} is the second half of this
+ * predicate:
+ *
+ * * A question an agent raised *from a card* is linked (`{link: "task"}`), not
+ *   `unlinked` at all — approving moves that card back into In Progress, where
+ *   its dispatch edge fires, and the work really does carry on. Never
+ *   answer-only.
+ * * A question a workflow node raised is `unlinked` **and carries a
+ *   {@link ApprovalSummary.workflow_run_id}** — there is no card, but
+ *   `resume_node_blocker` re-dispatches the node from the run's own trigger
+ *   input, carrying the answer onto it (issues #1863, #2005). Not answer-only
+ *   either, even though the task link alone looks identical to the case below.
+ * * A question asked mid-conversation is `unlinked` with **no** run behind it
+ *   — the host says so on the wire — and deciding it banks the answer and
+ *   starts nothing. This is the only true answer-only case.
+ *
+ * The console used to tell all three the same story. A founder answered a
+ * genuine either/or, watched the card vanish under "Approved — carrying it out
+ * now", and twenty-five minutes later nothing had been routed, created or
+ * said; the card was gone from the queue, so the question could not even be
+ * re-decided. This is the predicate that keeps them apart, and it is exported
+ * so the card's own footnote and the confirmation banner cannot claim
+ * different things about one press.
+ *
+ * A `task` the host did not send at all is deliberately NOT treated as
+ * answer-only: that is "we do not know", and guessing either way is what the
+ * `stillAwaiting === undefined` arm of {@link approvedLine} already refuses to
+ * do.
+ */
+export function isAnswerOnlyBlocker(
+  a: Pick<ApprovalSummary, "kind" | "task" | "workflow_run_id">,
+): boolean {
+  return isBlockerKind(a.kind) && a.task?.link === "unlinked" && !a.workflow_run_id;
+}
+
+/**
  * The operator-readable fields a blocker card renders (#1862): what stopped,
  * what would unblock it, and the connection it is about when one groups it.
  *
@@ -200,6 +243,121 @@ export function blockerFields(a: ApprovalSummary): {
     ? groupKey.slice("connection:".length)
     : undefined;
   return { reason: str(payload.reason), needed: str(payload.needed), connection };
+}
+
+/**
+ * Where the operator writes the answer to the question a blocker parked on
+ * (defect B-046, 2026-09-02).
+ *
+ * ## Why this control has to exist at all
+ *
+ * A blocker is the one approval kind that is a *question*: `blockerFields`
+ * above reads a `reason` ("parked on your answer to the two questions I
+ * asked") and a `needed`, and until this control the console offered no way to
+ * supply either. The only text box anywhere near the card was the Discussion
+ * tab, whose posts carry no approval id and never touch a blocker — so an
+ * answer typed there was stored and ignored, and every Approve re-entered the
+ * step with the same input, re-asked, and re-billed the turn.
+ *
+ * ## Blockers only, and one at a time
+ *
+ * Self-gating on {@link isBlockerKind} for the same reason
+ * {@link ApprovalScopeControl} self-gates on `broadly_grantable`: the surfaces
+ * that render it should not each have to remember which kinds it applies to.
+ * A `payment.send` has no question to answer, so it shows nothing here.
+ *
+ * The caller is responsible for the other half — that this is a *single*
+ * approval, not a batch. One box over a batch would be one answer silently
+ * copied onto several unrelated parks, and the host appends it to the card the
+ * approval is linked to. In practice this cannot arise: an agent's question
+ * parks with `group_key: None`, so a blocker never batches with anything.
+ */
+export function BlockerAnswerControl({
+  approval: a,
+  value,
+  onChange,
+  disabled,
+  compact = false,
+}: {
+  approval: ApprovalSummary;
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  /**
+   * A chat transcript's row, which is a quiet interruption rather than a
+   * decision surface: the label and placeholder carry the whole explanation and
+   * the sentence below the box is dropped, because a paragraph of guidance in a
+   * transcript costs more room than it earns.
+   */
+  compact?: boolean;
+}) {
+  // Before the gate, so the hook order does not depend on the approval's kind.
+  const id = useId();
+  if (!isBlockerKind(a.kind)) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5" data-blocker-answer={a.id}>
+      <label htmlFor={id} className="text-xs font-medium text-foreground">
+        Your answer
+      </label>
+      <Textarea
+        id={id}
+        value={value}
+        disabled={disabled}
+        rows={compact ? 2 : 3}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Answer what was asked — this goes back with your approval"
+        className={cn("text-sm", compact && "min-h-14 py-1.5 text-xs md:text-xs")}
+      />
+      {/* Only what the host actually does with it, and the three re-entry
+          shapes are worded differently rather than folded into one claim
+          (defect B-070): a card-linked question really is picked up by the
+          teammate on it; a workflow node's question has no card at all, but
+          the node it stopped is re-dispatched from the run's own trigger
+          input (issues #1863, #2005); a question asked mid-conversation has
+          neither. `isAnswerOnlyBlocker` is the one place that tells the last
+          apart from the middle — see its own doc.
+          Defect B-124 gave the conversational case a real resume: `Approve`
+          with a non-blank box now runs `deliverable_answer` on the host,
+          which carries the words straight into the parked thread as an
+          `OperatorMessage` rather than just banking them — the same route a
+          typed reply already takes. This paragraph used to say "nothing
+          restarts on its own" unconditionally, which was true right up until
+          B-124 landed in the same pull request and made it false for every
+          non-blank answer, the one case this box exists for. It now mirrors
+          `deliverable_answer`'s own gate (a trimmed, non-empty `value`) so the
+          two cannot say opposite things about one press again. */}
+      {!compact &&
+        (isAnswerOnlyBlocker(a) ? (
+          <p className="text-xs text-muted-foreground">
+            {value.trim() ? (
+              <>
+                Approve carries your answer into that conversation and the
+                teammate replies to it there — same as typing it yourself.
+              </>
+            ) : (
+              <>
+                Approve with nothing typed just records that you saw it;
+                nothing restarts on its own — tell the teammate in chat when
+                you want it acted on.
+              </>
+            )}{" "}
+            Decline doesn&apos;t send it.
+          </p>
+        ) : isBlockerKind(a.kind) && a.task?.link === "unlinked" ? (
+          <p className="text-xs text-muted-foreground">
+            Approve records your answer and re-enters the workflow step it
+            stopped — approving runs it again, and denying stops the run.
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Approve sends this back and the teammate picks the card up with it.
+            Approve with the box empty and it starts again with nothing new.
+            Decline doesn't send it.
+          </p>
+        ))}
+    </div>
+  );
 }
 
 /** The glyph for an effect kind; a question for a blocker, a shield for the unknown. */
@@ -270,7 +428,13 @@ export function ApprovalHeadline({
           overflow the card there instead of wrapping. */}
       <div className="min-w-[min(12rem,100%)] flex-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <p className="font-medium">{approvalAction(a)}</p>
+          {/* Defect B-068: what is being decided, not only what kind of thing
+              it is. `approvalHeadline` is the chat card's own composition,
+              shared rather than copied — this queue used to print "Use one of
+              its tools" over a request whose title was sitting in the payload
+              block directly below it. No hidden-detail argument: that block
+              renders beneath and says it in full (#618). */}
+          <p className="font-medium">{approvalHeadline(a)}</p>
           {consequence && (
             <span className="rounded-full bg-muted px-2 py-0.5 text-2xs font-medium text-foreground">
               {consequence.label}

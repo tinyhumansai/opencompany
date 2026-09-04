@@ -41,7 +41,6 @@ import {
   reportAddMember,
   type MissedStep,
 } from "@/lib/member-feedback";
-import { usd } from "@/lib/money";
 import { fromDto, newMember, roleSubtitle, type TeamMember } from "@/lib/team";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
 import { personName } from "@/lib/person";
@@ -49,6 +48,7 @@ import { cn } from "@/lib/utils";
 import { AgentDetailView } from "@/views/team/AgentDetailView";
 import { AgentFields } from "@/views/team/AgentFields";
 import { FieldCopilot } from "@/views/team/FieldCopilot";
+import { formatUsd } from "@/lib/cost";
 
 interface Props {
   client: OpenCompanyClient;
@@ -907,7 +907,7 @@ function DailyBudgetLine({
         data-testid="team-budget"
         className={cn("text-xs", overBudget ? "text-destructive" : "text-muted-foreground")}
       >
-        {usd(cap)}/day · {usd(spent)} spent today
+        {formatUsd(cap)}/day · {formatUsd(spent)} spent today
         {overBudget && " · paused until 00:00 UTC"}
       </p>
       {attribution}

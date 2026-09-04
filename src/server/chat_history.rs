@@ -186,6 +186,35 @@ pub fn same_conversation(a: Option<&str>, b: Option<&str>) -> bool {
     a == b
 }
 
+/// Whether something that recorded *where it was raised* was raised in `desk`.
+///
+/// The same question [`same_conversation`] answers, minus its one fold: a
+/// `None` here means **no conversation raised this**, not "unaddressed,
+/// therefore General".
+///
+/// The distinction is the whole point, and [`owns`] below already draws it
+/// inline for a dispatch terminal — "**`None` is not the General desk** …
+/// It is the single most bug-prone line in this function." It is named here
+/// because a second caller needed it and did not have it: a blocker parked by
+/// a workflow node records `thread: None`, deliberately ("a workflow run has
+/// no board card behind it and no conversation to raise the question in"), and
+/// `pending_blocker_groups` matched it with `same_conversation` against the
+/// General desk. An unaddressed console post is exactly `chat: None` folded to
+/// the `General` default desk, and almost any substantive sentence classifies
+/// as an amend — so an ordinary message about something else silently settled
+/// an approval nobody had decided. It left the approvals queue, the run went on
+/// waiting, and the three screens that read it disagreed for the rest of its
+/// life.
+///
+/// Use this wherever a `None` means "nobody raised this"; use
+/// [`same_conversation`] where it means "the id was never addressed".
+pub fn raised_in(thread: Option<&str>, desk: &str) -> bool {
+    match thread {
+        None => false,
+        Some(thread) => same_conversation(Some(thread), Some(desk)),
+    }
+}
+
 /// Whether a stored event belongs to the desk identified by `desk_id` /
 /// `desk_name`.
 ///
@@ -1194,6 +1223,38 @@ fn is_admin_only_event(event: &CompanyEvent) -> bool {
 
 #[cfg(test)]
 mod test {
+    /// The one line B-012 turned on: a `None` thread names no conversation, so
+    /// it is raised in none — including the General desk, whose every spelling
+    /// `same_conversation` otherwise folds a `None` into.
+    #[test]
+    fn nothing_was_raised_in_a_conversation_it_never_named() {
+        for desk in ["General", "main", "general", "dm:eng", ""] {
+            assert!(
+                !super::raised_in(None, desk),
+                "a blocker that named no conversation must not answer to {desk}"
+            );
+            // The contrast: `same_conversation` deliberately folds the same
+            // `None` into General, which is right for an unaddressed *message*
+            // and wrong for a park that named nobody.
+            assert_eq!(
+                super::same_conversation(None, Some(desk)),
+                super::is_general_chat(Some(desk)),
+                "{desk}"
+            );
+        }
+    }
+
+    /// And a thread that *was* named still matches its desk, through every
+    /// spelling of the General one.
+    #[test]
+    fn a_named_thread_still_matches_its_desk() {
+        assert!(super::raised_in(Some("General"), "main"));
+        assert!(super::raised_in(Some("main"), "General"));
+        assert!(super::raised_in(Some("dm:eng"), "dm:eng"));
+        assert!(!super::raised_in(Some("dm:eng"), "dm:ceo"));
+        assert!(!super::raised_in(Some("dm:eng"), "General"));
+    }
+
     use super::*;
     use crate::ports::tasks::{
         COLUMN_DONE, COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_PLANNING,

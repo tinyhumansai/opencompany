@@ -32,6 +32,7 @@ import {
 } from "./run-output";
 // Issue #1002: which of the company's parked cards this run is held on.
 import { blockingApprovals, runApprovals, type RunApproval } from "./run-approvals";
+import { resumeClaimFor } from "./resume-claim";
 // Issue #981: the one rung for "this report did not go out", shared with the
 // history rows, the run dot, the SSE toast and the host itself.
 import { undeliveredCount, undeliveredNodes } from "./run-health";
@@ -123,7 +124,13 @@ export function RunResultPanel({
    * racing operator on the other surface gets a real approval or a `NotParked`
    * no-op receipt, never a double execution.
    */
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
 }) {
   const nodeResults = useMemo(
     () => parseRunNodes(result.output, graph),
@@ -154,6 +161,13 @@ export function RunResultPanel({
   // cannot disagree about whether this run stopped for a person.
   const blockedNodes = result.blockedNodes ?? [];
   const parkedCount = result.approvals?.length ?? 0;
+  // Issue B-013: what deciding this run's cards DOES is not this screen's to
+  // word. It used to be, and it stated the gated-call behaviour for both kinds
+  // — "this run continues on its own" — while the Observatory told the same
+  // operator, about the same run, that answering does not restart it.
+  // `resumeClaimFor` is the one place either screen answers that now.
+  const resumeClaim = resumeClaimFor(blockedNodes);
+  const resumeSuffix = resumeClaim ? ` ${resumeClaim}` : "";
   // Issue #1014: the board writes this run performed — shipped on the wire
   // since #661 but never rendered, so "this run opened card X" was invisible.
   const board = result.board ?? [];
@@ -279,7 +293,7 @@ export function RunResultPanel({
                   // still gets the original sentence rather than a pointer to
                   // something that is not there.
                   canDecideHere ? "below or in Approvals" : "in Approvals"
-                } and this run continues on its own — approving re-runs the step, so a changed decision may ask again.`
+                }.${resumeSuffix}`
               : "Nothing here can be approved; change the policy and run the workflow again."}
           </p>
         )}
@@ -504,7 +518,13 @@ function RunApprovalsSection({
   askerNames: Map<string, string>;
   deciding: ReadonlyMap<string, Verdict>;
   failed: Record<string, string>;
-  onDecide: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
 }) {
   const nameById = useMemo(
     () => new Map(graph?.nodes.map((n) => [n.id, n.name]) ?? []),

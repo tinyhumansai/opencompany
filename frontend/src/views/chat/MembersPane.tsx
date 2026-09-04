@@ -14,10 +14,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { PresenceStatus } from "@/lib/awareness";
-import { usd } from "@/lib/money";
 import { roleSubtitle, type TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { PresenceDot } from "@/views/chat/PresenceDot";
+import { formatUsd } from "@/lib/cost";
 
 interface Props {
   /**
@@ -438,7 +438,7 @@ function DailyBudgetLine({ member, setByLabel }: { member: TeamMember; setByLabe
         data-testid="team-budget"
         className={cn("block truncate text-3xs", overBudget ? "text-destructive" : "text-muted-foreground")}
       >
-        {usd(cap)}/day · {usd(spent)} spent today
+        {formatUsd(cap)}/day · {formatUsd(spent)} spent today
         {overBudget && " · paused"}
       </span>
       {attribution}

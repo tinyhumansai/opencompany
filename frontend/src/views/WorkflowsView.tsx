@@ -341,6 +341,8 @@ export function WorkflowsView({
     approval: ApprovalSummary,
     verdict: Verdict,
     scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
   ) => void;
 }) {
   const { resolvedTheme } = useTheme();

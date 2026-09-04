@@ -64,6 +64,9 @@ describe("FinancesView empty data", () => {
     expect(container.textContent).not.toContain("Available USDC");
 
     const net = container.querySelectorAll<HTMLElement>(".text-2xl")[3];
+    // Cents, like every other money figure on the page. This tile used to
+    // render whole dollars, which is what made a real -$0.16 read as -$0
+    // beside the transactions that added up to it (issue B-016).
     expect(net?.textContent).toBe("$0.00");
     expect(net?.className).not.toContain("text-status-done-text");
   });

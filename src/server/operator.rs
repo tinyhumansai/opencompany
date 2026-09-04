@@ -2951,8 +2951,18 @@ async fn chat_and_emit(
                     accept_chat_turn(&runtime, id, &message, by.as_ref(), parent, &desk).await?;
                 let message_id = accepted.message_seq.value().to_string();
                 let turn_id = accepted.turn_id.clone();
+                // CodeRabbit review, PR #2054: `accept_chat_turn` just journaled
+                // this exact text as an `OperatorMessage` — hand its seq along so
+                // a bare agent question's resume re-enters on that event instead
+                // of minting a second, identical one.
                 let applied = runtime
-                    .apply_blocker_reply(&ids, intent, &message.text, by.as_ref())
+                    .apply_blocker_reply(
+                        &ids,
+                        intent,
+                        &message.text,
+                        by.as_ref(),
+                        Some(accepted.message_seq),
+                    )
                     .await
                     .map_err(ApiError);
                 settle_chat_turn(&runtime, id, turn_id.as_deref(), applied.as_ref().err()).await;
@@ -4342,6 +4352,21 @@ struct ResolveApproval {
     /// An optional payload edit; overlaid onto the parked effect on `approve`.
     #[serde(default)]
     amended_payload: Option<serde_json::Value>,
+    /// The operator's answer to a question a blocker parked on (issue #1863).
+    ///
+    /// An `approve` carrying words re-enters the stopped step with them —
+    /// the `Amend` verdict, whose answer `resume_task_card` writes onto the
+    /// card note so the re-dispatched turn reads different input. Without it
+    /// the console could only ever send a wordless retry, and a card parked on
+    /// a question was re-dispatched unchanged: the agent asked again, and the
+    /// turn was billed again.
+    ///
+    /// Absent, empty or whitespace is today's behaviour exactly, so no
+    /// existing caller changes. Ignored on a `deny` — words attached to a
+    /// refusal are a reason, not an answer, and re-entering the step with them
+    /// would contradict the verdict.
+    #[serde(default)]
+    answer: Option<String>,
     /// Answer as soon as the verdict is durable, rather than holding the
     /// response open for the agent's follow-up turn (issue #383).
     ///
@@ -4610,6 +4635,7 @@ async fn run_resolve(
     // The verdict is settled inline; only the follow-up cycle is on the handle.
     // So by the time this returns — in either mode — the decision is journaled
     // and any grant is minted.
+    let answer = body.answer.clone();
     let (receipt, follow_up) = match (body.verdict, body.amended_payload) {
         (Verdict::Approve, Some(payload)) => {
             runtime
@@ -4623,7 +4649,7 @@ async fn run_resolve(
         }
         (verdict, None) => {
             runtime
-                .resolve_approval_spawned(&id, verdict, actor, scope)
+                .resolve_approval_spawned(&id, verdict, actor, scope, answer.as_deref())
                 .await?
         }
     };
@@ -4824,6 +4850,25 @@ mod test {
             .prefix("opencompany-http-")
             .tempdir()
             .expect("tempdir")
+    }
+
+    /// The wire name of the operator's answer to a blocker (issue #1863).
+    ///
+    /// Pinned separately from the behaviour tests in `company::runtime`,
+    /// because those call the runtime directly: a misspelt or renamed field
+    /// here would leave every one of them green while the console's answer
+    /// silently never arrived, which is the shape of the defect being fixed.
+    #[test]
+    fn a_resolve_body_carries_the_operators_answer() {
+        let with_answer: ResolveApproval =
+            serde_json::from_str(r#"{"verdict":"approve","answer":"the 14th, not the 7th"}"#)
+                .expect("a body carrying an answer parses");
+        assert_eq!(with_answer.answer.as_deref(), Some("the 14th, not the 7th"));
+
+        // And every existing caller, which sends no such field, is unchanged.
+        let without: ResolveApproval =
+            serde_json::from_str(r#"{"verdict":"approve"}"#).expect("today's body still parses");
+        assert_eq!(without.answer, None);
     }
 
     fn manifest() -> CompanyManifest {
@@ -9734,8 +9779,13 @@ mode = "full"
         let home_dir = home();
         let state = state_with_company(home_dir.path(), "running").await;
         let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
-        // Parked long ago, so its original deadline is `1_000 + ttl`.
-        let id = park_for_extend(&runtime, "appr-ext", 1_000).await;
+        // Parked a moment ago — the case an operator is actually in when they
+        // decide they want longer, and the one the old re-anchoring behaviour
+        // was a no-op for. A park dated 1970 would instead hit the floor that
+        // keeps an already-expired entry from being handed a past deadline,
+        // which is not what this test is about.
+        let parked_at = crate::ports::now_millis().saturating_sub(1_000);
+        let id = park_for_extend(&runtime, "appr-ext", parked_at).await;
         let before = runtime.pending_approvals()[0]
             .expires_at_millis
             .expect("a deadline is projected");
@@ -9748,9 +9798,15 @@ mode = "full"
         let after = runtime.pending_approvals()[0]
             .expires_at_millis
             .expect("a deadline is still projected");
-        assert!(
-            after > before,
-            "the deadline moved out: before={before} after={after}"
+        // Defect B-069: by a whole window, not by however long the request took.
+        // Re-anchoring to `now` moved this by the wall-clock elapsed since the
+        // park — tens of milliseconds on a fresh card — while the route still
+        // answered 200 and the countdown read the same before and after.
+        let ttl = runtime.approval_gate.ttl_millis();
+        assert_eq!(
+            after,
+            before + ttl,
+            "Extend buys another full window: before={before} after={after} ttl={ttl}"
         );
         assert!(body["extended"].as_bool().unwrap());
         assert_eq!(
@@ -11759,6 +11815,7 @@ mode = "full"
                 approval_ids: vec!["appr-1".into()],
                 unparkable: 0,
                 stranded: 0,
+                blockers: 0,
             }],
             approvals: vec![crate::ports::WorkflowRunApprovalRow {
                 node_id: Some("spec".into()),

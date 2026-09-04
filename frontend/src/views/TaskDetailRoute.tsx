@@ -61,7 +61,13 @@ export function TaskDetailRoute({
   deciding?: ReadonlyMap<string, Verdict>;
   decided?: Readonly<Record<string, DecidedApproval>>;
   failed?: Record<string, string>;
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
   /** The shell's host thread → Room channel map, which places this card's origin. */
   chatChannelByThread?: Readonly<Record<string, string>>;
   /** Opens the Room channel this card's conversation lives on (issue #246). */

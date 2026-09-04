@@ -204,9 +204,7 @@ describe("a blocked run whose every card the queue lost", () => {
   it("stops promising the run continues on its own", async () => {
     await renderHistory(strandedBlockedRun());
     const text = container.textContent ?? "";
-    expect(text).not.toContain(
-      "Approve them in Approvals and this run continues on its own",
-    );
+    expect(text).not.toContain("continues this run automatically");
     expect(text).toContain("Nothing here is waiting on you any more");
     // …and it must NOT have fallen into the "the policy refused this" copy,
     // which is where a naive `parked === 0` lands. No policy refused anything.
@@ -244,14 +242,18 @@ describe("a blocked run whose every card the queue lost", () => {
             tools: ["shell", "curl"],
             approvalIds: ["appr-1", "appr-2", "appr-3"],
             stranded: 1,
+            // Gated tool calls, none of them a question the agent raised —
+            // which is the case where "approving continues the run" is true
+            // (issue B-013). Stated rather than left absent: absent means "this
+            // host cannot answer", and the copy degrades for that.
+            blockers: 0,
           },
         ],
       }),
     );
     const text = container.textContent ?? "";
-    expect(text).toContain(
-      "Approve them in Approvals and this run continues on its own",
-    );
+    expect(text).toContain("Decide them in Approvals.");
+    expect(text).toContain("continues this run automatically");
     expect(
       container.querySelectorAll(
         '[data-testid="workflow-blocked-approval-link"]',

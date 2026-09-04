@@ -2,6 +2,7 @@
 // rules the timeline reads. Everything here is pure — the view owns the state.
 
 import type { ApprovalSummary, DeskDto, OperatorChannelDto, Verdict } from "@/api/types";
+import { isBlockerKind } from "@/components/approval-card";
 import { isAnyBudgetPauseNotice, parseBudgetPauseAgent } from "@/hooks/use-events";
 import {
   clearTaskCard,
@@ -1542,6 +1543,19 @@ export function approvalBatchKey(approval: ApprovalSummary): string {
   // apart. Falls back to the turn batch, then to the id — so an ordinary
   // approval groups exactly as before.
   if (approval.group_key) return `group:${approval.group_key}`;
+  // A blocker never borrows an ordinary call's turn `batch`, even though the
+  // host sets one on it exactly the same as on a gated call (issue #842's
+  // `PendingApproval::batch` reads the parking cycle for every kind alike —
+  // there is no blocker exemption on the wire, whatever this function used to
+  // assume). `ApprovalRow.answerable` requires `approvals.length === 1`
+  // before it will render the answer box at all, so a turn that parked a
+  // blocker alongside another approval — a genuinely reachable shape, not the
+  // theoretical case the old comment here dismissed — folded the blocker into
+  // a multi-item card with no way to answer it, while the card's own
+  // "Approve all" still sent it as a wordless retry. A blocker still folds
+  // with its true root-cause siblings through `group_key` above; it just
+  // never inherits a sibling's turn-batch the way an ordinary call does.
+  if (isBlockerKind(approval.kind)) return `solo:${approval.id}`;
   return approval.batch ?? `solo:${approval.id}`;
 }
 

@@ -1032,9 +1032,11 @@ pub struct ParkedCalls {
     /// carries the node's turn key, so a verdict re-runs the turn. A blocker
     /// is parked `Unlinked`, with `agent: None` and no continuation, precisely
     /// because answering a question is not the same act as authorising a call —
-    /// so deciding it resumes nothing until #1863/#1864 land. Counted here so
-    /// [`blocked_diagnosis`] can stop telling the operator and the model that
-    /// the run continues on approval when, for these ids, it will not.
+    /// so deciding it resumes by a different route, re-dispatching the node
+    /// from the run's trigger input rather than re-running the parked turn
+    /// (issues #1863, #2005). Counted here so [`blocked_diagnosis`] can name
+    /// the right verdicts for whichever shape (or mix) is waiting, rather than
+    /// making the gated-call promise for every kind of park.
     pub blockers: usize,
 }
 
@@ -2692,6 +2694,12 @@ impl HarnessAgentRunner {
                         approval_ids: vec![approval_id],
                         unparkable: 0,
                         stranded: 0,
+                        // A question the agent (or this host) raised, not a
+                        // gated call — the empty `tools` above is the same
+                        // fact. Answering it is recorded and re-enters this
+                        // node from the run's trigger input (issues B-013,
+                        // #1863, #2005).
+                        blockers: 1,
                     });
                     // `Blocked`, where #881's sibling says `WaitingApproval`:
                     // both hold the node open for a person, but one is a
@@ -2746,6 +2754,13 @@ impl HarnessAgentRunner {
                 approval_ids: parked.approval_ids.clone(),
                 unparkable: parked.unparkable,
                 stranded: 0,
+                // The split the console needs to word "what does approving do"
+                // correctly (issue B-013). `blocked_diagnosis` right below
+                // branches on this same number for the Observatory's sentence;
+                // shipping it means the run drawer stops having to guess, and
+                // stops guessing "the run continues" for a question that will
+                // not continue it.
+                blockers: parked.blockers,
             });
             let diagnosis = blocked_diagnosis(node_id.as_deref(), agent_ref, &parked);
             // `WaitingApproval`, not `Failed`: a person still has to decide, and
@@ -2966,6 +2981,9 @@ impl HarnessAgentRunner {
                                 approval_ids: vec![approval_id],
                                 unparkable: 0,
                                 stranded: 0,
+                                // A question, not a gated call — same fact the
+                                // empty `tools` above states (issue B-013).
+                                blockers: 1,
                             });
                             self.settle_attempt(
                                 run_sink.as_ref(),
@@ -3006,6 +3024,12 @@ impl HarnessAgentRunner {
                             approval_ids: vec![approval_id],
                             unparkable: 0,
                             stranded: 0,
+                            // A question the agent (or this host) raised, not a
+                            // gated call — the empty `tools` above is the same
+                            // fact. Answering it is recorded and re-enters this
+                            // node from the run's trigger input (issues B-013,
+                            // #1863, #2005).
+                            blockers: 1,
                         });
                         self.settle_attempt(
                             run_sink.as_ref(),
@@ -3354,7 +3378,11 @@ fn transcript_from_steps(steps: &[crate::ports::types::TurnStep]) -> Vec<Transcr
 ///
 /// Composed from the structural summary, never from a store's error text or the
 /// model's prose — this string reaches host logs.
-fn blocked_diagnosis(node_id: Option<&str>, agent_ref: &str, parked: &ParkedCalls) -> String {
+pub(crate) fn blocked_diagnosis(
+    node_id: Option<&str>,
+    agent_ref: &str,
+    parked: &ParkedCalls,
+) -> String {
     let node = node_id.unwrap_or(agent_ref);
     let tools = if parked.tools.is_empty() {
         "a tool call".to_string()
@@ -3384,32 +3412,20 @@ fn blocked_diagnosis(node_id: Option<&str>, agent_ref: &str, parked: &ParkedCall
             if parked.unparkable == 1 { "it" } else { "them" }
         ));
     }
-    // Gated calls and blocker questions resume differently: a gated call's
-    // approval re-runs the turn, a blocker's approve/deny re-enters or stops
-    // the step — the sentence below has to name only the verdicts the console
-    // can actually send for whichever shape (or mix) is waiting.
-    let resume = if waiting == 0 {
-        String::new()
-    } else if parked.blockers == 0 {
-        " Approving the card continues this run automatically; because approving re-runs the \
-         agent's turn, a changed decision may ask again."
-            .to_string()
-    } else if parked.blockers == waiting {
-        format!(
-            " {} a question the agent raised, not a call waiting to be authorised: answering it \
-             re-enters this step — approving runs it again, and denying stops the run.",
-            if waiting == 1 {
-                "The card is"
-            } else {
-                "The cards are"
-            }
-        )
-    } else {
-        " Some of these are gated tool calls, which continue this run when approved; the rest \
-         are questions the agent raised, which re-enter the step they stopped — approving runs \
-         it again, and denying stops the run."
-            .to_string()
-    };
+    // What deciding the cards actually does, which is not one answer
+    // (CodeRabbit review on #1905). A gated call's park carries the node's turn
+    // key, so a verdict re-runs the turn and the run goes on. A blocker's
+    // re-enters too, now that node-level restart is real (issues #1863,
+    // #2005): it is parked `Unlinked` with no continuation, but the answer is
+    // threaded onto the run's trigger input and the node is re-dispatched —
+    // approving runs it again, denying stops the run.
+    // Defect B-072: the branch itself moved to `workflows::resume_claim`, which
+    // `runner::blocked_notice` now reads too. It used to live here alone, and
+    // the notice — composed from the same counts, rendered in the same panel —
+    // went on making the gated-call promise for every kind of park.
+    let resume = super::resume_claim::resume_claim(waiting, parked.blockers)
+        .map(|claim| format!(" {claim}"))
+        .unwrap_or_default();
     format!(
         "workflow node '{node}' is blocked: {tools} needed approval before {agent_ref} could \
          finish, so the node produced no deliverable and nothing after it ran. {}.{resume}",

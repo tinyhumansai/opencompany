@@ -257,6 +257,35 @@ pub struct WorkflowBlockedNode {
     /// see #1145).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub stranded: usize,
+    /// How many of this node's [`approval_ids`](Self::approval_ids) are a
+    /// **question the agent raised** rather than a gated tool call it wants
+    /// authorised (issue B-013).
+    ///
+    /// The two ride the same id list and hold the node open the same way, and
+    /// they restart by **different routes**. A gated call's park carries the
+    /// node's turn key, so a verdict re-runs the turn and the run goes on by
+    /// itself. A blocker is parked `Unlinked`, deliberately, because answering
+    /// a question is not the act of authorising a call — `resume_node_blocker`
+    /// banks the answer, delivers it into the DM, and re-dispatches the node
+    /// from the run's own trigger input, carrying the answer onto it (issues
+    /// #1863, #2005).
+    ///
+    /// The host has always known this — `ParkedCalls::blockers` is what
+    /// `blocked_diagnosis` branches on to word the Observatory's sentence
+    /// correctly. It was never put on the wire, so the console's run drawer had
+    /// no way to ask and stated the gated-call behaviour for both kinds. The
+    /// two screens used to make opposite claims about the same parked run:
+    /// "Approve it in Approvals and this run continues on its own" beside "it
+    /// does not restart this run". One of them was teaching an operator the
+    /// wrong model of what their agents do. This field is the fact both now
+    /// read, and now that node-level restart has shipped, both say the run
+    /// goes on either way — just by a different mechanism.
+    ///
+    /// `#[serde(default)]` so a run journaled before this field existed folds
+    /// back as zero, and `skip_serializing_if` so a run that parked only gated
+    /// calls — the ordinary case — serializes byte-for-byte as it did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub blockers: usize,
 }
 
 /// `skip_serializing_if` predicate for a count that is almost always zero.

@@ -44,6 +44,30 @@ describe("approvalBatchKey for blockers", () => {
     const a: ApprovalSummary = { ...blocker({ id: "a" }), kind: "web_fetch", batch: "turn-9" };
     expect(approvalBatchKey(a)).toBe("turn-9");
   });
+
+  // A blocker carries `batch` too — the host sets it on every parked
+  // approval alike (issue #842) — but folding by it the way an ordinary
+  // gated call does hid `ApprovalRow`'s only answer box whenever a turn
+  // happened to park a blocker alongside something else, and left the
+  // batch's "Approve all" free to resolve the blocker as a wordless retry.
+  it("never inherits an ordinary call's turn batch, even parked in the very same turn", () => {
+    const a = blocker({ id: "a", batch: "turn-5" });
+    const b = blocker({ id: "b", batch: "turn-5" });
+    expect(approvalBatchKey(a)).not.toBe(approvalBatchKey(b));
+    expect(approvalBatchKey(a)).toBe("solo:a");
+  });
+
+  it("splits a blocker out of a batch it shares with an ordinary gated call", () => {
+    const question = blocker({ id: "b", batch: "turn-7" });
+    const gatedCall: ApprovalSummary = {
+      ...blocker({ id: "g" }),
+      kind: "web_fetch",
+      batch: "turn-7",
+    };
+    expect(approvalBatchKey(question)).not.toBe(approvalBatchKey(gatedCall));
+    // The gated call keeps behaving exactly as before — only the blocker splits out.
+    expect(approvalBatchKey(gatedCall)).toBe("turn-7");
+  });
 });
 
 describe("buildTimelineItems groups connection blockers into one card", () => {

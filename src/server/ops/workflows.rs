@@ -4763,6 +4763,7 @@ mod tests {
                 approval_ids: vec!["appr-1".into()],
                 unparkable: 0,
                 stranded: 0,
+                blockers: 0,
             }],
             approvals: vec![crate::ports::WorkflowRunApprovalRow {
                 node_id: Some("spec".into()),
@@ -4779,6 +4780,11 @@ mod tests {
         assert!(
             json["blockedNodes"][0].get("unparkable").is_none(),
             "the ordinary case — every call was parked — stays off the wire: {json}"
+        );
+        assert!(
+            json["blockedNodes"][0].get("blockers").is_none(),
+            "and so does a node holding no questions, so a run that parked only gated calls \
+             serializes byte-for-byte as it did before issue B-013: {json}"
         );
         assert_eq!(json["approvals"][0]["outcome"], "parked");
         assert_eq!(json["approvals"][0]["approvalId"], "appr-1");
@@ -4825,6 +4831,7 @@ mod tests {
                 approval_ids: Vec::new(),
                 unparkable: 2,
                 stranded: 0,
+                blockers: 0,
             }],
             approvals: vec![crate::ports::WorkflowRunApprovalRow {
                 node_id: Some("spec".into()),
@@ -4839,6 +4846,38 @@ mod tests {
         assert!(
             json["approvals"][0].get("approvalId").is_none(),
             "there is no card, so naming one would point at nothing: {json}"
+        );
+
+        // Issue B-013: a node holding a question the agent raised says so on
+        // the wire. Without this the console cannot tell it from a gated call,
+        // and it told operators the run would continue on approval — which for
+        // a question it will not.
+        let json = serde_json::to_value(RunWorkflowResponse {
+            output: serde_json::json!({ "nodes": {} }),
+            pending_approvals: Vec::new(),
+            deliveries: Vec::new(),
+            run_id: "run-4".into(),
+            cancelled: false,
+            verdict: WorkflowRunVerdict::Blocked,
+            nodes: Vec::new(),
+            dry_run: false,
+            board: Vec::new(),
+            blocked_nodes: vec![crate::ports::WorkflowBlockedNode {
+                node_id: "spec".into(),
+                // No tools: nothing the agent called was gated — the node
+                // itself is what stopped, which is what a blocker is.
+                tools: Vec::new(),
+                approval_ids: vec!["appr-9".into()],
+                unparkable: 0,
+                stranded: 0,
+                blockers: 1,
+            }],
+            approvals: Vec::new(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            json["blockedNodes"][0]["blockers"], 1,
+            "the console words 'what does deciding this do' from this count: {json}"
         );
     }
 
@@ -8253,6 +8292,7 @@ mod tests {
                             approval_ids: vec!["appr-1".to_string()],
                             unparkable: 0,
                             stranded: 0,
+                            blockers: 0,
                         }],
                         approvals: vec![crate::ports::WorkflowRunApprovalRow {
                             node_id: Some("spec".to_string()),
@@ -8321,6 +8361,7 @@ mod tests {
                             approval_ids: vec!["appr-gone".to_string()],
                             unparkable: 0,
                             stranded: 0,
+                            blockers: 0,
                         }],
                         approvals: Vec::new(),
                     },
@@ -8415,6 +8456,7 @@ mod tests {
                             approval_ids: vec![approval_id.as_ref().to_string()],
                             unparkable: 0,
                             stranded: 0,
+                            blockers: 0,
                         }],
                         approvals: Vec::new(),
                     },

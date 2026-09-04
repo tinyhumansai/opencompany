@@ -776,6 +776,7 @@ mod test {
                         approval_ids: Vec::new(),
                         unparkable: 0,
                         stranded: 0,
+                        blockers: 0,
                     }],
                     approvals: Vec::new(),
                 },

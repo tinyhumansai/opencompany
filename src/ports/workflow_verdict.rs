@@ -990,6 +990,7 @@ mod test {
             approval_ids: ids.iter().map(|id| id.to_string()).collect(),
             unparkable: 0,
             stranded: 0,
+            blockers: 0,
         }
     }
 

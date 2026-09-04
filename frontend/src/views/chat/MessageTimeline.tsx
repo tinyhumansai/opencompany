@@ -111,7 +111,13 @@ interface Props {
   decidingApprovals?: ReadonlyMap<string, Verdict>;
   /** Decisions that did not land, per approval id (#842) — see `ApprovalRow`. */
   failedApprovals?: Record<string, string>;
-  onDecideApproval?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecideApproval?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
   /**
    * Whether this company's teammates can think (issue #1735). On either echo
    * state every company-side row below is a canned line rather than a
@@ -444,8 +450,8 @@ export function MessageTimeline({
               deciding={decidingIn(item.approvals, decidingApprovals)}
               decided={item.decided}
               failed={failedApprovals ?? EMPTY_FAILURES}
-              onDecide={(approval, verdict, scope) =>
-                onDecideApproval?.(approval, verdict, scope)
+              onDecide={(approval, verdict, scope, answer) =>
+                onDecideApproval?.(approval, verdict, scope, answer)
               }
             />
           ),

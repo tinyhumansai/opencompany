@@ -933,11 +933,28 @@ export class OpenCompanyClient {
    * that predates #383 ignores `detach` and answers with `responses` anyway, so
    * the caller is handed whichever shape actually arrived — and never a receipt
    * fabricated from a body that isn't one.
+   *
+   * ## `answer` — the words the operator sends back (B-046, 2026-09-02)
+   *
+   * A blocker parks a *question*, and until now this argument was named
+   * `_note` and thrown away: the console had no way to send one, so a card
+   * parked on "your answer to the two questions I asked" could only be
+   * re-approved with nothing, and the re-dispatched turn read the same input
+   * and parked again — a re-billed cycle per attempt with the same reasoning.
+   * A non-empty `answer` on an `approve` re-enters the parked step carrying
+   * those words; a `deny` ignores it, and an `approve` without one behaves
+   * exactly as it did before.
+   *
+   * Empty and whitespace-only are sent as *nothing at all*, on the same rule
+   * `scope` follows above: the omitted-field form is what an old host
+   * understands, so for every caller that has no answer to send the request
+   * stays byte-identical to today's and a new console against an old host
+   * keeps working instead of 400ing on a key it has never heard of.
    */
   async resolveApproval(
     approvalId: string,
     verdict: Verdict,
-    _note?: string,
+    note?: string,
     company?: string | null,
     options: { detach?: boolean; scope?: GrantScope } = {},
   ): Promise<ChatResponse | ResolveReceipt> {
@@ -946,8 +963,11 @@ export class OpenCompanyClient {
       detach?: boolean;
       scope?: "once" | "tool";
       expires_in_millis?: number;
+      answer?: string;
     } = { verdict };
     if (options.detach) body.detach = true;
+    const trimmed = note?.trim();
+    if (trimmed) body.answer = trimmed;
     // Issue #374. The `once` scope is sent as *nothing at all*, not as
     // `scope: "once"`: the omitted-field form is what an old host understands,
     // so a new console against an old host keeps working instead of 400ing on a

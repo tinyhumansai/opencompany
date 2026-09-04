@@ -44,6 +44,7 @@ import {
   undeliveredCount,
   undeliveredNodes,
 } from "./run-health";
+import { resumeClaimFor } from "./resume-claim";
 import { stripEnginePrefixes } from "./run-error-message";
 
 /** Badge styling per delivery outcome. A report that did NOT go out must not
@@ -1002,7 +1003,14 @@ export function RunHistoryRow({
           {unparkable > 0 &&
             `${unparkable} call${unparkable === 1 ? "" : "s"} could not be queued for approval at all, so you will not be asked about ${unparkable === 1 ? "it" : "them"}. `}
           {parked > 0
-            ? `Approve ${parked === 1 ? "it" : "them"} in Approvals and this run continues on its own — approving re-runs the step, so a changed decision may ask again.`
+            ? // Issue B-013: this used to state the gated-call behaviour for
+              // every kind of card — "this run continues on its own" — while
+              // the Observatory told the same operator, about the same run,
+              // that answering does not restart it. `resumeClaimFor` is the one
+              // place either screen answers that now, off the host's own count.
+              `Decide ${parked === 1 ? "it" : "them"} in Approvals.${
+                resumeClaimFor(blocked) ? ` ${resumeClaimFor(blocked)}` : ""
+              }`
             : stranded
               ? // Says only what is observable. Approving a gate starts a NEW
                 // run rather than continuing this one, and records no link back

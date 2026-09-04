@@ -2,7 +2,7 @@
 // never exposes runtime internals ("agent graph", "tier", "dispatch", "cycle",
 // "checkpoint", "A2A"). Everything a person sees goes through this layer.
 
-import { usd } from "./money";
+import { formatUsd } from "@/lib/cost";
 import type { TaskApprovalStatus } from "../api/tasks";
 import type {
   ApprovalSummary,
@@ -391,7 +391,13 @@ export function decisionLabel(
   askerNames: Map<string, string>,
   now: number,
 ): string {
-  const parts = [approvalSummary(a)];
+  // `approvalAction` plus the amount, deliberately — NOT `approvalHeadline`.
+  // This label's job (#1411) is to tell two buttons apart, and it composes the
+  // payload itself below, with the discriminators a headline has no room for:
+  // the argument's own name, the entries past the lead, and a middle clip that
+  // keeps both ends. Leading with the headline would print the lead twice and
+  // let an unbounded request title push those discriminators out.
+  const parts = [approvalActionWithMoney(a)];
   const lead = payloadLead(a);
   if (lead != null) parts.push(lead);
   // Two hidden cards of the same kind from the same asker carry identical
@@ -442,7 +448,7 @@ function payloadLead(a: ApprovalSummary): string | null {
   // approvals (issue #618), and the resolve route accepts any member, not just
   // admins — so the name has to tell the reader the payload is gone rather
   // than pretend it was never there.
-  if (a.contents_hidden) return "details hidden by your role";
+  if (a.contents_hidden) return HIDDEN_BY_ROLE;
 
   const lines = payloadLines(a);
   const first = lines[0];
@@ -484,6 +490,54 @@ function payloadLead(a: ApprovalSummary): string | null {
     parts.push(`${lead.label}: ${lead.value}`);
   }
   return clipMiddle(parts.join(" — "), MAX_LEAD_CHARS);
+}
+
+/**
+ * The accessible name of a decide button: the verb, then what pressing it
+ * would settle (defect B-076).
+ *
+ * #1411 composed this for the Approvals page and left the chat card's buttons
+ * with no `aria-label` at all, so the two surfaces were wrong in opposite
+ * directions over the same request — one announcing four hundred characters,
+ * the other announcing "Approve" with no way to know what. Same card, same
+ * decision, two answers to "what does this button do".
+ *
+ * A batch names every request rather than counting them, on the same grounds
+ * `compactLabel` does: a second call can be the consequential one, and "and 2
+ * more" hides it behind the first. Each is a headline rather than a full
+ * {@link decisionLabel}, because the discriminators a label adds are for
+ * telling two *buttons* apart, and a batch has one.
+ */
+export function decideButtonLabel(
+  verb: string,
+  approvals: readonly ApprovalSummary[],
+  askerNames: Map<string, string>,
+  now: number,
+): string {
+  const lead = approvals[0];
+  if (lead == null) return verb;
+  if (approvals.length === 1)
+    return `${verb}: ${decisionLabel(lead, askerNames, now)}`;
+  const each = approvals
+    .map((a) => approvalHeadline(a, HIDDEN_BY_ROLE))
+    .join("; ");
+  return `${verb} all ${approvals.length} requests: ${each}`;
+}
+
+/**
+ * The category and the amount — {@link decisionLabel}'s own opening, kept
+ * separate from {@link approvalSummary} on purpose.
+ *
+ * The two used to be one function, so when the summary learned to name the
+ * request (defect B-068) the decide buttons inherited it and printed their
+ * payload lead twice. They answer different questions: a summary is read once,
+ * in prose, and wants the request's words; a button's accessible name is read
+ * against its neighbours and wants whatever differs between them.
+ */
+function approvalActionWithMoney(a: ApprovalSummary): string {
+  const action = approvalAction(a);
+  if (a.amount_usd != null) return `${action} — ${money(a.amount_usd)}`;
+  return action;
 }
 
 /** How many follow-up payload lines a decision label may carry (#1411). */
@@ -642,11 +696,71 @@ function toolkitLabel(scope: string): string {
     .join(" ");
 }
 
-/** A one-line, human summary of what needs approval. */
+/**
+ * A one-line, human summary of what needs approval — the line a toast, an
+ * announcement or a button's accessible name is built on.
+ *
+ * Composed from {@link approvalHeadline}, so it names the request and not only
+ * its category (defect B-068). It used to be {@link approvalAction} plus the
+ * amount, which is how "Extended the deadline for Use one of its tools." became
+ * a sentence the product said out loud.
+ */
 export function approvalSummary(a: ApprovalSummary): string {
+  const headline = approvalHeadline(a, HIDDEN_BY_ROLE);
+  if (a.amount_usd != null) return `${headline} — ${money(a.amount_usd)}`;
+  return headline;
+}
+
+/**
+ * What a surface with no payload block says where the request would be, when
+ * the host withheld it (#618).
+ *
+ * One string, because the compact chat row's headline, its per-item batch
+ * labels and every spoken summary have to agree about it.
+ */
+export const HIDDEN_BY_ROLE = "details hidden by your role";
+
+/**
+ * What this card is *about*, in the operator's words — the category plus the
+ * request's own title (defect B-068).
+ *
+ * {@link approvalAction} answers "what kind of thing is this", and for a
+ * teammate-raised sign-off the honest answer is the near-useless "Use one of
+ * its tools": `request_approval` is one effect kind whatever is being asked, so
+ * the kind cannot carry the question. The question is in the payload — the
+ * tool's own `title` — and it always was.
+ *
+ * The chat card has read it since #375; the Approvals page never did. So the
+ * two surfaces disagreed about the same card: the transcript said "Use one of
+ * its tools — Approve autumn range pricing" while the queue said only "Use one
+ * of its tools", with `title:`, `question:` and `context:` dumped underneath as
+ * a raw key-by-key blob, clipped mid-word until "Show everything" was pressed.
+ * The toast after deciding inherited the queue's half — "Extended the deadline
+ * for Use one of its tools."
+ *
+ * This is the composition both surfaces now use, extracted rather than copied
+ * for the reason `workflows::resume_claim` was on the host side: two places
+ * describing one card is how they come to describe it differently, and the one
+ * that drifts is the one nobody was reading when it mattered.
+ *
+ * Degrades in both directions. A payload whose lead *is* the action, or that has
+ * no lead at all, renders once rather than twice; a withheld payload keeps the
+ * action, so a member who may not read the request is still told what kind of
+ * decision it is.
+ *
+ * @param hiddenDetail what to put where the request would be when the host
+ *   withheld it (#618). A surface that renders {@link ApprovalPayload} beneath
+ *   the headline passes nothing — that block already says it, in full, and
+ *   twice on one card is worse than once. A surface with no room for it (the
+ *   compact chat row) passes the short form.
+ */
+export function approvalHeadline(
+  a: ApprovalSummary,
+  hiddenDetail?: string,
+): string {
   const action = approvalAction(a);
-  if (a.amount_usd != null) return `${action} — ${money(a.amount_usd)}`;
-  return action;
+  const detail = a.contents_hidden ? hiddenDetail : payloadLeadLabel(a);
+  return detail == null || detail === action ? action : `${action} — ${detail}`;
 }
 
 /** One line of an approval's payload preview: a label and its value. */
@@ -782,6 +896,13 @@ const PAYLOAD_KEY_ORDER: Readonly<Record<string, string[]>> = {
   curl: ["url", "dest_path"],
   http_request: ["url", "method"],
   git_operations: ["operation"],
+  // A teammate's own sign-off request (defect B-068). Its arguments are the
+  // whole question — `request_approval` carries `{title, question, context}`
+  // verbatim from the tool call — and until this entry existed they were
+  // ranked equally, so which of the three led the card was whatever order the
+  // model happened to serialize them in. The title is the line an operator
+  // scans a queue by, so it leads; the question and its context follow.
+  request_approval: ["title", "question", "context"],
 };
 
 /**
@@ -871,9 +992,17 @@ function renderValue(value: unknown): string {
   return JSON.stringify(value) ?? String(value);
 }
 
-/** An effect's dollar amount, rendered like every other real-money figure. */
+/**
+ * A USD amount inside a sentence — an approval's amount, a consequence line.
+ *
+ * Delegates to {@link formatUsd} rather than calling `Intl` again (issue
+ * B-016). This was the console's second independent USD formatter, and it
+ * carried the same failure in miniature: `Intl`'s default for USD rounds to
+ * cents, so an approval for $0.004 rendered as `$0.00` — an operator asked to
+ * authorise a payment the card told them was free.
+ */
 export function money(amountUsd: number): string {
-  return usd(amountUsd);
+  return formatUsd(amountUsd);
 }
 
 /** Feedback categories, phrased the way an operator would think about them. */

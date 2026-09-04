@@ -262,6 +262,49 @@ export function newMember(fields: { name: string; role: string; description: str
 }
 
 /**
+ * A stable fingerprint of the roster a surface resolved its addressing from, so
+ * a later read can answer "did anything change?" without re-deriving anything.
+ *
+ * # Why a fingerprint, and not a count or a reference
+ *
+ * The shell derives every DM thread id, every `chat/history` poll target and
+ * the thread-to-channel map a live SSE frame is routed through from the roster.
+ * That derivation used to run once per company and then be closed over, so a
+ * teammate hired afterwards was addressable but unreadable: `ChatView` keeps
+ * its own live roster and puts the new DM in the rail the moment the host
+ * confirms the write, while the shell never polled that desk's history and had
+ * no channel to route their live frames into. Re-deriving on every read instead
+ * would re-render the shell on the five-second history cadence forever, so the
+ * read needs a cheap "same roster?" answer.
+ *
+ * Row **count** is not that answer: hiring one teammate and dropping another
+ * between two ticks leaves the count identical while the ids have moved. Object
+ * identity is not either — every read is a fresh parse, so it always differs.
+ *
+ * Ids **and** names, because the shell derives both the addressing (ids) and
+ * the name map a live receipt resolves an agent id through (names): a rename
+ * changes nothing about where a message goes and everything about whose name is
+ * on it. Order counts too — the roster's order is the order DM threads are
+ * built in, so a reorder really does change what renders.
+ *
+ * The separators are ASCII unit (`U+001F`) and record (`U+001E`) separator,
+ * because neither can appear in a host-issued agent id or in a name typed into
+ * the add-teammate dialog. A plain `,` would let `["a,b"]` and `["a", "b"]`
+ * fingerprint identically.
+ */
+export function rosterIdentity(team: readonly TeamMemberDto[]): string {
+  // Codex review, PR #2054: the DISPLAYED name, not the raw `name` field —
+  // `fromDto` falls back to `role` when a teammate carries no explicit name,
+  // and a fingerprint keyed on the raw field never moved for that teammate's
+  // own role change (`m.name` stayed `undefined`/empty on both sides of it).
+  // The shell read "same roster" and skipped `applyRoster`, so the DM rail,
+  // the live-reply name map and the mention directory kept showing the old
+  // role as that teammate's name until a reload.
+  const name = (m: TeamMemberDto) => m.name?.trim() || m.role;
+  return team.map((m) => `${m.id ?? ""}\u001f${name(m)}`).join("\u001e");
+}
+
+/**
  * The tile colours behind a desk's or teammate's initials.
  *
  * **The keys are legacy slot names, not colour claims.** They are persisted

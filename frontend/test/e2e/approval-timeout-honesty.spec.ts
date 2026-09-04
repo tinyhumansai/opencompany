@@ -126,8 +126,23 @@ test.beforeEach(async ({ page }) => {
 });
 
 const toasts = (page: Page) => page.locator("[data-sonner-toast]");
+/**
+ * The queue card for this approval, by id rather than by its "acme-supplies"
+ * text.
+ *
+ * Defect B-068 (`4c293f0f2`) put the request's counterparty in the card
+ * headline (`approvalHeadline`, via `ApprovalHeadline`) *and* it was already
+ * printed verbatim in the raw payload block below (`ApprovalPayload`,
+ * `frontend/src/components/approval-card.tsx`) — both real, both intentional,
+ * so `getByText("acme-supplies")` now matches two elements on one card and
+ * trips Playwright's strict-mode locator check. Every assertion here only
+ * ever cares whether *the card* is present or gone, never which of its two
+ * lines carries the name, so scoping to `ApprovalCard`'s own
+ * `data-approval-id` (`frontend/src/views/ApprovalsView.tsx`) is the correct
+ * fix rather than picking one of the two text matches with `.first()`.
+ */
 const approvalCard = (page: Page) =>
-  page.getByText("acme-supplies", { exact: false });
+  page.locator(`[data-approval-id="${APPROVAL_ID}"]`);
 
 /**
  * Serve one parked approval until `resolved` flips, then serve an empty queue —

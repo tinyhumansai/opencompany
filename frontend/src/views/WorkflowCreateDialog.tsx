@@ -47,6 +47,7 @@ import {
   configFromDraft,
   hasConfigForm,
 } from "@/lib/workflow-node-config";
+import { useHashNavigationGuard } from "@/hooks/use-hash-view";
 import { draftBanners, draftLanding } from "@/lib/workflow-draft";
 import { isSafeId, slugifyWorkflowId } from "@/lib/workflow-id";
 import type { OpenCompanyClient } from "@/api/client";
@@ -859,6 +860,29 @@ export function WorkflowCreateDialog({
    * fixed there and the form field is read-only.
    */
   const [confirmingId, setConfirmingId] = useState(false);
+  /**
+   * The exit waiting on "yes, throw the edits away" — `null` when nothing is
+   * being asked (defect B-081).
+   *
+   * # Why this is state rather than a `window.confirm`
+   *
+   * Every deliberate way out of this dialog funnels through `requestClose`,
+   * and while the form was dirty `requestClose` asked `window.confirm` and
+   * bailed on a falsy answer. `window.confirm` cannot distinguish "the
+   * operator said no" from "this environment does not ask" — and it returns
+   * `false` for the second case with no prompt drawn and nothing logged.
+   * Chrome returns `false` forever once a person ticks "prevent this page from
+   * creating additional dialogs"; an automation-driven browser auto-dismisses;
+   * the `src-tauri` desktop shell's webview has no confirm panel at all. In any
+   * of those, Cancel, the ×, Escape, the backdrop and a scripted `.click()` all
+   * ran the handler and silently returned, leaving a modal with no exit but a
+   * page reload — which destroys the very graph the guard exists to protect.
+   *
+   * So the console asks the question itself. The stored continuation is what to
+   * do once it is answered, which keeps the two askers (this dialog's close,
+   * and the hash guard below) on one prompt and one code path.
+   */
+  const [discardPending, setDiscardPending] = useState<(() => void) | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** The submit-time error banner, so a failed submit can scroll it into view
    * and focus it rather than leave the message off-screen (#813 defect 6). */
@@ -1156,9 +1180,28 @@ export function WorkflowCreateDialog({
    * Every deliberate exit routes through here — Esc, a click outside, Cancel —
    * so there is one answer to "does this lose my edits?" rather than three. */
   const requestClose = useCallback(() => {
-    if (dirty && !window.confirm(DISCARD_PROMPT)) return;
-    onOpenChange(false);
+    if (!dirty) {
+      onOpenChange(false);
+      return;
+    }
+    // Defect B-081: ask through the console's own AlertDialog, not
+    // `window.confirm`. The guard may refuse an exit only after a person has
+    // actually declined it — a refusal nobody was asked for is a trap, and
+    // this was the only way out of the dialog.
+    // `setState` treats a function argument as an updater, so the continuation
+    // has to be wrapped to be stored rather than called.
+    setDiscardPending(() => () => onOpenChange(false));
   }, [dirty, onOpenChange]);
+
+  // Codex review, PR #2054: claims this navigation for the in-app guard
+  // below, for every OTHER `useHashView` router mounted anywhere in the
+  // console — the app shell's own top-level route among them. Without this,
+  // the shell's router listener (registered at app mount, so always earlier
+  // than this dialog's own) read a Back press's new hash and queued a route
+  // change in the same React batch as the confirmation below, unmounting
+  // this dialog before the confirmation could ever render. See
+  // `useHashNavigationGuard`'s own doc for the full race.
+  const releaseHashNavigationGuard = useHashNavigationGuard(dirty);
 
   // Issue #1006: the tab-level guard. A reload or a close is the one exit the
   // dialog cannot intercept itself, so it hands the question to the browser.
@@ -1187,12 +1230,27 @@ export function WorkflowCreateDialog({
     const onHashChange = () => {
       const moved = window.location.hash;
       if (moved === at) return;
-      if (window.confirm(DISCARD_PROMPT)) {
-        at = moved;
-        onOpenChange(false);
-        return;
-      }
+      // Defect B-081: restore first, then ask. `window.confirm` blocked here,
+      // which held the console's router — its `hashchange` listener is
+      // registered at app mount and so runs before this one — from committing
+      // the move until the answer came back. An AlertDialog cannot block, so
+      // the move is undone synchronously instead, which returns the router to
+      // this view in the same tick it left. The restore re-fires `hashchange`
+      // and the equality check above absorbs it.
       window.location.hash = at;
+      setDiscardPending(() => () => {
+        at = moved;
+        // CodeRabbit review, PR #2054: released synchronously, here, rather
+        // than left to the `dirty`-keyed effect's own cleanup — that cleanup
+        // is a passive effect, flushed on React's own schedule, and the
+        // `hashchange` the assignment below is about to raise is a
+        // plain browser macrotask that can reach every `useHashView`'s
+        // listener before React gets to it. An approved navigation must not
+        // itself get swallowed by the guard it is retiring.
+        releaseHashNavigationGuard();
+        onOpenChange(false);
+        window.location.hash = moved;
+      });
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
@@ -2415,6 +2473,48 @@ export function WorkflowCreateDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+      {/* Defect B-081: the discard confirm, drawn by the console instead of by
+          `window.confirm`. Every exit from a dirty dialog is gated on this
+          answer, so the ask has to be one the operator can always see and
+          always answer — a `confirm()` that an environment declines on their
+          behalf turned this dialog into a trap whose only exit was the reload
+          that destroys the graph. Rendered outside the editor Dialog so it
+          survives the moment that one starts closing. */}
+      <AlertDialog
+        open={discardPending !== null}
+        onOpenChange={(o) => {
+          // Dismissing the ask — Esc, an outside click — is "keep editing",
+          // the same as Cancel. It must never be read as consent to discard.
+          if (!o) setDiscardPending(null);
+        }}
+      >
+        <AlertDialogContent data-testid="workflow-discard-confirm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Leave without saving?</AlertDialogTitle>
+            <AlertDialogDescription>{DISCARD_PROMPT}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              data-testid="workflow-discard-keep"
+              onClick={() => setDiscardPending(null)}
+            >
+              Keep editing
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-testid="workflow-discard-leave"
+              onClick={() => {
+                // Read the continuation before clearing it: the state update
+                // is what closes this ask, and the exit must still run.
+                const leave = discardPending;
+                setDiscardPending(null);
+                leave?.();
+              }}
+            >
+              Discard changes
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {/* Issue #1808: the create-time id confirm. The id is a permanent backend
           join key set only at creation and silently derived from the name, so a
           typo becomes a permanent id with no acknowledgement — this is the one

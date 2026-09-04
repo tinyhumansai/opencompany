@@ -37,8 +37,8 @@ import { Label } from "@/components/ui/label";
 // waiting for its 30s poll. Not a cycle: `use-autonomy` imports only
 // `@/api/policy` and `@/lib/visible-poll`.
 import { applyAutonomy } from "@/hooks/use-autonomy";
-import { usd } from "@/lib/money";
 import { cn } from "@/lib/utils";
+import { formatUsd } from "@/lib/cost";
 
 /**
  * Tools worth naming as an *example* of something to always ask about, most
@@ -1204,8 +1204,8 @@ export function PolicySettings({ client, company }: Props) {
                       <>
                         {status.autoApproveUnderUsd === null
                           ? "Today every spend asks first."
-                          : `Today spend under ${usd(status.autoApproveUnderUsd)} asks nothing.`}{" "}
-                        {`Raising the cap to ${usd(pendingCapRaise)} lets qualifying spends under the new cap pass without asking; the daily budget still stops spending after its limit.`}
+                          : `Today spend under ${formatUsd(status.autoApproveUnderUsd)} asks nothing.`}{" "}
+                        {`Raising the cap to ${formatUsd(pendingCapRaise)} lets qualifying spends under the new cap pass without asking; the daily budget still stops spending after its limit.`}
                       </>
                     ) : resetAwaitingConfirmation ? (
                       <>
@@ -1295,7 +1295,7 @@ export function PolicySettings({ client, company }: Props) {
                     }}
                   >
                     {pendingCapRaise !== null
-                      ? `Raise cap to ${usd(pendingCapRaise)}`
+                      ? `Raise cap to ${formatUsd(pendingCapRaise)}`
                       : resetAwaitingConfirmation
                         ? "Revert and give more autonomy"
                         : AUTONOMY_CONFIRM_ACTION}

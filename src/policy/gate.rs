@@ -355,34 +355,50 @@ impl ManifestApprovalGate {
         );
     }
 
-    /// Re-anchors a parked approval's TTL window to `now`, giving the operator a
-    /// fresh full deadline on it (issue #1805). Returns whether an entry was
-    /// actually moved — `false` for an id that is not (or no longer) parked, so a
-    /// caller can answer 404 rather than pretend it extended something.
+    /// Gives a parked approval **another full TTL window** (issue #1805),
+    /// returning the anchor it now runs from — or `None` for an id that is not
+    /// (or no longer) parked, so a caller can answer 404 rather than pretend it
+    /// extended something.
     ///
-    /// # Why a full fresh window, not "+N hours"
+    /// # Why it adds a window rather than re-anchoring to `now` (defect B-069)
     ///
-    /// The parked entry carries a single `parked_at_millis`, and both the sweeper
-    /// and the console's deadline are `parked_at + ttl`. Moving that instant to
-    /// `now` is therefore the *whole* of an extension: the sweep that would have
-    /// retired it no longer sees it expired, and the projected deadline moves in
-    /// lockstep, with no second knob that could disagree. An additive "+N" would
-    /// need its own stored offset and a second place computing the deadline — the
-    /// exact fork [`ttl_millis`](Self::ttl_millis) exists to avoid.
+    /// It used to set the anchor to `now`, which moved the deadline by *the
+    /// time that had passed since the park* and nothing more. On a fresh
+    /// approval that is a no-op: measured over four presses the deadline moved
+    /// 23,772 ms and 27,078 ms — exactly the wall-clock elapsed between the
+    /// calls — while the route answered `200 {"extended":true}` and the card's
+    /// countdown read "Declines itself in 23h" before and after every one. A
+    /// founder who wanted the weekend to think pressed it, saw nothing change,
+    /// and pressed it again.
     ///
-    /// The durable half lives in the journal (`record_extended`): this moves the
-    /// **live** anchor the sweeper reads, and boot replay re-applies the move by
-    /// rehydrating from the journal's extended anchor, so an extension survives a
-    /// redeploy rather than reverting to the original park instant.
-    pub fn extend(&self, id: &ApprovalId, now_millis: u64) -> bool {
+    /// The old reasoning was that an additive extension "would need its own
+    /// stored offset and a second place computing the deadline". It does not.
+    /// The deadline is `anchor + ttl` and that stays the only formula: adding
+    /// one `ttl` to the **anchor** moves the deadline by exactly one `ttl`,
+    /// through the same single knob the sweeper and the projection already
+    /// share. What was actually needed was to stop confusing "the window is
+    /// measured from here" with "the work was parked here", and the journal had
+    /// already drawn that line — `deadline_anchor_millis` beside `at_millis`,
+    /// so the payload's age does not move when a deadline does.
+    ///
+    /// `.max(now_millis)` is the floor the old behaviour guaranteed and this
+    /// keeps: an approval whose deadline has already passed but which the
+    /// sweeper has not yet reached is given a full window from now, never a
+    /// deadline still in the past.
+    ///
+    /// There is no ceiling. Pressing Extend twice buys two windows, which is
+    /// what the word means and what an operator who presses it twice is asking
+    /// for; the parked work is theirs to keep alive.
+    ///
+    /// The durable half lives in the journal (`record_extended`), which stores
+    /// this returned anchor, so boot replay re-applies the move rather than
+    /// reverting to the original park instant.
+    pub fn extend(&self, id: &ApprovalId, now_millis: u64) -> Option<u64> {
+        let ttl = self.ttl_millis();
         let mut map = self.parked.lock().expect("parked map poisoned");
-        match map.get_mut(id) {
-            Some(parked) => {
-                parked.parked_at_millis = now_millis;
-                true
-            }
-            None => false,
-        }
+        let parked = map.get_mut(id)?;
+        parked.parked_at_millis = parked.parked_at_millis.saturating_add(ttl).max(now_millis);
+        Some(parked.parked_at_millis)
     }
 
     /// Removes every parked approval older than the TTL relative to `now`,
@@ -1787,24 +1803,58 @@ mod test {
         assert!(gate.parked_ids().is_empty());
     }
 
-    /// Issue #1805: extending re-anchors the TTL window, so an entry that was
-    /// one tick from expiry survives the sweep that would have retired it and
-    /// only expires on the fresh window.
+    /// Issue #1805: extending moves the TTL window, so an entry that was one
+    /// tick from expiry survives the sweep that would have retired it and only
+    /// expires on the new window.
     #[test]
     fn extend_keeps_a_near_expiry_entry_out_of_the_sweep() {
         let gate = ManifestApprovalGate::new(policy("supervised", None)).with_ttl_millis(1_000);
         let id = ApprovalId::from("appr-extend".to_string());
         gate.rehydrate(id.clone(), effect("filing.submit", EffectGroup::Sign), 0);
         // Just before the original deadline (0 + 1000) the operator extends it.
-        assert!(gate.extend(&id, 900));
-        // Past the ORIGINAL deadline the sweep now leaves it: its window runs
-        // from 900, so 1500 - 900 = 600 < 1000.
+        // The window is ADDED to the one it had, so the anchor moves to 1000.
+        assert_eq!(gate.extend(&id, 900), Some(1_000));
+        // Past the ORIGINAL deadline the sweep now leaves it: 1500 - 1000 = 500.
         assert!(gate.sweep_expired(1_500).is_empty());
         assert_eq!(gate.parked_ids(), vec![id.clone()]);
-        // It still expires, on the NEW window: 1901 - 900 = 1001 >= 1000.
-        assert_eq!(gate.sweep_expired(1_901), vec![id]);
+        // It still expires, on the NEW window: 2001 - 1000 = 1001 >= 1000.
+        assert_eq!(gate.sweep_expired(2_001), vec![id]);
         // Extending an id that is not parked reports it rather than pretending.
-        assert!(!gate.extend(&ApprovalId::from("ghost".to_string()), 0));
+        assert_eq!(gate.extend(&ApprovalId::from("ghost".to_string()), 0), None);
+    }
+
+    /// Defect B-069: Extend buys a whole window, not the time that happened to
+    /// have passed.
+    ///
+    /// It used to set the anchor to `now`, so the deadline moved by the elapsed
+    /// time and nothing more. Pressed on a fresh approval — which is the case
+    /// an operator is actually in when they decide they want longer — that is a
+    /// no-op: measured over four presses the deadline moved 23.8 and 27.1
+    /// seconds against a claimed 24 hours, and the card read the same "Declines
+    /// itself in 23h" before and after every one.
+    #[test]
+    fn extend_adds_a_window_rather_than_re_anchoring_to_now() {
+        let gate = ManifestApprovalGate::new(policy("supervised", None)).with_ttl_millis(1_000);
+        let id = ApprovalId::from("appr-fresh".to_string());
+        gate.rehydrate(
+            id.clone(),
+            effect("filing.submit", EffectGroup::Sign),
+            1_000,
+        );
+
+        // Pressed 10ms after the park: the deadline was 2000 and is now 3000,
+        // a whole extra window — not 2010.
+        assert_eq!(gate.extend(&id, 1_010), Some(2_000));
+        // Pressing again buys another. Nothing caps it: keeping parked work
+        // alive is the operator's call.
+        assert_eq!(gate.extend(&id, 1_020), Some(3_000));
+
+        // An entry the sweeper has not yet reached is never handed a deadline
+        // still in the past — that floor is what re-anchoring guaranteed, and
+        // it is kept.
+        let late = ApprovalId::from("appr-late".to_string());
+        gate.rehydrate(late.clone(), effect("filing.submit", EffectGroup::Sign), 0);
+        assert_eq!(gate.extend(&late, 900_000), Some(900_000));
     }
 
     // -- Emergency stop (issue #86) -----------------------------------------

@@ -172,13 +172,27 @@ async function openEditDialog(page: Page, name: string) {
 }
 
 /**
- * Accepts the one discard confirmation an edited dialog raises on the next
- * close (issue #1006). Cancel out of a touched form now asks before throwing
- * the work away, and Playwright dismisses an unhandled `confirm` — which reads
- * as "no, keep editing" and leaves the dialog open.
+ * Confirms the discard prompt a dirty dialog's Cancel raises (issue #1006).
+ *
+ * That prompt used to be `window.confirm`, answerable with a
+ * `page.once("dialog", ...)` handler. Defect B-081 (`d5c710e06`) replaced it
+ * with the console's own `AlertDialog` — a `window.confirm` an automated
+ * environment declines on the operator's behalf made the editor inescapable,
+ * only a page reload got out, and a reload destroys the graph being edited.
+ * The in-app dialog fixes that for a real user, but it is not a native
+ * dialog: nothing here fires Playwright's `dialog` event, so the old
+ * `page.once("dialog", ...)` handler this replaced was inert. It left the
+ * "Leave without saving?" `AlertDialog` standing over the page, and its
+ * full-screen overlay swallowed every click a spec made afterwards —
+ * `workflow-conflict-reload` or `workflow-back-to-index` timing out with
+ * `alert-dialog-overlay` intercepting pointer events, never the button
+ * itself missing.
  */
-function acceptDiscard(page: Page) {
-  page.once("dialog", (d) => void d.accept());
+async function confirmDiscard(page: Page) {
+  const confirm = page.getByTestId("workflow-discard-confirm");
+  await expect(confirm).toBeVisible();
+  await confirm.getByTestId("workflow-discard-leave").click();
+  await expect(confirm).toBeHidden();
 }
 
 /** Reads a workflow's stored graph back from the host. */
@@ -476,8 +490,8 @@ test("a stale save surfaces the conflict banner and writes nothing", async ({
 
     // And the way out is the banner Delete already had, waiting behind the
     // dialog rather than vanishing with it.
-    acceptDiscard(page);
     await dialog.getByRole("button", { name: "Cancel" }).click();
+    await confirmDiscard(page);
     const banner = page.getByTestId("workflow-conflict");
     await expect(banner).toBeVisible();
     await banner.getByTestId("workflow-conflict-reload").click();
@@ -524,8 +538,8 @@ test("a field error raised on one graph never appears on another", async ({
     // The rule, not the standing hint under the field (which also says
     // "5-field cron") — those are different strings for a reason.
     await expect(dialog).toContainText(/A schedule is a 5-field cron/);
-    acceptDiscard(page);
     await dialog.getByRole("button", { name: "Cancel" }).click();
+    await confirmDiscard(page);
 
     // Both graphs have a trigger node whose id is `start`, so an error map keyed
     // on the node id (rather than on the freshly minted row key) would carry

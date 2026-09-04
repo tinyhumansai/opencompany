@@ -415,6 +415,28 @@ pub struct BlockerResolution {
     /// of the resume is carrying the answer back into the DM it was asked in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<BlockerStep>,
+    /// The seq the operator's own `OperatorMessage` was already appended
+    /// under, when the answer arrived by being typed directly into the
+    /// blocked conversation — `None` for one typed into the Approvals card's
+    /// answer box instead (CodeRabbit review, PR #2054: "Reuse the
+    /// already-journaled chat answer").
+    ///
+    /// `accept_chat_turn` journals the operator's chat message *before*
+    /// `apply_blocker_reply` ever banks a resolution from it — the same
+    /// pre-journal-then-cycle ordering [`CompanyRuntime::run_journaled_cycle`]
+    /// exists for generally. A bare agent question's resume
+    /// (`drive_blocker_resume`'s no-step arm) used to always synthesize a
+    /// *fresh* `OperatorMessage` with the same text via `deliver_blocker_answer`
+    /// regardless of that — so a DM answer landed in the transcript, and in the
+    /// agent's own context, twice. This seq is how that arm tells the two
+    /// origins apart: present, it re-enters the cycle on the event already on
+    /// the journal instead of minting a second one; absent, nothing was
+    /// journaled yet and `deliver_blocker_answer` still has to be the one that
+    /// does it.
+    ///
+    /// [`CompanyRuntime::run_journaled_cycle`]: crate::company::runtime::CompanyRuntime::run_journaled_cycle
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journaled_answer_seq: Option<crate::ports::types::EventSeq>,
 }
 
 impl BlockerResolution {
@@ -424,6 +446,7 @@ impl BlockerResolution {
             verdict,
             answer: String::new(),
             step: None,
+            journaled_answer_seq: None,
         }
     }
 
@@ -433,12 +456,20 @@ impl BlockerResolution {
             verdict,
             answer: answer.into(),
             step: None,
+            journaled_answer_seq: None,
         }
     }
 
     /// The same resolution with its stopped step recorded.
     pub fn with_step(mut self, step: Option<BlockerStep>) -> Self {
         self.step = step;
+        self
+    }
+
+    /// The same resolution, marked as answering a message already journaled
+    /// at `seq` — see [`Self::journaled_answer_seq`].
+    pub fn with_journaled_answer_seq(mut self, seq: Option<crate::ports::types::EventSeq>) -> Self {
+        self.journaled_answer_seq = seq;
         self
     }
 

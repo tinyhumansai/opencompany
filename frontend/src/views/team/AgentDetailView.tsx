@@ -74,13 +74,13 @@ import { FieldCopilot } from "@/views/team/FieldCopilot";
 import { fetchBoardColumns } from "@/lib/board-columns";
 import { avatarRef } from "@/lib/avatar";
 import { AvatarPicker } from "@/components/avatar-picker";
-import { usd } from "@/lib/money";
 import { personName } from "@/lib/person";
 import { roleSubtitle, toneFor } from "@/lib/team";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
 import { cn } from "@/lib/utils";
 import { AgentFields } from "@/views/team/AgentFields";
 import { AgentRuns } from "@/views/team/AgentRuns";
+import { formatUsd } from "@/lib/cost";
 
 type Load = "loading" | "ready" | "missing" | "unsupported" | "error";
 
@@ -497,7 +497,7 @@ export function AgentDetailView({
             }
           : held,
       );
-      toast.success(cap === null ? "Daily cap removed." : `Daily cap set to ${usd(cap)}.`);
+      toast.success(cap === null ? "Daily cap removed." : `Daily cap set to ${formatUsd(cap)}.`);
     } catch (error) {
       toast.error(budgetError(error, "Couldn't change the daily cap."));
     }
@@ -1256,7 +1256,8 @@ function FactLine({
       )}
       {capped && (
         <span data-testid="agent-spend">
-          Today {usd(agent.spentTodayUsd ?? 0)} of {usd(agent.budgetUsdDaily ?? 0)}
+          Today {formatUsd(agent.spentTodayUsd ?? 0)} of{" "}
+          {formatUsd(agent.budgetUsdDaily ?? 0)}
         </span>
       )}
     </div>
@@ -1857,7 +1858,7 @@ function Budget({
         {capped ? (
           <>
             <p className="text-muted-foreground">
-              {usd(cap)}/day · {usd(agent.spentTodayUsd ?? 0)} spent today
+              {formatUsd(cap)}/day · {formatUsd(agent.spentTodayUsd ?? 0)} spent today
             </p>
             <p className="text-xs text-muted-foreground" data-testid="agent-budget-scope">
               Spent today counts everything this teammate has spent since 00:00

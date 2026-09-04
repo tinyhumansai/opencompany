@@ -57,6 +57,42 @@ export function approvedByRuntimeLine(stillAwaiting: StillAwaiting, detail?: str
   } before it runs${suffix}`;
 }
 
+/**
+ * The confirmation for approving a question that has no work behind it
+ * (defect B-070).
+ *
+ * `approvedLine` and `approvedByRuntimeLine` both answer "is anything still
+ * owed before this moves?" — and when nothing is, they say the work is
+ * starting. For the blocker `isAnswerOnlyBlocker` names that is false however
+ * few sign-offs remain: a question asked mid-conversation, with no card and no
+ * workflow run behind it, has no step to re-enter. A founder read "Approved —
+ * carrying it out now", watched the card leave the queue, and waited
+ * twenty-five minutes for work that was never going to begin.
+ *
+ * A blocker `unlinked` on a workflow node is not this case — it re-enters the
+ * node it stopped (issues #1863, #2005), just not through this line; see
+ * `isAnswerOnlyBlocker`'s own doc for the three-way split.
+ *
+ * `carried` is defect B-124's half of this: the host no longer just banks a
+ * non-blank answer here, it runs `deliver_blocker_answer` and posts it into
+ * the parked conversation as an `OperatorMessage` — the same route a typed
+ * reply already takes. `answerRecordedLine()` used to claim unconditionally
+ * that nothing restarts on its own, which stayed true only for a blank answer
+ * once B-124 landed; a non-blank one now genuinely reaches the teammate.
+ * `carried` mirrors the host's own `deliverable_answer` gate: `verdict ===
+ * "approve"` and a trimmed, non-empty answer.
+ *
+ * Deliberately says what DID happen and what did not, in the host's own words
+ * for the same event, so the banner here and the note that lands in the
+ * conversation cannot contradict each other about one press.
+ */
+export function answerRecordedLine(carried: boolean, detail?: string): string {
+  const suffix = detail ? `: ${detail}` : "";
+  return carried
+    ? `Answer sent — the teammate will reply to it in that conversation${suffix}`
+    : `Answer recorded — this doesn't restart anything on its own${suffix}`;
+}
+
 /** This card's place in its turn's batch: 1-based `index` of `total` (#1289). */
 export interface BatchPosition {
   index: number;

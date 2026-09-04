@@ -219,6 +219,8 @@ interface Props {
     approval: ApprovalSummary,
     verdict: Verdict,
     scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
   ) => void;
   /**
    * Re-reads the shared list (`useLedgerNav.refresh`) — called after the
@@ -1345,7 +1347,13 @@ function BoardMode({
   decided: Readonly<Record<string, DecidedApproval>>;
   failed: Record<string, string>;
   /** The shell's one resolve — absent when this board is read-only. */
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
   /** Re-dispatch a paused card. */
   onResume?: (entry: LedgerEntry) => void;
 }) {

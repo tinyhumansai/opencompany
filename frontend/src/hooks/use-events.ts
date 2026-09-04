@@ -10,8 +10,8 @@ import type {
 } from "@/api/workflows";
 // Issue #981: the one definition of "this report did not go out", shared with
 // the run drawer, the history rows and the host itself.
-import { usd } from "@/lib/money";
 import { undeliveredCount } from "@/views/workflows/run-health";
+import { formatUsd } from "@/lib/cost";
 
 /**
  * One attention item off the company → operator SSE feed (issue #66). Mirrors
@@ -1273,7 +1273,7 @@ export function handleEvent(
       break;
     case "payment_received":
       toast.success("Payment received", {
-        description: `${usd(event.amountUsd)} — ${event.memo}`,
+        description: `${formatUsd(event.amountUsd)} — ${event.memo}`,
       });
       break;
     // Issue #228. A run that went fine is not an attention signal — toasting

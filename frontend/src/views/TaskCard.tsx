@@ -170,7 +170,13 @@ export function TaskItem({
    * a surface with no handler renders no decide controls rather than live
    * buttons that do nothing. Every board in this console is handed one.
    */
-  onDecide?: (approval: ApprovalSummary, verdict: Verdict, scope: GrantScope) => void;
+  onDecide?: (
+    approval: ApprovalSummary,
+    verdict: Verdict,
+    scope: GrantScope,
+    /** The operator's answer to a blocker's question (B-046) — see `ApprovalRow`. */
+    answer?: string,
+  ) => void;
   onOpen: () => void;
   onResume: () => void;
 }) {
