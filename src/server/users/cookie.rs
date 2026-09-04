@@ -18,9 +18,11 @@
 //! session for company A — same origin, same cookie name, last write wins.
 //! Naming the cookie `oc_session_<company>` keeps them independent.
 //!
-//! It also gives the GraphQL handler a way to find the company: the resolver's
-//! company argument lives in the request *body*, which is unavailable when
-//! extractors run, but the cookie name carries it.
+//! The name is how a cookie is *looked up* once the request has established
+//! which company it addresses. It is not how that company is decided: the jar
+//! belongs to the origin and holds one cookie per company signed into on it, so
+//! reading a company out of it would answer from whichever the browser happened
+//! to send rather than the one the request named.
 //!
 //! ## Why the name is validated
 //!

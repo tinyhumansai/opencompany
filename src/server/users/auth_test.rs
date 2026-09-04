@@ -472,9 +472,198 @@ async fn a_session_cookie_cannot_reach_the_platform_plane() {
 }
 
 #[tokio::test]
+async fn a_second_session_cookie_does_not_hide_the_addressed_one() {
+    // A browser attaches every cookie for an origin, and cookies ignore port,
+    // so one browser holds a session per company ever signed into on that host
+    // — including companies this host has never heard of. None of that changes
+    // which company the request addresses.
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with(&home, &["acme"]).await;
+    let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!(
+            "{}; oc_session_ghost=stale; theme=dark",
+            cookie_header("acme", &token)
+        )
+        .parse()
+        .unwrap(),
+    );
+
+    // Unaddressed: the registry's sole company is the addressed one.
+    match resolve_principal(&headers, &state, None, None)
+        .await
+        .expect("a decoy cookie must not refuse the request")
+    {
+        GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new("acme")),
+        other => panic!("expected a user, got {other:?}"),
+    }
+
+    // Addressed explicitly: same answer, by the same lookup.
+    match resolve_principal(&headers, &state, Some(&CompanyId::new("acme")), None)
+        .await
+        .expect("a decoy cookie must not refuse an addressed request")
+    {
+        GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new("acme")),
+        other => panic!("expected a user, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_expired_cookie_beside_a_live_one_still_reads_as_ambiguous() {
+    // Both name companies this host serves, so both are candidates. Liveness is
+    // not consulted to break the tie: that would mean authenticating every
+    // cookie in the jar to decide which one the request meant, and the answer
+    // would still be a guess. The refusal is the conservative direction, and
+    // the company-scoped routes resolve it — see the test below.
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with(&home, &["acme", "globex"]).await;
+    let live = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
+    let expired = seed_session(&state, "globex", UserRole::Member, UserStatus::Active).await;
+    let globex = CompanyId::new("globex");
+    let runtime = state.registry().get(&globex).unwrap();
+    let mut record = runtime
+        .sessions()
+        .find_by_token_hash(&globex, &sha256_hex(&expired))
+        .await
+        .unwrap()
+        .unwrap();
+    runtime
+        .sessions()
+        .delete(&globex, &record.id)
+        .await
+        .unwrap();
+    record.id = "s1-expired".into();
+    record.expires_at_millis = crate::ports::now_millis() - 1;
+    runtime.sessions().create(&globex, &record).await.unwrap();
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!(
+            "{}; {}",
+            cookie_header("acme", &live),
+            cookie_header("globex", &expired)
+        )
+        .parse()
+        .unwrap(),
+    );
+    assert!(
+        resolve_principal(&headers, &state, None, None)
+            .await
+            .is_err(),
+        "two served companies in the jar stay ambiguous whatever their liveness"
+    );
+    // Naming the company is what resolves it, and the dead cookie is irrelevant.
+    match resolve_principal(&headers, &state, Some(&CompanyId::new("acme")), None)
+        .await
+        .unwrap()
+    {
+        GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new("acme")),
+        other => panic!("expected a user, got {other:?}"),
+    }
+    // And the expired one authenticates nobody even when it is addressed.
+    assert!(
+        resolve_principal(&headers, &state, Some(&globex), None)
+            .await
+            .is_err(),
+        "an expired session must not authenticate its own company either"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_cookie_does_not_make_one_login_ambiguous() {
+    // Several companies served here, the caller signed into one of them, plus a
+    // cookie left by a company this host does not serve — a neighbouring host
+    // on the same hostname, or one since deleted. Only one candidate is real,
+    // so the request is not ambiguous and must still resolve.
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with(&home, &["acme", "globex"]).await;
+    let token = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!(
+            "{}; oc_session_elsewhere=stale",
+            cookie_header("acme", &token)
+        )
+        .parse()
+        .unwrap(),
+    );
+    match resolve_principal(&headers, &state, None, None)
+        .await
+        .expect("one served company plus a foreign cookie is not ambiguous")
+    {
+        GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new("acme")),
+        other => panic!("expected a user, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_addressed_company_picks_its_cookie_out_of_a_shared_jar() {
+    // Two real companies on one origin, a live session for each. The address
+    // decides which one answers — never the jar's contents or its order.
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with(&home, &["acme", "globex"]).await;
+    let acme = seed_session(&state, "acme", UserRole::Member, UserStatus::Active).await;
+    let globex = seed_session(&state, "globex", UserRole::Member, UserStatus::Active).await;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        format!(
+            "{}; {}",
+            cookie_header("acme", &acme),
+            cookie_header("globex", &globex)
+        )
+        .parse()
+        .unwrap(),
+    );
+
+    for name in ["acme", "globex"] {
+        match resolve_principal(&headers, &state, Some(&CompanyId::new(name)), None)
+            .await
+            .unwrap()
+        {
+            GqlAuth::User(u) => assert_eq!(u.company, CompanyId::new(name)),
+            other => panic!("expected a user, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cookie_for_another_company_never_answers_for_the_addressed_one() {
+    // The jar holds a perfectly good session — for somewhere else. Reading it
+    // would answer from a company the request did not name.
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let state = state_with(&home, &["acme", "globex"]).await;
+    let globex = seed_session(&state, "globex", UserRole::Member, UserStatus::Active).await;
+
+    assert!(
+        resolve_principal(
+            &headers_with_cookie("globex", &globex),
+            &state,
+            Some(&CompanyId::new("acme")),
+            None,
+        )
+        .await
+        .is_err(),
+        "globex's session must not authenticate a request addressing acme"
+    );
+}
+
+#[tokio::test]
 async fn without_an_addressed_company_a_lone_cookie_selects_its_own() {
-    // The GraphQL path: the company lives in the request body, so the cookie
-    // name is the only signal.
+    // The unaddressed forms — bare `/graphql` and the `/api/v1/company`
+    // aliases. The host serves one company, so that is the one addressed.
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme"]).await;
@@ -491,8 +680,9 @@ async fn without_an_addressed_company_a_lone_cookie_selects_its_own() {
 
 #[tokio::test]
 async fn without_an_addressed_company_ambiguous_cookies_resolve_no_user() {
-    // Two companies' sessions in one jar (only reachable in local dev). Picking
-    // one would be a guess; degrade instead.
+    // Several companies registered, so no unaddressed request can name one.
+    // Picking from the jar would be a guess; degrade instead. The console
+    // addresses these hosts through the `{id}` routes.
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with(&home, &["acme", "globex"]).await;

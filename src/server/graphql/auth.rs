@@ -170,14 +170,13 @@ pub fn resolve_claims(headers: &HeaderMap, state: &AppState) -> Result<GqlAuth, 
 /// Resolves the full principal: a valid session wins, else the machine
 /// credentials from [`resolve_claims`].
 ///
-/// `company` is the addressed company when the caller knows it (the REST
-/// routes, from the path or the sole registered company). Pass `None` when it
-/// is not knowable at resolution time — the GraphQL handler's company argument
-/// lives in the request body — and the carrier selects it: the cookie *name*,
-/// or the company embedded in the header value. With several session cookies
-/// present and no addressed company (only reachable in local dev, where one
-/// origin serves many companies) no user is resolved, because guessing which
-/// one the request meant would be worse than degrading.
+/// `company` is the addressed company when the caller knows it (the REST routes
+/// and the company-scoped GraphQL routes, from the `{id}` path param). Pass
+/// `None` on the alias forms and bare `/graphql`, where the carrier selects it:
+/// the company embedded in the header value, or the one session cookie naming a
+/// company **this host serves**. Several such cookies resolve no user, because
+/// guessing which one the request meant would be worse than degrading — the
+/// company-scoped routes are how a caller says which.
 ///
 /// A present-but-invalid session falls through to the bearer path rather than
 /// failing the request: a stale cookie must not brick an operator sharing the
@@ -402,7 +401,7 @@ async fn resolve_session(
     state: &AppState,
     company: Option<&CompanyId>,
 ) -> Option<UserPrincipal> {
-    let (company, token) = session_carrier(headers, company)?;
+    let (company, token) = session_carrier(headers, state, company)?;
     authenticate_session(state, company, &token).await
 }
 
@@ -417,8 +416,22 @@ async fn resolve_session(
 /// cookie rather than failing the request, matching the existing policy for a
 /// present-but-invalid cookie: a credential for somewhere else must not brick a
 /// request that had a valid one all along.
+///
+/// Without an addressed company the cookie jar is the only thing left to read,
+/// and it is scoped to the **origin** rather than to this host: a browser
+/// attaches every `oc_session_*` it holds for that hostname, and cookies ignore
+/// port, so a second host on the same machine — or a company since deleted, or
+/// a stray name any script on the origin can set — puts cookies here for
+/// companies this process has never served.
+///
+/// Only a company this host actually serves can be the one an unaddressed
+/// request meant, so the candidates are filtered to those first. Two survivors
+/// are genuinely ambiguous and resolve nobody; picking either would answer from
+/// a company the request never named. The company-scoped routes exist so a
+/// caller in that position can say which one it means.
 fn session_carrier(
     headers: &HeaderMap,
+    state: &AppState,
     company: Option<&CompanyId>,
 ) -> Option<(CompanyId, String)> {
     use crate::server::users::cookie::{
@@ -432,8 +445,6 @@ fn session_carrier(
     }
 
     let cookies = parse_cookies(headers);
-    // Resolve which company's cookie to read: the addressed one when known,
-    // else the sole session cookie present.
     match company {
         Some(id) => {
             let name = crate::server::users::cookie::session_cookie_name(id)?;
@@ -443,14 +454,15 @@ fn session_carrier(
             let mut sessions = cookies
                 .iter()
                 .filter_map(|(name, value)| {
-                    company_from_cookie_name(name).map(|id| (CompanyId::new(id), value.clone()))
+                    company_from_cookie_name(name).map(|id| (CompanyId::new(id), value))
                 })
+                .filter(|(id, _)| state.registry().get(id).is_some())
                 .collect::<Vec<_>>();
-            // Exactly one, or we cannot know which company was meant.
             if sessions.len() != 1 {
                 return None;
             }
-            Some(sessions.remove(0))
+            let (id, value) = sessions.remove(0);
+            Some((id, value.clone()))
         }
     }
 }

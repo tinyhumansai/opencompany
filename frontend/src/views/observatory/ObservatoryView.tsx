@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { ApiError } from "@/api/types";
 import {
   fetchRecentRuns,
   fetchRun,
@@ -59,7 +60,7 @@ type Load =
   | { phase: "loading" }
   | { phase: "ready"; runs: ObservatoryRun[] }
   | { phase: "unavailable" }
-  | { phase: "error"; message: string };
+  | { phase: "error"; message: string; retryable: boolean };
 
 export function ObservatoryView({ client, company, runId, eventTick }: Props) {
   const [load, setLoad] = useState<Load>({ phase: "loading" });
@@ -130,6 +131,7 @@ export function ObservatoryView({ client, company, runId, eventTick }: Props) {
           : {
               phase: "error",
               message: err instanceof Error ? err.message : "the read failed",
+              retryable: !(err instanceof ApiError && err.code === "graphql_refused"),
             },
       );
     }
@@ -237,9 +239,11 @@ export function ObservatoryView({ client, company, runId, eventTick }: Props) {
         <PageHeader title={runId ? "Run" : "Observatory"} />
         <div className="flex flex-col items-start gap-2 p-4">
           <p className="text-[var(--status-failed-text)] text-sm">{load.message}</p>
-          <Button variant="outline" size="sm" onClick={() => void reload()}>
-            Try again
-          </Button>
+          {load.retryable ? (
+            <Button variant="outline" size="sm" onClick={() => void reload()}>
+              Try again
+            </Button>
+          ) : null}
         </div>
       </div>
     );

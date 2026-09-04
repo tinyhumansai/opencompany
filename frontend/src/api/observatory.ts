@@ -169,12 +169,12 @@ export async function fetchRunsForWorkflowRun(
   workflowRunId: string,
   limit = 50,
 ): Promise<ObservatoryRun[]> {
-  const data = await runQuery<RunsResult>(client, RUNS_QUERY, {
+  const data = await runQuery<RunsResult>(
+    client,
+    RUNS_QUERY,
+    { company, workflowRunId, taskId: null, limit },
     company,
-    workflowRunId,
-    taskId: null,
-    limit,
-  });
+  );
   return data.company?.agentRuns ?? [];
 }
 
@@ -184,12 +184,12 @@ export async function fetchRecentRuns(
   company: string,
   limit = 50,
 ): Promise<ObservatoryRun[]> {
-  const data = await runQuery<RunsResult>(client, RUNS_QUERY, {
+  const data = await runQuery<RunsResult>(
+    client,
+    RUNS_QUERY,
+    { company, workflowRunId: null, taskId: null, limit },
     company,
-    workflowRunId: null,
-    taskId: null,
-    limit,
-  });
+  );
   return data.company?.agentRuns ?? [];
 }
 
@@ -207,6 +207,6 @@ export async function fetchRun(
   company: string,
   id: string,
 ): Promise<ObservatoryRun | null> {
-  const data = await runQuery<RunResult>(client, RUN_QUERY, { company, id });
+  const data = await runQuery<RunResult>(client, RUN_QUERY, { company, id }, company);
   return data.company?.agentRun ?? null;
 }

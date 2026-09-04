@@ -1449,12 +1449,22 @@ export class OpenCompanyClient {
    * Deliberately untyped in `variables`/return shape: the caller (a page
    * author, indirectly) supplies an arbitrary document, so there is no fixed
    * response type to declare here the way every other method has one.
+   *
+   * Routed through {@link scope} like every REST call, so the company travels
+   * in the path. A document's own company argument is invisible to the host's
+   * auth layer, which runs before the body is read; naming it in the URL is
+   * what lets a browser holding a session per company on one origin be matched
+   * to the right one.
    */
   graphqlRequest(
     query: string,
     variables?: Record<string, unknown>,
+    company?: string | null,
   ): Promise<{ data?: unknown; errors?: unknown }> {
-    return this.request("POST", "/graphql", { query, variables });
+    return this.request("POST", `${this.scope(company)}/graphql`, {
+      query,
+      variables,
+    });
   }
 
   /**

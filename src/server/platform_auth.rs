@@ -406,7 +406,7 @@ pub(crate) fn forbidden() -> Response {
 ///
 /// The extractor resolves the addressed company from the `{id}` path param when
 /// present so a session cookie can be matched to it; on the single-company
-/// alias the sole session cookie selects itself.
+/// alias the registry's sole company is the addressed one.
 pub struct CompanyAuth(pub GqlAuth);
 
 impl FromRequestParts<AppState> for CompanyAuth {

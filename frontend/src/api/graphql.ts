@@ -25,13 +25,33 @@ interface GraphQLErrorEntry {
   path?: (string | number)[];
 }
 
+/**
+ * Wire messages the read plane returns as bare codes, and what they mean to
+ * whoever is looking at the panel.
+ *
+ * A GraphQL error message is a protocol token, not prose. Rendering one
+ * verbatim puts a word like `unauthorized` on screen next to a retry that
+ * repeats the identical request and therefore fails identically — it names
+ * neither what went wrong nor what would fix it.
+ */
+const WIRE_MESSAGES: Record<string, string> = {
+  unauthorized: "Your session didn't cover this company. Sign in again to reload it.",
+  forbidden: "This company's data isn't visible to your account.",
+};
+
 /** Flattens an `errors` array into one operator-facing sentence. */
 function describe(errors: GraphQLErrorEntry[]): string {
   const messages = errors
     .map((e) => (typeof e?.message === "string" ? e.message : ""))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((m) => WIRE_MESSAGES[m] ?? m);
   if (messages.length === 0) return "the query was refused";
   return messages.join("; ");
+}
+
+/** Whether `errors` says the caller was refused rather than the query failed. */
+function isRefusal(errors: GraphQLErrorEntry[]): boolean {
+  return errors.some((e) => e?.message === "unauthorized" || e?.message === "forbidden");
 }
 
 /**
@@ -46,8 +66,9 @@ export async function runQuery<T>(
   client: OpenCompanyClient,
   document: string,
   variables?: Record<string, unknown>,
+  company?: string | null,
 ): Promise<T> {
-  const response = await client.graphqlRequest(document, variables);
+  const response = await client.graphqlRequest(document, variables, company);
   const errors = Array.isArray(response?.errors)
     ? (response.errors as GraphQLErrorEntry[])
     : [];
@@ -57,7 +78,10 @@ export async function runQuery<T>(
   // host considered this request and refused it, which is not the same as
   // something between the browser and the host giving up.
   if (errors.length > 0) {
-    throw new ApiError(200, "graphql_error", describe(errors), true);
+    // A distinct code, because a refusal and a failed read need different
+    // offers: retrying a refusal repeats it exactly.
+    const code = isRefusal(errors) ? "graphql_refused" : "graphql_error";
+    throw new ApiError(200, code, describe(errors), true);
   }
   if (response?.data === undefined || response.data === null) {
     throw new ApiError(200, "graphql_error", "the query returned no data", true);

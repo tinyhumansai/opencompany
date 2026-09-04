@@ -54,10 +54,21 @@ pub fn sdl() -> String {
 ///
 /// `POST /graphql` serves queries; `GET /graphql` serves an embedded GraphiQL
 /// explorer for interactive use during development.
+///
+/// The same handler is also mounted through [`scoped`](crate::server::ops::scoped),
+/// giving `POST /api/v1/companies/{id}/graphql` alongside the
+/// `/api/v1/company/graphql` alias — the identical pair every REST route gets.
+/// A console addressing one of several companies on an origin names it in the
+/// path, exactly as it already does for REST, so the request says which company
+/// it means instead of the host inferring it.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/graphql", post(graphql_handler))
         .route("/graphql", get(graphiql))
+        .merge(crate::server::ops::scoped(
+            "/graphql",
+            post(graphql_handler),
+        ))
 }
 
 /// The query root: the three top-level entry points into the read plane.
@@ -121,11 +132,13 @@ async fn graphql_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     auth::MaybePeer(peer): auth::MaybePeer,
+    company: Option<axum::extract::Path<String>>,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    // `None`: the company a query addresses lives in the request body, which is
-    // not available here, so a session cookie selects its own company by name.
-    let auth = match resolve_principal(&headers, &state, None, peer).await {
+    // Present on the `{id}` form, absent on the alias and on bare `/graphql`,
+    // where `resolve_principal` falls back to the sole registered company.
+    let addressed = company.map(|axum::extract::Path(id)| CompanyId::new(id));
+    let auth = match resolve_principal(&headers, &state, addressed.as_ref(), peer).await {
         Ok(auth) => auth,
         Err(_) => {
             let err = async_graphql::ServerError::new("unauthorized", None);
