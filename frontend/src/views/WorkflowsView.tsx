@@ -680,6 +680,32 @@ export function WorkflowsView({
   // out (Reload) — a toast that auto-dismisses would leave them staring at the
   // old graph believing the write landed.
   const [conflict, setConflict] = useState<string | null>(null);
+  /**
+   * The corrections the host made while drafting the workflow that was just
+   * created — "matched the teammate you named by role to `qa_engineer`", and
+   * so on.
+   *
+   * They used to be read in the dialog, next to the form the draft hydrated.
+   * The one-box dialog closes onto the canvas the instant the write lands, so
+   * without this they would be written, applied, and never shown. Not a toast,
+   * for the same reason `conflict` is not: they say the saved graph differs
+   * from a literal reading of the sentence, which is worth reading once and
+   * dismissing deliberately.
+   *
+   * Keyed by the workflow AND the company they describe rather than held bare.
+   * The workflow half is because a create MOVES the selection — so the
+   * selection-change sweep below has to tell "the operator navigated away from
+   * it" from "the operator has just this instant arrived on it", and a bare
+   * value cannot. The company half is because ids are only unique within a
+   * company: two companies with a `weekly-digest` would otherwise carry one's
+   * corrections onto the other's canvas, which is the failure every other
+   * persistent banner here is swept on the same axis to avoid.
+   */
+  const [createdNotes, setCreatedNotes] = useState<{
+    company: string | null;
+    workflowId: string;
+    notes: string[];
+  } | null>(null);
   // Bumped by the conflict banner's Reload, to re-fetch the selected graph (and
   // with it a fresh `version`) without changing the selection.
   const [graphTick, setGraphTick] = useState(0);
@@ -1916,7 +1942,14 @@ export function WorkflowsView({
 
   // The creator posts the full graph back, so the new entry can be spliced
   // straight into the list and selected — no extra round trip to re-list.
-  const handleCreated = useCallback((created: WorkflowGraph) => {
+  const handleCreated = useCallback((created: WorkflowGraph, notes?: string[]) => {
+    // What the copilot changed on the way from the sentence to the graph. Set
+    // BEFORE the selection moves, so the sweep on `[selectedId, company]` sees
+    // them already keyed to the workflow it is arriving at.
+    const kept = (notes ?? []).filter((note) => note.trim().length > 0);
+    setCreatedNotes(
+      kept.length ? { company, workflowId: created.id, notes: kept } : null,
+    );
     // Newer than any list request already in flight — see `localWriteRef`.
     // This is the race the operator would notice most: the workflow they just
     // created disappearing out of the picker a moment after it appeared.
@@ -1966,7 +1999,7 @@ export function WorkflowsView({
     // reconciles that response when it lands.
     hasCreatedLocallyRef.current = true;
     clearNudge();
-  }, [announceDisarm, clearNudge]);
+  }, [announceDisarm, clearNudge, company]);
 
   // Issue #1110: leave the workflow on screen and go back to the index.
   //
@@ -2305,6 +2338,13 @@ export function WorkflowsView({
     // clears it — but a graph read that FAILS does not, which is precisely the
     // case where the operator is left staring at it.
     setConflict(null);
+    // The draft's corrections, but ONLY once the selection has actually left
+    // the workflow they are about. A create sets them and moves the selection
+    // in the same batch, so an unconditional clear here would wipe them on the
+    // very render that was supposed to show them.
+    setCreatedNotes((prev) =>
+      prev && prev.workflowId === selectedId && prev.company === company ? prev : null,
+    );
     // Issue #1704: and the graph-load error, whose reach is wider still. It
     // renders outside the `detailOpen` gate, so "could not load the workflow
     // graph" about the workflow just left follows the operator all the way back
@@ -3120,6 +3160,36 @@ export function WorkflowsView({
               >
                 <RotateCw className="mr-1.5 size-4" />
                 Reload
+              </Button>
+            </AlertDescription>
+          </Alert>
+        </div>
+      )}
+
+      {/* What the copilot corrected while drafting the workflow now on screen.
+          The one-box New-workflow dialog saves and closes in one gesture, so
+          the canvas is the first surface these can be read on — and they are
+          the answer to "why does this graph not say quite what I asked for?".
+          Not destructive: nothing is wrong, something was decided for you. */}
+      {detailOpen && createdNotes && (
+        <div className="px-4 pt-3">
+          <Alert data-testid="workflow-created-notes">
+            <AlertDescription className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p>The copilot made a few calls of its own while drafting this:</p>
+                <ul className="mt-1 list-disc space-y-1 pl-4">
+                  {createdNotes.notes.map((note, i) => (
+                    <li key={i}>{note}</li>
+                  ))}
+                </ul>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setCreatedNotes(null)}
+                data-testid="workflow-created-notes-dismiss"
+              >
+                Got it
               </Button>
             </AlertDescription>
           </Alert>

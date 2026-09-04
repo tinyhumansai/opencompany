@@ -45,8 +45,15 @@ function stubClient(): OpenCompanyClient {
   return {
     scopeFor: () => "/api/companies/acme",
     listTeam: async () => [],
-    get: async (path: string) =>
-      path.endsWith("/wired-channels") ? { channels: [] } : [],
+    // Creating a workflow is one description box now, on every company —
+    // `echo`, the offline brain, included. This suite is about the manual
+    // Name/ID/Description/Nodes/Connections form, which `openCreateForm` below
+    // reaches the way an operator does. See `createSurface` in
+    // `@/lib/workflow-create-surface`.
+    get: async (path: string) => {
+      if (path.endsWith("/inference")) return { cognition: "echo" };
+      return path.endsWith("/wired-channels") ? { channels: [] } : [];
+    },
   } as unknown as OpenCompanyClient;
 }
 
@@ -110,6 +117,45 @@ async function open(opts: {
   await render({ ...opts, open: true });
 }
 
+/** Sets a controlled textarea the way a keystroke would. */
+function typeDescription(value: string) {
+  const box = document.body.querySelector<HTMLTextAreaElement>(
+    '[data-testid="workflow-describe-box"]',
+  );
+  expect(box, "the create dialog should open as one description box").toBeTruthy();
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value",
+  )!.set!;
+  setter.call(box, value);
+  box!.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/**
+ * Opens the create dialog **on its manual form**, by the route an operator
+ * takes to it.
+ *
+ * Create mode opens as one description box. The fields come back when the
+ * dialog cannot finish without them, and the shortest such case is driven here:
+ * this company cannot draft (`echo`), and a sentence with no words in it
+ * derives no name — so rather than mint an empty id, which is the permanent
+ * join key this whole suite is about, the dialog hands over the fields and asks
+ * for a name. Crucially it hands them over **derivable**: an operator who is
+ * being asked for a name must get an id out of typing one.
+ */
+async function openCreateForm() {
+  await open();
+  await act(async () => {
+    typeDescription("...");
+  });
+  await act(async () => {
+    document
+      .body
+      .querySelector<HTMLButtonElement>('[data-testid="workflow-dialog-submit"]')!
+      .click();
+  });
+}
+
 beforeEach(() => {
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
     true;
@@ -133,7 +179,7 @@ afterAll(() => {
 
 describe("the create form derives the id from the name (#1053)", () => {
   it("starts with the human name, then explains the editable permanent machine id", async () => {
-    await open();
+    await openCreateForm();
 
     const name = field("name");
     const id = field("id");
@@ -152,7 +198,7 @@ describe("the create form derives the id from the name (#1053)", () => {
   });
 
   it("fills the id in as the name is typed, so a bare name is not rejected", async () => {
-    await open();
+    await openCreateForm();
 
     await type(field("name"), "Weekly digest");
 
@@ -162,7 +208,7 @@ describe("the create form derives the id from the name (#1053)", () => {
   });
 
   it("keeps deriving while the id is nobody's, so it tracks the name", async () => {
-    await open();
+    await openCreateForm();
     const name = field("name");
 
     await type(name, "Weekly");
@@ -172,7 +218,7 @@ describe("the create form derives the id from the name (#1053)", () => {
   });
 
   it("leaves the field alone when the name derives to nothing", async () => {
-    await open();
+    await openCreateForm();
 
     await type(field("name"), "Campaign pipeline");
     expect(field("id").value).toBe("campaign-pipeline");
@@ -185,7 +231,7 @@ describe("the create form derives the id from the name (#1053)", () => {
 
 describe("deriving stops the moment the id is somebody's (#1053)", () => {
   it("never writes over an id the operator typed", async () => {
-    await open();
+    await openCreateForm();
 
     await type(field("id"), "chosen-by-hand");
     await type(field("name"), "Weekly digest");
@@ -194,7 +240,7 @@ describe("deriving stops the moment the id is somebody's (#1053)", () => {
   });
 
   it("treats clearing the id back to empty as a decision too", async () => {
-    await open();
+    await openCreateForm();
 
     // Derive one, then take it away. An operator who empties the field meant
     // to; the next keystroke in Name must not quietly refill it.
@@ -207,7 +253,7 @@ describe("deriving stops the moment the id is somebody's (#1053)", () => {
   });
 
   it("starts derivable again on the next open, so the latch is not one-way", async () => {
-    await open();
+    await openCreateForm();
     await type(field("id"), "the-first-one");
     await type(field("name"), "First workflow");
     expect(field("id").value).toBe("the-first-one");
@@ -217,23 +263,32 @@ describe("deriving stops the moment the id is somebody's (#1053)", () => {
     // matching failure: the second workflow an operator creates in a session
     // would silently stop deriving, and only the second one.
     await render({ open: false });
-    await open();
+    await openCreateForm();
 
     await type(field("name"), "Second workflow");
     expect(field("id").value).toBe("second-workflow");
   });
 
-  it("never writes over an id a copilot draft supplied", async () => {
-    // Create mode with a drafted graph: the copilot chose the id, so it is
-    // already somebody's before the operator has touched anything.
+  it("never derives over the id a copilot correction came back to", async () => {
+    // A copilot correction (fix-from-run, issue #840) is the one thing that
+    // hands the dialog a graph it did not load itself. It always arrives
+    // alongside the saved workflow — `WorkflowsView` renders the dialog with
+    // `open={editOpen && editGraph !== null}` — so this is the production
+    // shape, and the id is already somebody's twice over: the saved graph's own
+    // id wins even over the one the correction minted, because it keys the
+    // overlay body, the schedule and the run history.
     await open({
-      prefilledDraft: { workflow: { ...savedGraph(), id: "copilot-chose-this" } },
+      workflow: savedGraph(),
+      prefilledDraft: { workflow: { ...savedGraph(), id: "copilot-minted-this" } },
     });
-    expect(field("id").value).toBe("copilot-chose-this");
+    expect(field("id").value).toBe("weekly_report");
 
-    await type(field("name"), "Renamed by the operator");
+    // The correction renames the workflow, which is exactly the keystroke that
+    // would re-slug an unlatched id — and a re-slug here is a rename the host
+    // answers 400 to.
+    await type(field("name"), "Renamed by the copilot");
 
-    expect(field("id").value).toBe("copilot-chose-this");
+    expect(field("id").value).toBe("weekly_report");
   });
 });
 

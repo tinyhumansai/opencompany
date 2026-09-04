@@ -85,6 +85,11 @@ function makeClient(rows: WorkflowSummary[] = ROWS, created?: WorkflowGraph) {
       if (path.endsWith("/workflows")) return rows;
       if (path.includes("/workflows/tool-slugs")) return { slugs: [], unwired: [] };
       if (path.includes("/workflows/wired-channels")) return { channels: [] };
+      // `echo` is the offline brain: no model to draft with. The create dialog
+      // is one description box there as it is everywhere, and Create builds the
+      // workflow from the sentence — which is all this suite needs, since its
+      // subject is what the INDEX says once the host has answered.
+      if (path.endsWith("/inference")) return { cognition: "echo" };
       if (path.includes("/workflows/runs")) return { runs: [], hasMore: false };
       const m = path.match(/\/workflows\/([^/?]+)$/);
       if (m) return graphFor(decodeURIComponent(m[1]));
@@ -138,41 +143,35 @@ function pausedFor(selector: string, name: string): boolean {
   return row.querySelector('[data-testid="workflow-index-paused"]') !== null;
 }
 
-/** Sets a controlled input the way a keystroke would, so React's own value
+/** Sets the description box the way a keystroke would, so React's own value
  * descriptor sees the change and `onChange` fires. */
-function type(selector: string, value: string) {
-  const input = document.querySelector<HTMLInputElement>(
-    `[data-slot="dialog-content"] ${selector}`,
+function typeDescription(value: string) {
+  const box = document.querySelector<HTMLTextAreaElement>(
+    '[data-testid="workflow-describe-box"]',
   );
-  if (!input) throw new Error(`no input matching ${selector}`);
-  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
-  input.dispatchEvent(new Event("input", { bubbles: true }));
+  if (!box) throw new Error("the create dialog did not open as one description box");
+  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box, value);
+  box.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-/** Opens the New-workflow dialog, fills the smallest draft `validate()` accepts
- * (the starter trigger node already carries an id and a name), and submits. The
- * stub client answers the POST with whatever `makeClient` was given.
+/**
+ * Opens the New-workflow dialog, describes a workflow, and creates it.
  *
- * Create confirms the permanent id first (#1808): the form's Create opens a
- * confirm, and the confirm's own action runs the write — so this clicks both. */
+ * The dialog is one description box: this company has no model configured, so
+ * Create names the workflow from the sentence and posts it. The stub answers
+ * that POST with whatever `makeClient` was given, which is the graph the index
+ * then has to say something true about.
+ */
 async function createThroughDialog() {
   await act(async () => {
     container.querySelector<HTMLButtonElement>('[data-testid="workflow-create"]')?.click();
   });
   await act(async () => {
-    type('[placeholder="e.g. campaign_pipeline"]', "nightly");
-  });
-  await act(async () => {
-    type('[placeholder="e.g. Campaign pipeline"]', "Nightly sweep");
+    typeDescription("Nightly sweep of the overnight queue.");
   });
   await act(async () => {
     document
       .querySelector<HTMLButtonElement>('[data-testid="workflow-dialog-submit"]')
-      ?.click();
-  });
-  await act(async () => {
-    document
-      .querySelector<HTMLButtonElement>('[data-testid="workflow-id-confirm-create"]')
       ?.click();
   });
 }
