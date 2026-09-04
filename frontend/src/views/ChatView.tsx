@@ -2419,9 +2419,21 @@ export function ChatView({
                 the order read correct with nobody typing and wrong with someone
                 typing.
 
-                Suppressed on a read-only channel: nothing can be sent there, so a
-                caveat about what sending produces has nothing left to qualify —
-                and the composer it would sit above is not rendered at all.
+                NOT suppressed on a read-only channel, though the composer it
+                sits above is gone there. It was, briefly, on the reasoning that
+                a caveat about sending has nothing left to qualify — but the
+                sentence is not about sending. It is about attribution: these
+                rows are not the teammate's words. `#Operator` carries
+                company-authored reports rendered under a teammate's name and
+                avatar, `MessageRow` marks each of them from the same cognition
+                state, and suppressing this left the operator with only
+                `EchoPlaceholder`'s chip — the word "Placeholder", with its
+                explanation in a `title` that touch and keyboard users never see
+                (codex review on PR #1984). A read-only feed is where a reader is
+                least able to test the attribution by asking, so it is the last
+                place to drop the only visible statement of it. With no composer
+                there, the strip simply lands under the read-only notice as the
+                bottom strip of the pane.
 
                 All four states below say "the replies in this conversation", not
                 "the replies below". They said "below" while this strip sat above
@@ -2434,7 +2446,7 @@ export function ChatView({
                 `role="status"` (not `alert`) for the reason
                 `components/ui/alert.tsx` gives — a notice present on mount should
                 not interrupt a screen reader. */}
-            {echoing && !readOnly && (
+            {echoing && (
               <p
                 role="status"
                 data-testid="chat-cognition-banner"

@@ -295,11 +295,39 @@ describe("the harness-unavailable notice sits next to the composer", () => {
     expect(kids.indexOf(composerRoot)).toBe(kids.indexOf(strip) + 1);
   });
 
-  it("is suppressed on a read-only channel, where nothing can be sent", async () => {
+  it("still states the false attribution on a read-only feed", async () => {
+    // It was suppressed here for one commit, on the reasoning that a caveat
+    // about sending has nothing to qualify where nothing can be sent. The
+    // sentence is not about sending: `#Operator` renders company-authored
+    // reports under a teammate's name, `MessageRow` marks each of them from
+    // this same state, and with the strip gone the only explanation left was
+    // `EchoPlaceholder`'s `title` — invisible to touch and keyboard (codex
+    // review on PR #1984). A feed the reader cannot reply to is the last place
+    // to drop it.
     await mount("operator", "unavailable");
 
-    expect(banner()).toBeNull();
+    const strip = banner();
+    expect(strip).not.toBeNull();
+    expect(strip?.textContent).toContain(
+      "come from the offline echo brain rather than the teammate they appear under",
+    );
+    // Still no composer, and the read-only notice still explains the channel.
+    expect(composerInput()).toBeNull();
     expect(container.textContent).toContain("There is nothing to reply to here");
+  });
+
+  it("sits under the read-only notice, as the bottom strip of the pane", async () => {
+    await mount("operator", "unavailable");
+
+    const strip = banner()!;
+    const column = strip.parentElement!;
+    const kids = Array.from(column.children);
+    const notice = kids.find((el) => el.textContent?.includes("There is nothing to reply to here"))!;
+
+    expect(notice).not.toBeUndefined();
+    expect(kids.indexOf(notice)).toBeLessThan(kids.indexOf(strip));
+    // Nothing after it: the composer that would normally follow is not here.
+    expect(kids.indexOf(strip)).toBe(kids.length - 1);
   });
 });
 
