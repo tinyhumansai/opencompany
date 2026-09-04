@@ -3521,7 +3521,20 @@ pub(crate) async fn refer_committed_replies(
             &queue,
             ReferralPolicy {
                 enabled: true,
-                max_hops: 2,
+                // **Two round trips.** A crossing question and the answer
+                // coming home are two hops, not one — a return carries no
+                // origin, so the library counts it as its own step. `2` was
+                // therefore exactly one exchange, and the asker's report, being
+                // one deeper, could never start a second: an answer that missed
+                // the point was the end of the conversation.
+                //
+                // `4` buys the asker one follow-up: ask, answer, ask again,
+                // answer again. That is the shape of an actual clarification —
+                // "you covered layout, but what about the error state?" — and
+                // stopping there is deliberate. A pair of desks that cannot
+                // converge in two exchanges is not going to converge in six,
+                // and every hop is a model call somebody pays for.
+                max_hops: 4,
                 reach: ReferralReach::Desks,
                 returns: true,
             },

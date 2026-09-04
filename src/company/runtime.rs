@@ -1298,6 +1298,18 @@ impl CompanyRuntime {
         // Where an answer goes home, on a crossing FORWARD. `None` on a return
         // — an answer that has arrived does not need carrying further.
         origin: Option<tinyhivemind_core::referral::ReferralOrigin>,
+        // How deep in the chain this turn sits. Its own replies are offered to
+        // the referral pass at this depth, so a follow-up is one deeper than
+        // the answer it follows and `max_hops` finally counts something.
+        //
+        // This was a hardcoded `1`, which read as "a referred turn is depth 1"
+        // and is true only of the first one. Every later generation claimed
+        // depth 1 as well, so the counter reset on each hop: two desks could
+        // have passed a question back and forth forever without the policy ever
+        // reaching its limit. Nothing drove that loop at the time — the asker
+        // had no way to ask again — so it cost nothing until it would have cost
+        // everything.
+        hop: u32,
     ) {
         tokio::spawn(async move {
             let desk_for_replies = desk.clone();
@@ -1336,15 +1348,14 @@ impl CompanyRuntime {
                     .await;
                     // The back edge. This turn's reply is the ANSWER to the
                     // referral that caused it, so it is offered to the decision
-                    // carrying the origin it must return to — and at depth 1,
-                    // so `max_hops` finally bounds something.
+                    // carrying the origin it must return to, at its own depth.
                     crate::server::operator::refer_committed_replies(
                         &self,
                         &company,
                         &desk_for_replies,
                         &report,
                         origin,
-                        1,
+                        hop,
                     )
                     .await;
                 }

@@ -714,6 +714,151 @@ mod test {
         }
     }
 
+    /// **The asker is told it may ask again — that is what makes it able to.**
+    ///
+    /// The returning answer never reaches the channel, so this frame is the
+    /// only thing the asker ever reads about it. Raw, it offered one ending;
+    /// framed, it offers both and gives the spelling that reaches back.
+    #[test]
+    fn a_returning_answer_offers_both_endings_and_a_forward_is_untouched() {
+        let record = software_company();
+        let members = roster_members(&record);
+        let people: Vec<tinyhivemind_core::roster::Person> = Vec::new();
+        let retired: Vec<String> = Vec::new();
+        let roster = tinyhivemind_core::roster::Roster::new(&members, &people, &retired);
+        let desks = desk_snapshots(&record);
+
+        let body = "@product_designer can you take the login screen?";
+        let mentions = tinyhivemind_core::mention::resolve(
+            body,
+            None,
+            &tinyhivemind_core::mention::MentionAuthor::Agent {
+                id: "software_engineer".to_string(),
+            },
+            &roster,
+            &desks.set(),
+        );
+        let tinyhivemind_core::referral::ReferralDecision::One { mut referral } =
+            tinyhivemind_core::referral::referral(
+                tinyhivemind_core::referral::ReferralPolicy {
+                    enabled: true,
+                    max_hops: 4,
+                    reach: tinyhivemind_core::referral::ReferralReach::Channels,
+                    returns: true,
+                },
+                &referral_input(body, mentions),
+                &roster,
+                &desks.set(),
+            )
+            .expect("decides")
+        else {
+            panic!("a crossing referral was available");
+        };
+
+        assert_eq!(
+            returned_answer(&record, &referral),
+            body,
+            "a forward carries the asker's own words into a room people read"
+        );
+
+        // A real return has the mirrored geometry: it was committed on the desk
+        // that answered, and travels to the one that asked. Flipping `kind`
+        // alone would leave a forward's desks in place and let this pass while
+        // naming the wrong room to go back to.
+        referral.kind = tinyhivemind_core::referral::ReferralKind::Return;
+        referral.from = referral.to.clone();
+        referral.source_id = "product_designer".to_string();
+        referral.content = "use a skeleton, not a spinner".to_string();
+        let framed = returned_answer(&record, &referral);
+        assert!(
+            framed.contains("use a skeleton, not a spinner"),
+            "the answer survives the framing: {framed}"
+        );
+        assert!(
+            framed.contains("@#product_design"),
+            "and names the exact spelling that reaches back: {framed}"
+        );
+        assert!(
+            framed.contains("report back") && framed.contains("ask them again"),
+            "both endings are stated, so choosing is the asker's: {framed}"
+        );
+    }
+
+    /// **The chain deepens, and therefore ends.**
+    ///
+    /// Each generation must sit one hop below the one that caused it, or the
+    /// bound is decorative. The host used to hand every referred turn a
+    /// hardcoded depth of `1`, which is true of the first one and of no other:
+    /// a follow-up claimed the same depth as the answer it followed, so
+    /// `max_hops` was never approached however long two desks went on. Nothing
+    /// drove such a loop then — the asker could not ask again — so the defect
+    /// was invisible until the moment it mattered.
+    ///
+    /// Walked here as the policy sees it: the depth a turn reports is the depth
+    /// its own replies are offered at, so the walk is `child_hop` feeding the
+    /// next `hop`. Four hops is ask, answer, ask again, answer again — and the
+    /// fifth is refused.
+    #[test]
+    fn a_follow_up_is_one_hop_deeper_and_the_budget_ends_it() {
+        let record = software_company();
+        let members = roster_members(&record);
+        let people: Vec<tinyhivemind_core::roster::Person> = Vec::new();
+        let retired: Vec<String> = Vec::new();
+        let roster = tinyhivemind_core::roster::Roster::new(&members, &people, &retired);
+        let desks = desk_snapshots(&record);
+        let policy = tinyhivemind_core::referral::ReferralPolicy {
+            enabled: true,
+            max_hops: 4,
+            reach: tinyhivemind_core::referral::ReferralReach::Channels,
+            returns: true,
+        };
+
+        let body = "@product_designer can you take the login screen?";
+        let mut depths: Vec<u32> = Vec::new();
+        let mut hop = 0;
+        loop {
+            let mentions = tinyhivemind_core::mention::resolve(
+                body,
+                None,
+                &tinyhivemind_core::mention::MentionAuthor::Agent {
+                    id: "software_engineer".to_string(),
+                },
+                &roster,
+                &desks.set(),
+            );
+            let mut input = referral_input(body, mentions);
+            input.hop = hop;
+            match tinyhivemind_core::referral::referral(policy, &input, &roster, &desks.set())
+                .expect("decides")
+            {
+                tinyhivemind_core::referral::ReferralDecision::One { referral } => {
+                    assert_eq!(
+                        referral.child_hop,
+                        hop + 1,
+                        "a child sits exactly one below its cause"
+                    );
+                    depths.push(referral.child_hop);
+                    hop = referral.child_hop;
+                }
+                tinyhivemind_core::referral::ReferralDecision::None { reason } => {
+                    assert_eq!(
+                        reason,
+                        tinyhivemind_core::referral::NoReferralReason::HopLimitReached,
+                        "the chain ends because the budget ran out, not for some other reason"
+                    );
+                    break;
+                }
+            }
+            assert!(hop <= 8, "the walk must terminate; it did not");
+        }
+
+        assert_eq!(
+            depths,
+            vec![1, 2, 3, 4],
+            "four hops: ask, answer, ask again, answer again"
+        );
+    }
+
     /// **Journey 1** — a named teammate who is not on this desk runs on THEIR
     /// desk, rather than being pulled into this conversation.
     #[test]
@@ -1166,14 +1311,55 @@ impl tinyhivemind::referral::ReferralQueue for JournalReferralQueue {
             // 4. The child turn, on the TARGET's conversation.
             self.runtime.clone().spawn_referred_turn(
                 referral.to.desk_id.clone(),
-                referral.content.clone(),
+                returned_answer(&record, &referral),
                 referral.source_id.clone(),
                 referral.origin.clone(),
+                // The depth THIS child sits at, so the chain it may start is
+                // measured from here. Passing a constant made every generation
+                // claim the same depth, and a bound that never advances bounds
+                // nothing — see `spawn_referred_turn`.
+                referral.child_hop,
             );
 
             Ok(EnqueueOutcome::Enqueued)
         })
     }
+}
+
+/// What the asker is handed when an answer comes home.
+///
+/// # Why the answer is framed rather than passed through
+///
+/// A returning answer is not a message in the channel — it is dropped from the
+/// projection (see `attach_referral_origins`) precisely so the asker's own
+/// report is the only thing a reader sees. That makes this text private to the
+/// asker, and the only place it can be told what its options are.
+///
+/// Passed through raw, they were exactly one: the answer arrived as bare prose
+/// with no indication of where it came from or what to do with it, and the
+/// asker did the obvious thing — summarise it and move on. That is right when
+/// the answer lands, and wrong when it misses. "You covered layout, but what
+/// about the error state?" was unreachable, not because the machinery could not
+/// carry it, but because nothing ever told the asker it could ask.
+///
+/// So the frame states both endings and the exact spelling that reaches the
+/// other desk. Deciding WHICH ending is the asker's judgement and stays the
+/// asker's — this only makes the second one expressible.
+///
+/// A forward is passed through untouched: that content is the asker's own words,
+/// and it RENDERS on the desk it lands on. Framing it would put the host's
+/// scaffolding in a room where a person is reading.
+fn returned_answer(record: &CompanyRecord, referral: &tinyhivemind::referral::Referral) -> String {
+    if !matches!(referral.kind, tinyhivemind::referral::ReferralKind::Return) {
+        return referral.content.clone();
+    }
+    let who = agent_label(record, &referral.source_id);
+    let desk = desk_label(record, &referral.from.desk_id);
+    let back = &referral.from.desk_id;
+    format!(
+        "{who} on #{desk} answered what you asked them:\n\n{}\n\n         ---\n         This did not appear in your channel — you are the only one who has seen it.          Decide which of these the answer deserves:\n         - It covers the question: report back in your channel, in your own words,          what they said. Do not paste it back verbatim.\n         - Something important is still missing: ask them again. Begin your reply          with @#{back} and put the ONE thing still open in a single short line.\n         Ask again only for a real gap, not for more detail on what they already covered.",
+        referral.content
+    )
 }
 
 /// A desk's operator-facing name, or its id when it has none to show.
