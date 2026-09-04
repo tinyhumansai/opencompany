@@ -144,13 +144,17 @@ test("a member sees what is connected but is offered nothing that changes it", a
 
 test("an admin is still offered every control across the three pages", async ({ page }) => {
   await openSettingsPage(page, "oauth");
-  // The member's banner is absent, and the credential surface is present.
-  // The company-credential key is the Apps page's write surface on every
-  // build: the Composio token card only renders when the host reports a
-  // composio credential the admin may override (default-feature hosts never
-  // do), so it is not the invariant to assert here.
+  // The member's banner is absent, and an admin-only write surface is present.
+  // Company-credential is gone from this page product-wide with the managed
+  // Composio route (`COMPOSIO_MANAGED_HIDDEN`, `src/product-scope.ts`) — it is
+  // no longer the invariant to assert. The Composio token card is not one
+  // either: it only renders when the host reports a credential the admin may
+  // override, which a default-feature host never does. What is left on every
+  // build is the by-slug connect hatch — gated on `canManage` the same as the
+  // "Sign in" button the member half of this spec already proves is absent
+  // for a member.
   await expect(page.getByTestId("connections-read-only")).toHaveCount(0);
-  await expect(page.locator("#company-credential")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("#providers-other-toolkit")).toBeVisible({ timeout: 30_000 });
 
   await openSettingsPage(page, "mcp");
   await expect(page.getByTestId("mcp-read-only")).toHaveCount(0);

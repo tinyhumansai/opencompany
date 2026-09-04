@@ -19,7 +19,7 @@ import {
   CREATE_UNAVAILABLE_NOTE,
   CreateCompanyDialog,
   type CreateCompanyRequest,
-  canCreateCompanies,
+  offersCompanyCreation,
 } from "@/components/create-company-dialog";
 import { ConsoleChrome } from "@/components/host-switcher";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -296,7 +296,7 @@ export function ConnectionConsole({
   // reset the operator's archived company has to be left, both of which are this
   // component's job.
   const [createRequest, setCreateRequest] = useState<CreateCompanyRequest | null>(null);
-  const canCreate = canCreateCompanies(client);
+  const canCreate = offersCompanyCreation(client);
 
   // Whichever companies the current phase knows about, so a create can drop the
   // operator into the new one alongside the rest.

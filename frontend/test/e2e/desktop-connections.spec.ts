@@ -129,6 +129,29 @@ async function asDesktop(page: Page, config: BridgeConfig) {
                 ? null
                 : { baseUrl: cfg.embedded, dataDir: "/tmp/e2e-desktop" };
             }
+            case "oc_local_instances": {
+              // The roster a current console asks first — `App` only falls back to
+              // `oc_embedded` when this command is absent, which is not what a
+              // packaged shell answers. Mirrors `cfg.embedded`: one running
+              // instance when there is a host, none when there is not, so a
+              // machine with nothing running is still a machine that can start
+              // one — not a shell predating the roster.
+              if (cfg.discoveryDelayMs) {
+                await new Promise((resolve) => setTimeout(resolve, cfg.discoveryDelayMs));
+              }
+              return cfg.embedded === null
+                ? []
+                : [
+                    {
+                      id: "default",
+                      label: "This computer",
+                      dataDir: "/tmp/e2e-desktop",
+                      running: true,
+                      baseUrl: cfg.embedded,
+                      instanceId: "default",
+                    },
+                  ];
+            }
             case "oc_request": {
               const id = args.connectionId as string;
               // Only ever a host `oc_connect` accepted, so no second check is

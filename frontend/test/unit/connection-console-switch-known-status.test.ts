@@ -126,62 +126,36 @@ afterEach(() => {
   container.remove();
 });
 
-describe("a create provisioning a company whose follow-up status lookup would fail", () => {
-  it("still lands the operator in the fresh company, without re-fetching what the create already returned", async () => {
-    const provisioned = company("co-fresh1", "Fresh Co");
-    const { client, statusSpy } = stubClient(provisioned);
+/**
+ * Retired with the trigger it drove.
+ *
+ * It covered the landing after a create: the operator ends up inside the
+ * fresh company, and the console does not re-fetch a status the create call
+ * already returned — the point being that a follow-up lookup which fails must
+ * not strand them outside a company that exists.
+ *
+ * It reached that through the no-company screen's "New company" button, and
+ * no company-creation trigger renders while the product does not offer it
+ * (`src/product-scope.ts`). The picker's own button is gated the same way, so
+ * there is no second way in to re-point this at.
+ *
+ * Deliberately not re-pointed at the handler directly: driving
+ * `onCompanyCreated` below the trigger would keep this green while the shipped
+ * path renders nothing to reach it. The handler is untouched; turning the flag
+ * off restores the trigger and this case.
+ */
+
+describe("the no-company screen while the product offers no company creation", () => {
+  it("shows no way to create one", async () => {
+    // What replaces the retired case above: the trigger it drove is the thing
+    // under test now, and its absence is asserted where the case used to press
+    // it. A platform-scoped client is used deliberately — the caller *could*
+    // create a company, and it is product scope that withholds the control.
+    const { client } = stubClient(company("co-fresh1", "Fresh Co"));
 
     await show(client);
     await settle();
 
-    // A configured host with zero companies lands on "no-company" — the
-    // lightest phase with a reachable "New company" trigger.
-    const trigger = container.querySelector<HTMLButtonElement>('[data-testid="no-company-new"]');
-    expect(trigger, "no-company-new trigger not found").toBeTruthy();
-    await act(async () => {
-      trigger!.click();
-    });
-
-    // The dialog renders through a Radix portal into `document.body`, not
-    // into `container` — matching `create-company-reset-fresh-id.test.ts`'s
-    // `[data-slot="dialog-content"]` queries.
-    const nameInput = document.querySelector<HTMLInputElement>("#create-company-name");
-    expect(nameInput, "create-company-name field not found").toBeTruthy();
-    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
-    await act(async () => {
-      setValue.call(nameInput, "Fresh Co");
-      nameInput!.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
-    // Required after codex review comment 3864885200 — unrelated to what
-    // this file pins (skipping the redundant status lookup), so the submit
-    // needs one filled in first or validation blocks it before provisioning.
-    const adminInput = document.querySelector<HTMLInputElement>("#create-company-admin");
-    expect(adminInput, "create-company-admin field not found").toBeTruthy();
-    await act(async () => {
-      setValue.call(adminInput, "ceo@fresh.test");
-      adminInput!.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
-    const submit = Array.from(
-      document.querySelectorAll<HTMLButtonElement>('[data-slot="dialog-content"] button'),
-    ).find((b) => b.textContent?.trim() === "Create company");
-    expect(submit, 'no "Create company" button found').toBeTruthy();
-    await act(async () => {
-      submit!.click();
-    });
-    await settle();
-
-    // Never the generic connection-error screen — a transient failure on a
-    // lookup nothing needed should not surface at all.
-    expect(container.querySelector('[data-testid="connection-error"]')).toBeNull();
-
-    const phase = container.querySelector('[data-testid="console-phase"]');
-    expect(phase, "console phase never rendered").toBeTruthy();
-    expect(phase!.getAttribute("data-company")).toBe("co-fresh1");
-    // Populated from the status the create call already returned, not a
-    // second fetch — which is exactly what the assertion below proves.
-    expect(phase!.getAttribute("data-status-id")).toBe("co-fresh1");
-    expect(statusSpy).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="no-company-new"]')).toBeNull();
   });
 });

@@ -83,21 +83,34 @@ export const CREATE_UNAVAILABLE_NOTE =
   "Creating a company needs a platform credential, which a person signed in here doesn't hold.";
 
 /**
- * Whether a company can be created from this console at all.
+ * Whether this client can reach the provisioning + archive routes at all.
  *
- * The one funnel every trigger asks, and the reason it is asked here rather
- * than at each of them: provisioning is reachable from four places — the
- * switcher's "New company", the picker's own button, the picker's per-card
- * Reset, the no-company screen, and Settings' "Reset / Start clean", which
- * archives and re-provisions through this same dialog. Gating them one at a
- * time is how three of them stayed live after the first was hidden.
- *
- * Two conditions, deliberately in one place: the client has to hold a platform
- * credential to reach the routes, and the product has to be offering company
- * creation in the first place.
+ * A fact about the caller, not about the product: it answers "may this
+ * principal create a company", and the dialog's own preflight and submit read
+ * it for exactly that. It must stay free of product scope — a scope flag that
+ * reached in here would make the shipped dialog inert while its tests went on
+ * passing against logic nothing could run.
  */
 export function canCreateCompanies(client: OpenCompanyClient): boolean {
-  return !COMPANY_SWITCHING_HIDDEN && client.carriesPlatformBearer;
+  return client.carriesPlatformBearer;
+}
+
+/**
+ * Whether a company-creation entry point should render.
+ *
+ * The presentation half, asked once where every trigger already asks: creation
+ * is reachable from the switcher's "New company", the picker's own button, the
+ * picker's per-card Reset, the no-company screen, and Settings' "Reset / Start
+ * clean" — which archives and re-provisions through this same dialog. Gating
+ * them one at a time is how four stayed live after the first was hidden.
+ *
+ * Separate from {@link canCreateCompanies} on purpose. "Do we offer this in
+ * this product configuration" and "may this caller do it" are different
+ * questions, and answering both with one predicate is what turned a hidden
+ * button into a disabled code path.
+ */
+export function offersCompanyCreation(client: OpenCompanyClient): boolean {
+  return !COMPANY_SWITCHING_HIDDEN && canCreateCompanies(client);
 }
 
 interface Props {

@@ -9,7 +9,7 @@ import type { ComposioStatus } from "@/api/composio";
 import type { InferenceStatus } from "@/api/inference";
 import { INFERENCE_PROVIDERS, SETUP_INFERENCE_OPTIONS } from "@/api/setup";
 import { HostSwitcher, hostSwitcherMenu } from "@/components/host-switcher";
-import { canCreateCompanies } from "@/components/create-company-dialog";
+import { canCreateCompanies, offersCompanyCreation } from "@/components/create-company-dialog";
 import { ComposioSection } from "@/views/connections/ComposioSection";
 import { InferenceSection } from "@/views/connections/InferenceSection";
 import { HostsProvider, type HostsValue } from "@/connections/HostsContext";
@@ -437,18 +437,23 @@ describe("company creation is gone from every trigger, not just the switcher", (
    * first was hidden, so the question is asked once, where they all ask it.
    */
   it("answers no at the funnel every trigger goes through", () => {
-    const withBearer = { carriesPlatformBearer: true } as unknown as OpenCompanyClient;
-
-    expect(canCreateCompanies(withBearer)).toBe(false);
-  });
-
-  it("stays no even for a client that could reach the routes", () => {
-    // The platform credential is the other half of the condition, and on its own
-    // it used to be the whole of it at two call sites.
     const platform = { carriesPlatformBearer: true } as unknown as OpenCompanyClient;
     const person = { carriesPlatformBearer: false } as unknown as OpenCompanyClient;
 
-    expect(canCreateCompanies(platform)).toBe(false);
+    expect(offersCompanyCreation(platform)).toBe(false);
+    expect(offersCompanyCreation(person)).toBe(false);
+  });
+
+  it("leaves the caller's own capability alone", () => {
+    // Product scope decides whether an entry point renders. Whether this
+    // principal may create a company is a different question, and the dialog's
+    // preflight and submit read it — so a scope flag reaching in there would
+    // make the shipped path inert while its tests passed against logic nothing
+    // could run.
+    const platform = { carriesPlatformBearer: true } as unknown as OpenCompanyClient;
+    const person = { carriesPlatformBearer: false } as unknown as OpenCompanyClient;
+
+    expect(canCreateCompanies(platform)).toBe(true);
     expect(canCreateCompanies(person)).toBe(false);
   });
 });
