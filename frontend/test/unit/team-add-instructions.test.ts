@@ -96,6 +96,11 @@ beforeEach(() => {
   api.listPeople.mockResolvedValue([]);
   // The dialog reads this to gate the copilot; an offline brain keeps the
   // control disabled and out of the way of what this file is about.
+  //
+  // Since issue #1989 it decides more than that: `echo` is what makes the dialog
+  // render the FULL form at all, so this line is now what puts the Instructions
+  // box this file is about on screen. A company that can draft gets the reduced
+  // dialog instead — proved separately in `team-add-one-box.test.ts`.
   api.getInferenceStatus.mockResolvedValue({ cognition: "echo" });
 });
 
@@ -117,6 +122,21 @@ function click(el: HTMLElement | undefined | null) {
   act(() => {
     el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+}
+
+/**
+ * Opens the Add-teammate dialog and waits for its cognition read to land.
+ *
+ * The wait is load-bearing since issue #1989. The dialog fetches `/inference`
+ * when it opens and, until that answers, biases to the reduced one-box form —
+ * deliberately, because guessing "can draft" wrong is corrected out loud while
+ * guessing "cannot" is silent. So the full form this file drives does not exist
+ * on the first paint even on an `echo` company; flushing the promise is what
+ * puts it there.
+ */
+async function openDialog() {
+  click(byText("button", "Add teammate"));
+  await act(async () => {});
 }
 
 /** Types into a controlled input/textarea the way React sees it. */
@@ -151,7 +171,7 @@ describe("adding a teammate (issue #1776)", () => {
       );
     });
 
-    click(byText("button", "Add teammate"));
+    await openDialog();
     type("member-name", "Growth");
     type("member-role", "Growth Marketer");
     type("member-description", "Owns paid acquisition and reports on ROAS.");
@@ -193,7 +213,7 @@ describe("adding a teammate (issue #1776)", () => {
       );
     });
 
-    click(byText("button", "Add teammate"));
+    await openDialog();
     type("member-name", "Growth");
     type("member-role", "Growth Marketer");
 

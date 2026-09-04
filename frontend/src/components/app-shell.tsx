@@ -3517,8 +3517,17 @@ export function AppShell({
               // The roster half's own sub-page is `#/team/<agentId>`, not a
               // second segment of this view — the teammate detail page is a
               // linkable address of its own (issue #264) and stays one.
-              onOpenAgent={(agentId) =>
-                agentId ? navigate("team", agentId) : navigate("company")
+              onOpenAgent={(agentId, options) =>
+                agentId
+                  ? // Issue #1989: `?edit` lands on the detail page with its
+                    // edit form already open, which is where the reduced
+                    // Add-teammate dialog sends a teammate it has just created
+                    // — the copilot that drafts their description and persona
+                    // lives inside that form. `undefined` otherwise, so every
+                    // other way of opening a teammate keeps exactly the
+                    // navigation it had.
+                    navigate("team", agentId, options?.edit ? { edit: "" } : undefined)
+                  : navigate("company")
               }
               // The graph at `#/company/graph` names its core node after the
               // company the way the rest of the console does (issue #1219),
@@ -3541,6 +3550,13 @@ export function AppShell({
               resolveTypingNames={resolveTypingNames}
               onTyping={typing.announce}
               onNavigate={(channelId) => navigate("chat", channelId)}
+              // Chat's own Add-teammate dialog lands a created teammate on its
+              // detail page with the edit form open (issue #1989) — the same
+              // `#/team/<agentId>?edit` address the roster and the org chart
+              // send theirs to.
+              onOpenAgent={(agentId, options) =>
+                navigate("team", agentId, options?.edit ? { edit: "" } : undefined)
+              }
               onReply={() => void feed.refresh()}
               transcripts={transcripts}
               setTranscripts={setTranscripts}
@@ -3719,8 +3735,17 @@ export function AppShell({
               client={client}
               company={company}
               sub={sub}
-              onOpenAgent={(agentId) =>
-                agentId ? navigate("team", agentId) : navigate("company")
+              onOpenAgent={(agentId, options) =>
+                agentId
+                  ? // Issue #1989: `?edit` lands on the detail page with its
+                    // edit form already open, which is where the reduced
+                    // Add-teammate dialog sends a teammate it has just created
+                    // — the copilot that drafts their description and persona
+                    // lives inside that form. `undefined` otherwise, so every
+                    // other way of opening a teammate keeps exactly the
+                    // navigation it had.
+                    navigate("team", agentId, options?.edit ? { edit: "" } : undefined)
+                  : navigate("company")
               }
               // Setup just staffed the company, so the roster read is stale.
               refreshKey={teamBuilt}

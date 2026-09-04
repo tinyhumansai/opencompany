@@ -43,11 +43,16 @@ import {
 } from "@/lib/member-feedback";
 import { usd } from "@/lib/money";
 import { fromDto, newMember, roleSubtitle, type TeamMember } from "@/lib/team";
+import {
+  addTeammateSurface,
+  describedTeammateFields,
+} from "@/lib/team-add-surface";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
 import { personName } from "@/lib/person";
 import { cn } from "@/lib/utils";
 import { AgentDetailView } from "@/views/team/AgentDetailView";
 import { AgentFields } from "@/views/team/AgentFields";
+import { DescribeTeammate } from "@/views/team/DescribeTeammate";
 import { FieldCopilot } from "@/views/team/FieldCopilot";
 
 interface Props {
@@ -59,8 +64,17 @@ interface Props {
    * agent, refresh onto it, and use Back (issue #264).
    */
   sub: string | null;
-  /** Open an agent, or return to the roster with `null`. */
-  onOpenAgent: (agentId: string | null) => void;
+  /**
+   * Open an agent, or return to the roster with `null`.
+   *
+   * `edit` lands on `#/team/<id>?edit` — the detail page with its edit form
+   * already open (issue #1989). That flag is not a convenience: the reduced
+   * Add-teammate dialog collects a name and a sentence and nothing else, and
+   * the copilot that fills in the rest lives inside that form. Landing beside
+   * it rather than on the read-only profile is what makes the reduction a
+   * handoff instead of a subtraction.
+   */
+  onOpenAgent: (agentId: string | null, options?: { edit?: boolean }) => void;
   /**
    * Bumped when first-run setup staffs the company, so this view re-reads a
    * roster that now has people on it (`docs/spec/runtime/company-setup.md`).
@@ -368,6 +382,24 @@ export function TeamView({
         });
       }
     }
+    // Issue #1989: the reduced dialog's write is only half of its flow. It
+    // collected a name and a sentence, so the description, the persona, the
+    // budget and the inbox are all still to be written — on the teammate's own
+    // page, where the copilot that drafts two of them lives.
+    //
+    // The redirect goes BEFORE the roster refetch on purpose. The operator is
+    // being taken off the roster, so blocking the handoff on a read of the list
+    // they are leaving delays it for nothing — and a read that failed would
+    // raise "the roster couldn't be read back" over a page the roster is not on,
+    // which is a sentence about a list nobody is looking at.
+    if (fields.landOnProfile) {
+      setAddOpen(false);
+      onOpenAgent(created.id, { edit: true });
+      reportAddMember(addOutcome(fields.name, missed));
+      // Still re-read, so the roster is current when Back returns to it.
+      void boot();
+      return;
+    }
     // Persisted on the host — refetch so the card reflects the real record
     // (id, merge order, inbox state) rather than a locally-guessed one.
     if (!(await boot())) {
@@ -606,6 +638,16 @@ interface AddMemberFields {
   inbox?: boolean;
   /** An optional daily cap. Undefined means "don't set one", never "$0". */
   budgetUsdDaily?: number;
+  /**
+   * Land on the new teammate's detail page with its edit form open, rather than
+   * staying on the roster (issue #1989).
+   *
+   * Set only by the reduced dialog, and it is that dialog's second half: it
+   * collects a name and a sentence, so the description, the instructions, the
+   * budget and the inbox are all still to be filled in — on the page this
+   * flag opens, beside the copilot that drafts two of them.
+   */
+  landOnProfile?: boolean;
 }
 
 function MemberCard({
@@ -941,6 +983,14 @@ function AddMemberDialog({
   const [draft, setDraft] = useState<AgentDraft>(emptyDraft);
   const [inbox, setInbox] = useState(false);
   const [budget, setBudget] = useState("");
+  /** Everything the reduced dialog collects: a name and a sentence (issue #1989). */
+  const [described, setDescribed] = useState({ name: "", description: "" });
+  /**
+   * Whether a Create found no role in that sentence, which retires the reduced
+   * dialog for this open. See `roleFromDescription` for why a blank role is not
+   * an option and the full form is the answer instead.
+   */
+  const [roleUnderivable, setRoleUnderivable] = useState(false);
   /**
    * The cognition path this company booted onto (issue #1776), read while the
    * dialog is open so the copilot can say "no model is configured" rather than
@@ -958,6 +1008,20 @@ function AddMemberDialog({
    * they drift, and the edit form asks the same question one import away.
    */
   const missing = missingRequired(draft);
+
+  /**
+   * Which of the two dialogs is on screen (issue #1989), decided in exactly one
+   * place because the wrong answer is silent in one direction: render the full
+   * form on a company whose copilot works and the dialog looks precisely as it
+   * always did, so nothing reports that the reduction never shipped.
+   */
+  const describing = addTeammateSurface({ cognition, roleUnderivable }) === "describe";
+  /** Why the reduced dialog's Create is dead, or `null` when it is not. */
+  const describeBlocked = !described.name.trim()
+    ? "A name is required."
+    : !described.description.trim()
+      ? "Say what they should do."
+      : null;
 
   useEffect(() => {
     if (!open) return;
@@ -979,6 +1043,11 @@ function AddMemberDialog({
     setDraft(emptyDraft());
     setInbox(false);
     setBudget("");
+    setDescribed({ name: "", description: "" });
+    // The hand-over lasts for one open, not for the session: the next add
+    // starts from the reduced dialog again, because the sentence that could not
+    // be read is gone with it.
+    setRoleUnderivable(false);
   }
 
   const parsedBudget = Number(budget);
@@ -991,6 +1060,34 @@ function AddMemberDialog({
   const budgetInvalid = budget.trim() !== "" && budgetUsdDaily === undefined;
 
   function submit() {
+    if (describing) {
+      const fields = describedTeammateFields(described);
+      if (!fields) {
+        // The sentence yielded no role — nothing in it survived the clause
+        // split. Hand over the full form carrying what WAS typed rather than
+        // writing a role-less teammate, which would land the operator on a
+        // detail page whose Save is dead and whose copilot is switched off.
+        setDraft((d) => ({
+          ...d,
+          name: described.name.trim(),
+          description: described.description.trim(),
+        }));
+        setRoleUnderivable(true);
+        return;
+      }
+      onAdd({
+        name: fields.name,
+        role: fields.role,
+        description: fields.description,
+        // Deliberately not collected here. The copilot drafts the persona on
+        // the page this create lands on, grounded in a teammate the host has
+        // actually stored — a better grounding than this dialog could send.
+        instructions: "",
+        landOnProfile: true,
+      });
+      reset();
+      return;
+    }
     if (!draft.name.trim() || !draft.role.trim() || budgetInvalid) return;
     onAdd({
       name: draft.name,
@@ -1014,82 +1111,134 @@ function AddMemberDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Add teammate</DialogTitle>
-          <DialogDescription>Add a teammate to your company&apos;s roster.</DialogDescription>
+          <DialogDescription>
+            {describing
+              ? "Name them and say what they should do. You can fill in the rest on their profile."
+              : "Add a teammate to your company's roster."}
+          </DialogDescription>
         </DialogHeader>
-        <AgentFields
-          idPrefix="member"
-          draft={draft}
-          onChange={(key: AgentFieldKey, value) => setDraft((d) => ({ ...d, [key]: value }))}
-          copilot={(key) =>
-            key === "description" || key === "instructions" ? (
-              <FieldCopilot
-                field={key}
-                // No id to address — this teammate does not exist yet — so the
-                // fields being typed ride the request. Everything else the
-                // draft is grounded in still comes from the record host-side.
-                onTurn={(conversation) =>
-                  draftNewAgentField(client, company, key, conversation, {
-                    role: draft.role,
-                    name: draft.name,
-                    description: draft.description,
-                    instructions: draft.instructions,
-                  })
-                }
-                onAccept={(text) => setDraft((d) => ({ ...d, [key]: text }))}
-                // A draft is written FROM the role, so there is nothing to
-                // write one from until it is filled in — the same rule the
-                // host enforces, said here before the operator meets it as a
-                // refusal.
-                disabled={!draft.role.trim() || cognition === "echo"}
-                disabledNotice={
-                  cognition === "echo"
-                    ? "No model is configured, so the copilot can't draft yet."
-                    : !draft.role.trim()
-                      ? "Give this teammate a role first — the copilot drafts from it."
-                      : undefined
-                }
-              />
-            ) : null
-          }
-        />
-        {canSetBudget && (
-          <div className="grid gap-2">
-            <Label htmlFor="member-budget-new">Daily budget (optional)</Label>
-            <Input
-              id="member-budget-new"
-              type="number"
-              min={0}
-              step="0.01"
-              inputMode="decimal"
-              value={budget}
-              onChange={(e) => setBudget(e.target.value)}
-              placeholder="e.g. 5.00 — leave blank for no cap"
-              data-testid="team-add-budget"
+        {describing ? (
+          <DescribeTeammate
+            idPrefix="member"
+            name={described.name}
+            description={described.description}
+            onNameChange={(name) => setDescribed((d) => ({ ...d, name }))}
+            onDescriptionChange={(description) =>
+              setDescribed((d) => ({ ...d, description }))
+            }
+          />
+        ) : (
+          <>
+            {/* Said only when the full form arrived by hand-over, so the
+                operator knows why the dialog changed under them rather than
+                meeting a different form with no explanation. Never shown on the
+                no-model path, where this form is simply what the dialog is. */}
+            {roleUnderivable && (
+              <p className="text-2xs text-muted-foreground" data-testid="team-add-handover">
+                We couldn&apos;t read a role out of that description, so here are all the
+                fields.
+              </p>
+            )}
+            <AgentFields
+              idPrefix="member"
+              draft={draft}
+              onChange={(key: AgentFieldKey, value) =>
+                setDraft((d) => ({ ...d, [key]: value }))
+              }
+              copilot={(key) =>
+                key === "description" || key === "instructions" ? (
+                  <FieldCopilot
+                    field={key}
+                    // No id to address — this teammate does not exist yet — so
+                    // the fields being typed ride the request. Everything else
+                    // the draft is grounded in still comes from the record
+                    // host-side.
+                    onTurn={(conversation) =>
+                      draftNewAgentField(client, company, key, conversation, {
+                        role: draft.role,
+                        name: draft.name,
+                        description: draft.description,
+                        instructions: draft.instructions,
+                      })
+                    }
+                    onAccept={(text) => setDraft((d) => ({ ...d, [key]: text }))}
+                    // A draft is written FROM the role, so there is nothing to
+                    // write one from until it is filled in — the same rule the
+                    // host enforces, said here before the operator meets it as
+                    // a refusal.
+                    disabled={!draft.role.trim() || cognition === "echo"}
+                    disabledNotice={
+                      cognition === "echo"
+                        ? "No model is configured, so the copilot can't draft yet."
+                        : !draft.role.trim()
+                          ? "Give this teammate a role first — the copilot drafts from it."
+                          : undefined
+                    }
+                  />
+                ) : null
+              }
             />
-          </div>
+            {canSetBudget && (
+              <div className="grid gap-2">
+                <Label htmlFor="member-budget-new">Daily budget (optional)</Label>
+                <Input
+                  id="member-budget-new"
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  inputMode="decimal"
+                  value={budget}
+                  onChange={(e) => setBudget(e.target.value)}
+                  placeholder="e.g. 5.00 — leave blank for no cap"
+                  data-testid="team-add-budget"
+                />
+              </div>
+            )}
+            <label className="flex items-center justify-between rounded-lg border p-3">
+              <span className="flex items-center gap-2 text-sm">
+                <Mail className="size-4 text-muted-foreground" /> Give this teammate an inbox
+              </span>
+              <Switch
+                checked={inbox}
+                onCheckedChange={setInbox}
+                aria-label="Give this teammate an inbox"
+              />
+            </label>
+          </>
         )}
-        <label className="flex items-center justify-between rounded-lg border p-3">
-          <span className="flex items-center gap-2 text-sm">
-            <Mail className="size-4 text-muted-foreground" /> Give this teammate an inbox
-          </span>
-          <Switch checked={inbox} onCheckedChange={setInbox} aria-label="Give this teammate an inbox" />
-        </label>
         <DialogFooter className="items-center">
           {/* Why the button is dead, next to the button (issue #1776) — the
               same answer the edit form gives, from the same definition, so the
-              two forms cannot come to disagree about what a teammate needs. */}
-          {missing.length > 0 && (
-            <p className="mr-auto text-2xs text-muted-foreground" data-testid="team-add-blocked">
-              {missing.map((field) => field.label).join(" and ")}{" "}
-              {missing.length > 1 ? "are" : "is"} required.
-            </p>
-          )}
+              two forms cannot come to disagree about what a teammate needs.
+              The reduced dialog asks for two things, so it answers for those
+              two rather than from `AGENT_FIELDS`, which describes fields it
+              does not render. */}
+          {describing
+            ? describeBlocked && (
+                <p
+                  className="mr-auto text-2xs text-muted-foreground"
+                  data-testid="team-add-blocked"
+                >
+                  {describeBlocked}
+                </p>
+              )
+            : missing.length > 0 && (
+                <p
+                  className="mr-auto text-2xs text-muted-foreground"
+                  data-testid="team-add-blocked"
+                >
+                  {missing.map((field) => field.label).join(" and ")}{" "}
+                  {missing.length > 1 ? "are" : "is"} required.
+                </p>
+              )}
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
           <Button
             onClick={submit}
-            disabled={missing.length > 0 || budgetInvalid}
+            disabled={
+              describing ? Boolean(describeBlocked) : missing.length > 0 || budgetInvalid
+            }
           >
             Add teammate
           </Button>

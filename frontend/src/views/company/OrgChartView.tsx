@@ -173,11 +173,22 @@ interface Props {
    * Optional, so the chart still stands alone.
    */
   onBack?: () => void;
+  /**
+   * Open a teammate's detail page, with `edit` opening its edit form too
+   * (issue #1989).
+   *
+   * Where the reduced Add-teammate dialog lands what it just created: it
+   * collects a name and a sentence, and the copilot that drafts the rest lives
+   * in that form. Optional, so the chart still stands alone — but a chart
+   * mounted without it leaves the reduced dialog creating teammates and going
+   * nowhere, so `CompanyView` always passes it.
+   */
+  onOpenAgent?: (agentId: string, options?: { edit?: boolean }) => void;
 }
 
 type Load = "loading" | "ready" | "error";
 
-export function OrgChartView({ client, company, focusDeskId, onBack }: Props) {
+export function OrgChartView({ client, company, focusDeskId, onBack, onOpenAgent }: Props) {
   const [load, setLoad] = useState<Load>("loading");
   const [tree, setTree] = useState<OrgTree | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -428,6 +439,13 @@ export function OrgChartView({ client, company, focusDeskId, onBack }: Props) {
       }
       outcome = addOutcome(fields.name, missed);
       setAddMemberOpen(false);
+      // Issue #1989: the reduced dialog collected a name and a sentence, so the
+      // description, the persona, the budget and the inbox are all still to be
+      // written — on the teammate's own page, beside the copilot that drafts
+      // two of them. After the desk placement and the chart re-read, not
+      // before: the operator is told what half-landed (a desk add that failed
+      // is fixed on the chart they are leaving) and only then taken away.
+      if (fields.landOnProfile) onOpenAgent?.(created.id, { edit: true });
     } catch (e) {
       setAddMemberOpen(false);
       outcome = addMemberFailure(e, "Could not create teammate.");
@@ -622,6 +640,8 @@ export function OrgChartView({ client, company, focusDeskId, onBack }: Props) {
         open={addMemberOpen}
         onOpenChange={setAddMemberOpen}
         onAdd={(fields) => void addMember(fields)}
+        client={client}
+        company={company}
       />
     </div>
   );

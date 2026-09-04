@@ -134,6 +134,21 @@ interface Props {
   /** The hash's second segment — the channel id, e.g. `main` in `#/chat/main`. */
   sub: string | null;
   onNavigate: (channelId: string) => void;
+  /**
+   * Leave chat for a teammate's detail page, with `edit` opening its edit form
+   * too (issue #1989).
+   *
+   * The one navigation out of this view, and it exists for one reason: the
+   * reduced Add-teammate dialog collects a name and a sentence, and the copilot
+   * that drafts the description and the persona lives in that form. Creating a
+   * teammate here and staying in chat would leave them half-written with
+   * nothing pointing at where to finish them.
+   *
+   * Optional, so `ChatView` still mounts standalone in tests — but a mount
+   * without it turns the reduced dialog's create into a dead end, so the shell
+   * always passes it.
+   */
+  onOpenAgent?: (agentId: string, options?: { edit?: boolean }) => void;
   /** Called after a reply lands, so the shell can refresh approvals/status. */
   onReply?: () => void;
   /**
@@ -405,6 +420,7 @@ export function ChatView({
   company,
   sub,
   onNavigate,
+  onOpenAgent,
   onReply,
   transcripts,
   setTranscripts,
@@ -1468,6 +1484,8 @@ export function ChatView({
               open={addOpen}
               onOpenChange={setAddOpen}
               onAdd={(fields) => void addMember(fields)}
+              client={client}
+              company={company}
             />
           }
         />
@@ -2167,6 +2185,12 @@ export function ChatView({
     }
     setAddOpen(false);
     reportAddMember(outcome);
+    // Issue #1989: the reduced dialog collected a name and a sentence, so the
+    // rest of the teammate is still to be written — on their own page, beside
+    // the copilot that drafts it. Guarded on `created`, not on the flag alone:
+    // the 404 fallback above adds a console-only row with no host id, and there
+    // is no detail page for a teammate the host has never heard of.
+    if (fields.landOnProfile && created) onOpenAgent?.(created.id, { edit: true });
   }
 
   /**
@@ -2686,7 +2710,13 @@ export function ChatView({
         </div>
       </div>
 
-      <AddMemberDialog open={addOpen} onOpenChange={setAddOpen} onAdd={(fields) => void addMember(fields)} />
+      <AddMemberDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        onAdd={(fields) => void addMember(fields)}
+        client={client}
+        company={company}
+      />
       <ChannelCreateDialog
         client={client}
         company={company}
