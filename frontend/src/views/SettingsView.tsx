@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { me as fetchMe, type UserRole } from "@/api/auth";
 import type { LifecycleAction, OpenCompanyClient } from "@/api/client";
 import { memoryEngine, type MemoryEngineState } from "@/api/memory";
 import { ApiError } from "@/api/types";
@@ -287,6 +288,33 @@ export function LifecycleControls({
   const [pending, setPending] = useState<string | null>(null);
   const state = pending ?? feed.status.lifecycle;
 
+  /**
+   * The signed-in caller's role, or `null` when the console found no session.
+   *
+   * `null` is not "non-admin" — `resolve_principal` prefers a resolved
+   * session over a platform bearer whenever both are present, so whether a
+   * session exists at all changes which credential `pause` / `resume`
+   * actually authorize against. Defaults to `null` so an unresolved read
+   * never renders an enabled Pause/Resume, matching the closed-by-default
+   * pattern every other admin-gated view uses (`HostingView`, `TeamView`, ...).
+   */
+  const [session, setSession] = useState<UserRole | null>(null);
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      let role: UserRole | null = null;
+      try {
+        role = (await fetchMe(client, company)).role;
+      } catch {
+        // No user plane on this host, or not signed in — no session.
+      }
+      if (live) setSession(role);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
+
   async function run(action: LifecycleAction) {
     if (busy) return;
     setBusy(true);
@@ -310,8 +338,8 @@ export function LifecycleControls({
   }
 
   const platform = client.carriesPlatformBearer;
-  const { actions, explainPlatformOnly, explainPlatformSuspended, archived } =
-    lifecycleAffordances(state, platform);
+  const { actions, explainPlatformOnly, explainPlatformSuspended, explainAdminOnly, archived } =
+    lifecycleAffordances(state, session, platform);
   const offers = (action: LifecycleAction) => actions.includes(action);
 
   return (
@@ -348,6 +376,15 @@ export function LifecycleControls({
             <AlertDescription>
               The platform suspended this company. Only the platform can lift a suspension — an
               admin here cannot resume it, so there is no Resume button to offer.
+            </AlertDescription>
+          </Alert>
+        )}
+        {explainAdminOnly && (
+          <Alert data-testid="lifecycle-admin-only">
+            <TriangleAlert className="size-4" />
+            <AlertDescription>
+              Pausing and resuming a company need admin authority here — ask one of this
+              company&rsquo;s admins, since a member&rsquo;s session cannot reach these controls.
             </AlertDescription>
           </Alert>
         )}

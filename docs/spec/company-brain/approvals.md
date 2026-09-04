@@ -117,7 +117,11 @@ agent calls request_approval ─▶ park (ApprovalId)
 `POST /api/v1/companies/{id}/emergency-pause` denies **every** new effect
 outside the `Other` group, ahead of every policy rule including
 `always_approve`. `POST .../emergency-resume` releases it. Both are
-owner-scoped and both take a confirmation phrase in the body. Normative:
+admin-scoped — a human must administer the company, not merely be a member —
+and both take a confirmation phrase in the body. The hosting control plane's
+machine principal is the one exception: it already owns or holds platform
+scope over the company by the time it reaches these routes, so it is not
+asked to be an admin on top of that. Normative:
 
 - **It denies, it does not park.** Parking would make the approval queue an
   escape hatch from the switch: an operator could approve the very effects they
