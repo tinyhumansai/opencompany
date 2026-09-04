@@ -255,7 +255,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `tracing::error!` to events and `warn!`/`info!` to breadcrumbs,
 # `backtrace` + `debug-images` make those frames symbolicable, and `contexts`
 # attaches OS and runtime metadata.
-sentry = { version = "0.47.0", default-features = false, optional = true, features = [
+sentry = { version = "0.49.2", default-features = false, optional = true, features = [
     "backtrace",
     "contexts",
     "panic",
