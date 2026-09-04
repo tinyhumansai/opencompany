@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -1133,6 +1133,9 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   async function open(id: string) {
     await flush();
     setOpenId(id);
+    // Below `md` the two panes share one column, so opening a note has to hand
+    // it over; above `md` both are shown regardless and this is inert.
+    setShowExplorer(false);
     setMode("read");
     setDraft(null);
     setSaveState("idle");
@@ -1558,9 +1561,12 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
         id="workspace-explorer"
         className={cn(
           "min-w-0 shrink-0 flex-col overflow-hidden bg-card/40 md:flex",
+          // Full width while it owns the column; the resizable width only
+          // applies once the note pane is beside it.
+          "w-full md:w-(--workspace-list-width)",
           showExplorer ? "flex" : "hidden",
         )}
-        style={{ width: listWidth }}
+        style={{ "--workspace-list-width": `${listWidth}px` } as CSSProperties}
       >
         <div className="flex items-center gap-1 border-b px-2 py-2">
           <span className="flex-1 px-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">
@@ -1753,7 +1759,7 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
           "relative w-1.5 shrink-0 touch-none cursor-col-resize bg-border outline-none transition-colors select-none motion-reduce:transition-none",
           "hover:bg-primary/50 focus-visible:bg-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
           resizingList && "bg-primary/70",
-          showExplorer ? "hidden md:block" : "hidden",
+          "hidden md:block",
         )}
         onPointerDown={(e) => {
           if (e.button !== 0) return;
