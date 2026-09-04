@@ -3092,9 +3092,9 @@ checksum = "851fac73f7fe22f6a3ab87f720ce509cae7c9fd08e7dd27866cc232dee07ccf4"
 
 [[package]]
 name = "mongodb"
-version = "3.8.1"
+version = "3.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99a95f3a5e3b3912e93f10d6784cd641a70a94d7ffe15561a2c89891d1bf85fd"
+checksum = "d220eb9ba80bad420e1f9efc4e895fede7418f8779a8e38a3b750e57ff397720"
 dependencies = [
  "base64 0.22.1",
  "bitflags",
