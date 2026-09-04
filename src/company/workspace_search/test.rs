@@ -564,6 +564,15 @@ impl WorkspaceStore for FixedTree {
             .find(|(node, _)| node.id == id)
             .map(|(node, body)| (node.clone(), body.clone())))
     }
+
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> crate::Result<Option<(WorkspaceNode, String, u64)>> {
+        crate::ports::workspace::read_capped_by_reading(self, company, id, max_bytes).await
+    }
     async fn write(
         &self,
         _company: &CompanyId,

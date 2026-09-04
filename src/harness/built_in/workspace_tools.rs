@@ -2829,6 +2829,14 @@ mod tests {
         ) -> crate::Result<Option<(WorkspaceNode, String)>> {
             unreachable!("the ownership gate only reads the tree")
         }
+        async fn read_capped(
+            &self,
+            _company: &CompanyId,
+            _id: &str,
+            _max_bytes: u64,
+        ) -> crate::Result<Option<(WorkspaceNode, String, u64)>> {
+            unreachable!("the ownership gate only reads the tree")
+        }
         async fn write(
             &self,
             _company: &CompanyId,
@@ -4230,6 +4238,14 @@ mod tests {
                 Some(ReadFault::Failed(make)) => Err(make()),
             }
         }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> crate::Result<Option<(WorkspaceNode, String, u64)>> {
+            crate::ports::workspace::read_capped_by_reading(self, company, id, max_bytes).await
+        }
         async fn write(
             &self,
             _company: &CompanyId,
@@ -5046,6 +5062,14 @@ mod tests {
             id: &str,
         ) -> crate::Result<Option<(WorkspaceNode, String)>> {
             self.inner.read(company, id).await
+        }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> crate::Result<Option<(WorkspaceNode, String, u64)>> {
+            self.inner.read_capped(company, id, max_bytes).await
         }
         async fn write(
             &self,

@@ -239,8 +239,13 @@ under a name disambiguated from the upload's own id rather than surfacing the
 `/chat`'s `attachments` field is **node ids only**. The host re-resolves each
 id against the sending company's own workspace tree and takes the name / mime
 / size from the store — never the client's claim — the same discipline a
-`parent` thread reference gets; an id that resolves to no binary node in this
-company is a `400`, on the same terms a bad `parent` is. Server-side, the host
+`parent` thread reference gets. **Any file in the tree may be attached**,
+however it was written (issue #2029): an upload through `…/chat/upload`, a
+text upload the workspace route stored as a note, a seeded note, one an agent
+wrote. A prose note's `mime` is guessed from the stored name and its `size` is
+the body's byte length, both read at resolve time. An id naming a folder, or
+naming nothing in this company, is a `400`, on the same terms a bad `parent`
+is. Server-side, the host
 also extracts each attachment's text where the format and size allow it (PDF,
 DOCX, PPTX, XLSX, plain text — the same `ingest::extract` pipeline
 `POST …/memory/ingest` runs; see [memory.md](../company-brain/memory.md)) and

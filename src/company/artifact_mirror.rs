@@ -1130,6 +1130,14 @@ mod test {
         ) -> Result<Option<(WorkspaceNode, String)>> {
             WorkspaceStore::read(&*self.0, company, id).await
         }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            WorkspaceStore::read_capped(&*self.0, company, id, max_bytes).await
+        }
         async fn write(
             &self,
             company: &CompanyId,
@@ -1239,6 +1247,14 @@ mod test {
             id: &str,
         ) -> Result<Option<(WorkspaceNode, String)>> {
             WorkspaceStore::read(&*self.0, company, id).await
+        }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            WorkspaceStore::read_capped(&*self.0, company, id, max_bytes).await
         }
         async fn write(
             &self,
@@ -1659,6 +1675,14 @@ mod test {
         ) -> Result<Option<(WorkspaceNode, String)>> {
             WorkspaceStore::read(&*self.0, company, id).await
         }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            WorkspaceStore::read_capped(&*self.0, company, id, max_bytes).await
+        }
         async fn write(
             &self,
             company: &CompanyId,
@@ -1948,6 +1972,14 @@ mod test {
             id: &str,
         ) -> Result<Option<(WorkspaceNode, String)>> {
             WorkspaceStore::read(&*self.inner, company, id).await
+        }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            WorkspaceStore::read_capped(&*self.inner, company, id, max_bytes).await
         }
         async fn write(
             &self,

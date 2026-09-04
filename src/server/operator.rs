@@ -1954,8 +1954,9 @@ struct ChatMessage {
     /// those ids here. The host re-resolves each within this company's own
     /// workspace and takes the name / mime / size from the store — so a foreign
     /// or spoofed reference cannot cross a company boundary or misdescribe its
-    /// payload (see `resolve_attachments`). An id that resolves to no binary
-    /// node in this company is a `400`.
+    /// payload (see `resolve_attachments`). Any file in the tree may be
+    /// attached, however it was written; an id naming a folder, or naming
+    /// nothing in this company, is a `400`.
     ///
     /// Additive in both directions: this struct has no `deny_unknown_fields`,
     /// so a newer console against an older host has its ids ignored and its
@@ -2531,24 +2532,38 @@ async fn resolve_attachments(
     let tree = runtime.workspace().tree(id).await?;
     let mut resolved = Vec::with_capacity(node_ids.len());
     for node_id in node_ids {
-        let node = tree
-            .iter()
-            .find(|n| &n.id == node_id && n.is_binary())
-            .ok_or_else(|| {
-                ApiError(OpenCompanyError::InvalidRequest(format!(
-                    "attachment {node_id} is not a file in this company's workspace"
-                )))
-            })?;
-        let extracted_text = extracted_attachment_text(runtime, id, node).await;
+        let node = tree.iter().find(|n| &n.id == node_id).ok_or_else(|| {
+            ApiError(OpenCompanyError::InvalidRequest(format!(
+                "attachment {node_id} is not in this company's workspace"
+            )))
+        })?;
+        if node.kind != crate::ports::workspace::NodeKind::File {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                "attachment {node_id} is a folder, not a file"
+            ))));
+        }
+        let (mime, size, extracted_text) = if node.is_binary() {
+            (
+                node.mime.clone().unwrap_or_default(),
+                node.size.unwrap_or(0),
+                extracted_attachment_text(runtime, id, node).await,
+            )
+        } else {
+            let (content, size) = note_within_extract_cap(runtime, id, &node.id).await;
+            (
+                mime_guess::from_path(&node.name)
+                    .first_raw()
+                    .unwrap_or("text/plain")
+                    .to_string(),
+                size,
+                extracted_note_text(&content),
+            )
+        };
         resolved.push(Attachment {
             node_id: node.id.clone(),
             name: node.name.clone(),
-            // A binary node always carries both — `is_binary()` is exactly
-            // `mime.is_some()`, and the store computes `size` alongside it —
-            // so the defaults are unreachable and exist only to keep this
-            // total without an `unwrap` a later store change could break.
-            mime: node.mime.clone().unwrap_or_default(),
-            size: node.size.unwrap_or(0),
+            mime,
+            size,
             extracted_text,
         });
     }
@@ -2583,6 +2598,47 @@ const MAX_ATTACHMENT_EXTRACT_BYTES: u64 = 4 * 1024 * 1024;
 /// carries the operator's own words too, so no single attachment may be free
 /// to crowd out the rest of the turn.
 const MAX_ATTACHMENT_EXTRACT_CHARS: usize = 6_000;
+
+/// One prose node's byte length, and its body only while that length stays
+/// within [`MAX_ATTACHMENT_EXTRACT_BYTES`].
+///
+/// [`WorkspaceStore::read_capped`](crate::ports::workspace::WorkspaceStore::read_capped)
+/// rather than a read and a length check, so the ceiling holds where the binary
+/// path's does — before the transfer, not after it. A plain `read` would
+/// materialise the whole note to discover it must be discarded, and a message
+/// may carry [`MAX_CHAT_ATTACHMENTS`] of them.
+///
+/// Best-effort on the same terms as [`extracted_attachment_text`]: a read that
+/// races a delete or hits a transient store error leaves the reference itself
+/// intact rather than failing the send. The size is then `0`, which is what the
+/// caller can honestly say about a body it could not measure.
+async fn note_within_extract_cap(
+    runtime: &Arc<CompanyRuntime>,
+    id: &CompanyId,
+    node_id: &str,
+) -> (String, u64) {
+    runtime
+        .workspace()
+        .read_capped(id, node_id, MAX_ATTACHMENT_EXTRACT_BYTES)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, body, len)| (body, len))
+        .unwrap_or_default()
+}
+
+/// A prose attachment's text for the brain, `None` when there is none to carry
+/// — an empty note, or one the store withheld for weighing more than the
+/// extraction cap.
+fn extracted_note_text(content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    Some(crate::ledger::budget::truncate(
+        content,
+        MAX_ATTACHMENT_EXTRACT_CHARS,
+    ))
+}
 
 /// Reads and extracts one binary node's text where the format and size allow
 /// it, `None` otherwise (issue #1682, codex review finding).

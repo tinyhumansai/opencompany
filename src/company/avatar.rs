@@ -1641,6 +1641,15 @@ mod test {
                 .get(id)
                 .map(|node| (node.clone(), String::new())))
         }
+
+        async fn read_capped(
+            &self,
+            company: &crate::ports::types::CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            crate::ports::workspace::read_capped_by_reading(self, company, id, max_bytes).await
+        }
         async fn write(
             &self,
             _company: &crate::ports::types::CompanyId,

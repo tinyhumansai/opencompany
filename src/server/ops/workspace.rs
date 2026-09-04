@@ -524,19 +524,20 @@ async fn search(
     }))
 }
 
-/// `GET …/workspace/blob/{node_id}` — stream a binary node's payload.
+/// `GET …/workspace/blob/{node_id}` — download a file's payload.
 ///
-/// The counterpart of [`read_file`], and the only way bytes leave the tree. The
-/// body is streamed rather than buffered, so serving a 200 MiB video costs the
-/// process a chunk at a time.
+/// The counterpart of [`read_file`], and the only way a file leaves the tree as
+/// a download. A binary node's body is streamed rather than buffered, so serving
+/// a 200 MiB video costs the process a chunk at a time; a prose note is served
+/// from its body, under the same neutralised headers.
 ///
-/// A folder, a prose note and an id that names nothing all 404 identically: the
-/// port answers `None` for each, and telling them apart would leak which node
-/// ids exist to a caller that cannot read them anyway.
+/// A folder and an id that names nothing 404 identically: telling them apart
+/// would leak which node ids exist to a caller that cannot read them anyway.
 ///
 /// `ETag` is the payload's sha256 — the digest the store computed from the
 /// bytes it holds, so a conditional request is answered by the thing itself
-/// rather than by a timestamp that a rename would move.
+/// rather than by a timestamp that a rename would move. A prose note carries no
+/// digest, so it is served without one.
 ///
 /// # A stored `mime` is a caller's claim, so it does not decide the disposition
 ///
@@ -556,15 +557,37 @@ async fn read_blob(
     company: ScopedCompany,
     Path(NodePath { node_id }): Path<NodePath>,
 ) -> Result<Response, ApiError> {
-    let Some((node, stream)) = company
+    let missing = || {
+        ApiError(OpenCompanyError::CompanyNotFound(format!(
+            "workspace blob {node_id}"
+        )))
+    };
+    let (node, stream, size) = match company
         .runtime
         .workspace()
         .read_bytes(company.id(), &node_id)
         .await?
-    else {
-        return Err(ApiError(OpenCompanyError::CompanyNotFound(format!(
-            "workspace blob {node_id}"
-        ))));
+    {
+        Some((node, stream)) => {
+            let size = node.size;
+            (node, stream, size)
+        }
+        None => {
+            let Some((node, content)) = company
+                .runtime
+                .workspace()
+                .read(company.id(), &node_id)
+                .await?
+            else {
+                return Err(missing());
+            };
+            if node.kind != NodeKind::File || node.is_binary() {
+                return Err(missing());
+            }
+            let bytes = content.into_bytes();
+            let size = Some(bytes.len() as u64);
+            (node, crate::ports::workspace::one_chunk(bytes), size)
+        }
     };
     let serving = serving_for(node.mime.as_deref());
     let mut response = Response::builder()
@@ -588,7 +611,7 @@ async fn read_blob(
     if let Some(sha) = node.sha256 {
         response = response.header(header::ETAG, format!("\"{sha}\""));
     }
-    if let Some(size) = node.size {
+    if let Some(size) = size {
         response = response.header(header::CONTENT_LENGTH, size);
     }
     response.body(Body::from_stream(stream)).map_err(|e| {

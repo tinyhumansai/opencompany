@@ -601,6 +601,13 @@ fn sql_limit(limit: usize) -> i64 {
     }
 }
 
+/// Saturates a `u64` byte cap to SQLite's bindable `i64` range, so a cap
+/// above `i64::MAX` compares as effectively unlimited instead of wrapping
+/// negative.
+fn clamp_max_bytes(max_bytes: u64) -> i64 {
+    max_bytes.min(i64::MAX as u64) as i64
+}
+
 /// A single SQLite database implementing all five storage ports.
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -3532,6 +3539,46 @@ impl crate::ports::workspace::WorkspaceStore for SqliteStore {
         }
     }
 
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(crate::ports::workspace::WorkspaceNode, String, u64)>> {
+        let conn = self.conn();
+        // One statement, so the length and the body it admits describe the same
+        // row: the cap is applied by SQLite, and an over-cap body is never
+        // carried across the boundary into a Rust `String`.
+        let row: Option<(String, i64, String)> = conn
+            .query_row(
+                "SELECT node_json, \
+                        length(CAST(content AS BLOB)), \
+                        CASE WHEN length(CAST(content AS BLOB)) <= ?3 THEN content ELSE '' END \
+                 FROM workspace_nodes WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), id, clamp_max_bytes(max_bytes)],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_err)?;
+        match row {
+            Some((node_json, len, content)) => {
+                let node: crate::ports::workspace::WorkspaceNode =
+                    serde_json::from_str(&node_json)?;
+                if node.kind != crate::ports::workspace::NodeKind::File || node.is_binary() {
+                    return Ok(Some((node, String::new(), 0)));
+                }
+                Ok(Some((node, content, len.max(0) as u64)))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn write(
         &self,
         company: &CompanyId,
@@ -4756,6 +4803,11 @@ mod test {
         conformance::assert_workspace_binary_store(store()).await;
     }
 
+    #[tokio::test]
+    async fn conformance_workspace_read_capped() {
+        conformance::assert_workspace_read_capped(store()).await;
+    }
+
     /// Issue #759: the folder-claim primitive, including the eight-way
     /// contention case an immediate transaction is what decides here.
     #[tokio::test]
@@ -4878,6 +4930,54 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conformance_workspace_read_never_tears() {
         conformance::assert_workspace_read_never_tears(store()).await;
+    }
+
+    /// The stat-then-open race fixed in the `fs` backend's `read_capped`.
+    /// This backend measures and reads under one query and passes on both
+    /// sides of that fix — the contract is the port's, not one backend's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_workspace_read_capped_race() {
+        conformance::assert_workspace_read_capped_race(store()).await;
+    }
+
+    /// A cap above `i64::MAX` must still admit a small body. SQLite binds the
+    /// comparison as a signed integer, so an unclamped cast wraps negative and
+    /// withholds every note regardless of size.
+    #[tokio::test]
+    async fn read_capped_clamps_oversized_max_bytes() {
+        use crate::ports::workspace::{NodeKind, WorkspaceNode, WorkspaceOrigin, WorkspaceStore};
+
+        let store = store();
+        let company = CompanyId::new("clamp-co");
+        let origin = WorkspaceOrigin::Operator;
+        let node = WorkspaceNode {
+            id: "clamp-note".to_string(),
+            name: "clamp.md".to_string(),
+            kind: NodeKind::File,
+            parent_id: None,
+            updated_at_millis: crate::ports::now_millis(),
+            created_by: origin.clone(),
+            updated_by: origin,
+            mime: None,
+            size: None,
+            sha256: None,
+            adopted: false,
+        };
+        store
+            .create(&company, &node, Some("small body"))
+            .await
+            .expect("create the note");
+
+        let (_, body, len) = store
+            .read_capped(&company, "clamp-note", u64::MAX)
+            .await
+            .expect("read with an oversized cap")
+            .expect("the note exists");
+        assert_eq!(
+            body, "small body",
+            "a cap above i64::MAX must not withhold a body far under it"
+        );
+        assert_eq!(len, "small body".len() as u64);
     }
 
     /// Issue #700's emptiness predicate, against the backend that can actually

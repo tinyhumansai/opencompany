@@ -139,6 +139,15 @@ impl WorkspaceStore for WorkspaceAnnouncer {
         self.inner.read(company, id).await
     }
 
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+        self.inner.read_capped(company, id, max_bytes).await
+    }
+
     async fn is_empty(&self, company: &CompanyId) -> Result<bool> {
         self.inner.is_empty(company).await
     }

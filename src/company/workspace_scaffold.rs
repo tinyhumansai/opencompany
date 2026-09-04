@@ -1776,6 +1776,14 @@ mod tests {
         ) -> Result<Option<(WorkspaceNode, String)>> {
             self.inner.read(company, id).await
         }
+        async fn read_capped(
+            &self,
+            company: &CompanyId,
+            id: &str,
+            max_bytes: u64,
+        ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+            self.inner.read_capped(company, id, max_bytes).await
+        }
 
         async fn write(
             &self,

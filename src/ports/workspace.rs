@@ -365,6 +365,29 @@ impl WorkspaceNode {
     }
 }
 
+/// Answers [`WorkspaceStore::read_capped`] by reading the whole body and
+/// measuring it.
+///
+/// For a store that already holds every body in memory — the test doubles — where
+/// the read *is* the measurement and there is nothing to transfer. **Never for a
+/// decorator over a real store**: forwarding is what keeps the ceiling, and this
+/// would quietly spend the allocation the caller asked the store to avoid.
+pub async fn read_capped_by_reading(
+    store: &(impl WorkspaceStore + ?Sized),
+    company: &CompanyId,
+    id: &str,
+    max_bytes: u64,
+) -> Result<Option<(WorkspaceNode, String, u64)>> {
+    Ok(store.read(company, id).await?.map(|(node, body)| {
+        let len = body.len() as u64;
+        if len > max_bytes {
+            (node, String::new(), len)
+        } else {
+            (node, body, len)
+        }
+    }))
+}
+
 /// Wraps already-buffered bytes as a one-chunk [`BlobStream`].
 ///
 /// For the backends that hold a payload in memory by the time they can answer
@@ -496,6 +519,36 @@ pub trait WorkspaceStore: Send + Sync {
     /// Reads one node and, for files, its content. Folders — and binary nodes —
     /// yield an empty body; see the trait docs.
     async fn read(&self, company: &CompanyId, id: &str) -> Result<Option<(WorkspaceNode, String)>>;
+    /// Reads one node's body only when it weighs no more than `max_bytes`,
+    /// alongside the byte length it actually has.
+    ///
+    /// The body is empty when it is longer than `max_bytes`; the length tells
+    /// that apart from a note that is genuinely empty. Folders and binary nodes
+    /// answer an empty body and a length of `0`, exactly as [`read`](Self::read)
+    /// does.
+    ///
+    /// # Why this is not `read` plus a length check
+    ///
+    /// [`read`](Self::read) has no ceiling. A caller that will discard anything
+    /// over a cap — a chat attachment's extraction, whose cap is a fraction of
+    /// what a note may weigh — would have to materialise the whole body to find
+    /// out it must throw it away, which is the allocation the cap exists to
+    /// prevent. The binary half of this port has never had that problem:
+    /// [`size`](WorkspaceNode::size) rides the node, so a caller decides on
+    /// metadata and [`read_bytes`](Self::read_bytes) is never reached for a
+    /// payload over the cap. A prose node carries no `size`, so the store is the
+    /// only place that can answer the same question that cheaply — and it is the
+    /// only place that can answer both parts of it at once, so a body cannot
+    /// grow past the cap between the measurement and the read.
+    ///
+    /// A decorator MUST forward this rather than let it fall back to `read`;
+    /// the whole point is what is *not* transferred.
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(WorkspaceNode, String, u64)>>;
     /// Overwrites a file's content, returning the updated node. A folder id —
     /// or a **binary** node's id — is an
     /// [`OpenCompanyError::InvalidRequest`](crate::error::OpenCompanyError).

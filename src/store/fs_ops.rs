@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 
 use crate::Result;
 use crate::error::OpenCompanyError;
@@ -1625,6 +1626,43 @@ impl WorkspaceStore for FsOps {
         Ok(Some((node, content)))
     }
 
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(WorkspaceNode, String, u64)>> {
+        let index = self.load_index(company).await?;
+        let Some(node) = index.get(id).cloned() else {
+            return Ok(None);
+        };
+        if node.kind != NodeKind::File || node.is_binary() {
+            return Ok(Some((node, String::new(), 0)));
+        }
+        let path = self.physical_path(company, &index, id)?;
+        // One open handle for both the length and the body. A concurrent
+        // replacement publishes via rename (`write_atomic`), which repoints
+        // the directory entry at a new inode rather than mutating this one,
+        // so a handle opened before that rename keeps reading the file it
+        // opened — `metadata` and the read below always agree.
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some((node, String::new(), 0)));
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
+        let len = file.metadata().await.map_err(|e| io_err(&path, e))?.len();
+        if len > max_bytes {
+            return Ok(Some((node, String::new(), len)));
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .await
+            .map_err(|e| io_err(&path, e))?;
+        Ok(Some((node, content, len)))
+    }
+
     async fn write(
         &self,
         company: &CompanyId,
@@ -2863,6 +2901,13 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conformance_workspace_read_capped() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_workspace_read_capped(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test]
     async fn conformance_workspace_folder_claims() {
         let root_dir = tmp_root();
         let root = root_dir.path().to_path_buf();
@@ -2894,6 +2939,13 @@ mod test {
         let root_dir = tmp_root();
         let root = root_dir.path().to_path_buf();
         conformance::assert_workspace_read_never_tears(Arc::new(FsOps::new(&root))).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_workspace_read_capped_race() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        conformance::assert_workspace_read_capped_race(Arc::new(FsOps::new(&root))).await;
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ Supporting docs:
   - [ports-effects.md](ports-effects.md) — `ToolProvider`, `AgentEconomy`,
     `ApprovalGate`
   - [ports-console.md](ports-console.md) — the WS3 console-surface stores
+    - [ports-console-workspace.md](ports-console-workspace.md) — `WorkspaceStore`,
+      the Obsidian-style note tree, its binary half, folder claims, and the
+      system workspace roots
   - [ports-runs.md](ports-runs.md) — `RunStore`: one attempt at a task, its
     trace, and who writes it
   - [journal.md](journal.md) — `JournalStore`: the runtime journal's durable

@@ -118,6 +118,13 @@ fn find_limit(limit: usize) -> FindLimit {
     }
 }
 
+/// Saturates a `u64` byte cap to Mongo's bindable `i64` range, so a cap
+/// above `i64::MAX` compares as effectively unlimited instead of wrapping
+/// negative.
+fn clamp_max_bytes(max_bytes: u64) -> i64 {
+    max_bytes.min(i64::MAX as u64) as i64
+}
+
 fn get_str(doc: &Document, key: &str) -> Result<String> {
     doc.get_str(key)
         .map(str::to_owned)
@@ -3771,6 +3778,50 @@ impl crate::ports::workspace::WorkspaceStore for MongoStore {
         }
     }
 
+    async fn read_capped(
+        &self,
+        company: &CompanyId,
+        id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(crate::ports::workspace::WorkspaceNode, String, u64)>> {
+        // Projected server-side, so an over-cap body stays in the server: the
+        // length is computed there and the content field is replaced with an
+        // empty string unless it fits. `$strLenBytes` is the same unit the cap
+        // is expressed in — `$strLenCP` would admit a body up to four times it.
+        let len_bytes = doc! {"$strLenBytes": {"$ifNull": ["$content", ""]}};
+        let mut cursor = self
+            .collection("workspace_nodes")
+            .aggregate(vec![
+                doc! {"$match": {"company_id": company.as_ref(), "node_id": id}},
+                doc! {"$limit": 1},
+                doc! {"$project": {
+                    "node_json": 1,
+                    "content_len": len_bytes.clone(),
+                    "content": {"$cond": [
+                        {"$lte": [len_bytes, clamp_max_bytes(max_bytes)]},
+                        {"$ifNull": ["$content", ""]},
+                        "",
+                    ]},
+                }},
+            ])
+            .await
+            .map_err(mongo_err)?;
+        let Some(doc) = cursor.try_next().await.map_err(mongo_err)? else {
+            return Ok(None);
+        };
+        let node: crate::ports::workspace::WorkspaceNode =
+            serde_json::from_str(&get_str(&doc, "node_json")?)?;
+        if node.kind != crate::ports::workspace::NodeKind::File || node.is_binary() {
+            return Ok(Some((node, String::new(), 0)));
+        }
+        let len = doc.get_i64("content_len").unwrap_or_else(|_| {
+            doc.get_i32("content_len")
+                .map(i64::from)
+                .unwrap_or_default()
+        });
+        Ok(Some((node, get_str(&doc, "content")?, len.max(0) as u64)))
+    }
+
     async fn write(
         &self,
         company: &CompanyId,
@@ -6213,6 +6264,13 @@ mod test {
         drop_db(&s).await;
     }
 
+    #[tokio::test]
+    async fn conformance_workspace_read_capped() {
+        let Some(s) = store().await else { return };
+        conformance::assert_workspace_read_capped(s.clone()).await;
+        drop_db(&s).await;
+    }
+
     /// Issue #759. The only lane where the folder-claim primitive's contention
     /// case runs against the partial unique index that actually decides it —
     /// this backend has neither a lock nor a transaction to fall back on.
@@ -6241,6 +6299,16 @@ mod test {
     async fn conformance_workspace_read_never_tears() {
         let Some(s) = store().await else { return };
         conformance::assert_workspace_read_never_tears(s.clone()).await;
+        drop_db(&s).await;
+    }
+
+    /// The stat-then-open race fixed in the `fs` backend's `read_capped`.
+    /// This backend measures and reads under one aggregation and passes on
+    /// both sides of that fix — the contract is the port's, not one backend's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_workspace_read_capped_race() {
+        let Some(s) = store().await else { return };
+        conformance::assert_workspace_read_capped_race(s.clone()).await;
         drop_db(&s).await;
     }
 
