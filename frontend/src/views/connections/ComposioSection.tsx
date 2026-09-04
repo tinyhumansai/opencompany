@@ -198,7 +198,9 @@ interface Props {
  * feature is not in the build.
  */
 export function ComposioSection({ client, company, canManage, onChanged }: Props) {
-  const [load, setLoad] = useState<"loading" | "ready" | "unavailable" | "error">("loading");
+  const [load, setLoad] = useState<
+    "loading" | "ready" | "unavailable" | "unconfigured" | "error"
+  >("loading");
   const [status, setStatus] = useState<ComposioStatus | null>(null);
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState<"save" | "clear" | "route" | null>(null);

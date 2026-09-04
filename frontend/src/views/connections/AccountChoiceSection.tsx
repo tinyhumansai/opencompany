@@ -87,9 +87,11 @@ export function AccountChoiceSection({ client, company, canManage, generation = 
       setFailed(false);
     } catch (err) {
       if (generation !== requestGeneration.current) return;
-      // A 404 (or no credential) is genuinely "nothing to choose between", and
-      // the sections above say why. Any other failure means the host could not
-      // answer — don't render that as an empty choice (issue #1470).
+      // A host with no Composio surface, and a company with no credential, both
+      // have nothing to choose between — and the sections above already say
+      // which of the two it is, so a second notice here would only be a second
+      // voice on the same fact. Any other failure means the host could not
+      // answer, and an unknown list must not render as an empty one (#1470).
       if (classifyLoadFailure(err) === "error") {
         setFailed(true);
       } else {

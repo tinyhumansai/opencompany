@@ -121,11 +121,12 @@ export function ObservatoryView({ client, company, runId, eventTick }: Props) {
       setLoad({ phase: "ready", runs });
     } catch (err) {
       if (generation !== reloadGeneration.current) return;
-      // A host that predates the GraphQL surface answers 404. That is
-      // "unavailable", not "broken", and it gets its own honest empty state
-      // rather than an error the operator cannot act on.
+      // A host that predates the GraphQL surface answers 404, and one built
+      // without it says so in its code. Both are "unavailable", not "broken",
+      // and get the honest empty state rather than an error with a retry the
+      // operator can only watch fail.
       setLoad(
-        classifyLoadFailure(err) === "unavailable"
+        classifyLoadFailure(err) !== "error"
           ? { phase: "unavailable" }
           : {
               phase: "error",

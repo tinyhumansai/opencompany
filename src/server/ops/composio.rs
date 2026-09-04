@@ -212,7 +212,7 @@ async fn fetch_catalog(runtime: &CompanyRuntime) -> Result<Vec<CatalogEntry>, St
     // never set a key, which is the confident-wrong-answer this credential work
     // exists to remove (see `company_key::resolve`).
     let config = resolve_tenant(runtime).await.map_err(|err| {
-        if matches!(err.0, crate::error::OpenCompanyError::Conflict(_)) {
+        if matches!(err.0, crate::error::OpenCompanyError::NotConfigured(_)) {
             "this company has no Composio credential yet, so the catalog cannot be read".to_string()
         } else {
             format!(
@@ -257,7 +257,7 @@ async fn fetch_catalog(_runtime: &CompanyRuntime) -> Result<Vec<CatalogEntry>, S
 /// route table — mirroring how `get_status` stays wired and reports
 /// `inBuild:false` rather than `#[cfg]`-ing itself out — but its handlers only
 /// reach the live Composio client under the `composio` feature; otherwise they
-/// answer `409 Conflict` "not in this build".
+/// answer `409 not_in_build` "not in this build".
 pub fn router() -> Router<AppState> {
     scoped("/composio", get(get_status))
         .merge(scoped("/composio/token", put(set_token)))
@@ -670,8 +670,8 @@ async fn journal(
 ///
 /// Composio runs the OAuth flow itself — there is **no** local callback route.
 /// The console opens the URL and polls [`connections`] until the toolkit
-/// reports connected. Under a non-`composio` build this answers `409 Conflict`
-/// (see [`router`]).
+/// reports connected. Under a non-`composio` build this answers `409
+/// not_in_build` (see [`router`]).
 ///
 /// **Admin-only** (issue #403). The connection this begins belongs to the
 /// company — it is the account its agents will act through from then on — so
@@ -700,18 +700,21 @@ async fn authorize(
 /// `GET …/composio/connections` — the company's per-toolkit connected state,
 /// one [`ConnectionDto`] per toolkit that has at least one connection. The
 /// console cross-references this against the granted `toolkits` to render each
-/// provider row's connected/sign-in state. `409 Conflict` on a non-`composio`
-/// build.
+/// provider row's connected/sign-in state. `409 not_in_build` on a
+/// non-`composio` build, and `409 not_configured` when this company has no
+/// Composio credential — two permanent states the console reads off the code,
+/// because neither is cleared by trying the read again.
 async fn connections(company: ScopedCompany) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
     connections_impl(company.runtime.as_ref()).await
 }
 
 /// Resolve the per-tenant Composio config (bearer + backend URL + toolkit
 /// allowlist) the way the harness roster build does, so the console dials the
-/// backend with the exact same tenant identity. A `409 Conflict` when no
+/// backend with the exact same tenant identity. A `409 not_configured` when no
 /// credential of any tier can be resolved — neither this company's own stored
 /// token nor a platform identity — in which case the operator must paste a token
-/// before OAuth.
+/// before OAuth. Its own code, not the catch-all `conflict`: a caller has to be
+/// able to tell "nothing is set up here" from a write that lost a race.
 #[cfg(feature = "composio")]
 pub(crate) async fn resolve_tenant(
     runtime: &CompanyRuntime,
@@ -744,7 +747,7 @@ pub(crate) async fn resolve_tenant(
         // different places, so they say different things. A BYOK company told
         // to "set its TinyHumans credential" would be sent to a control that
         // has no effect on the route it chose.
-        return Err(ApiError(crate::error::OpenCompanyError::Conflict(
+        return Err(ApiError(crate::error::OpenCompanyError::NotConfigured(
             match access.mode {
                 ComposioMode::Byok => "this company uses its own Composio account but no Composio \
                      API key is stored — paste one, or clear it to go back to OpenHuman-managed \
@@ -1097,12 +1100,18 @@ async fn set_default_impl(
     Err(not_in_build())
 }
 
-/// A `409 Conflict` "Composio is not in this build" — the OAuth plane's off-state
-/// under a non-`composio` build. Mirrors the status route's `inBuild:false`
-/// semantics rather than pretending nothing is connected.
+/// A `409 not_in_build` "Composio is not in this build" — the OAuth plane's
+/// off-state under a non-`composio` build. Mirrors the status route's
+/// `inBuild:false` semantics rather than pretending nothing is connected.
+///
+/// The code is what the console keys on. Under the catch-all `conflict` this
+/// answer was indistinguishable on the wire from a lost publish race, so the
+/// only reading available to a caller was the recoverable one — and the Apps
+/// page told every operator on a default build to reload a section no reload
+/// could ever fill.
 #[cfg(not(feature = "composio"))]
 fn not_in_build() -> ApiError {
-    ApiError(crate::error::OpenCompanyError::Conflict(
+    ApiError(crate::error::OpenCompanyError::NotInBuild(
         "Composio is not compiled into this build".to_string(),
     ))
 }

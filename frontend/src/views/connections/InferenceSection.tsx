@@ -212,7 +212,7 @@ function presetFor(
   return preset;
 }
 
-type Load = "loading" | "ready" | "unavailable" | "error";
+type Load = "loading" | "ready" | "unavailable" | "unconfigured" | "error";
 type TestState =
   | { kind: "idle" }
   | { kind: "loading" }

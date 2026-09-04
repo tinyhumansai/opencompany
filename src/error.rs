@@ -254,6 +254,28 @@ pub enum OpenCompanyError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A surface this binary was compiled without. Renders as `409 Conflict`
+    /// with the stable code `not_in_build`.
+    ///
+    /// Split out of [`Conflict`](Self::Conflict) because the two are the same
+    /// status but opposite advice. `Conflict` is overloaded across a hundred
+    /// call sites — a lost publish race, an optimistic-lock version skew, a
+    /// duplicate desk id — most of which a caller clears by retrying or by
+    /// sending something else. This one is a fact about the binary: nothing the
+    /// operator does in this session changes it, and a console that cannot tell
+    /// the two apart can only offer the recoverable reading of both.
+    #[error("{0}")]
+    NotInBuild(String),
+
+    /// A surface this build has, that this company has not configured. Renders
+    /// as `409 Conflict` with the stable code `not_configured`.
+    ///
+    /// The middle rung between [`NotInBuild`](Self::NotInBuild) and a genuine
+    /// failure: retrying the same read never succeeds, but the operator can
+    /// reach the control that clears it. The message names that control.
+    #[error("{0}")]
+    NotConfigured(String),
+
     /// The company's runtime is quiescing for a swap (issue #290): it has
     /// stopped accepting new cycles while the one in flight drains, and a
     /// successor is being built. Distinct from
@@ -453,6 +475,8 @@ impl OpenCompanyError {
             Self::LifecycleConflict(_) => "lifecycle_conflict".to_string(),
             Self::EmergencyStop(_) => "emergency_stop".to_string(),
             Self::Conflict(_) => "conflict".to_string(),
+            Self::NotInBuild(_) => "not_in_build".to_string(),
+            Self::NotConfigured(_) => "not_configured".to_string(),
             Self::Quiescing(_) => "quiescing".to_string(),
             Self::InvalidRequest(_) => "invalid_request".to_string(),
             Self::WorkflowInvalid { .. } => "workflow_invalid".to_string(),

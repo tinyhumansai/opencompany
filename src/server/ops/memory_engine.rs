@@ -439,7 +439,7 @@ fn ensure_available(engine: &str) -> Result<(), OpenCompanyError> {
     if option.available {
         return Ok(());
     }
-    Err(OpenCompanyError::Conflict(format!(
+    Err(OpenCompanyError::NotInBuild(format!(
         "{} cannot be bound here: {}.",
         option.label,
         option

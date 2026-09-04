@@ -423,6 +423,25 @@ JSON error envelope `{ "error": string, "code": string }` with stable `code`
 values; 4xx for caller mistakes, 402 reserved for x402 challenges, 409 for
 lifecycle-state conflicts (e.g. chatting with an archived company).
 
+`409` is the most overloaded status here, so **the `code` carries the meaning,
+not the status**. Three of its codes are permanent states rather than failures,
+and a caller that retries them retries forever:
+
+| `code` | Means | What clears it |
+|---|---|---|
+| `not_in_build` | the binary was compiled without this surface | a different build |
+| `not_configured` | the surface is here; this company has not set it up | an operator setting it, elsewhere |
+| `restart_required` | saved config the running runtime booted without | restarting the company |
+
+Everything else on `409` — `conflict`, `lifecycle_conflict` — is an ordinary
+conflict a caller clears by retrying or by sending something else. Clients must
+branch on `code` and never infer permanence from the status: the console's
+`classifyLoadFailure` does exactly this, and read `409` as transient across the
+board until it did (issue #2081).
+
+`not_in_build` is `501` on the finance routes and `409` elsewhere. The status
+differs; the code does not, which is why the code is the thing to read.
+
 ## Platform webhooks (Phase 5)
 
 Platform mode can register outbound webhooks per tenant for

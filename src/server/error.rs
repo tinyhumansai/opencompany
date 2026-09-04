@@ -87,9 +87,10 @@ impl ApiError {
             // A file that parses but fails validation is a semantically bad
             // payload the caller can correct — 422.
             OpenCompanyError::DataInvalid { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            OpenCompanyError::LifecycleConflict(_) | OpenCompanyError::Conflict(_) => {
-                StatusCode::CONFLICT
-            }
+            OpenCompanyError::LifecycleConflict(_)
+            | OpenCompanyError::Conflict(_)
+            | OpenCompanyError::NotInBuild(_)
+            | OpenCompanyError::NotConfigured(_) => StatusCode::CONFLICT,
             // A runtime swap is in progress and clears itself within a turn, so
             // this is a retry-me, not a refusal (issue #290).
             OpenCompanyError::Quiescing(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -208,6 +209,53 @@ mod test {
 
         let other = ApiError(OpenCompanyError::Store("disk full".into()));
         assert_eq!(other.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Issue #2081: the two permanent capability states share `409` with every
+    /// ordinary conflict, so the **code** is the only thing that tells them
+    /// apart. A console that cannot make that distinction can only offer the
+    /// recoverable reading of both, and asks operators to reload a section no
+    /// reload can fill.
+    #[test]
+    fn capability_refusals_keep_409_and_carry_their_own_codes() {
+        let not_in_build = ApiError(OpenCompanyError::NotInBuild(
+            "Composio is not compiled into this build".into(),
+        ));
+        assert_eq!(not_in_build.status(), StatusCode::CONFLICT);
+        assert_eq!(not_in_build.0.code(), "not_in_build");
+
+        let not_configured = ApiError(OpenCompanyError::NotConfigured(
+            "no Composio credential is available for this company".into(),
+        ));
+        assert_eq!(not_configured.status(), StatusCode::CONFLICT);
+        assert_eq!(not_configured.0.code(), "not_configured");
+
+        // The neighbours they must stay distinguishable from: same status,
+        // opposite advice.
+        let ordinary = ApiError(OpenCompanyError::Conflict(
+            "a desk with that id exists".into(),
+        ));
+        assert_eq!(ordinary.status(), StatusCode::CONFLICT);
+        assert_eq!(ordinary.0.code(), "conflict");
+
+        let lifecycle = ApiError(OpenCompanyError::LifecycleConflict("paused".into()));
+        assert_eq!(lifecycle.status(), StatusCode::CONFLICT);
+        assert_eq!(lifecycle.0.code(), "lifecycle_conflict");
+    }
+
+    /// The message must reach the operator unprefixed. `Conflict` renders as
+    /// `conflict: {0}`, and these carry prose that already names the control to
+    /// go and use — a `conflict: ` in front of it is noise the console shows.
+    #[tokio::test]
+    async fn capability_refusals_render_their_message_verbatim() {
+        let response = ApiError(OpenCompanyError::NotInBuild(
+            "Composio is not compiled into this build".into(),
+        ))
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "Composio is not compiled into this build");
+        assert_eq!(json["code"], "not_in_build");
     }
 
     #[test]
