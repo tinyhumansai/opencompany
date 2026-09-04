@@ -83,6 +83,12 @@ pub struct ChatSeedRequest {
     /// coupling this crate keeps getting bitten by — it would also cost a
     /// journal read on the *non*-switch turns the switch branch exists to keep
     /// free.
+    /// Whose seed this is — the agent the projection is FOR.
+    ///
+    /// Only the `hivemind` projection reads it: attribution is the whole point
+    /// of that path, and it cannot tell "something I said" from "something a
+    /// teammate said to me" without knowing who is reading.
+    pub reader: String,
     pub thread_root: Option<EventSeq>,
     /// This turn's own operator message, as its position in the company
     /// journal — the boundary [`build_chat_seed`] cuts the history at.
@@ -93,6 +99,65 @@ pub struct ChatSeedRequest {
 }
 
 impl ChatSeedRequest {
+    /// The attributed projection, mapped onto the `(role, content)` ladder the
+    /// agent runtime takes.
+    ///
+    /// The mapping is the only decision left to the host, because it is the
+    /// only part that depends on this runtime's shape: MY prior turns are
+    /// `agent` turns and carry no name — an assistant turn needs none, and an
+    /// unadorned one is nothing for the model to imitate. Everything else is
+    /// an INPUT, and says who it came from, which is exactly the distinction
+    /// the flat fold destroys.
+    #[cfg(feature = "hivemind")]
+    async fn hivemind_seed(
+        &self,
+        company: &CompanyId,
+        desk_id: &str,
+        desk_name: &str,
+    ) -> Option<Vec<(String, String)>> {
+        use tinyhivemind::session::{Conversation, SessionAuthor, SessionQuery, project_session};
+
+        let record = self.store.load(company).await.ok()??;
+        let people = std::collections::HashMap::new();
+        let log = crate::runtime::hivemind::JournalSessionLog::new(
+            self.events.as_ref(),
+            company,
+            &record,
+            &people,
+        );
+        let query = SessionQuery {
+            conversation: Conversation {
+                desk_id: desk_id.to_string(),
+                desk_name: desk_name.to_string(),
+                thread_root: self
+                    .thread_root
+                    .map(|seq| tinyhivemind::session::Sequence(seq.value())),
+            },
+            before: self
+                .current_message_seq
+                .map(|seq| tinyhivemind::session::Sequence(seq.value())),
+            window: CHAT_SEED_WINDOW,
+        };
+        let projected = project_session(&log, &query).await.ok()?;
+        Some(
+            projected
+                .into_iter()
+                .map(|message| match &message.author {
+                    SessionAuthor::Agent { id, .. } if *id == self.reader => {
+                        ("agent".to_string(), message.content)
+                    }
+                    SessionAuthor::Operator => ("user".to_string(), message.content),
+                    SessionAuthor::Person { label, .. }
+                    | SessionAuthor::Agent { label, .. }
+                    | SessionAuthor::System { label, .. } => (
+                        "user".to_string(),
+                        format!("{label} said: {}", message.content),
+                    ),
+                })
+                .collect(),
+        )
+    }
+
     /// Projects this desk's recent history — bounded at this turn's own
     /// message so a concurrently-accepted later message never leaks in (see
     /// [`build_chat_seed`]) — and strips the current message's own trailing
@@ -123,6 +188,20 @@ impl ChatSeedRequest {
             },
         )
         .await;
+        // The `tinyhivemind` projection, when this build has it (P4).
+        //
+        // The fold below is lossy in one specific way — it discards the author
+        // of every reply — so on a shared desk agent B reads agent A's turns as
+        // its OWN. `tinyhivemind::session::project_session` answers the same
+        // question attributed, and `runtime::hivemind::JournalSessionLog` is
+        // the port it reads this company's journal through. Where it is
+        // available it is the answer; the fold stays as the default build's
+        // behaviour rather than being forked into a second implementation of
+        // the same idea.
+        #[cfg(feature = "hivemind")]
+        if let Some(attributed) = self.hivemind_seed(company, &desk_id, &desk_name).await {
+            seed = attributed;
+        }
         if self.current_message_seq.is_none() {
             strip_current_message(&mut seed, &self.raw_message);
         }

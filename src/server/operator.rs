@@ -3435,9 +3435,112 @@ fn spawn_chat_turn(turn: ChatTurn) -> JoinHandle<Result<(CycleReport, Option<Str
         };
         let reply_parent = reply_thread(parent, accepted.message_seq);
         journal_chat_replies(&runtime, &company, &desk, reply_parent, &mut report).await;
+        // SPIKE (tinyhivemind P15): a committed reply may refer work to another
+        // desk. AFTER journaling, never before — the referral is keyed on the
+        // reply's own sequence, so it has to exist first.
+        #[cfg(feature = "hivemind")]
+        refer_committed_replies(&runtime, &company, &desk, &report, None, 0).await;
         settle_chat_turn(&runtime, &company, turn_id.as_deref(), None).await;
         Ok((report, feedback_note))
     })
+}
+
+/// Offer each committed agent reply to the referral decision (tinyhivemind P15).
+///
+/// The decision is pure and the queue is the only thing that acts, so this is
+/// safe to run over every reply: a message that refers nobody costs one
+/// in-memory decision and calls the queue zero times.
+///
+/// Policy is deliberately hard-coded here for the spike. In production it is an
+/// operator setting — `ReferralPolicy::DEFAULT` has every knob off, and that is
+// the shipping default the library intends.
+#[cfg(feature = "hivemind")]
+pub(crate) async fn refer_committed_replies(
+    runtime: &Arc<CompanyRuntime>,
+    company: &CompanyId,
+    desk: &str,
+    report: &CycleReport,
+    // The referral these replies are ANSWERING, when they are answering one.
+    //
+    // This is the back edge, and it is the host's to carry: "when a host runs
+    // a child turn that carried a `ReferralOrigin`, it must pass that origin
+    // back in the next `ReferralInput`, or the answer has no way home. Nothing
+    // in the library remembers it."
+    origin: Option<tinyhivemind_core::referral::ReferralOrigin>,
+    // Depth of the reply being offered. A first-level reply is 0; a reply
+    // produced BY a referred turn is 1, which is what lets `max_hops` bound
+    // the chain instead of being inert.
+    hop: u32,
+) {
+    use tinyhivemind::referral::{ReferralPolicy, ReferralReach, dispatch_referral};
+
+    let Ok(Some(record)) = runtime.store().load(company).await else {
+        return;
+    };
+    let members = crate::runtime::hivemind::roster_members(&record);
+    let people: Vec<tinyhivemind_core::roster::Person> = Vec::new();
+    let retired: Vec<String> = Vec::new();
+    let roster = tinyhivemind_core::roster::Roster::new(&members, &people, &retired);
+    let desks = crate::runtime::hivemind::desk_snapshots(&record);
+    let gate = runtime.referral_gate();
+
+    for response in &report.responses {
+        let (Some(agent), Some(id)) = (response.agent.as_deref(), response.message_id.as_deref())
+        else {
+            continue;
+        };
+        let Ok(sequence) = id.parse::<u64>() else {
+            continue;
+        };
+        let mentions = tinyhivemind_core::mention::resolve(
+            &response.text,
+            None,
+            &tinyhivemind_core::mention::MentionAuthor::Agent {
+                id: agent.to_string(),
+            },
+            &roster,
+            &desks.set(),
+        );
+        let input = tinyhivemind_core::referral::ReferralInput {
+            key: tinyhivemind_core::dispatch::DispatchKey {
+                trigger_sequence: sequence,
+            },
+            conversation: tinyhivemind_core::dispatch::DispatchConversation {
+                desk_id: desk.to_string(),
+                thread_root: None,
+            },
+            author_id: agent.to_string(),
+            content: response.text.clone(),
+            mentions,
+            hop,
+            origin: origin.clone(),
+        };
+        let queue =
+            crate::runtime::hivemind::JournalReferralQueue::new(runtime.clone(), gate.clone());
+        match dispatch_referral(
+            &queue,
+            ReferralPolicy {
+                enabled: true,
+                max_hops: 2,
+                reach: ReferralReach::Desks,
+                returns: true,
+            },
+            &input,
+            &roster,
+            &desks.set(),
+        )
+        .await
+        {
+            Ok(outcome) => tracing::info!(
+                company = %company,
+                desk = %desk,
+                author = %agent,
+                ?outcome,
+                "[referral] decided"
+            ),
+            Err(err) => tracing::warn!(error = %err, "[referral] decision failed"),
+        }
+    }
 }
 
 /// Awaits a spawned chat turn, turning a task that never finished into an error.
@@ -3693,6 +3796,39 @@ struct ChatHistoryQuery {
 
 /// One desk-history message, as the console renders it. Mirrors `ChatMessage`
 /// in `frontend/src/lib/chat.ts`.
+/// Where a crossing referral came from, when another desk caused this message
+/// (tinyhivemind P15).
+///
+/// Mirrors `ReferredFromDto` in `frontend/src/api/types.ts`.
+///
+/// The labels are **captured with the row** rather than resolved when the
+/// transcript is read, for the reason [`SessionAuthor`] captures its own: a
+/// desk renamed later must not rewrite what the conversation said at the time.
+///
+/// [`SessionAuthor`]: tinyhivemind::session::SessionAuthor
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReferredFromDto {
+    /// The desk that asked, by id — for the link, never for display.
+    desk_id: String,
+    /// The desk's display name as it stood when the referral was made.
+    desk_name: String,
+    /// The agent that asked, by id.
+    asker_id: String,
+    /// That agent's display label as it stood when the referral was made.
+    asker_label: String,
+    /// The asking message, so the chip links straight to it.
+    sequence: u64,
+    /// Which word the chip uses. `"asked"` on the outbound leg, `"answered"`
+    /// when the answer has come home.
+    ///
+    /// Sent as the word rather than a bool because the console renders it and
+    /// nothing else: a `returning: true` would have the render side translating
+    /// a host decision back into English, which is how it came to guess in the
+    /// first place.
+    direction: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatHistoryMessageDto {
@@ -3704,6 +3840,10 @@ struct ChatHistoryMessageDto {
     author: String,
     /// The message text.
     text: String,
+    /// Set only when another desk's referral caused this line. Absent on every
+    /// ordinary message, so the wire shape is unchanged for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referred_from: Option<ReferredFromDto>,
     /// When it was journaled, epoch millis.
     at_millis: f64,
     /// Whether it is the operator's own message.
@@ -3842,6 +3982,18 @@ impl From<ReactionView> for ChatReactionDto {
 impl From<MessageView> for ChatHistoryMessageDto {
     fn from(view: MessageView) -> Self {
         Self {
+            referred_from: view.referred_from.map(|origin| ReferredFromDto {
+                desk_id: origin.desk_id,
+                desk_name: origin.desk_name,
+                asker_id: origin.asker_id,
+                asker_label: origin.asker_label,
+                sequence: origin.sequence,
+                direction: if origin.returning {
+                    "answered"
+                } else {
+                    "asked"
+                },
+            }),
             id: view.id,
             channel: view.channel,
             author: view.author,

@@ -55,6 +55,7 @@ tinyplace      | tested       | tinyplace                       | Runs the whole
 # --- Partial: a lane exists, but filtered ----------------------------------
 
 sqlite         | partial      | sqlite                          | store::sqlite
+hivemind       | partial      | hivemind                        | runtime::hivemind
 mongodb        | partial      | mongodb                         | store::mongodb store::select
 acp            | partial      | acp,runner,tinymemory | server::acp harness::acp::run_turn
 runner         | partial      | acp,runner,tinymemory | runner

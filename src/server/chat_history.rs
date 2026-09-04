@@ -20,15 +20,29 @@ use crate::ports::types::{
     Actor, ActorKind, Attachment, CompanyEvent, CompanyId, CompanyRecord, EventSeq, Mention,
     MentionTarget, StoredEvent, TurnStep,
 };
-use crate::server::ops::language::DEFAULT_DESK as GENERAL_DESK;
+use crate::server::ops::language::DEFAULT_DESK;
 
-/// The console's default/orchestrator thread id
-/// (`frontend/src/lib/threads.ts` `mainThread()`). The console addresses every
-/// send on that thread with `chat: "main"`, so `AgentReply`s answering it are
-/// journaled with `chat_id == "main"` rather than [`GENERAL_DESK`]. `owns`
-/// admits both spellings for the General desk so a transcript is never split
-/// across the two ids depending on which one happened to write it (issue #65).
-pub const MAIN_THREAD_ID: &str = "main";
+// Conversation identity now lives in `tinyhivemind_core::chat`, and these are
+// re-exported so every existing caller keeps its path (issue #65, #435).
+//
+// The move is what lets `ports::types` stop reaching *upward* into
+// `crate::server::` to fold a General spelling: `resolve_desk_id` and
+// `desk_alias_is_ambiguous` call this rule, and a port calling a server module
+// was a layering violation that only a shared crate could remove.
+pub use tinyhivemind_core::chat::{
+    GENERAL_DESK, MAIN_THREAD_ID, is_general_chat, same_conversation,
+};
+
+// `DEFAULT_DESK` is the prosumer glossary string mirroring
+// `frontend/src/lib/language.ts`; `GENERAL_DESK` is the desk's identity. They
+// are different concerns that happen to be the same literal, so neither imports
+// the other — but they must never drift, because a message journaled under the
+// glossary word has to fold into the identity. Pinned here rather than
+// duplicated, and it costs nothing at runtime.
+const _: () = assert!(
+    matches!(DEFAULT_DESK.as_bytes(), b"General") && matches!(GENERAL_DESK.as_bytes(), b"General"),
+    "the operator-facing default desk name and the General desk id must agree",
+);
 
 /// The largest message page either history surface may materialize. Keeping
 /// the limit beside the shared reader prevents a new caller from turning its
@@ -144,48 +158,6 @@ fn trivially_resolved(chat_id: Option<&str>) -> Option<(String, String)> {
     }
 }
 
-/// Does this stored chat id mean the General desk?
-///
-/// **Four spellings, one desk.** The console addresses its default thread as
-/// `"main"`, the chat route stores an unaddressed message as `None`, older
-/// events carry `""`, and the desk's own id/name is `"General"`. [`owns`] has
-/// admitted all four since issue #65, which is what stops a transcript from
-/// splitting across whichever id happened to write each message.
-///
-/// Exposed because that equivalence is **not** local to history rendering.
-/// `CompanyRuntime::resolvable_parent` compares a remembered thread root's chat
-/// id against the channel being answered into, and comparing the raw strings
-/// there made a root stored as `None` fail to match the `"General"` it is
-/// rendered under — so a threaded approval rooted in an unaddressed message
-/// silently resumed in the channel, which is the exact symptom issue #435 set
-/// out to remove. Two places deciding "same conversation?" by different rules
-/// is the drift; one function is the fix. See [`same_conversation`].
-pub fn is_general_chat(chat: Option<&str>) -> bool {
-    match chat {
-        None => true,
-        Some(chat) => {
-            chat.is_empty()
-                || chat.eq_ignore_ascii_case(MAIN_THREAD_ID)
-                || chat.eq_ignore_ascii_case(GENERAL_DESK)
-        }
-    }
-}
-
-/// Do two stored chat ids name the same conversation (issue #435)?
-///
-/// Every spelling of the General desk is one conversation — see
-/// [`is_general_chat`] — and everything else compares verbatim, because a desk
-/// id is an opaque identifier and two desks differing only in case are two
-/// desks. Deliberately **not** a general-purpose case-insensitive compare: the
-/// folding is a fact about one desk's history, not a licence to loosen the
-/// others.
-pub fn same_conversation(a: Option<&str>, b: Option<&str>) -> bool {
-    if is_general_chat(a) || is_general_chat(b) {
-        return is_general_chat(a) && is_general_chat(b);
-    }
-    a == b
-}
-
 /// Whether a stored event belongs to the desk identified by `desk_id` /
 /// `desk_name`.
 ///
@@ -278,6 +250,24 @@ pub fn dispatch_marker_text(column: &str) -> String {
     format!("finished → {}", crate::ports::tasks::column_label(column))
 }
 
+/// Where a crossing referral came from, folded onto the message it caused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferredFrom {
+    /// The asking desk, by id — for the link.
+    pub desk_id: String,
+    /// Its display name as captured when the referral was made.
+    pub desk_name: String,
+    /// The agent that asked.
+    pub asker_id: String,
+    /// Its display label as captured when the referral was made.
+    pub asker_label: String,
+    /// The asking message, so the console can link to it.
+    pub sequence: u64,
+    /// Whether this is the answer coming home rather than the outbound ask.
+    /// Carried from the marker; see `CompanyEvent::ReferralEnqueued`.
+    pub returning: bool,
+}
+
 /// Who is reading a desk history. `mine` is relative to this.
 ///
 /// There is no `From<StoredEvent> for MessageView`, and there cannot be:
@@ -330,6 +320,12 @@ pub struct MessageView {
     /// dispatch marker and an agent reply are both `false`: neither was typed by
     /// a person.
     pub by_person: bool,
+    /// Set when a crossing referral caused this message (tinyhivemind P15).
+    ///
+    /// Folded from the `ReferralEnqueued` marker rather than stored on the
+    /// message: the marker is written inside the enqueue transaction, before
+    /// the child turn exists, so the message cannot carry it at write time.
+    pub referred_from: Option<ReferredFrom>,
     /// Whether this row may reach only administrators (issue #1781 review,
     /// Codex P1).
     ///
@@ -578,6 +574,8 @@ impl MessageView {
                 mine: false,
                 // The runtime wrote this, whichever brain produced it.
                 by_person: false,
+                // Set by the referral fold in `history_for_desk`, never here.
+                referred_from: None,
                 steps,
                 task_id,
                 parent_id: parent.map(|seq| seq.value().to_string()),
@@ -595,30 +593,73 @@ impl MessageView {
                 attachments,
                 ..
             } => {
-                let (author, mine) = match &by {
+                // `voice` is what the console draws the byline from: `senderOf`
+                // reads `channel`, not `author`, and treats the values in its
+                // COMPANY_VOICE set ("operator", "console", …) as "no distinct
+                // speaker — use the room's own name".
+                //
+                // That is right for a message a person sent. It is wrong for a
+                // referral, which arrives authored by a TEAMMATE: falling into
+                // that set made design's channel name the speaker, so an
+                // engineer asking design read as design talking to itself. An
+                // agent-authored line names the agent, exactly as an
+                // `AgentReply` already does one arm below.
+                let (author, mine, by_person, voice) = match &by {
                     // Sent by a signed-in human.
                     Some(actor) if actor.kind == ActorKind::User => {
                         let label = authors
                             .get(&actor.id)
                             .cloned()
                             .unwrap_or_else(|| "someone".to_string());
-                        (label, *viewer == Viewer::User(actor.id.clone()))
+                        (
+                            label,
+                            *viewer == Viewer::User(actor.id.clone()),
+                            true,
+                            "operator".to_string(),
+                        )
+                    }
+                    // A TEAMMATE sent it — a crossing referral arrives on the
+                    // target's desk as a message authored by the agent that
+                    // asked (tinyhivemind P15).
+                    //
+                    // Without this arm it fell to the machine-credential
+                    // fallback below and was projected as `operator`, with
+                    // `mine: true` for the operator's own view — so a question
+                    // engineering asked read as one the person at the console
+                    // had asked. That is the same shape as the `agent: None`
+                    // → `agent_id: "operator"` defect (#885): a fallback that
+                    // means "no person to name" rendered as a specific, wrong
+                    // person. `mine` is emphatically false: nobody typed it.
+                    Some(actor) if actor.kind == ActorKind::Agent => {
+                        (actor.id.clone(), false, false, actor.id.clone())
                     }
                     // Sent with a machine credential, or journaled before
                     // attribution existed. Either way there is no person to
                     // name, and it belongs to whoever holds that credential.
-                    _ => ("operator".to_string(), matches!(viewer, Viewer::Operator)),
+                    _ => (
+                        "operator".to_string(),
+                        matches!(viewer, Viewer::Operator),
+                        true,
+                        "operator".to_string(),
+                    ),
                 };
                 MessageView {
+                    // Set by the referral fold in `history_for_desk`, never here.
+                    referred_from: None,
                     id,
-                    channel: "operator".to_string(),
+                    channel: voice,
                     admin_only: false,
                     author,
                     text,
                     at_millis,
                     mine,
-                    // A person typed this — the one arm where that is true.
-                    by_person: true,
+                    // Decided with the author above, not assumed: this arm used
+                    // to be "the one arm where a person typed it", which stopped
+                    // being true when a referral began arriving here authored by
+                    // a teammate. `byPerson` gates real behaviour downstream —
+                    // the console's inline-reply promotion reads it — so a
+                    // teammate's line claiming to be a person's is not cosmetic.
+                    by_person,
                     steps: Vec::new(),
                     task_id: None,
                     parent_id: parent.map(|seq| seq.value().to_string()),
@@ -672,6 +713,8 @@ impl MessageView {
                 at_millis,
                 mine: false,
                 by_person: false,
+                // Set by the referral fold in `history_for_desk`, never here.
+                referred_from: None,
                 steps: Vec::new(),
                 task_id: Some(task_id),
                 // Rendered the same way an `OperatorMessage`'s parent is, a few
@@ -692,6 +735,8 @@ impl MessageView {
                 at_millis,
                 mine: false,
                 by_person: false,
+                // Set by the referral fold in `history_for_desk`, never here.
+                referred_from: None,
                 steps: Vec::new(),
                 task_id: None,
                 parent_id: None,
@@ -1054,7 +1099,138 @@ pub async fn history_for_desk(
     }
 
     drop_dead_cards(runtime, &mut messages).await?;
+    attach_referral_origins(runtime, desk_id, &mut messages).await?;
     Ok(messages)
+}
+
+/// Fold each `ReferralEnqueued` marker onto the message it caused
+/// (tinyhivemind P15).
+///
+/// # Why a fold and not a field on the message
+///
+/// The marker is written INSIDE the enqueue transaction, which is necessarily
+/// before the child turn exists — that ordering is what makes it an idempotency
+/// marker at all. So the message it causes cannot carry the provenance at write
+/// time, and the projection is the only place the two can meet.
+///
+/// # How they are matched
+///
+/// A marker names the desk the child runs on and the agent that asked. The
+/// child is the first message on that desk, after the marker, authored by that
+/// agent. Both are written by one task with nothing in between, so "first
+/// after" is exact rather than probabilistic — and the match still requires the
+/// author to agree, so an unrelated line landing between them is not adopted.
+///
+/// # The return leg is an INPUT, not a line in the channel
+///
+/// One agent speaks in both rooms, and it is the ASKER. It goes to the other
+/// desk and asks there under its own name; the desk that answers, answers on
+/// its OWN desk and never appears in the room it was asked from. When the asker
+/// judges the answer sufficient, it comes home and reports — in its own words,
+/// under its own name.
+///
+/// So the child of a RETURN marker is not a message anyone should read. It is
+/// the answer being handed back to the asker so the asker can run a turn on it,
+/// and rendering it produced exactly the double the single-accountable-voice
+/// rule exists to prevent: the other desk's agent posting its answer verbatim
+/// into a room it is not part of, immediately followed by the asker summarising
+/// that same answer. The reader saw the same content twice, in two voices, one
+/// of which does not belong there.
+///
+/// The relay is therefore dropped from the projection and its provenance moves
+/// onto the asker's report — which is the line a reader wants the chip on
+/// anyway, because that is the message whose origin is not otherwise visible.
+///
+/// **Only when the report actually exists.** If the asker's turn has not landed
+/// yet, or failed, the relay renders as it did before. A rendered line in the
+/// wrong voice is a cosmetic defect; a dropped one is a lost answer, and this
+/// projection already refuses that trade once (see the orphan arm below).
+async fn attach_referral_origins(
+    runtime: &CompanyRuntime,
+    desk_id: &str,
+    messages: &mut Vec<MessageView>,
+) -> Result<(), OpenCompanyError> {
+    let Some(oldest) = messages
+        .iter()
+        .filter_map(|m| m.id.parse::<u64>().ok())
+        .min()
+    else {
+        return Ok(());
+    };
+    let page = runtime
+        .events()
+        .read_from(runtime.id(), EventSeq::new(oldest.saturating_sub(2)), 4096)
+        .await?;
+    // Relays that a report has superseded, dropped once the scan is done —
+    // removing inside the loop would invalidate the positions it is still using.
+    let mut relayed: Vec<String> = Vec::new();
+    for (index, stored) in page.iter().enumerate() {
+        let CompanyEvent::ReferralEnqueued {
+            from_desk,
+            from_desk_name,
+            asker,
+            asker_label,
+            trigger_sequence,
+            to_desk,
+            target,
+            returning,
+        } = &stored.event
+        else {
+            continue;
+        };
+        if to_desk != desk_id {
+            continue;
+        }
+        let Some(child) = page[index + 1..].iter().find(|later| {
+            matches!(
+                &later.event,
+                CompanyEvent::OperatorMessage { chat, by, .. }
+                    if chat.as_deref() == Some(to_desk.as_str())
+                        && by.as_ref().is_some_and(|actor| actor.id == *asker)
+            )
+        }) else {
+            continue;
+        };
+        let child_id = child.seq.value().to_string();
+        let origin = ReferredFrom {
+            desk_id: from_desk.clone(),
+            desk_name: from_desk_name.clone(),
+            asker_id: asker.clone(),
+            asker_label: asker_label.clone(),
+            sequence: *trigger_sequence,
+            returning: *returning,
+        };
+
+        // On a return, the chip belongs on the ASKER's report — the first thing
+        // they say on this desk after the answer reached them. `target` is who
+        // the referral was routed to, which on a return is the agent that asked
+        // in the first place, so this needs no second notion of "the asker".
+        let report = returning
+            .then(|| {
+                messages
+                    .iter()
+                    .filter(|m| m.id.parse::<u64>().is_ok_and(|seq| seq > child.seq.value()))
+                    .find(|m| m.channel == *target && !m.by_person)
+                    .map(|m| m.id.clone())
+            })
+            .flatten();
+
+        match report {
+            Some(id) => {
+                relayed.push(child_id);
+                if let Some(view) = messages.iter_mut().find(|m| m.id == id) {
+                    view.referred_from = Some(origin);
+                }
+            }
+            None => {
+                if let Some(view) = messages.iter_mut().find(|m| m.id == child_id) {
+                    view.referred_from = Some(origin);
+                }
+            }
+        }
+    }
+    messages.retain(|m| !relayed.contains(&m.id));
+    Ok(())
 }
 
 /// Blanks `task_id` on any row naming a card the board no longer has
@@ -2812,6 +2988,262 @@ mod dead_card_test {
             .await
             .expect("audit");
         assert_eq!(as_admin.replies, 2, "an admin's count must count both rows");
+    }
+}
+
+/// Where a referred line says it came from, and who it says is speaking.
+#[cfg(test)]
+mod referral_origin_test {
+    use super::*;
+    use crate::company::CompanyManifest;
+    use crate::ports::types::CompanyId;
+    use crate::runtime::RuntimeBuilder;
+
+    fn manifest() -> CompanyManifest {
+        toml::from_str("[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n")
+            .expect("parse manifest")
+    }
+
+    async fn runtime(home: &std::path::Path) -> Arc<CompanyRuntime> {
+        Arc::new(
+            RuntimeBuilder::new(home.to_path_buf(), manifest())
+                .with_id(CompanyId::new("acme"))
+                .build()
+                .await
+                .expect("build a runtime"),
+        )
+    }
+
+    /// Helper: the marker and the agent-authored line it caused, as one leg.
+    fn referral_leg(
+        from_desk: &str,
+        from_desk_name: &str,
+        asker: &str,
+        to_desk: &str,
+        target: &str,
+        returning: bool,
+        text: &str,
+    ) -> [CompanyEvent; 2] {
+        [
+            CompanyEvent::ReferralEnqueued {
+                from_desk: from_desk.to_string(),
+                from_desk_name: from_desk_name.to_string(),
+                asker: asker.to_string(),
+                asker_label: asker.to_string(),
+                trigger_sequence: 1,
+                to_desk: to_desk.to_string(),
+                target: target.to_string(),
+                returning,
+            },
+            CompanyEvent::OperatorMessage {
+                text: text.to_string(),
+                by: Some(Actor {
+                    kind: ActorKind::Agent,
+                    id: asker.to_string(),
+                }),
+                chat: Some(to_desk.to_string()),
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            },
+        ]
+    }
+
+    /// **A referred line is the ASKING AGENT speaking, not the desk.**
+    ///
+    /// `senderOf` in the console draws the byline off `channel`, and treats
+    /// "operator" as "no distinct speaker — use the room's own name". That is
+    /// right for a message a person sent and wrong for a referral, which
+    /// arrives authored by a teammate: hardcoding "operator" made design's own
+    /// name the speaker, so an engineer asking design read as design talking to
+    /// itself. An `AgentReply` already names its agent here; this makes the two
+    /// paths agree rather than teaching the console a second rule.
+    #[tokio::test]
+    async fn a_referred_message_is_voiced_by_the_agent_that_asked() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        for event in referral_leg(
+            "engineering",
+            "Engineering",
+            "software_engineer",
+            "design",
+            "product_designer",
+            false,
+            "what would you change about the error messages?",
+        ) {
+            runtime.events().append(&id, event).await.expect("journal");
+        }
+
+        let history = history_for_desk(
+            &runtime,
+            "design",
+            "design",
+            &Viewer::Operator,
+            None,
+            50,
+            true,
+        )
+        .await
+        .expect("history");
+        let referred = history
+            .iter()
+            .find(|m| m.referred_from.is_some())
+            .expect("the referred line");
+
+        assert_eq!(
+            referred.channel, "software_engineer",
+            "the byline names the agent, not the desk it landed on: {referred:?}"
+        );
+        assert!(
+            !referred.by_person,
+            "an agent is not a person, whatever the event it rides on"
+        );
+    }
+
+    /// **One agent speaks in both rooms, and it is the asker.**
+    ///
+    /// The asker asks on the other desk under its own name; that desk answers
+    /// on its own desk; the asker comes home and reports. The relay that
+    /// carried the answer back is an input to the asker, not a line anyone
+    /// reads — rendering it put the other desk's agent in a room it is not part
+    /// of, saying the same thing the asker was about to say.
+    #[tokio::test]
+    async fn the_asker_brings_the_answer_home_and_the_other_desk_stays_out_of_the_room() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        let mut events: Vec<CompanyEvent> = referral_leg(
+            "engineering",
+            "Engineering",
+            "software_engineer",
+            "design",
+            "product_designer",
+            false,
+            "what would you change about the error messages?",
+        )
+        .into_iter()
+        .chain(referral_leg(
+            "design",
+            "Design",
+            "product_designer",
+            "engineering",
+            "software_engineer",
+            true,
+            "error messages look like a copy task and are not one",
+        ))
+        .collect();
+        // The asker's report — the only thing #engineering should show.
+        events.push(CompanyEvent::AgentReply {
+            chat_id: "engineering".to_string(),
+            agent_id: "software_engineer".to_string(),
+            text: "design came back: error messages are a design-system problem".to_string(),
+            steps: Vec::new(),
+            task_id: None,
+            parent: None,
+            mentions: Vec::new(),
+            mention_depth: 0,
+        });
+        for event in events {
+            runtime.events().append(&id, event).await.expect("journal");
+        }
+
+        let history = history_for_desk(
+            &runtime,
+            "engineering",
+            "engineering",
+            &Viewer::Operator,
+            None,
+            50,
+            true,
+        )
+        .await
+        .expect("history");
+
+        assert!(
+            history.iter().all(|m| m.channel != "product_designer"),
+            "the answering desk never speaks in the room it was asked from: {history:?}"
+        );
+        let referred = history
+            .iter()
+            .find(|m| m.referred_from.is_some())
+            .expect("something carries the provenance");
+        assert_eq!(
+            referred.channel, "software_engineer",
+            "the chip rides the asker's own report: {referred:?}"
+        );
+        let origin = referred.referred_from.as_ref().expect("origin");
+        assert!(origin.returning, "and it reads as an answer, not an ask");
+        assert_eq!(origin.desk_name, "Design");
+    }
+
+    /// **The fail-safe half: a relay renders while the report is still missing.**
+    ///
+    /// The test below drops the relay once the asker has reported. Until then
+    /// there is nothing else carrying design's answer, and dropping it would
+    /// lose the answer outright — so it renders, in the wrong voice, saying
+    /// truthfully that it is an answer rather than an ask.
+    ///
+    /// **Which leg this is, is the host's to say (the "Answered by" chip).**
+    ///
+    /// Both legs are agent-authored lines on a desk, so every signal the
+    /// console holds reads identically on each — it guessed from `from` and
+    /// called every returning answer an ask. `tinyhivemind` decided it already
+    /// (`ReferralKind`), and the marker carries that decision.
+    #[tokio::test]
+    async fn a_relay_with_no_report_yet_still_renders_and_says_it_is_an_answer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        for event in referral_leg(
+            "engineering",
+            "Engineering",
+            "software_engineer",
+            "design",
+            "product_designer",
+            false,
+            "what would you change about the error messages?",
+        )
+        .into_iter()
+        .chain(referral_leg(
+            "design",
+            "Design",
+            "product_designer",
+            "engineering",
+            "software_engineer",
+            true,
+            "error messages look like a copy task and are not one",
+        )) {
+            runtime.events().append(&id, event).await.expect("journal");
+        }
+
+        for (desk, desk_name, returning) in [
+            ("design", "Engineering", false),
+            ("engineering", "Design", true),
+        ] {
+            let history = history_for_desk(&runtime, desk, desk, &Viewer::Operator, None, 50, true)
+                .await
+                .expect("history");
+            let origin = history
+                .iter()
+                .find_map(|m| m.referred_from.as_ref())
+                .unwrap_or_else(|| panic!("#{desk} carries a referral origin"));
+            assert_eq!(origin.desk_name, desk_name, "on #{desk}");
+            assert_eq!(
+                origin.returning,
+                returning,
+                "#{desk} draws the {} chip",
+                if returning {
+                    "\"Answered by\""
+                } else {
+                    "\"Asked by\""
+                }
+            );
+        }
     }
 }
 

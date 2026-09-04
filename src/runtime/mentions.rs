@@ -863,12 +863,45 @@ pub fn resolve(
 /// second, competing notion of "who is this for".
 ///
 /// Resolving nothing returns `None`, which leaves dispatch exactly as it was.
-pub fn mention_responder(record: &CompanyRecord, mentions: &[Mention]) -> Option<String> {
+///
+/// # Naming an outsider does not summon them into the room
+///
+/// The candidate must be a member of `desk`. Roster membership alone was the
+/// old test, and it let `@product_designer` typed in `#engineering` make the
+/// designer answer *in #engineering* — a desk they are not on, in front of a
+/// room they are not part of, while engineering's own lead stayed silent about
+/// a question addressed to their channel.
+///
+/// That is the same defect the cross-desk referral exists to fix one level up,
+/// and `tinyhivemind` already states the rule: an outsider "runs on their OWN
+/// desk, not as a guest here". A mention that names one therefore resolves to
+/// nobody and the ladder continues to the desk's own answerer, who can carry
+/// the question across on the referral path — one agent speaking in both rooms,
+/// and it is the one that belongs to this one.
+///
+/// **A channel with no membership is unrestricted**, which is not a loophole
+/// but the same rule: the built-in `#general` is not a desk and has no members
+/// to be outside of (issue #1743), and neither has a DM. `resolve_desk_id`
+/// returning `None` is how both say so, and there the old behaviour is the
+/// correct one.
+pub fn mention_responder(
+    record: &CompanyRecord,
+    desk: Option<&str>,
+    mentions: &[Mention],
+) -> Option<String> {
+    let members = desk
+        .and_then(|desk| record.resolve_desk_id(desk))
+        .map(|desk_id| record.effective_desk_members(&desk_id));
     mentions
         .iter()
         .filter(|m| !m.quiet)
         .filter_map(|m| m.target.agent_id())
-        .find(|id| record.is_roster_agent(id))
+        .find(|id| {
+            record.is_roster_agent(id)
+                && members
+                    .as_ref()
+                    .is_none_or(|members| members.iter().any(|member| member == id))
+        })
         .map(str::to_string)
 }
 
@@ -1575,11 +1608,90 @@ members = ["engineer", "ceo"]
     // Routing
     // -----------------------------------------------------------------------
 
+    /// Two desks with no overlap, so "not on this desk" is expressible.
+    const TWO_DESKS: &str = r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "engineer"
+role = "Backend Engineer"
+
+[[agent]]
+id = "designer"
+role = "Product Designer"
+
+[[group_chat]]
+id = "engineering"
+name = "Engineering"
+members = ["engineer"]
+
+[[group_chat]]
+id = "design"
+name = "Design"
+members = ["designer"]
+"#;
+
+    /// **Naming an outsider does not summon them into the room.**
+    ///
+    /// `@designer` typed in `#engineering` used to make the designer answer
+    /// there — a desk they are not on. The mention now resolves to nobody, and
+    /// the ladder falls through to the desk's own answerer, who can carry the
+    /// question across on the referral path.
+    #[test]
+    fn a_teammate_from_another_desk_is_not_summoned_into_this_one() {
+        let record = record(TWO_DESKS);
+        let found = resolve(
+            "@designer what would you change about the login screen",
+            None,
+            None,
+            &record,
+            &people(),
+        );
+        assert!(
+            !found.is_empty(),
+            "the mention must resolve, or this test passes for the wrong reason"
+        );
+        assert_eq!(
+            mention_responder(&record, Some("engineering"), &found),
+            None,
+            "the designer answers on their own desk, not as a guest here"
+        );
+        assert_eq!(
+            mention_responder(&record, Some("design"), &found),
+            Some("designer".to_string()),
+            "and is still the responder in the room they belong to"
+        );
+    }
+
+    /// The rule needs a membership to check against. `#general` is not a desk
+    /// and has none (issue #1743), and neither has a DM — `resolve_desk_id`
+    /// says so by returning `None`, and there every roster agent stays
+    /// nameable, exactly as before.
+    #[test]
+    fn a_channel_with_no_membership_still_names_anybody() {
+        let record = record(TWO_DESKS);
+        let found = resolve(
+            "@designer can you look at this",
+            None,
+            None,
+            &record,
+            &people(),
+        );
+        for channel in [None, Some("general"), Some("dm:u1:designer")] {
+            assert_eq!(
+                mention_responder(&record, channel, &found),
+                Some("designer".to_string()),
+                "{channel:?} has no membership to be outside of"
+            );
+        }
+    }
+
     #[test]
     fn a_mentioned_teammate_becomes_the_responder() {
         let found = resolve_text("@engineer what is the build status");
         assert_eq!(
-            mention_responder(&acme(), &found),
+            mention_responder(&acme(), None, &found),
             Some("engineer".to_string())
         );
     }
@@ -1587,7 +1699,10 @@ members = ["engineer", "ceo"]
     #[test]
     fn the_first_mentioned_teammate_answers() {
         let found = resolve_text("@ceo can you check with @engineer");
-        assert_eq!(mention_responder(&acme(), &found), Some("ceo".to_string()));
+        assert_eq!(
+            mention_responder(&acme(), None, &found),
+            Some("ceo".to_string())
+        );
     }
 
     #[test]
@@ -1598,7 +1713,7 @@ members = ["engineer", "ceo"]
             offset: 0,
             quiet: true,
         }];
-        assert_eq!(mention_responder(&acme(), &mentions), None);
+        assert_eq!(mention_responder(&acme(), None, &mentions), None);
     }
 
     #[test]
@@ -1610,7 +1725,7 @@ members = ["engineer", "ceo"]
             quiet: false,
         }];
         assert_eq!(
-            mention_responder(&acme(), &mentions),
+            mention_responder(&acme(), None, &mentions),
             None,
             "so the caller uses the desk lead, exactly as before"
         );
@@ -1619,7 +1734,7 @@ members = ["engineer", "ceo"]
     #[test]
     fn mentioning_only_people_does_not_change_the_responder() {
         let found = resolve_text("@Jane Doe thoughts?");
-        assert_eq!(mention_responder(&acme(), &found), None);
+        assert_eq!(mention_responder(&acme(), None, &found), None);
     }
 
     // -----------------------------------------------------------------------

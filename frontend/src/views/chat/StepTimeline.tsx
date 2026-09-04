@@ -4,6 +4,7 @@ import {
   Brain,
   ChevronDown,
   ChevronRight,
+  CornerUpLeft,
   Hourglass,
   Loader2,
   Scissors,
@@ -201,6 +202,51 @@ function formatElapsed(ms: number | undefined, status: TurnStep["status"]): stri
  * that has no card-delete route — the thread panel, a future read-only
  * transcript — still renders the link half rather than a control that throws.
  */
+/**
+ * Where a crossing referral came from, or went (tinyhivemind P15).
+ *
+ * Modelled on {@link CardChip} deliberately: both are provenance on the bubble
+ * — "this message is connected to something not on this screen" — and a reader
+ * should not have to learn two shapes for one idea. It is NOT a centred system
+ * pill; a pill is a line the runtime wrote *about* the conversation, and this
+ * is a fact about the message under it.
+ *
+ * Two directions, two words, because the reader's question differs. In the
+ * desk that was asked, the question is "why is this here?" — `Asked by
+ * Engineering`. In the desk that asked, an answer has arrived from a teammate
+ * who is not on this desk, and without saying so it reads as local work —
+ * `Answered by Product & Design`.
+ *
+ * The label is whatever the host captured with the row; this never resolves a
+ * desk id at render, and never shows one — an id in operator copy is the thing
+ * `DiscussionMessage.author` refuses for the same reason.
+ */
+export function ReferralChip({
+  deskId,
+  deskName,
+  sequence,
+  direction,
+}: {
+  deskId: string;
+  deskName: string;
+  sequence: number;
+  direction: "asked" | "answered";
+}) {
+  const label = direction === "asked" ? `Asked by ${deskName}` : `Answered by ${deskName}`;
+  return (
+    <span className="mt-1.5 flex w-fit items-center rounded-full bg-accent text-accent-foreground">
+      <a
+        href={`#/chat?desk=${encodeURIComponent(deskId)}&at=${sequence}`}
+        className="flex items-center gap-1 px-2 py-0.5 text-2xs font-medium transition-opacity hover:opacity-80"
+        title={`Open the conversation that ${direction === "asked" ? "asked" : "answered"}`}
+      >
+        <CornerUpLeft className="size-3 shrink-0" />
+        {label}
+      </a>
+    </span>
+  );
+}
+
 export function CardChip({
   taskId,
   busy = false,

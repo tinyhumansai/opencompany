@@ -2396,6 +2396,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
 fn summarize_event(event: &CompanyEvent) -> String {
     match event {
         CompanyEvent::OperatorMessage { .. } => "operator message".to_string(),
+        // Structural only, like every arm here: which desks, never the content.
+        CompanyEvent::ReferralEnqueued {
+            from_desk, to_desk, ..
+        } => format!("referral {from_desk} → {to_desk}"),
         // Issue #983. Structural only, like every arm here: the turn id, which
         // is a minted identifier, and nothing else. Neither the desk nor the
         // failure reason is named — the desk is operator-authored free text on

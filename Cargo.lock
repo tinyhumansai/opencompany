@@ -3569,6 +3569,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tinyagents-harness",
  "tinyflows",
+ "tinyhivemind",
+ "tinyhivemind-core",
  "tinyinference",
  "tinymcp",
  "tinymemory",
@@ -5941,6 +5943,23 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tinyhivemind"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+ "tinyhivemind-core",
+]
+
+[[package]]
+name = "tinyhivemind-core"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

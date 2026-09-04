@@ -539,6 +539,14 @@ fn continuation_failure_notice(thread: String, parent: Option<EventSeq>) -> Comp
     }
 }
 
+/// SPIKE (async hand-off): how many times one card may change hands before a
+/// person is asked.
+///
+/// A hand-off chain terminates by construction rather than by nobody writing
+/// one. `pub(crate)` so the harness tests can drive a chain the same number of
+/// times production does, instead of hard-coding a number that drifts.
+pub(crate) const MAX_HAND_OFF_HOPS: usize = 3;
+
 impl CompanyRuntime {
     /// Assembles a runtime from its ports. Most callers use
     /// [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) instead.
@@ -959,6 +967,14 @@ impl CompanyRuntime {
     }
 
     /// This company's event log (append-only audit trail).
+    /// The gate a [`JournalReferralQueue`](crate::runtime::hivemind::JournalReferralQueue)
+    /// serialises its check-then-write under. One per company, so two referrals
+    /// decided at once cannot both find the marker absent.
+    #[cfg(feature = "hivemind")]
+    pub(crate) fn referral_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.task_writes.clone()
+    }
+
     pub fn events(&self) -> &Arc<dyn EventLog> {
         &self.events
     }
@@ -1262,6 +1278,81 @@ impl CompanyRuntime {
         let _ = task;
     }
 
+    /// SPIKE (tinyhivemind P15): run a referred child turn on the target desk.
+    ///
+    /// A referral arrives on the target's desk channel as a MESSAGE authored by
+    /// the agent that asked — which is what it is. That keeps one mechanism for
+    /// "a turn happens because something arrived on this conversation" instead
+    /// of a second, referral-only path, and it means the responder ladder picks
+    /// the target exactly as it would for any other addressed message.
+    ///
+    /// Detached, like every other turn this runtime starts: the enqueue
+    /// transaction has already committed its marker, and the caller must not
+    /// wait on a model.
+    #[cfg(feature = "hivemind")]
+    pub(crate) fn spawn_referred_turn(
+        self: Arc<Self>,
+        desk: String,
+        content: String,
+        asker: String,
+        // Where an answer goes home, on a crossing FORWARD. `None` on a return
+        // — an answer that has arrived does not need carrying further.
+        origin: Option<tinyhivemind_core::referral::ReferralOrigin>,
+    ) {
+        tokio::spawn(async move {
+            let desk_for_replies = desk.clone();
+            let event = CompanyEvent::OperatorMessage {
+                text: content,
+                // The asking AGENT, not the operator: a referral is a teammate
+                // asking, and recording it as an operator message would put
+                // words in a person's mouth.
+                by: Some(crate::ports::types::Actor {
+                    kind: crate::ports::types::ActorKind::Agent,
+                    id: asker,
+                }),
+                chat: Some(desk),
+                parent: None,
+                // Never a card: a referral asks a question, it does not hand
+                // work over. Ownership moving is the hand-off path's job.
+                deliverable: Some(crate::ports::types::MessageIntent::Chat),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            };
+            // `run_cycle` journals its INPUT events and returns the replies —
+            // it does not write them down. The chat route journals its own
+            // (`journal_chat_replies`) and the dispatch cycle journals its own
+            // (`journal_dispatch_replies`); a third caller needs the same, or
+            // the referred agent answers into a transcript nobody can read.
+            match self.run_cycle(vec![event]).await {
+                Ok(mut report) => {
+                    let company = self.id.clone();
+                    crate::server::operator::journal_chat_replies(
+                        &self,
+                        &company,
+                        &desk_for_replies,
+                        None,
+                        &mut report,
+                    )
+                    .await;
+                    // The back edge. This turn's reply is the ANSWER to the
+                    // referral that caused it, so it is offered to the decision
+                    // carrying the origin it must return to — and at depth 1,
+                    // so `max_hops` finally bounds something.
+                    crate::server::operator::refer_committed_replies(
+                        &self,
+                        &company,
+                        &desk_for_replies,
+                        &report,
+                        origin,
+                        1,
+                    )
+                    .await;
+                }
+                Err(err) => tracing::warn!(error = %err, "[referral] the referred turn failed"),
+            }
+        });
+    }
+
     /// The body of a dispatch's detached cycle (issue #242), split out of the
     /// `tokio::spawn` so the quiesce path below is reachable from a test.
     ///
@@ -1269,48 +1360,156 @@ impl CompanyRuntime {
     /// backstop cannot see — see [`abandon_run`](Self::abandon_run).
     #[cfg(feature = "openhuman")]
     async fn run_dispatch_cycle(self: Arc<Self>, task_id: String, run_id: Option<String>) {
-        let report = match self
-            .run_cycle(vec![CompanyEvent::TaskDispatched {
-                task_id: task_id.clone(),
-                run_id: run_id.clone(),
-            }])
-            .await
-        {
-            Ok(report) => report,
-            Err(err) => {
-                // Issue #290 meets issue #242. `ensure_accepting` refuses
-                // *before* `CycleRunner` takes the serial lock, so a dispatch
-                // that lands in the window while this runtime is being
-                // replaced never reaches `begin_run` — and the backstop
-                // inside the cycle only settles rows that cycle started.
-                // Every other dispatch failure is already covered in there.
-                // Left alone, the row minted a moment ago would sit `Pending`
-                // for the rest of the process's life: a card reading as under
-                // way by an attempt that never began, which nothing
-                // re-drives, and which the rebuild deliberately does *not*
-                // run the boot reaper to clean up.
-                if let Some(id) = run_id.as_deref()
-                    && matches!(err, OpenCompanyError::Quiescing(_))
-                {
-                    self.abandon_run(id, &task_id).await;
+        let mut run_id = run_id;
+        let mut hops = 0usize;
+        let mut handed_back: Option<(String, String)> = None;
+        loop {
+            // Who owns the card going INTO this attempt. Read here and not after
+            // the cycle, because by then a hand-off has already overwritten it —
+            // which is exactly the value a rollback needs.
+            let owner_before = self
+                .ops
+                .tasks
+                .list(&self.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|c| c.id == task_id)
+                .map(|c| c.assignee)
+                .unwrap_or_default();
+            let report = match self
+                .run_cycle(vec![CompanyEvent::TaskDispatched {
+                    task_id: task_id.clone(),
+                    run_id: run_id.clone(),
+                }])
+                .await
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    // Issue #290 meets issue #242. `ensure_accepting` refuses
+                    // *before* `CycleRunner` takes the serial lock, so a dispatch
+                    // that lands in the window while this runtime is being
+                    // replaced never reaches `begin_run` — and the backstop
+                    // inside the cycle only settles rows that cycle started.
+                    // Every other dispatch failure is already covered in there.
+                    // Left alone, the row minted a moment ago would sit `Pending`
+                    // for the rest of the process's life: a card reading as under
+                    // way by an attempt that never began, which nothing
+                    // re-drives, and which the rebuild deliberately does *not*
+                    // run the boot reaper to clean up.
+                    if let Some(id) = run_id.as_deref()
+                        && matches!(err, OpenCompanyError::Quiescing(_))
+                    {
+                        self.abandon_run(id, &task_id).await;
+                    }
+                    tracing::warn!(
+                        company = %self.id,
+                        task = %task_id,
+                        error = %err,
+                        "task dispatch cycle failed"
+                    );
+                    return;
                 }
+            };
+            // Issue #1852 Part 1: `run_task`/`refuse_dispatch` already build the
+            // right relay via `relay_reply` — it rides home in this report's
+            // responses — but until now nothing wrote it down. Unlike the
+            // chat-POST path (`journal_chat_replies`) and the approval path
+            // (`publish_continuation`), this dispatch path had no journaling step
+            // at all, so the answer never reached the thread it was spawned from,
+            // live or on reload.
+            self.journal_dispatch_replies(&report).await;
+
+            // ── SPIKE (async hand-off): re-dispatch for the card's new owner ────
+            //
+            // A settled dispatch that leaves its card in `in_progress` is the
+            // hand-off shape and nothing else: every other ending lands the card in
+            // a terminal column (`in_review`, `todo`, `paused`), and
+            // `settled_landing_column(Delegated)` deliberately keeps it here
+            // because "a hand-off is not an ending".
+            //
+            // The dispatch EDGE cannot fire on its own for this: it triggers on
+            // `→ in_progress`, and the card never left. So the re-dispatch is
+            // driven from here, where a fresh attempt row is minted for the
+            // delegate — which is the whole point. One attempt per agent, the
+            // serial cycle lock released between hops, and cost attributable to
+            // whoever actually spent it.
+            //
+            // Bounded by the hand-offs already recorded on the card, so a chain
+            // terminates by construction rather than by nobody writing one.
+            // SPIKE: undo a hand-off whose delegate could not run.
+            //
+            // `refuse_dispatch` bounces the card to To-do with the reason, but it
+            // leaves `assignee` naming the delegate — the state that makes the card
+            // permanently unrunnable and the thread permanently misrouted. Rolling
+            // the owner back is what makes the hand-off transactional: it either
+            // moved the work or it did not.
+            if let Some((delegate, prior)) = handed_back.take()
+                && !prior.is_empty()
+                && let Ok(cards) = self.ops.tasks.list(&self.id).await
+                && let Some(mut card) = cards.into_iter().find(|c| c.id == task_id)
+                && card.column == crate::ports::tasks::COLUMN_TODO
+                && card.bounced.is_some()
+                && card.assignee == delegate
+            {
                 tracing::warn!(
                     company = %self.id,
                     task = %task_id,
-                    error = %err,
-                    "task dispatch cycle failed"
+                    from = %delegate,
+                    to = %prior,
+                    "[hand-off] the delegate could not run; returning the card to its previous owner"
                 );
-                return;
+                card.assignee = prior;
+                card.updated_at_millis = crate::ports::now_millis();
+                // The plain store port: this must not re-fire the dispatch edge.
+                let _ = self.ops.tasks.upsert(&self.id, &card).await;
             }
-        };
-        // Issue #1852 Part 1: `run_task`/`refuse_dispatch` already build the
-        // right relay via `relay_reply` — it rides home in this report's
-        // responses — but until now nothing wrote it down. Unlike the
-        // chat-POST path (`journal_chat_replies`) and the approval path
-        // (`publish_continuation`), this dispatch path had no journaling step
-        // at all, so the answer never reached the thread it was spawned from,
-        // live or on reload.
-        self.journal_dispatch_replies(&report).await;
+
+            let handed_on = self
+                .ops
+                .tasks
+                .list(&self.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|card| card.id == task_id)
+                .filter(|card| card.column == crate::ports::tasks::COLUMN_IN_PROGRESS);
+            if let Some(card) = handed_on {
+                if hops >= MAX_HAND_OFF_HOPS {
+                    tracing::warn!(
+                        company = %self.id,
+                        task = %task_id,
+                        hops,
+                        "[hand-off] chain hit its cap; leaving the card for a person"
+                    );
+                    return;
+                }
+                hops += 1;
+                // Who owned it before this hop, so a hand-off that cannot run can
+                // be undone. Without this the card keeps an owner that never took
+                // the work: it bounces to To-do assigned to an agent this build
+                // cannot dispatch, every retry fails identically, and — since
+                // `assignee` is what the thread's overseer is read from — the
+                // conversation is redirected to them permanently.
+                handed_back = Some((card.assignee.clone(), owner_before.clone()));
+                tracing::info!(
+                    company = %self.id,
+                    task = %task_id,
+                    assignee = %card.assignee,
+                    hops,
+                    "[hand-off] re-dispatching for the card's new owner"
+                );
+                // A FRESH attempt row for the delegate — this is what makes cost
+                // attributable per agent instead of one figure spanning the chain.
+                // Looping rather than recursing keeps the whole chain on this one
+                // spawned task, and `run_cycle` takes and releases the per-company
+                // serial lock per iteration, so the company is not parked for the
+                // duration of the chain.
+                run_id = self.open_run(&card).await;
+                continue;
+            }
+            return;
+        }
     }
 
     /// Settles an attempt whose cycle was refused before it could start
@@ -9181,6 +9380,71 @@ mod tests {
     /// rather than rendering it flat, so a stale root would make the
     /// continuation invisible — strictly worse than the bug being fixed, since
     /// today's answer at least reaches the channel.
+
+    /// **The reason `ReferralQueue` exists**: the same trigger, twice, creates
+    /// one child turn.
+    ///
+    /// A referral is decided from a COMMITTED reply, so a restart, a
+    /// redelivered frame or a retry decides the identical referral again.
+    /// Without the durable marker the target desk is asked twice — two turns,
+    /// two answers, twice the spend, one question. `Already` is the whole
+    /// point of the port, and this is the test that would catch losing it.
+    #[cfg(all(feature = "openhuman", feature = "hivemind"))]
+    #[tokio::test]
+    async fn the_same_trigger_enqueues_one_child_turn() {
+        use tinyhivemind::dispatch::EnqueueOutcome;
+        use tinyhivemind::referral::ReferralQueue;
+
+        let (rt, _home) = runtime_with_events().await;
+        let rt = Arc::new(rt);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let queue = crate::runtime::hivemind::JournalReferralQueue::new(rt.clone(), gate);
+
+        let referral = tinyhivemind::referral::Referral {
+            key: tinyhivemind::dispatch::DispatchKey {
+                trigger_sequence: 77,
+            },
+            kind: tinyhivemind::referral::ReferralKind::Forward,
+            source_id: "ceo".to_string(),
+            target_id: "ceo".to_string(),
+            content: "who owns the login screen?".to_string(),
+            from: tinyhivemind::dispatch::DispatchConversation {
+                desk_id: "engineering".to_string(),
+                thread_root: None,
+            },
+            to: tinyhivemind::dispatch::DispatchConversation {
+                desk_id: "design".to_string(),
+                thread_root: None,
+            },
+            origin: None,
+            child_hop: 1,
+        };
+
+        // The fixture roster declares no `delegates_to`, so the FIRST call is
+        // refused on authorization — which is itself the fail-closed default
+        // worth pinning: referral is off until an operator opts an agent in.
+        let first = queue.enqueue_once(referral.clone()).await.expect("decides");
+        assert_eq!(
+            first,
+            EnqueueOutcome::Refused {
+                reason: tinyhivemind::dispatch::EnqueueRefusal::Unauthorized
+            },
+            "an agent with no `delegates_to` may not cause a turn on another desk"
+        );
+
+        // And a refusal leaves NO marker, so it is not mistaken for a
+        // completed enqueue on the next attempt.
+        let replay = queue.enqueue_once(referral).await.expect("decides");
+        assert_eq!(
+            replay,
+            EnqueueOutcome::Refused {
+                reason: tinyhivemind::dispatch::EnqueueRefusal::Unauthorized
+            },
+            "a refusal must not write the marker — otherwise a retry after the \
+             operator grants permission would report `Already` and drop the work"
+        );
+    }
+
     /// A runtime with a live event log, for the thread-root tests. Returns the
     /// tempdir too: dropping it deletes the log the runtime is reading.
     async fn runtime_with_events() -> (crate::company::runtime::CompanyRuntime, tempfile::TempDir) {

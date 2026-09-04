@@ -23,7 +23,7 @@ import {
   type TimelineEntry,
 } from "./model";
 import { EchoPlaceholder, echoMarkerFor } from "./EchoPlaceholder";
-import { CardChip, StepTimeline } from "./StepTimeline";
+import { CardChip, ReferralChip, StepTimeline } from "./StepTimeline";
 import { WorkingIndicator } from "./WorkingIndicator";
 
 interface Props {
@@ -341,6 +341,19 @@ export function MessageRow({
             above them is what the reader came for — there is no answer yet, and
             these rows are the only account of what is happening. */}
         {!!liveSteps?.length && <StepTimeline steps={[...liveSteps]} defaultOpen />}
+        {/* Provenance for a crossing referral: this turn exists because another
+            desk asked, and the reader of THIS desk cannot tell otherwise. */}
+        {message.referredFrom && (
+          <ReferralChip
+            deskId={message.referredFrom.deskId}
+            deskName={message.referredFrom.deskName}
+            sequence={message.referredFrom.sequence}
+            // The host's word, never a guess off `from`: both legs of a
+            // referral are `company` lines, so that test called every answer
+            // an ask. Falling back to "asked" matches a host too old to say.
+            direction={message.referredFrom.direction ?? "asked"}
+          />
+        )}
         {message.taskId && (
           <div className="flex flex-wrap items-center gap-2">
             <CardChip

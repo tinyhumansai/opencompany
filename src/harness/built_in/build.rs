@@ -203,6 +203,24 @@ pub fn model_for_tier(tier: Option<&str>) -> String {
     .to_string()
 }
 
+/// What an `@` in an agent's own reply does — and does not — do.
+///
+/// Every agent gets this, because every agent can write one. `Mention::quiet`
+/// is the contract it states in prose: "draw the chip, but do not notify and
+/// do not route". Without it an agent reaches for `@name` to make somebody
+/// pick something up, the chip renders, nothing happens, and the work is
+/// silently dropped — the failure is invisible precisely because the message
+/// LOOKS like a hand-off.
+///
+/// Deliberately does not name the hand-off tools: most agents do not have
+/// them, and pointing an agent at a tool it was not granted is the "a tool
+/// granted, unmentioned" problem pointed the other way. The agents that do
+/// have them are told in [`orchestrator::orchestrator_brief`].
+const MENTION_BRIEF: &str = " Naming a teammate: write their name or id as ordinary text when you are \
+referring to them — \"qa_engineer has the failing case\". An `@` in your reply renders a chip and \
+nothing more: it notifies nobody and starts no work, so it cannot hand anything over. Reaching for \
+`@` to make somebody pick something up does not make them pick it up. ";
+
 /// The persona system prompt for a company agent.
 ///
 /// Frames the agent as its manifest role at the company, in the first person.
@@ -832,6 +850,10 @@ pub fn build_agent(
     // static-before-volatile is what keeps an operator editing a workspace note
     // from invalidating the briefing behind it.
     persona.push_str(&crate::company::prompt::bundle_section(manifest_agent));
+
+    // Every agent, granted tools or not: an `@` is something any of them can
+    // write, and what it does is not guessable from the fact that it renders.
+    persona.push_str(MENTION_BRIEF);
 
     // A short, STATIC brief — never a tree snapshot. A snapshot baked into the
     // system prompt would be stale the moment the operator edits a note, which

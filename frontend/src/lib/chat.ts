@@ -213,6 +213,18 @@ export interface ChatMessage {
    */
   parentId?: string;
   /**
+   * The desk that caused this message, when another desk's agent referred the
+   * work here (tinyhivemind P15). Renders as a chip on the bubble — provenance
+   * of the message itself, which is why it rides here and not as a separate
+   * system line.
+   *
+   * A crossing referral cannot be threaded — the library lands one on the
+   * target's desk channel, "never in a thread, because a thread root is a
+   * sequence number in the conversation that owns it" — so this chip is the
+   * only link back to the conversation that asked.
+   */
+  referredFrom?: import("@/api/types").ReferredFromDto;
+  /**
    * Who reacted to this line with what — one row per person per emoji, not a
    * count (issue #364).
    *
@@ -525,6 +537,9 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       // namespace as `entry.id` — so it takes the same prefix, or the reply
       // would point at a line no console id matches (issue #364).
       parentId: entry.parentId ? hostMessageId(entry.parentId) : undefined,
+      // Straight through, like `byPerson`: only the host knows another desk
+      // caused this line, and nothing here may infer it.
+      referredFrom: entry.referredFrom,
       // Reactions come through whoever the host said reacted; nothing is
       // inferred here, `mine` included.
       reactions: entry.reactions?.length ? entry.reactions : undefined,

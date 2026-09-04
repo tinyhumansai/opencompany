@@ -271,11 +271,46 @@ export interface CreateDeskInput {
  * projection logic with the GraphQL `Chat.history` resolver, so the two can
  * never disagree about a desk's history (issue #65).
  */
+/**
+ * Where a message came from when another desk caused it (tinyhivemind P15).
+ *
+ * A crossing referral runs a turn on a desk the asker is not a member of, so
+ * the message needs to say so on its face — otherwise a turn that exists only
+ * because engineering asked reads as design's own idea.
+ *
+ * The labels are **captured with the row**, never resolved at render, for the
+ * reason `SessionAuthor` captures its own: a desk renamed later must not
+ * rewrite what the transcript said at the time.
+ */
+export interface ReferredFromDto {
+  deskId: string;
+  deskName: string;
+  askerId: string;
+  askerLabel: string;
+  /** The asking message, so the chip can link straight to it. */
+  sequence: number;
+  /**
+   * Which leg of the referral this message is: the outbound ask, or the answer
+   * arriving home.
+   *
+   * The host says it because only the host can. Both legs are agent-authored
+   * lines on a desk, so `from`, `byPerson` and the author all read identically
+   * on each — a console that guesses from those gets every return wrong, which
+   * is exactly what it did before this field existed.
+   *
+   * Optional: a host that predates it says nothing, and the chip then falls
+   * back to "asked", which is what every marker written before the return leg
+   * shipped actually was.
+   */
+  direction?: "asked" | "answered";
+}
+
 export interface ChatHistoryMessageDto {
   id: string;
   channel: string;
   author: string;
   text: string;
+  referredFrom?: ReferredFromDto;
   atMillis: number;
   mine: boolean;
   /**

@@ -2839,6 +2839,9 @@ fn cycle_task_id(
     let mut found: Option<String> = None;
     for event in events {
         let candidate = match event {
+            // Never a trigger: the marker records that a child turn was created,
+            // it does not ask for one.
+            CompanyEvent::ReferralEnqueued { .. } => None,
             CompanyEvent::TaskDispatched { task_id, .. } => Some(task_id.clone()),
             CompanyEvent::ApprovalResolved { approval_id, .. } => {
                 match approval_task(approval_id) {
@@ -3042,6 +3045,9 @@ fn cycle_conversation(
     let mut found: Option<(String, Option<EventSeq>)> = None;
     for (index, event) in events.iter().enumerate() {
         let candidate = match event {
+            // Names no conversation to answer in: it records that a child
+            // turn was created elsewhere, and that turn carries its own.
+            CompanyEvent::ReferralEnqueued { .. } => None,
             // The one event that names a thread outright. An unaddressed message
             // (`chat: None`) went to the orchestrator with no conversation of its
             // own — a rival, not a neutral pass-through, for the same reason a

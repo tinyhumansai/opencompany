@@ -255,6 +255,19 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("extended approval {approval_id}"),
             "approval.extended",
         ),
+        // Structural only, like the approval arms above — which desks and who,
+        // never the referred content.
+        CompanyEvent::ReferralEnqueued {
+            from_desk,
+            to_desk,
+            target,
+            ..
+        } => (
+            Role::System,
+            "referral".to_string(),
+            format!("referred {from_desk} → {to_desk} ({target})"),
+            "referral.enqueued",
+        ),
         CompanyEvent::FeedbackFiled { note } => (
             Role::User,
             "operator".to_string(),
