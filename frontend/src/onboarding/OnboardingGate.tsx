@@ -1,16 +1,31 @@
-import { lazy, Suspense, useState } from "react";
-import { Check, Loader2, PartyPopper, Plug, UserCog, Workflow } from "lucide-react";
+import { type MouseEvent, useState } from "react";
+import { Check, Loader2, Minus, PartyPopper, Plug, UserCog, Workflow } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
 import { type ActivationStatus, confirmCompanyName } from "@/api/activation";
 import { ApiError } from "@/api/types";
-import { RouteLoading } from "@/components/route-loading";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { VIEWS } from "@/lib/console-routes";
 import { cn } from "@/lib/utils";
-import { OAuthView } from "@/views/OAuthView";
+import { IntegrationStep } from "@/onboarding/IntegrationStep";
+import type { GateStepId } from "@/onboarding/state";
+import { WorkflowStep } from "@/onboarding/WorkflowStep";
+
+/**
+ * Whether `href` names a route this console actually serves — the same test
+ * `useHashView` applies to the real router's own hash (`hooks/use-hash-view.ts`'s
+ * `readSegments`, mirrored here since that function reads `window.location.hash`
+ * directly rather than taking a string to validate). Only the first path
+ * segment is checked, the same way the router itself only routes on it — a
+ * sub-page's own validity is that view's problem, not this gate's.
+ */
+function isKnownConsoleRoute(href: string): boolean {
+  const head = href.replace(/^#\/?/, "").split("?")[0].split("/")[0];
+  return (VIEWS as readonly string[]).includes(head);
+}
 
 // Same reason `app-shell.tsx` lazy-loads it: React Flow is heavy, and it
 // should not tax a screen an operator only sees once.
@@ -42,17 +57,26 @@ export function clampToCompanyNameLimit(value: string): string {
   return points.length <= COMPANY_NAME_MAX_CHARS ? value : points.slice(0, COMPANY_NAME_MAX_CHARS).join("");
 }
 
-const WorkflowsView = lazy(() =>
-  import("@/views/WorkflowsView").then((m) => ({ default: m.WorkflowsView })),
-);
-
 interface GateStep {
-  id: "name" | "integration" | "workflow";
+  id: GateStepId;
   label: string;
   hint: string;
   icon: typeof UserCog;
   done: boolean;
+  /** Answered as far as this build allows, rather than actually complete. */
+  waived: boolean;
 }
+
+/**
+ * Where "Enter a credential in Apps" sends the founder. The hash the console's
+ * own Connections rail uses for its Apps sub-page (`CONNECTION_PAGES`), named
+ * here as a bare string rather than imported so this module stays clear of the
+ * section that pulls `OAuthView` and `McpServersView` in behind it — the same
+ * reason `connection-pages.ts` is a leaf module in the first place.
+ */
+const APPS_ROUTE = "#/connections/apps";
+const WORKFLOWS_ROUTE = "#/workflows";
+const APPROVALS_ROUTE = "#/approvals";
 
 /**
  * The blocking first-run gate (issue #1844): a full-screen replacement for the
@@ -76,19 +100,39 @@ export function OnboardingGate({
   company,
   status,
   currentName,
+  waived = [],
   onRefresh,
   onSkip,
+  onLeave,
+  onWaiveStep,
 }: {
   client: OpenCompanyClient;
   company: string | null;
   status: ActivationStatus;
   /** The company's current display name, to prefill the naming step. */
   currentName: string;
+  /** Steps already answered as far as this build allows (bugs B-001/B-020). */
+  waived?: readonly GateStepId[];
   /** Called after an in-gate action that may have moved the funnel. */
   onRefresh: () => void;
   /** "Skip for now" — de-emphasized, and always available (issue #1844). */
   onSkip: () => void;
+  /**
+   * Stands the gate down and navigates to a console route (bug B-006).
+   *
+   * Every link the gate offers into the rest of the console goes through this
+   * one seam, and that is the whole point of it existing. The gate renders
+   * *instead of* the router outlet, so a plain `<a href="#/...">` inside it
+   * changes `location.hash`, re-renders the same checklist, and looks to the
+   * founder like a link that does nothing — which is exactly what "decide in
+   * Approvals" did from inside the embedded workflow view. A route the gate
+   * does not own is a route the gate has to get out of the way for.
+   */
+  onLeave: (route: string) => void;
+  /** Records a step as answered as far as this build allows. */
+  onWaiveStep: (step: GateStepId) => void;
 }) {
+  const isWaived = (id: GateStepId) => waived.includes(id);
   const steps: GateStep[] = [
     {
       id: "name",
@@ -96,6 +140,7 @@ export function OnboardingGate({
       hint: "A real name beats the placeholder it launched with.",
       icon: UserCog,
       done: status.nameConfirmed,
+      waived: !status.nameConfirmed && isWaived("name"),
     },
     {
       id: "integration",
@@ -103,6 +148,7 @@ export function OnboardingGate({
       hint: "Gmail, Slack, GitHub — wherever your teammates should reach first.",
       icon: Plug,
       done: status.integrationConnected,
+      waived: !status.integrationConnected && isWaived("integration"),
     },
     {
       id: "workflow",
@@ -110,14 +156,62 @@ export function OnboardingGate({
       hint: "One real run — not a test — proves the company actually works.",
       icon: Workflow,
       done: status.workflowRunSucceeded,
+      waived: !status.workflowRunSucceeded && isWaived("workflow"),
     },
   ];
 
-  const firstOpen = steps.find((s) => !s.done)?.id ?? null;
+  // A waived step is settled as far as this founder is concerned, so it must
+  // not be the one the gate opens on — landing them back inside the step they
+  // just answered is the trap in miniature.
+  const firstOpen = steps.find((s) => !s.done && !s.waived)?.id ?? null;
   const [active, setActive] = useState<GateStep["id"] | null>(firstOpen);
 
   return (
-    <div className="flex min-h-screen flex-col bg-background">
+    <div
+      className="flex min-h-screen flex-col bg-background"
+      // The structural half of B-006, and the reason it is a class of bug
+      // rather than one broken link.
+      //
+      // The gate renders *instead of* the router outlet, so an `<a href="#/…">`
+      // anywhere inside it changes `location.hash`, re-renders this same
+      // checklist, and reads to the founder as a link that does nothing — no
+      // error, no toast, nothing. That is what "decide in Approvals" did.
+      // Rewriting the one anchor that happened to be reachable would leave the
+      // next one to be discovered the same way, by a founder.
+      //
+      // So the gate refuses to swallow *any* in-app hash link, wherever it came
+      // from: a capture-phase click here intercepts the anchor before it can
+      // navigate and sends it out through `onLeave`, which stands the gate down
+      // first. External links, new-tab clicks and anything already handled are
+      // left alone.
+      onClickCapture={(event: MouseEvent<HTMLDivElement>) => {
+        // A modified click is the operator asking for a new tab or window,
+        // where the gate is not in the way and the browser's own behaviour is
+        // correct. Never hijack those.
+        if (event.defaultPrevented || event.button !== 0) return;
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        const anchor = (event.target as Element | null)?.closest?.("a");
+        const href = anchor?.getAttribute("href");
+        if (!anchor || !href?.startsWith("#")) return;
+        if (anchor.target && anchor.target !== "_self") return;
+        // CodeRabbit review, PR #2046: nothing this gate renders today puts an
+        // `<a>` in its own tree — every step's controls are plain buttons
+        // going through `onLeave` with one of the three hardcoded routes
+        // below — but the handler's own doc above says it means to catch
+        // one "wherever it came from", which promises more than the
+        // `href?.startsWith("#")` check alone delivers: a same-origin hash is
+        // not itself unsafe (it cannot execute script the way a `javascript:`
+        // URI would), but forwarding an unrecognized one to `onLeave` still
+        // stands the gate down for an address this console does not route —
+        // not a bug today with no such link to click, but not a check this
+        // handler should rely on staying true forever either. Validated the
+        // same way `useHashView` validates the real router's own hash: the
+        // first path segment must name a known `View`.
+        if (!isKnownConsoleRoute(href)) return;
+        event.preventDefault();
+        onLeave(href);
+      }}
+    >
       <header className="border-b px-6 py-5 sm:px-10">
         <div className="mx-auto max-w-4xl">
           <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
@@ -138,9 +232,9 @@ export function OnboardingGate({
               type="button"
               className={cn(
                 "flex w-full items-center gap-3 rounded-xl px-4 py-3 text-left",
-                !step.done && "hover:bg-muted/50",
+                !step.done && !step.waived && "hover:bg-muted/50",
               )}
-              disabled={step.done}
+              disabled={step.done || step.waived}
               aria-expanded={active === step.id}
               onClick={() => setActive((cur) => (cur === step.id ? null : step.id))}
             >
@@ -153,7 +247,13 @@ export function OnboardingGate({
                     : "border-border text-muted-foreground",
                 )}
               >
-                {step.done ? <Check className="size-4" /> : <step.icon className="size-4" />}
+                {step.done ? (
+                  <Check className="size-4" />
+                ) : step.waived ? (
+                  <Minus className="size-4" />
+                ) : (
+                  <step.icon className="size-4" />
+                )}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block text-sm font-medium">{step.label}</span>
@@ -162,9 +262,15 @@ export function OnboardingGate({
               {step.done && (
                 <span className="shrink-0 text-xs font-medium text-status-done-text">Done</span>
               )}
+              {step.waived && (
+                // Never "Done" — the step did not complete, the founder
+                // answered it as far as this build allows, and saying otherwise
+                // would be the console lying about the company's own state.
+                <span className="shrink-0 text-xs font-medium text-muted-foreground">Skipped</span>
+              )}
             </button>
 
-            {!step.done && active === step.id && (
+            {!step.done && !step.waived && active === step.id && (
               <div className="border-t px-4 py-4">
                 {step.id === "name" && (
                   <NameStep
@@ -174,11 +280,21 @@ export function OnboardingGate({
                     onDone={onRefresh}
                   />
                 )}
-                {step.id === "integration" && <OAuthView client={client} company={company} />}
+                {step.id === "integration" && (
+                  <IntegrationStep
+                    client={client}
+                    company={company}
+                    onOpenApps={() => onLeave(APPS_ROUTE)}
+                    onWaive={() => onWaiveStep("integration")}
+                  />
+                )}
                 {step.id === "workflow" && (
-                  <Suspense fallback={<RouteLoading title="Workflows" label="Loading canvas…" />}>
-                    <WorkflowsView client={client} company={company} />
-                  </Suspense>
+                  <WorkflowStep
+                    client={client}
+                    company={company}
+                    onOpenWorkflows={() => onLeave(WORKFLOWS_ROUTE)}
+                    onOpenApprovals={() => onLeave(APPROVALS_ROUTE)}
+                  />
                 )}
               </div>
             )}

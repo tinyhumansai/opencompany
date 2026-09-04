@@ -39,7 +39,15 @@ import {
 import { TourController } from "@/tour/TourController";
 import { OnboardingGate } from "@/onboarding/OnboardingGate";
 import { useActivationGate } from "@/onboarding/useActivationGate";
-import { clearGateSkipped, gateSkippedThisSession, markGateSkipped } from "@/onboarding/state";
+import {
+  clearGateSkipped,
+  clearGateStepWaivers,
+  type GateStepId,
+  gateSkippedThisSession,
+  markGateSkipped,
+  markGateStepWaived,
+  waivedGateSteps,
+} from "@/onboarding/state";
 import {
   resolveGateAdminCheckError,
   shouldHoldShellPending,
@@ -153,6 +161,7 @@ import { UnknownRouteView } from "@/views/UnknownRouteView";
 import { ConnectionsSection } from "@/views/connections/ConnectionsSection";
 import { SettingsSection } from "@/views/SettingsSection";
 import { useLocalScope } from "@/connections/ConnectionContext";
+import type { LocalScope } from "@/connections/types";
 
 // React Flow is heavy and only used here — load it on demand.
 const WorkflowsView = lazy(() =>
@@ -929,6 +938,49 @@ export function AppShell({
   }, [scope]);
 
   /**
+   * Steps the founder has durably waived (bugs B-001/B-020) — held in state for
+   * the same reason `gateSkipped` is: waiving has to re-render past the gate
+   * without a reload, and `localStorage` alone would need one.
+   */
+  const [gateWaived, setGateWaived] = useState<GateStepId[]>(() => waivedGateSteps(scope));
+  useEffect(() => {
+    setGateWaived(waivedGateSteps(scope));
+  }, [scope]);
+  // The `storage`-event cross-tab listener lives further down, right after
+  // `activationGate` is declared — a REMOVAL it observes has to trigger a
+  // fresh activation read on THIS tab before it is safe to apply, so it
+  // needs `activationGate.refresh` in scope. See that effect's own doc.
+  const waiveGateStep = useCallback(
+    (step: GateStepId) => {
+      markGateStepWaived(scope, step);
+      setGateWaived(waivedGateSteps(scope));
+    },
+    [scope],
+  );
+
+  /**
+   * Leaves the gate for a console route (bug B-006).
+   *
+   * The session skip is what actually stands the gate down — the founder asked
+   * to be somewhere else, and a gate that re-renders over the page they asked
+   * for is the defect. It is deliberately the *session* marker rather than a
+   * durable waiver: following a link is not an answer to the step, so the gate
+   * is still owed on the next fresh tab.
+   *
+   * Order matters. The hash is set first so the router has the destination
+   * before this render swaps the gate out for the shell; setting it afterwards
+   * renders the shell on the old route for a frame and then moves it.
+   */
+  const leaveGateFor = useCallback(
+    (route: string) => {
+      window.location.hash = route;
+      markGateSkipped(scope);
+      setGateSkipped(true);
+    },
+    [scope],
+  );
+
+  /**
    * Whether the signed-in user is this company's admin (PR #1875 review
    * finding) — `null` until the read lands. Mirrors the `admin =
    * (await fetchMe(...)).role === "admin"` pattern every other admin-gated
@@ -1012,13 +1064,87 @@ export function AppShell({
   // the company is actually activated; nothing here needs to.
   const activationGate = useActivationGate(client, company, shouldPollActivationForRole(isGateAdmin));
 
+  // CodeRabbit review, PR #2046: which scope `activationGate.status` actually
+  // describes, read during THIS effect before it is overwritten below.
+  //
+  // `useActivationGate` resets `status` to `null` for the new company only
+  // from its OWN effect, which runs in the same commit as this one but is not
+  // guaranteed to run first, and even when it does the reset does not take
+  // effect until the next render. So the very first commit after switching
+  // companies can still pair the FORMER company's `isActivated: true` with the
+  // NEW `scope` — and without this guard the branch below would read that
+  // combination and wipe the new company's just-loaded waiver before its own
+  // activation read has ever landed. Comparing against the scope this effect
+  // itself saw last time closes that one-render race; a bare
+  // `[activationGate.status?.isActivated, scope]` dependency list cannot, since
+  // both can appear to "agree" on exactly the commit where they do not.
+  const lastGateWaiverScopeRef = useRef<LocalScope | null>(null);
   // PR #1875 review finding, round 4: a skip marker from before the funnel
   // completed cannot matter once `isActivated` is true (`shouldShowOnboardingGate`
   // already stops gating on it either way), but leaving it in `sessionStorage`
   // is still a leak worth cleaning up — see `clearGateSkipped`'s own doc.
   useEffect(() => {
-    if (activationGate.status?.isActivated) clearGateSkipped(scope);
+    const previous = lastGateWaiverScopeRef.current;
+    const scopeJustChanged =
+      previous === null || previous.connection !== scope.connection || previous.company !== scope.company;
+    lastGateWaiverScopeRef.current = scope;
+    if (scopeJustChanged) return;
+    if (!activationGate.status?.isActivated) return;
+    clearGateSkipped(scope);
+    // Same housekeeping, one step down: a waiver cannot matter once the funnel
+    // has actually completed, and leaving one behind would let it speak for a
+    // later incomplete funnel the founder never answered (see
+    // `clearGateStepWaivers`).
+    clearGateStepWaivers(scope);
+    setGateWaived([]);
   }, [activationGate.status?.isActivated, scope]);
+
+  // Codex review, PR #2046: a waiver is durably scoped and meant to survive a
+  // FRESH tab (see `markGateStepWaived`'s own doc) — but a tab that was
+  // already open when a DIFFERENT tab wrote one never noticed, because
+  // `gateWaived` only re-read when `scope` itself changed. The `storage`
+  // event is the browser's own cross-tab signal for exactly this: it fires
+  // in every OTHER same-origin tab (never the one that wrote), so listening
+  // for it and re-reading closes the gap without polling.
+  //
+  // Codex review, round 2: an ADDITION and a REMOVAL are not safe to trust
+  // the same way. `clearGateStepWaivers` above fires from ANOTHER tab too,
+  // the moment THAT tab's own poll confirms `isActivated` — and every
+  // `removeItem` it makes is a deletion `storage` event here. Applying that
+  // removal immediately would drop this tab's waiver against a `status` this
+  // tab has not yet refreshed itself: `outstandingGateSteps` would count the
+  // step as outstanding again, and the gate would reopen until this tab's
+  // own poll independently catches up — or, through an outage, stay open
+  // for as long as that poll keeps failing. An addition has no such failure
+  // mode (it can only shorten `outstandingGateSteps`, never lengthen it), so
+  // only a removal needs the extra caution: ask `activationGate` to refresh
+  // right now instead of trusting the other tab's word, and let THIS tab's
+  // own cleanup effect above — gated on ITS OWN confirmed `isActivated` —
+  // be what actually drops the waiver once it lands.
+  useEffect(() => {
+    const onStorage = () => {
+      setGateWaived((previous) => {
+        const next = waivedGateSteps(scope);
+        const isRemoval = previous.some((step) => !next.includes(step));
+        if (isRemoval) {
+          void activationGate.refresh();
+          return previous;
+        }
+        return next;
+      });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+    // `activationGate.refresh` (not the whole `activationGate` object) is the
+    // dependency: `useActivationGate` returns a fresh object literal every
+    // render, so depending on the object itself would tear down and re-add
+    // this listener on every AppShell render regardless of whether anything
+    // it actually reads (`scope`, `refresh`) changed — the same reason the
+    // cleanup effect above depends on `activationGate.status?.isActivated`
+    // rather than `activationGate.status`. `refresh` (`load`) is itself
+    // `useCallback`-memoized on `[client, company]`, so this is stable across
+    // ordinary renders.
+  }, [scope, activationGate.refresh]);
 
   const refreshTaskStatuses = useCallback(async () => {
     const read = ++taskStatusRead.current;
@@ -3192,6 +3318,7 @@ export function AppShell({
       skippedThisSession: gateSkipped,
       isAdmin: isGateAdmin,
       retrying: activationGate.retrying,
+      waived: gateWaived,
     })
   ) {
     // A durable read failure must not read as a hang. `stuck` means three
@@ -3258,6 +3385,7 @@ export function AppShell({
       setupOpen,
       skippedThisSession: gateSkipped,
       isAdmin: isGateAdmin,
+      waived: gateWaived,
     }) &&
     // Narrows `status` for the render below — `shouldShowOnboardingGate`
     // already guarantees this is non-null whenever it returns `true`, but
@@ -3272,8 +3400,11 @@ export function AppShell({
           company={company}
           status={activationGate.status}
           currentName={feed.status.name}
+          waived={gateWaived}
           onRefresh={activationGate.refresh}
           onSkip={skipGate}
+          onLeave={leaveGateFor}
+          onWaiveStep={waiveGateStep}
         />
       </ConsoleProvider>
     );

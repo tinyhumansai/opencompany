@@ -10,6 +10,33 @@
 
 import type { ActivationStatus } from "@/api/activation";
 import { ApiError } from "@/api/types";
+import type { GateStepId } from "@/onboarding/state";
+
+/**
+ * The steps still standing between this company and a finished funnel: those
+ * the host reports incomplete AND the founder has not durably waived.
+ *
+ * Split out because both predicates below need the same answer and a second
+ * transcription of "which steps count" is exactly the kind of drift the rest of
+ * this module exists to prevent.
+ *
+ * A waiver is only ever consulted for a step the host reports *incomplete* — a
+ * step that actually completed needs no waiver, and a stale waiver must never
+ * be able to mask a step going incomplete again later.
+ */
+export function outstandingGateSteps(
+  status: ActivationStatus,
+  waived: readonly GateStepId[],
+): GateStepId[] {
+  const done: Record<GateStepId, boolean> = {
+    name: status.nameConfirmed,
+    integration: status.integrationConnected,
+    workflow: status.workflowRunSucceeded,
+  };
+  return (["name", "integration", "workflow"] as const).filter(
+    (id) => !done[id] && !waived.includes(id),
+  );
+}
 
 export interface GateDecisionInput {
   /** The funnel's last successful read, or `null` before the first one lands. */
@@ -43,6 +70,17 @@ export interface GateDecisionInput {
    * anything of.
    */
   isAdmin: boolean | null;
+  /**
+   * Steps the founder has durably waived — "there is nothing more I can do
+   * about this one on this build" (bugs B-001/B-020; see
+   * `onboarding/state.ts`'s waiver half for why this is `localStorage` while
+   * "skip for now" is `sessionStorage`).
+   *
+   * Optional so every existing caller and test keeps compiling with the
+   * pre-waiver meaning — an omitted list is "nothing waived", which is exactly
+   * the old behaviour.
+   */
+  waived?: readonly GateStepId[];
 }
 
 /**
@@ -78,7 +116,21 @@ export function shouldShowOnboardingGate(input: GateDecisionInput): boolean {
   // rather than this ever flashing open for a member who cannot clear it.
   if (input.isAdmin === null || !input.isAdmin) return false;
 
-  return !input.status.isActivated;
+  if (input.status.isActivated) return false;
+
+  // Bugs B-001/B-020: the funnel is incomplete, but every step still
+  // outstanding has been answered as far as this build allows. Blocking here is
+  // what made the gate permanent for a self-hosted founder — step 2 cannot read
+  // true without a Composio credential this build offers no way to obtain, so
+  // "wait until all three complete" was a condition that could never be met and
+  // the session-scoped skip re-asked it on every new tab, forever.
+  //
+  // Deliberately NOT folded into `isActivated`: the host's latch is the host's
+  // to set, and a waiver is a local acknowledgement rather than a claim that
+  // the step is done. The console stops *blocking* on it; nothing here tells
+  // the host the funnel completed, and `shouldPollActivation` keeps running so
+  // a step that later genuinely completes is still noticed and latched.
+  return outstandingGateSteps(input.status, input.waived ?? []).length > 0;
 }
 
 /**
@@ -211,6 +263,13 @@ export function shouldHoldShellPending(
   // make the gate appear — nothing left to hold for, `isAdmin` resolved or
   // not.
   if (input.status.isActivated) return false;
+
+  // Every outstanding step has been durably waived, so `shouldShowOnboardingGate`
+  // already answers "no gate" regardless of what the role read does next
+  // (bugs B-001/B-020). Holding the shell for a role that cannot change the
+  // outcome would put a founder who has answered everything they can back on a
+  // loader on every fresh tab — a quieter version of the same trap.
+  if (outstandingGateSteps(input.status, input.waived ?? []).length === 0) return false;
 
   // The company is not (yet) activated and the admin role is still
   // unresolved: `shouldShowOnboardingGate` cannot rule the gate in or out
