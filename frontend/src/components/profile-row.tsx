@@ -6,10 +6,11 @@
 // the place every other app puts that, and opening the one form that changes it.
 
 import { useCallback, useEffect, useState } from "react";
+import { LogOut, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
 import type { OpenCompanyClient } from "@/api/client";
-import { me as fetchMe, updateMe, type Me } from "@/api/auth";
+import { logout, me as fetchMe, updateMe, type Me } from "@/api/auth";
 import { AvatarPicker } from "@/components/avatar-picker";
 import { TeammateAvatar } from "@/components/teammate-avatar";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
@@ -33,9 +43,17 @@ export function ProfileRow({
   client,
   company,
   variant = "sidebar",
+  onSignedOut,
 }: {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * What to do once the host has revoked this session.
+   *
+   * Omitted where nothing owns the connection's state, in which case the menu
+   * offers no sign-out rather than one that ends nowhere.
+   */
+  onSignedOut?: () => void;
   /**
    * Which chrome this is drawn in.
    *
@@ -51,6 +69,7 @@ export function ProfileRow({
 }) {
   const [me, setMe] = useState<Me | null>(null);
   const [open, setOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -107,36 +126,78 @@ export function ProfileRow({
     />
   );
 
+  // The host is the authority on whether the session ended, so the console is
+  // told nothing until it answers. A failed revocation leaves every bit of
+  // state alone and says so: dropping to a login screen over a session that is
+  // still live is the one outcome worse than a sign-out that visibly failed.
+  async function signOut() {
+    setSigningOut(true);
+    try {
+      await logout(client, company);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Couldn't sign you out. You're still signed in.",
+      );
+      return;
+    } finally {
+      setSigningOut(false);
+    }
+    setOpen(false);
+    onSignedOut?.();
+  }
+
+  const menu = (
+    <DropdownMenuContent align="end" data-testid="profile-menu">
+      <DropdownMenuGroup>
+        {/* Which account this menu would sign out, for the shared machine the
+            control exists for. */}
+        <DropdownMenuLabel className="max-w-56 truncate font-normal text-muted-foreground">
+          {me.email}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => setOpen(true)} data-testid="profile-open">
+          <UserRound className="mr-2 size-4" />
+          Your profile
+        </DropdownMenuItem>
+        {onSignedOut && (
+          <DropdownMenuItem
+            disabled={signingOut}
+            onClick={() => void signOut()}
+            data-testid="profile-sign-out"
+          >
+            <LogOut className="mr-2 size-4" />
+            {signingOut ? "Signing out…" : "Sign out"}
+          </DropdownMenuItem>
+        )}
+      </DropdownMenuGroup>
+    </DropdownMenuContent>
+  );
+
   if (variant === "titlebar") {
     return (
       <>
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          data-testid="profile-row"
-          // Native `title` rather than the sidebar's tooltip component, which
-          // only renders while the rail is collapsed and needs the sidebar
-          // context to know it. This control is not in the rail any more.
-          title={name}
-          // Capped so a long display name cannot push the switcher off the
-          // other end of a narrow window; it truncates instead, exactly as it
-          // did in the column.
-          aria-label={name}
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            data-testid="profile-row"
+            // Native `title` rather than the sidebar's tooltip component, which
+            // only renders while the rail is collapsed and needs the sidebar
+            // context to know it. This control is not in the rail any more.
+            title={name}
+            aria-label={name}
             // The avatar alone. A title row is chrome, and the operator's own
             // name is the one label they never need read back to them — it cost
             // horizontal space at every window width to say something they
             // already know. `title` and `aria-label` keep it reachable by
             // pointer and by screen reader, so only the pixels are lost.
-            // A ring at rest, not only on hover. Stripped to the avatar alone
+            // A ring at rest, not only on hover: stripped to the avatar alone
             // the control had no edge of its own, so it read as a decorative
-            // mark sitting on the chrome rather than something clickable — the
-            // page's own rule is that what is interactive should look
-            // interactive. The border is the quietest thing that says so, and
-            // it firms up on hover rather than appearing from nothing.
+            // mark rather than something clickable.
             className="flex items-center rounded-full border border-sidebar-border bg-sidebar/60 p-0.5 transition hover:border-sidebar-accent-foreground/30 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-        >
-          {face}
-        </button>
+          >
+            {face}
+          </DropdownMenuTrigger>
+          {menu}
+        </DropdownMenu>
         {dialog}
       </>
     );
@@ -145,14 +206,16 @@ export function ProfileRow({
   return (
     <SidebarMenu>
       <SidebarMenuItem>
-        <SidebarMenuButton
-          tooltip={name}
-          onClick={() => setOpen(true)}
-          data-testid="profile-row"
-        >
-          {face}
-          <span className="truncate">{name}</span>
-        </SidebarMenuButton>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={<SidebarMenuButton tooltip={name} />}
+            data-testid="profile-row"
+          >
+            {face}
+            <span className="truncate">{name}</span>
+          </DropdownMenuTrigger>
+          {menu}
+        </DropdownMenu>
       </SidebarMenuItem>
       {dialog}
     </SidebarMenu>

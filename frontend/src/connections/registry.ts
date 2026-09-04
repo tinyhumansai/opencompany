@@ -683,6 +683,19 @@ export function unpairConnection(id: ConnectionId): void {
 }
 
 /**
+ * Records that the host has revoked this connection's session.
+ *
+ * Call only once the host has answered the revocation, never optimistically.
+ * Drops the client-held credential too: a `session` or `device` connection
+ * carries its own token, which would otherwise be re-presented on the next
+ * load.
+ */
+export function signedOut(id: ConnectionId): void {
+  adoptCredential(id, { kind: "cookie" });
+  patch(id, { status: "unauthenticated" });
+}
+
+/**
  * Records the session a cross-origin sign-in just returned.
  *
  * Called with the `session` from a {@link SignIn}, and it must be called or the

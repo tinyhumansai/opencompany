@@ -169,12 +169,18 @@ describe("the sidebar identity while the operator changes company", () => {
     const { client, patches } = host();
     await show(client, "alpha");
 
-    // Open the profile dialog. The dialog renders through a portal, so its
-    // controls live under `document.body`, not the mount container.
+    // Open the account menu, then the profile dialog from it. Both render
+    // through a portal, so their controls live under `document.body`, not the
+    // mount container.
     const row = container.querySelector('[data-testid="profile-row"]');
     expect(row).toBeTruthy();
     await act(async () => {
       (row as HTMLElement).click();
+    });
+    const openProfile = document.body.querySelector('[data-testid="profile-open"]');
+    expect(openProfile).toBeTruthy();
+    await act(async () => {
+      (openProfile as HTMLElement).click();
     });
 
     // Save with no edits at all. The name in the box equals the stored
