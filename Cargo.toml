@@ -327,7 +327,7 @@ getrandom = "0.4"
 # system libs, no network. `default-features = false` + "alloc"/"password-hash"
 # drops argon2's own RNG feature — salts come from the crate's TokenSource seam
 # instead, so there is one source of randomness rather than two.
-argon2 = { version = "0.5", default-features = false, features = [
+argon2 = { version = "0.6", default-features = false, features = [
     "alloc",
     "password-hash",
 ] }
