@@ -2697,6 +2697,14 @@ async fn accept_chat_turn(
     // message that points at a file this company does not have.
     let attachments = resolve_attachments(runtime, id, &message.attachments).await?;
 
+    // Both halves of one resolution: who this message reached, and every
+    // `@name` that reached more than one thing and therefore reached nobody
+    // (B-101). The second half is reported below, after the message is
+    // journaled, so the notice can never precede the line it is about.
+    let resolved = runtime
+        .resolve_mentions_reporting(&message.text, message.mentions.clone(), by)
+        .await;
+
     let message_event = CompanyEvent::OperatorMessage {
         text: message.text.clone(),
         by: by.cloned(),
@@ -2716,9 +2724,7 @@ async fn accept_chat_turn(
         // routing decision that follows read the same list. The picker's answer
         // when it sent one, extraction from the text when it did not — and
         // either way re-validated against the live roster.
-        mentions: runtime
-            .resolve_mentions(&message.text, message.mentions.clone(), by)
-            .await,
+        mentions: resolved.mentions.clone(),
         // Issue #1682: the store-resolved references, so the durable record
         // carries the name/mime/size the store computed and never the client's
         // claim. Empty on a message with no attachment, which skips the field.
@@ -2749,6 +2755,15 @@ async fn accept_chat_turn(
             .notify_mentions(id, mentions, &message_seq, by, desk)
             .await;
     }
+
+    // The other half of the same resolution (B-101): every `@name` that reached
+    // two things and therefore reached nobody. Posted after the message's own
+    // append so the notice can never sort above the line it is about, and on
+    // the same not-fatal terms as the notifications above — a message whose
+    // advisory could not be written is still a delivered message.
+    runtime
+        .post_mention_ambiguity_note(desk, parent, &resolved.ambiguous)
+        .await;
 
     let turn_id = crate::ports::generate_id();
     let turn_id = match runtime

@@ -40,6 +40,7 @@ import {
   fromHistory,
   isGeneralChannel,
   makeMessage,
+  markSendFailed,
   reconcileIds,
   replyVoice,
   toHostMessageId,
@@ -191,7 +192,18 @@ interface Props {
   resolveTypingNames?: (chatId: string, parentId?: string) => string[];
   /** Called as a composer is typed in; the caller throttles. */
   onTyping?: (chatId: string, parentId?: string) => void;
-  onSendEnd?: (threadId: string, gen?: number) => void;
+  /**
+   * `responseTexts` is every reply line this settled POST's own body carried
+   * (issue #101 review, PR #2052) — what `PendingSyncPosts.ended` needs to
+   * tell a held **system**-attributed live frame (never the operator's own
+   * reply, which is always in the response) apart from one the response never
+   * carried: a `system_notice` fallback (approval overflow, "Acknowledged.")
+   * is folded into this same response body, but B-101's mention-ambiguity
+   * note deliberately never is. Without it, either every held system frame
+   * had to be discarded (silently losing the ambiguity note) or none did
+   * (double-rendering the ones the response does carry).
+   */
+  onSendEnd?: (threadId: string, gen?: number, responseTexts?: readonly string[]) => void;
   /**
    * The host accepted the turn and answered `202` instead of the reply
    * (issue #983). Distinct from `onSendEnd`, which says the turn is *over*:
@@ -888,43 +900,46 @@ export function ChatView({
     });
   }, [client, company]);
 
-  /**
-   * Re-entering Chat with no channel in the hash returns the operator to the
-   * one they were last reading (issue #412).
-   *
-   * Leaving Chat drops the hash's second segment, so coming back used to fall
-   * straight through to `firstChannel` — which is not memory, it is whichever
-   * channel sorts first, and it cost a re-navigation on every trip.
-   *
-   * The remembered id is written into the **hash**, not held here, for three
-   * reasons: the channel on screen stays shareable, it survives a reload, and a
-   * remembered channel that has since been removed then falls through the exact
-   * same stale-id path as a bad deep link — so it raises the unknown-channel
-   * notice from issue #370 rather than needing a second one, and lands on the
-   * fallback visibly rather than silently. The `onChannelViewed` report for
-   * whatever it fell back to re-remembers that instead, so a vanished channel
-   * corrects itself after one visit.
-   *
-   * A hash that already names a channel is a deep link and always outranks
-   * memory; this only runs when there is nothing to override. The ref makes it
-   * one attempt per bare-hash entry, so it can never fight a navigation.
-   */
+  /** One attempt per bare-hash entry; see the effect below `channel`, which
+   * is the single owner of what a bare `#/chat` resolves to. */
   const restoredFor = useRef<string | null | undefined>(undefined);
-  useEffect(() => {
-    if (sub) {
-      // A channel is named, so the next bare `#/chat` is a fresh re-entry.
-      restoredFor.current = undefined;
-      return;
-    }
-    // Scoped like `readLastChannel(scope)`: two connections serving the same
-    // company must each restore their own remembered channel, so a host switch
-    // cannot be mistaken for a re-entry into the previous host's state.
-    const scopeKey = `${scope.connection}::${scope.company ?? "single"}`;
-    if (restoredFor.current === scopeKey) return;
-    restoredFor.current = scopeKey;
-    const remembered = readLastChannel(scope);
-    if (remembered) onNavigate(remembered);
-  }, [company, scope, sub, onNavigate]);
+
+  /**
+   * What a failed send needs to be sent again (B-099), by the optimistic id of
+   * the row it failed on.
+   *
+   * A ref, not state: nothing rendered depends on it — `message.sendFailed` is
+   * what draws the row — and a re-render per failed send would be a re-render
+   * for a value only a click ever reads.
+   *
+   * It is deliberately not stored on the `ChatMessage`. Two of these five
+   * fields are not on the bubble and cannot be recovered from it: the wire
+   * `mentions` carry a target the rendered chip does not, and an `attachment`
+   * is a workspace node reference rather than the projection the row shows. A
+   * Retry rebuilt from the rendered message would quietly send a *different*
+   * message — chip-less, or without its file — which is a worse failure than
+   * the one being fixed.
+   *
+   * Declared **here**, beside the other long-lived refs, rather than beside
+   * `retrySend` where it is read: three early returns sit between the two
+   * (`desksError`, `!desks`, `!channel`), and a hook below them runs on some
+   * renders and not others. That is React error 310 — a blank console with no
+   * composer at all, on exactly the first paint, where `desks` is still `null`.
+   * Every hook in this component belongs above those returns.
+   */
+  const failedSends = useRef<
+    Map<
+      string,
+      {
+        target: string;
+        text: string;
+        intent?: MessageIntent;
+        parentId?: string;
+        attachments?: AttachmentDto[];
+        mentions?: Mention[];
+      }
+    >
+  >(new Map());
 
   // No channels exist until the host has answered. Resolving against a
   // half-built list is exactly the first-paint swap issue #370 describes.
@@ -1005,6 +1020,66 @@ export function ChatView({
       directMessageForId(members, generalSub ?? resolvedSub ?? decodedSub) ??
       firstChannel(sections))
     : null;
+
+  /**
+   * A bare `#/chat` is resolved **into the hash**, so which conversation is open
+   * is routed state rather than derived state (B-096).
+   *
+   * Two facts made a draft escape into somebody else's DM. The first is that a
+   * bare hash never named a channel: the magic-link landing route puts the
+   * console on `#/chat` with no second segment, `useHashView` canonicalises the
+   * *view* and knows nothing about chat's channels, and nothing else wrote one —
+   * so `channel` above stayed the value of an expression over `members`,
+   * `desks`, `transcripts` and `operator`, every one of which lands
+   * asynchronously and can re-order what `firstChannel` answers. The second is
+   * that the composer is deliberately ONE instance shared by every channel, and
+   * its draft deliberately survives a channel change (see `MessageComposer`'s
+   * `suppressed` doc, PR #1984) — so when the derived channel moved, the
+   * half-written message moved with it and `send` addressed whatever `channel`
+   * had become. The founder watched a message they wrote in `#general` post into
+   * a private DM with a teammate.
+   *
+   * Keeping a draft across a switch is right and stays. What is wrong is a
+   * conversation that can change with no navigation behind it, so this closes
+   * the gap at that end: the moment there is a channel to name, its id goes in
+   * the hash, and from then on `decodedSub` pins it. A deep link outranks
+   * everything (`sub` short-circuits), so this can never fight one.
+   *
+   * It also subsumes issue #412's restore, which used to be its own effect
+   * above. That is not a merge of convenience — two effects both writing the
+   * hash for a bare entry raced, and the loser silently won: memory would
+   * navigate to the remembered channel and the normaliser would immediately
+   * replace it with `firstChannel`. One effect, one decision, memory first.
+   *
+   * `restoredFor` keeps this to one attempt per bare-hash entry per scope, so a
+   * remembered channel the operator then navigates away from is not yanked back;
+   * `sub` becoming truthy re-arms it for the next re-entry. The `!channel` guard
+   * sits BEFORE the ref is stamped, so an entry that arrives before `/desks` has
+   * answered waits for a real channel instead of burning its one attempt on
+   * nothing.
+   */
+  useEffect(() => {
+    if (sub) {
+      // A channel is named, so the next bare `#/chat` is a fresh re-entry.
+      restoredFor.current = undefined;
+      return;
+    }
+    // Nothing to normalise *to* yet. `channel` is null until `/desks` answers.
+    if (!channel) return;
+    // Scoped like `readLastChannel(scope)`: two connections serving the same
+    // company must each restore their own remembered channel, so a host switch
+    // cannot be mistaken for a re-entry into the previous host's state.
+    const scopeKey = `${scope.connection}::${scope.company ?? "single"}`;
+    if (restoredFor.current === scopeKey) return;
+    restoredFor.current = scopeKey;
+    // Memory outranks the fallback, and is written into the hash rather than
+    // held here (issue #412): the channel on screen stays shareable, survives a
+    // reload, and a remembered channel that has since been removed falls through
+    // the same stale-id path as a bad deep link — raising issue #370's
+    // unknown-channel notice rather than landing somewhere else in silence.
+    onNavigate(readLastChannel(scope) ?? channel.id);
+  }, [scope, sub, channel, onNavigate]);
+
   /**
    * The hash named a channel this company doesn't have, and the first-channel
    * fallback answered instead.
@@ -1590,6 +1665,38 @@ export function ChatView({
   const append = (channelId: string, ...added: ChatMessage[]) =>
     setTranscripts((t) => ({ ...t, [channelId]: [...(t[channelId] ?? []), ...added] }));
 
+
+  /**
+   * Send a failed line again (B-099).
+   *
+   * The failed row is dropped first, because `send` appends its own optimistic
+   * bubble: keeping both would show the operator their message twice, one of
+   * them a corpse. Its retry payload goes with it, so a Retry cannot be
+   * replayed twice from one click; a second failure re-registers a fresh one
+   * under the new row's id.
+   *
+   * Nothing is retried automatically. A throw is ambiguous — the host may have
+   * journaled the message before the request died (see `send`'s doc) — so an
+   * automatic resend would risk posting the same instruction twice. Whether
+   * that is worth it is the operator's call, which is exactly what a button is.
+   */
+  const retrySend = (messageId: string) => {
+    // `send` itself no-ops while a POST is already in flight (`if (sending)
+    // return false`). Checked here too, before the payload and failed row are
+    // consumed, because otherwise a Retry clicked mid-send would drop both —
+    // silently losing the only copy of the retry (CodeRabbit review) — and
+    // `send`'s own guard would have nothing left to return `false` about.
+    if (sending) return;
+    const payload = failedSends.current.get(messageId);
+    if (!payload) return;
+    failedSends.current.delete(messageId);
+    setTranscripts((t) => ({
+      ...t,
+      [payload.target]: (t[payload.target] ?? []).filter((m) => m.id !== messageId),
+    }));
+    void send(payload.text, payload.intent, payload.parentId, payload.attachments, payload.mentions);
+  };
+
   /**
    * Post a line and thread the company's answer back into the same place.
    * `parentId` set means the exchange stays inside the thread panel.
@@ -1693,15 +1800,33 @@ export function ChatView({
     // cross-company-reused) thread id — see `shouldClearReceipt`.
     // Armed under the same key the reload leg folds runs into, or the two
     // legs describe the same turn under two names and the indicator that
-    // survives a reload is not the one the POST armed. Unthreaded sends key at
-    // the channel exactly as before — `turnStateKey` returns `chatId` for them.
-    // Derived from `openThreadId`, not from `parentId`. A review reply is
-    // anchored to a *reply* (`threadReviewAnchor.anchorId`), not to the thread
-    // root, so keying on the parent would arm a key the panel's own lookup —
-    // which keys on the open thread — could never match. `parentId` stays what
-    // it was: the host's `parent`, for `client.chat` alone.
+    // survives a reload is not the one the POST armed.
+    //
+    // **Unthreaded (`parentId` unset) always keys the channel outright** —
+    // `turnStateKey(chatId)` with no root — regardless of what thread happens
+    // to be open in the panel beside it. The channel composer always sends
+    // `parentId: undefined`, and the channel row's own Retry button lives on
+    // that same top-level transcript, so both a fresh top-level send and a
+    // top-level failure's Retry can fire while an *unrelated* thread in this
+    // channel is open in the panel (`openThreadId` naming that other thread's
+    // root). Keying on `openThreadId` there used to mis-file the whole send —
+    // its receipt and open-turn recovery registered under a thread it never
+    // touched, so the panel showed work it did not start while the channel
+    // that actually ran it showed nothing (codex P2, PR #2052 review). A
+    // threaded retry cannot hit this: its Retry button only renders inside
+    // the thread panel for the thread it belongs to, so `openThreadId`
+    // already names that same thread whenever it is clickable.
+    //
+    // **Threaded (`parentId` set) still keys off `openThreadId`, not
+    // `parentId` itself.** A review reply is anchored to a *reply*
+    // (`threadReviewAnchor.anchorId`), not to the thread root, so keying on
+    // the parent would arm a key the panel's own lookup — which keys on the
+    // open thread — could never match. `parentId` stays what it was: the
+    // host's `parent`, for `client.chat` alone.
     const stateKey = chatId
-      ? turnStateKey(chatId, threadRootOf(openThreadId ?? undefined))
+      ? parentId === undefined
+        ? turnStateKey(chatId)
+        : turnStateKey(chatId, threadRootOf(openThreadId ?? undefined))
       : undefined;
     const gen = stateKey ? onSendStart?.(stateKey) : undefined;
     // Which of the POST's three outcomes actually happened, decided here and
@@ -1711,6 +1836,11 @@ export function ChatView({
     // working row down mid-turn (detached) or throw away the reply it was
     // holding (failed). See `PendingSyncPosts` for the table.
     let outcome: "resolved" | "detached" | "failed" | "stale" = "resolved";
+    // Every reply line a settled response actually carries, read by
+    // `onSendEnd` (issue #101 review) to tell a held system frame the
+    // response duplicates from one it never will. Declared here, not inside
+    // the `try` block that fills it in, so `finally` below can still see it.
+    let responseTexts: string[] = [];
     try {
       const answer = await client.chat(
         text,
@@ -1774,6 +1904,22 @@ export function ChatView({
         return true;
       }
       const reply = answer;
+      // What `onSendEnd` hands `PendingSyncPosts.ended`, unconditionally —
+      // even the `(no reply)` / review-feedback branches count as "this
+      // response carried nothing", which is exactly what an empty array
+      // already says correctly.
+      responseTexts = reply.responses.map((r) => r.text);
+      // Fired here, BEFORE `append` below, and not from the `finally` block
+      // this used to run from (Codex review, PR #2052). `onSendEnd` releases
+      // any held system frame the response above didn't carry — B-101's
+      // mention-ambiguity note, always journaled on the host *before* the
+      // reply it is about. Releasing it after `append` would render the
+      // reply first and the note second, the reverse of `chat/history`'s own
+      // order, so the note visibly jumps backward past the answer on the
+      // very next reload. Firing it here instead keeps the live order and
+      // the durable order the same. `finally` below no longer fires it for
+      // the `"resolved"` case this is the only path that reaches.
+      if (stateKey) onSendEnd?.(stateKey, gen, responseTexts);
       const replies = reply.responses.length
         ? reply.responses.map((r) =>
             // Same rule as the live path and `fromHistory`: a host-authored
@@ -1852,10 +1998,34 @@ export function ChatView({
       // Still said, even when the reply arrives on the stream a moment later:
       // the request did fail, and an operator not told that has no way to know
       // whether their message was taken at all. The two facts are not in
-      // competition — this line reports the request, the shell renders whatever
-      // the turn goes on to produce.
+      // competition — this marks the request, the shell renders whatever the
+      // turn goes on to produce.
+      //
+      // Marked ON the message rather than appended beside it (B-099). The old
+      // sibling `system` line left the bubble itself indistinguishable from a
+      // delivered one — same avatar, same timestamp, no warning of any kind —
+      // so scrolling away, or a message long enough to push the note off
+      // screen, left something that reads as sent and was not. `sendFailed` is
+      // a field of the row, so no renderer can draw the bubble without it, and
+      // the row can carry its own Retry.
       const msg = err instanceof ApiError ? err.message : "something went wrong";
-      append(target, makeMessage("system", `Couldn't send — ${msg}`, { parentId }));
+      setTranscripts((t) => ({
+        ...t,
+        [target]: markSendFailed(t[target] ?? [], local.id, msg),
+      }));
+      // What Retry needs to send this line again, kept off the message: the
+      // wire `mentions` carry targets the rendered chips do not, and an
+      // attachment is a node reference rather than the projection on the
+      // bubble. Keyed by the optimistic id, which is the id the failed row
+      // still has — a throw never reaches the `reconcileIds` above it.
+      failedSends.current.set(local.id, {
+        target,
+        text,
+        intent,
+        parentId,
+        attachments,
+        mentions,
+      });
       // Ambiguous, not a confirmed non-send — see this function's doc comment.
       return undefined;
     } finally {
@@ -1870,10 +2040,12 @@ export function ChatView({
       // carries on regardless, so the frame it holds is the only copy of the
       // answer. Routing the throw here is the drop this whole change removes,
       // put back on the one path the feature exists for.
-      if (stateKey) {
-        if (outcome === "resolved") onSendEnd?.(stateKey, gen);
-        else if (outcome === "failed") onSendFailed?.(stateKey, gen);
-      }
+      //
+      // The `"resolved"` case no longer fires `onSendEnd` from here (issue
+      // #101 review, PR #2052) — it fires earlier, in the try block, before
+      // `append` renders the response's own replies. See that call site's
+      // comment for why the order matters. This block still owns `"failed"`.
+      if (stateKey && outcome === "failed") onSendFailed?.(stateKey, gen);
       setSending(false);
     }
   }
@@ -2336,6 +2508,7 @@ export function ChatView({
               reviewingCardIds={reviewingCardIds}
               resolveAttachmentUrl={resolveAttachmentUrl}
               taskStatusByTaskId={taskStatusByTaskId}
+              onRetrySend={retrySend}
               onStartBrief={() =>
                 setComposerPrefill((current) => ({
                   text: FIRST_TEAM_BRIEF,
@@ -2620,6 +2793,7 @@ export function ChatView({
               typingNames={resolveTypingNames?.(active.id, parent.id) ?? []}
               openTurn={threadTurn}
               onTyping={() => onTyping?.(active.id, parent.id)}
+              onRetrySend={retrySend}
               // A thread is not a lesser transcript (issue #1734): an echoed
               // reply read here is the same false attribution as one read in
               // the channel, so the panel marks its rows from the same state.

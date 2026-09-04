@@ -4343,14 +4343,28 @@ impl CompanyRuntime {
     }
 
     /// Whether `parent` is the relay bubble `pill` actually produced: the
-    /// first `AgentReply` (`task_id: None`) posted to `desk` after `pill`,
-    /// with no other settle pill for `desk` interleaved.
+    /// first non-advisory `AgentReply` (`task_id: None`) posted to `desk`
+    /// after `pill`, with no other settle pill for `desk` interleaved.
     ///
     /// Without this check, any later ordinary chat turn in the same desk —
     /// also an `AgentReply` with `task_id: None` — would satisfy the "reply
     /// targets the relay bubble" test just by being the nearest one before
     /// whatever the operator replied to, silently turning a normal reply into
     /// review feedback on a card the operator never looked at.
+    ///
+    /// **Skips `SYSTEM_AUTHOR` replies** — the B-101 mention-ambiguity
+    /// advisory ([`Self::post_mention_ambiguity_note`]) also journals as an
+    /// `AgentReply` with `task_id: None` in the same desk. A dispatch can
+    /// append its `DeskTaskCompleted` and not yet reach
+    /// `journal_dispatch_replies`, leaving a window in which another accepted
+    /// chat's ambiguous `@name` interleaves that advisory between the pill
+    /// and the genuine relay. Before this guard the advisory — not the relay —
+    /// was "the first `AgentReply` after `pill`", so the scan returned
+    /// `Ok(false)` for the real relay's own reply and a review pass silently
+    /// ran as an ordinary chat turn instead (codex P2, PR #2052 fresh review
+    /// round). The advisory can never itself be the relay bubble a review
+    /// reply anchors to — nothing dispatches review feedback on a runtime
+    /// notice — so skipping it here costs nothing a real relay could need.
     ///
     /// Pages forward past [`RELAY_SCAN_PAGE`] rather than giving up at one
     /// page, for the same company-wide-log reason as [`settle_pill_before`].
@@ -4385,18 +4399,21 @@ impl CompanyRuntime {
                     CompanyEvent::AgentReply {
                         task_id: None,
                         chat_id,
+                        agent_id,
                         ..
-                    } if crate::server::chat_history::same_conversation(
-                        Some(chat_id.as_str()),
-                        Some(desk),
-                    ) =>
+                    } if agent_id != crate::ports::SYSTEM_AUTHOR
+                        && crate::server::chat_history::same_conversation(
+                            Some(chat_id.as_str()),
+                            Some(desk),
+                        ) =>
                     {
                         return Ok(seq == parent);
                     }
                     CompanyEvent::DeskTaskCompleted { origin_chat_id, .. }
-                        if origin_chat_id.as_deref().is_some_and(|origin| {
-                            crate::server::chat_history::same_conversation(Some(origin), Some(desk))
-                        }) =>
+                        if crate::server::chat_history::stamped_conversation_is(
+                            origin_chat_id.as_deref(),
+                            desk,
+                        ) =>
                     {
                         return Ok(false);
                     }
@@ -5746,6 +5763,16 @@ impl CompanyRuntime {
 
     /// The parked blockers pending in one DM, folded into root-cause groups
     /// (issue #1862). Oldest-first, the order `pending` already returns.
+    ///
+    /// Matched through
+    /// [`stamped_conversation_is`](crate::server::chat_history::stamped_conversation_is)
+    /// rather than `same_conversation`, so a blocker that names **no** thread is
+    /// pending in no conversation rather than in General. `park_blocker` always
+    /// stamps the sender's DM, but `cycle_conversation` hands back a thread-less
+    /// `ApprovalConversation` for every park that came from no conversation at
+    /// all — a planning pass, a scheduler tick, an unaddressed trigger — and
+    /// through `same_conversation` each of those read as pending in `#general`,
+    /// where the next top-level message was consumed as its answer.
     #[cfg(feature = "openhuman")]
     fn pending_blocker_groups(&self, desk: &str) -> Vec<PendingBlockerGroup> {
         let prefix = format!("{}.", crate::ports::blockers::BLOCKER_EFFECT_PREFIX);
@@ -5754,7 +5781,7 @@ impl CompanyRuntime {
             if !p.effect.kind.starts_with(&prefix) {
                 continue;
             }
-            if !crate::server::chat_history::same_conversation(p.thread.as_deref(), Some(desk)) {
+            if !crate::server::chat_history::stamped_conversation_is(p.thread.as_deref(), desk) {
                 continue;
             }
             let Ok(payload) = serde_json::from_value::<crate::ports::blockers::BlockerPayload>(
@@ -5818,10 +5845,10 @@ impl CompanyRuntime {
                 thread,
                 ..
             } if effect_kind.starts_with(&prefix)
-                && crate::server::chat_history::same_conversation(
-                    thread.as_deref(),
-                    Some(desk),
-                )
+                // Same rule as `pending_blocker_groups`: a card stamped with no
+                // thread was raised by no conversation, so no conversation's
+                // reply anchors to it — General included.
+                && crate::server::chat_history::stamped_conversation_is(thread.as_deref(), desk)
                 && self.is_blocker(&approval_id) =>
             {
                 Ok(Some(approval_id))
@@ -5992,6 +6019,68 @@ impl CompanyRuntime {
             )
             .await?;
         Ok(())
+    }
+
+    /// Says, in the conversation itself, that an `@name` reached more than one
+    /// thing and therefore reached nobody (B-101).
+    ///
+    /// Attributed to [`SYSTEM_AUTHOR`](crate::ports::SYSTEM_AUTHOR), which the
+    /// console renders as a centred system pill rather than as a teammate
+    /// speaking — the runtime is reporting its own refusal, and putting a
+    /// roster face on that would be a small lie about who decided.
+    ///
+    /// **Journaled, not returned in the POST response.** The response reaches
+    /// only the sender's own request, and this has to survive a reload and be
+    /// readable by anyone who later reads the channel — including the person
+    /// wondering why a reply is talking about them in the third person. It is
+    /// also what makes the notice reach an API poster, who never renders a chip
+    /// and for whom the old signal (a missing chip) did not exist at all.
+    ///
+    /// Never fatal: a message whose advisory line could not be appended is still
+    /// a delivered message, so a failure is logged and swallowed on exactly the
+    /// terms `resolve_mentions` already refuses to fail a send.
+    ///
+    /// Threaded the same way every real reply is: `parent` is the root the
+    /// caller resolved for the message this note is about, re-resolved here
+    /// through [`resolvable_parent`](Self::resolvable_parent) so a note about a
+    /// threaded reply lands in that thread rather than falling to the channel
+    /// timeline — the doc comment above promises "in the conversation itself",
+    /// and a thread is part of that conversation.
+    pub async fn post_mention_ambiguity_note(
+        &self,
+        desk: &str,
+        parent: Option<EventSeq>,
+        refused: &[crate::runtime::mentions::AmbiguousMention],
+    ) {
+        let Some(text) = crate::runtime::mentions::ambiguity_note(refused) else {
+            return;
+        };
+        let parent = self.resolvable_parent(parent, desk).await;
+        if let Err(err) = self
+            .events
+            .append(
+                &self.id,
+                CompanyEvent::AgentReply {
+                    parent,
+                    chat_id: desk.to_string(),
+                    agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
+                    text,
+                    steps: Vec::new(),
+                    task_id: None,
+                    mentions: Vec::new(),
+                    mention_depth: 0,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                company = %self.id,
+                desk = %desk,
+                error = %err,
+                "[mentions] an ambiguous @name could not be reported in the channel; the ping \
+                 still reached nobody and now nothing says so"
+            );
+        }
     }
 
     /// Captures a feedback item: persists it to the feedback family and logs a
@@ -6184,6 +6273,29 @@ impl CompanyRuntime {
         supplied: Option<Vec<Mention>>,
         sender: Option<&Actor>,
     ) -> Vec<Mention> {
+        self.resolve_mentions_reporting(text, supplied, sender)
+            .await
+            .mentions
+    }
+
+    /// [`resolve_mentions`](Self::resolve_mentions), also reporting every
+    /// `@name` that matched more than one thing and therefore matched nobody
+    /// (B-101).
+    ///
+    /// The refusal itself is correct and long-standing — see
+    /// [`crate::runtime::mentions`], never guess a ping — but it used to be
+    /// announced only by the *absence* of a chip. An absence is not a signal: it
+    /// is invisible in a wall of text and completely invisible over the API, so
+    /// a founder's `@Priya` reached neither the teammate nor the person of that
+    /// name, the channel's catch-all answered, and the reply talked about her in
+    /// the third person. Whoever refuses has to be the one who says so, which is
+    /// why this is here and not a second guess in the console.
+    pub async fn resolve_mentions_reporting(
+        &self,
+        text: &str,
+        supplied: Option<Vec<Mention>>,
+        sender: Option<&Actor>,
+    ) -> crate::runtime::mentions::Extraction {
         // Issue: on the operator-message path this runs BEFORE the journal
         // append (`mention_responder` reads the resolved mentions off the
         // journaled event, so the append cannot go first), which puts these
@@ -6195,7 +6307,7 @@ impl CompanyRuntime {
             tokio::join!(self.store.load(&self.id), self.users().list_users(&self.id));
         let record = match record {
             Ok(Some(record)) => record,
-            Ok(None) => return Vec::new(),
+            Ok(None) => return Default::default(),
             Err(err) => {
                 tracing::warn!(
                     company = %self.id,
@@ -6203,7 +6315,7 @@ impl CompanyRuntime {
                     "[mentions] the company record could not be read; this message is \
                      journaled with no mentions"
                 );
-                return Vec::new();
+                return Default::default();
             }
         };
         let mut users = user_list.unwrap_or_else(|err| {
@@ -6225,7 +6337,7 @@ impl CompanyRuntime {
         // otherwise resolve `@sam-2` to a different person than the one the
         // picker showed under that label.
         users.sort_by(|a, b| a.id.cmp(&b.id));
-        crate::runtime::mentions::resolve(text, supplied, sender, &record, &users)
+        crate::runtime::mentions::resolve_reporting(text, supplied, sender, &record, &users)
     }
 
     /// A status snapshot, loading the company record for name and lifecycle.
@@ -6643,6 +6755,7 @@ impl PendingBlockerGroup {
 
 /// What resolving a blocker reply does, decided before anything is written.
 #[cfg(feature = "openhuman")]
+#[derive(Debug)]
 pub(crate) enum BlockerReplyPlan {
     /// Not a verdict, or no blocker pending here — run an ordinary turn.
     NotBlocker,
@@ -9600,6 +9713,25 @@ mod tests {
             }
         }
 
+        /// The B-101 mention-ambiguity advisory
+        /// ([`CompanyRuntime::post_mention_ambiguity_note`]) — an `AgentReply`
+        /// with the identical `task_id: None` shape a relay bubble has, but
+        /// authored by [`crate::ports::SYSTEM_AUTHOR`] rather than a roster
+        /// agent. Used to seed the interleaving `is_relay_bubble_for` must not
+        /// be fooled by (codex P2, PR #2052 fresh review round).
+        fn advisory_bubble(origin: &str) -> CompanyEvent {
+            CompanyEvent::AgentReply {
+                chat_id: origin.to_string(),
+                agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
+                text: "@sam matches two people here, so it pinged nobody.".to_string(),
+                steps: Vec::new(),
+                task_id: None,
+                parent: None,
+                mentions: Vec::new(),
+                mention_depth: 0,
+            }
+        }
+
         async fn seed(runtime: &Arc<Runtime>, c: &TaskRecord) {
             runtime.tasks().upsert(runtime.id(), c).await.expect("seed");
         }
@@ -9709,6 +9841,57 @@ mod tests {
                 "replying to a later ordinary turn must run a normal turn, not \
                  re-open the earlier card just because the pill is still the \
                  nearest one before it"
+            );
+        }
+
+        /// PR #2052 fresh review round, codex P2: a dispatch that has appended
+        /// its `DeskTaskCompleted` but has not yet run
+        /// `journal_dispatch_replies` leaves a window in which another
+        /// accepted chat's ambiguous `@name` can interleave a same-desk B-101
+        /// advisory before the genuine relay lands. The advisory carries
+        /// `task_id: None` exactly like a relay bubble, so it must not be
+        /// mistaken for "the first `AgentReply` after the pill" — that would
+        /// make the real relay's own reply fail `seq == parent` and silently
+        /// run as an ordinary chat turn instead of review feedback.
+        #[tokio::test]
+        async fn the_resolver_skips_an_interleaved_ambiguity_advisory_to_find_the_real_relay() {
+            let (rt, _home) = runtime().await;
+            seed(&rt, &card("t-1", "strategy", COLUMN_IN_REVIEW)).await;
+            append(&rt, settle_pill("t-1", "strategy")).await;
+            // The advisory lands between the pill and the relay: exactly the
+            // interleaving window the finding describes.
+            append(&rt, advisory_bubble("strategy")).await;
+            let true_relay = append(&rt, relay_bubble("strategy")).await;
+
+            assert_eq!(
+                rt.review_feedback_target("strategy", true_relay)
+                    .await
+                    .unwrap()
+                    .map(|c| c.id),
+                Some("t-1".to_string()),
+                "the real relay must still anchor to its card past an \
+                 interleaved system advisory"
+            );
+        }
+
+        /// The negative half: a reply to the advisory itself is not a relay
+        /// bubble and must not anchor to the card either — only the genuine
+        /// relay does.
+        #[tokio::test]
+        async fn a_reply_to_the_advisory_itself_is_not_review_feedback() {
+            let (rt, _home) = runtime().await;
+            seed(&rt, &card("t-1", "strategy", COLUMN_IN_REVIEW)).await;
+            append(&rt, settle_pill("t-1", "strategy")).await;
+            let advisory = append(&rt, advisory_bubble("strategy")).await;
+            append(&rt, relay_bubble("strategy")).await;
+
+            assert!(
+                rt.review_feedback_target("strategy", advisory)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the advisory is not itself a relay bubble, so replying to it \
+                 must run an ordinary chat turn"
             );
         }
 
@@ -10064,6 +10247,176 @@ mod tests {
         );
     }
 
+    /// B-101: an `@name` that reaches two things reaches nobody — and the
+    /// conversation is told so, in the conversation.
+    mod ambiguous_mentions {
+        use crate::company::runtime::CompanyRuntime;
+        use crate::ports::types::{CompanyEvent, CompanyId, EventSeq};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        /// A company where one spelling reaches two different things: a roster
+        /// teammate `writer` and a desk `writer`. The reported case was a
+        /// teammate and a *person* sharing a name, which `mentions.rs` covers
+        /// directly; the collision is the same one and this needs no user store
+        /// to set up.
+        async fn runtime() -> (Arc<CompanyRuntime>, TempDir) {
+            let home = tempfile::Builder::new()
+                .prefix("opencompany-ambiguous-mentions-")
+                .tempdir()
+                .expect("tempdir");
+            let manifest: crate::company::CompanyManifest = toml::from_str(
+                "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+                 [[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n\
+                 [[agent]]\nid = \"writer\"\nrole = \"Writer\"\n\
+                 [[group_chat]]\nid = \"writer\"\nname = \"Writer desk\"\nmembers = [\"writer\"]\n",
+            )
+            .expect("manifest");
+            let runtime = Arc::new(
+                crate::runtime::RuntimeBuilder::new(home.path().to_path_buf(), manifest)
+                    .with_id(CompanyId::new("acme"))
+                    .build()
+                    .await
+                    .expect("runtime"),
+            );
+            (runtime, home)
+        }
+
+        /// Every `AgentReply` journaled so far, as `(agent, chat, text)`.
+        async fn replies(runtime: &Arc<CompanyRuntime>) -> Vec<(String, String, String)> {
+            runtime
+                .events
+                .read_from(runtime.id(), EventSeq::new(0), 500)
+                .await
+                .expect("events")
+                .into_iter()
+                .filter_map(|stored| match stored.event {
+                    CompanyEvent::AgentReply {
+                        agent_id,
+                        chat_id,
+                        text,
+                        ..
+                    } => Some((agent_id, chat_id, text)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The signal the founder never got: a positive line in the channel
+        /// saying the ping matched two things and reached neither. It is
+        /// attributed to the runtime itself, not to a teammate — the console
+        /// renders `SYSTEM_AUTHOR` as a centred system pill, and putting a
+        /// roster face on the runtime's own refusal would misstate who decided.
+        #[tokio::test]
+        async fn an_ambiguous_name_is_reported_in_the_channel_it_was_sent_to() {
+            let (runtime, _home) = runtime().await;
+            let resolved = runtime
+                .resolve_mentions_reporting("@writer can you draft the autumn brief?", None, None)
+                .await;
+            assert!(
+                resolved.mentions.is_empty(),
+                "the ping is still refused: {:?}",
+                resolved.mentions
+            );
+            assert_eq!(resolved.ambiguous.len(), 1, "and reported once");
+
+            runtime
+                .post_mention_ambiguity_note("main", None, &resolved.ambiguous)
+                .await;
+
+            let posted = replies(&runtime).await;
+            assert_eq!(posted.len(), 1, "exactly one line: {posted:?}");
+            let (agent, chat, text) = &posted[0];
+            assert_eq!(agent, crate::ports::SYSTEM_AUTHOR);
+            assert_eq!(chat, "main", "into the conversation it was sent to");
+            assert!(text.contains("@writer"), "names the literal typed: {text}");
+            assert!(
+                text.contains("pinged nobody"),
+                "states what happened: {text}"
+            );
+        }
+
+        /// The threaded case: an ambiguous `@name` sent as a reply inside a
+        /// thread must get its explanatory note posted into that same thread,
+        /// not top-level in the channel — otherwise the note contradicts its own
+        /// doc comment's promise to speak "in the conversation itself" the
+        /// moment the operator is looking at a thread rather than the main
+        /// timeline.
+        #[tokio::test]
+        async fn an_ambiguous_name_in_a_thread_is_reported_into_that_thread() {
+            let (runtime, _home) = runtime().await;
+
+            // Seed a root message to thread off of, the same way a real
+            // threaded reply would name an existing event as its parent.
+            let root = runtime
+                .events
+                .append(
+                    runtime.id(),
+                    CompanyEvent::OperatorMessage {
+                        text: "kicking off a thread".to_string(),
+                        by: None,
+                        chat: Some("main".to_string()),
+                        parent: None,
+                        deliverable: None,
+                        mentions: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                )
+                .await
+                .expect("root event");
+
+            let resolved = runtime
+                .resolve_mentions_reporting("@writer can you draft the autumn brief?", None, None)
+                .await;
+            assert_eq!(resolved.ambiguous.len(), 1, "reported once");
+
+            runtime
+                .post_mention_ambiguity_note("main", Some(root), &resolved.ambiguous)
+                .await;
+
+            let threaded = runtime
+                .events
+                .read_from(runtime.id(), EventSeq::new(0), 500)
+                .await
+                .expect("events")
+                .into_iter()
+                .filter_map(|stored| match stored.event {
+                    CompanyEvent::AgentReply {
+                        parent, chat_id, ..
+                    } => Some((parent, chat_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(threaded.len(), 1, "exactly one reply: {threaded:?}");
+            let (parent, chat) = &threaded[0];
+            assert_eq!(chat, "main");
+            assert_eq!(
+                *parent,
+                Some(root),
+                "the note lands in the thread the ambiguous ping was sent in, \
+                 not top-level in the channel"
+            );
+        }
+
+        /// The negative half, and the one that keeps the notice worth reading: a
+        /// message whose names all resolve says nothing at all.
+        #[tokio::test]
+        async fn an_unambiguous_message_posts_nothing() {
+            let (runtime, _home) = runtime().await;
+            let resolved = runtime
+                .resolve_mentions_reporting("@ceo can you take a look?", None, None)
+                .await;
+            assert_eq!(resolved.mentions.len(), 1, "the ping resolves");
+            runtime
+                .post_mention_ambiguity_note("main", None, &resolved.ambiguous)
+                .await;
+            assert!(
+                replies(&runtime).await.is_empty(),
+                "nothing is posted for a message that named somebody"
+            );
+        }
+    }
+
     /// Blocker DMs + reply attribution (issue #1862): a parked blocker surfaces
     /// in the responsible teammate's DM, groups by root cause, and an operator's
     /// reply routes back as a verdict.
@@ -10236,6 +10589,114 @@ mod tests {
                 runtime.pending_approvals().is_empty(),
                 "the verdict fanned to every card in the group"
             );
+        }
+
+        /// Parks a blocker the way a cycle that came from **no** conversation
+        /// does: `cycle_conversation` answers with a default
+        /// `ApprovalConversation`, so the journal row carries `thread: None`.
+        /// Every planning-pass park written before commit `26d558c92` has the
+        /// same shape, and those rows survive journal replay.
+        async fn park_thread_less_blocker(runtime: &Arc<CompanyRuntime>, task_id: &str) {
+            use crate::ports::types::{Effect, EffectGroup};
+            use crate::runtime::journal::{ApprovalConversation, TaskLink};
+
+            let payload = blocker(task_id, None);
+            let effect = Effect {
+                kind: payload.effect_kind(),
+                group: EffectGroup::Other,
+                amount_usd: None,
+                established_thread: false,
+                first_time_counterparty: false,
+                payload: serde_json::to_value(&payload).expect("payload"),
+                agent: None,
+                run_id: None,
+            };
+            let id = runtime
+                .approvals
+                .park(runtime.id(), effect.clone())
+                .await
+                .expect("parks");
+            runtime
+                .journal
+                .record_parked(
+                    &id,
+                    &effect,
+                    super::super::now_millis(),
+                    TaskLink::from_task_id(Some(task_id)),
+                    ApprovalConversation::default(),
+                    None,
+                )
+                .await
+                .expect("journals");
+        }
+
+        /// A blocker that names no conversation is pending in **no**
+        /// conversation — `#general` least of all.
+        ///
+        /// The bug (B-059): `pending_blocker_groups` matched through
+        /// `same_conversation`, which reads a missing chat id as "unaddressed,
+        /// therefore General". A thread-less park therefore read as pending in
+        /// the company-wide line, and the founder's next top-level message there
+        /// was consumed as its *answer* — accepted, settled in milliseconds with
+        /// no cycle and no reply, and indistinguishable in the console from a
+        /// message being worked on.
+        ///
+        /// All four General spellings are asserted because the fold admits all
+        /// four (`is_general_chat`), so fixing only the console's `"main"` would
+        /// leave the same drop reachable from a host addressing `"General"`.
+        #[tokio::test]
+        async fn a_thread_less_blocker_is_pending_in_no_conversation() {
+            let (runtime, _home) = runtime().await;
+            park_thread_less_blocker(&runtime, "t-1").await;
+            assert_eq!(
+                runtime.pending_approvals()[0].thread,
+                None,
+                "the park under test is the thread-less shape"
+            );
+
+            for desk in ["main", "general", "General", ""] {
+                let plan = runtime
+                    .plan_blocker_reply(desk, None, "please retry the nightly import")
+                    .await
+                    .expect("plan");
+                assert!(
+                    matches!(plan, BlockerReplyPlan::NotBlocker),
+                    "a top-level message in {desk:?} must run as an ordinary turn, not settle a \
+                     blocker no conversation raised: {plan:?}"
+                );
+            }
+            assert_eq!(
+                runtime.pending_approvals().len(),
+                1,
+                "nothing was consumed, so the blocker still pends for whoever can actually answer it"
+            );
+        }
+
+        /// The carve-out is not a blanket refusal: a blocker stamped with a real
+        /// thread still answers to it. Guards the fix from being "skip every
+        /// blocker", which would pass the test above and break #1862 outright.
+        #[tokio::test]
+        async fn a_threaded_blocker_still_answers_in_its_own_dm() {
+            let (runtime, _home) = runtime().await;
+            park_thread_less_blocker(&runtime, "t-1").await;
+            runtime
+                .park_blocker(&blocker("t-2", None), "t-2", assignee("eng"))
+                .await
+                .expect("parks");
+
+            let plan = runtime
+                .plan_blocker_reply("dm:eng", None, "retry it")
+                .await
+                .expect("plan");
+            match plan {
+                BlockerReplyPlan::Resolve { ids, .. } => assert_eq!(
+                    ids.len(),
+                    1,
+                    "only the blocker stamped with this DM is in scope; the thread-less one is in \
+                     no conversation and must not be fanned in"
+                ),
+                other => panic!("the DM's own blocker still resolves: {other:?}"),
+            }
         }
 
         /// An unrelated reply is not a verdict — it falls through to an ordinary

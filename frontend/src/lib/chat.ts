@@ -251,6 +251,47 @@ export interface ChatMessage {
    * a host that predates the field.
    */
   mentions?: Mention[];
+  /**
+   * This console tried to send this line and the request never completed
+   * (B-099), carrying the reason the network or the host gave.
+   *
+   * **A property of the message, not a line beside it.** The failure used to be
+   * reported by appending a separate `system` bubble underneath ("Couldn't
+   * send — …"), which left the message itself styled exactly like the delivered
+   * ones above it: same avatar, same timestamp, nothing red, nothing struck
+   * through, and no way to try again. Scroll away and back, or write a message
+   * long enough that the note falls off screen, and what remains reads as sent
+   * and was not — while the composer had already cleared, so the only copy of
+   * the text was the pixels on screen.
+   *
+   * So the fact rides the row it is about. A renderer cannot draw the bubble
+   * without seeing this, which is the property a sibling line could never have.
+   *
+   * Set only on a line this console originated (`from: "you"`), and never by
+   * {@link fromHistory}: a message the host handed back is by definition one it
+   * kept. A reload therefore clears it, which is correct — the reload re-reads
+   * what was actually journaled, and a send whose request died may well have
+   * landed (see `ChatView`'s `send` on why a throw is ambiguous).
+   */
+  sendFailed?: string;
+}
+
+/**
+ * Mark the line `id` as one that could not be sent (B-099), leaving the rest
+ * alone.
+ *
+ * Returns the same array reference when nothing matched, so the caller's
+ * `setState` is a no-op rather than a re-render, for a message no longer in
+ * this transcript — a send's target can be re-homed by a company switch while
+ * its POST is still in flight.
+ */
+export function markSendFailed(
+  messages: ChatMessage[],
+  id: string,
+  reason: string,
+): ChatMessage[] {
+  if (!messages.some((m) => m.id === id)) return messages;
+  return messages.map((m) => (m.id === id ? { ...m, sendFailed: reason } : m));
 }
 
 /**

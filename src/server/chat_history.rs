@@ -186,6 +186,39 @@ pub fn same_conversation(a: Option<&str>, b: Option<&str>) -> bool {
     a == b
 }
 
+/// Does a conversation id **stamped onto a record** name `desk`?
+///
+/// The fold is [`same_conversation`]'s — every spelling of General is one
+/// conversation, every other id compares verbatim — with the one difference
+/// this function exists to state:
+///
+/// **`None` is not the General desk.** [`same_conversation`] reads a missing id
+/// as *the id was never addressed*, which for a chat message is right: an
+/// unaddressed post went to the company-wide line, so it folds into General. A
+/// `None` **stamped on a record** means the opposite — *no conversation
+/// produced this*. A blocker parked by the planning pass, a card created on the
+/// board, a scheduler tick: each carries no thread because none of them
+/// happened in a conversation, and folding that into General hands every one of
+/// them to whoever next types in `#general`.
+///
+/// That is not hypothetical. `pending_blocker_groups` matched thread-less
+/// parked blockers against `#general` through [`same_conversation`], so a
+/// founder's first line in the channel was consumed as the *answer* to one of
+/// them: the send settled in milliseconds with no cycle, no run and no reply,
+/// and the console showed a message that read exactly like one being worked on.
+/// `owns` had already carved the same rule out by hand for a
+/// `DeskTaskCompleted` with no origin ("**`None` is not the General desk**",
+/// see its doc) — one carve-out written twice and missed a third time is the
+/// drift; one named predicate is the fix, the same argument
+/// [`same_conversation`] itself was extracted under.
+///
+/// The `desk` side stays a plain `&str` on purpose: a caller asking "is this
+/// record's origin the desk I am reading?" always has a desk, and taking an
+/// `Option` there would re-open the question this answers.
+pub fn stamped_conversation_is(origin: Option<&str>, desk: &str) -> bool {
+    origin.is_some_and(|origin| same_conversation(Some(origin), Some(desk)))
+}
+
 /// Whether a stored event belongs to the desk identified by `desk_id` /
 /// `desk_name`.
 ///
@@ -224,6 +257,13 @@ pub fn same_conversation(a: Option<&str>, b: Option<&str>) -> bool {
 /// line, which is a different bug from the one #377 fixes, so this arm answers
 /// `false` for every desk including General. It is the single most bug-prone
 /// line in this function and has its own test.
+///
+/// That rule is [`stamped_conversation_is`] now. This arm keeps its own
+/// `return false` because it must also skip the shared tail below, but anywhere
+/// *else* asking "does this record's stamped origin name my desk?" calls the
+/// predicate rather than writing the carve-out again — writing it twice and
+/// forgetting it a third time is what let a thread-less parked blocker read as
+/// pending in `#general`.
 pub fn owns(desk_id: &str, desk_name: &str, event: &CompanyEvent) -> bool {
     let stored = match event {
         CompanyEvent::AgentReply { chat_id, .. } => Some(chat_id.as_str()),
@@ -1225,6 +1265,50 @@ mod test {
             deliverable: None,
             attachments: Vec::new(),
         }
+    }
+
+    /// The whole difference between the two predicates, in one place.
+    ///
+    /// `same_conversation` folds a missing id into General because an
+    /// unaddressed *message* went to the company-wide line.
+    /// `stamped_conversation_is` refuses to, because a missing id *stamped on a
+    /// record* means no conversation produced it — and handing those to General
+    /// is what let a thread-less parked blocker eat a founder's first line in
+    /// `#general` (B-059).
+    #[test]
+    fn a_stamped_origin_of_none_names_no_conversation_including_general() {
+        for desk in [GENERAL_DESK, MAIN_THREAD_ID, "general", ""] {
+            assert!(
+                same_conversation(None, Some(desk)),
+                "an unaddressed message still folds into General ({desk:?})"
+            );
+            assert!(
+                !stamped_conversation_is(None, desk),
+                "but a record stamped with no conversation belongs to none, {desk:?} included"
+            );
+        }
+        assert!(!stamped_conversation_is(None, "engineering"));
+    }
+
+    /// Everything that *is* stamped compares exactly as `same_conversation`
+    /// does, so the carve-out cannot quietly become "refuse everything".
+    #[test]
+    fn a_stamped_origin_folds_general_and_compares_every_other_desk_verbatim() {
+        for origin in [GENERAL_DESK, MAIN_THREAD_ID, "general", ""] {
+            for desk in [GENERAL_DESK, MAIN_THREAD_ID, "general", ""] {
+                assert!(
+                    stamped_conversation_is(Some(origin), desk),
+                    "every spelling of General is one conversation: {origin:?} vs {desk:?}"
+                );
+            }
+        }
+        assert!(stamped_conversation_is(Some("dm:eng"), "dm:eng"));
+        assert!(!stamped_conversation_is(Some("dm:eng"), "dm:ops"));
+        assert!(!stamped_conversation_is(Some("dm:eng"), GENERAL_DESK));
+        assert!(
+            !stamped_conversation_is(Some("Engineering"), "engineering"),
+            "a desk id is opaque — the General fold is not a licence to loosen the rest"
+        );
     }
 
     #[test]

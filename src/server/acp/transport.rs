@@ -299,7 +299,17 @@ async fn prompt(state: &AppState, auth: &GqlAuth, params: &Value) -> Result<Valu
     // specific roster member. The text is sent as-is, exactly as a console DM
     // is; no synthetic `@`-mention is needed, and one would only be dropped by
     // revalidation against a body that does not contain it.
-    let mentions = runtime.resolve_mentions(&text, None, by.as_ref()).await;
+    // Both halves of one resolution, exactly as the REST chat path's
+    // `accept_chat_turn` runs them: who this prompt reached, and every `@name`
+    // that reached more than one thing and therefore reached nobody (B-101).
+    // The ACP surface used to call the plain `resolve_mentions` here and never
+    // report the ambiguous half, so a Zed (or other ACP client) operator whose
+    // `@name` matched two things got the same silent non-ping the console used
+    // to give before B-101, with no durable refusal notice anywhere (codex P2).
+    let resolved = runtime
+        .resolve_mentions_reporting(&text, None, by.as_ref())
+        .await;
+    let mentions = resolved.mentions.clone();
     // Journal the prompt up front so the transcript is right from acceptance
     // and the durable mention rows share its sequence — the same shape as the
     // operator `/chat` route (issue #983). `run_journaled_cycle` then runs the
@@ -345,6 +355,14 @@ async fn prompt(state: &AppState, auth: &GqlAuth, params: &Value) -> Result<Valu
             .notify_mentions(&session.company, mentions, &message_seq, by.as_ref(), &chat)
             .await;
     }
+    // The other half of the same resolution (B-101): every `@name` that
+    // reached two things and therefore reached nobody, on the same not-fatal
+    // terms as the notification above. Every ACP prompt is unrooted (this
+    // session model has no thread concept), matching the `parent: None` on
+    // the event just journaled above.
+    runtime
+        .post_mention_ambiguity_note(&chat, None, &resolved.ambiguous)
+        .await;
     let report = runtime
         .run_journaled_cycle(vec![(message_seq, event)], None)
         .await
@@ -542,9 +560,18 @@ name = "Acme"
 id = "product_manager"
 role = "Product Manager"
 
+[[agent]]
+id = "writer"
+role = "Writer"
+
 [[group_chat]]
 id = "engineering"
 name = "Engineering"
+members = []
+
+[[group_chat]]
+id = "writer"
+name = "Writer desk"
 members = []
 
 [policy]
@@ -659,6 +686,90 @@ mode = "full"
             .await
             .expect("list");
         assert!(admin_rows.is_empty(), "{admin_rows:?}");
+    }
+
+    /// B-101, on the ACP ingress (codex P2): a `@writer` that names both the
+    /// `writer` teammate and the `writer` desk must be refused and reported,
+    /// exactly as the REST chat path's `accept_chat_turn` does it. Before this
+    /// fix the ACP `session/prompt` handler called the plain `resolve_mentions`
+    /// and never posted the ambiguity note, so an ACP client (e.g. Zed) sending
+    /// an ambiguous `@name` pinged nobody with no durable refusal anywhere.
+    #[tokio::test]
+    async fn a_prompt_ambiguous_mention_is_reported_in_the_channel() {
+        let home = tempfile::Builder::new()
+            .prefix("oc-acp-ambiguous-")
+            .tempdir()
+            .expect("tempdir");
+        let state = acp_state(home.path()).await;
+        let company = CompanyId::new("acme");
+        let runtime = state.registry().get(&company).expect("company");
+        let admin = seed_user(&state, &company, "u-admin", "Admin Person").await;
+        let auth = GqlAuth::User(UserPrincipal {
+            company: company.clone(),
+            user_id: admin,
+            email: "admin@example.test".to_string(),
+            role: UserRole::Admin,
+            must_change_password: false,
+            session_token_hash: "hash".to_string(),
+            credential: crate::ports::SessionKind::Browser,
+        });
+
+        state.acp_sessions().insert(
+            "conn-1",
+            crate::server::acp::AcpSession {
+                id: "s-1".to_string(),
+                company: company.clone(),
+                chat: "engineering".to_string(),
+                agent_id: None,
+            },
+        );
+
+        let result = prompt(
+            &state,
+            &auth,
+            &json!({
+                "sessionId": "s-1",
+                "prompt": [
+                    { "type": "text", "text": "@writer can you draft the autumn brief?" },
+                ],
+                "_meta": { "opencompany/connectionId": "conn-1" },
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "prompt failed: {result:?}");
+
+        // The durable refusal notice: the same `AgentReply` the REST chat path
+        // posts, attributed to the runtime and landing in the channel the
+        // prompt ran in.
+        let events = runtime
+            .events()
+            .read_from(&company, EventSeq::new(0), usize::MAX)
+            .await
+            .expect("read events");
+        let advisories: Vec<(String, String)> = events
+            .into_iter()
+            .filter_map(|stored| match stored.event {
+                CompanyEvent::AgentReply {
+                    agent_id,
+                    chat_id,
+                    text,
+                    ..
+                } if agent_id == crate::ports::SYSTEM_AUTHOR => Some((chat_id, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "exactly one ambiguity note, cross-ingress: {advisories:?}"
+        );
+        let (chat, text) = &advisories[0];
+        assert_eq!(chat, "engineering");
+        assert!(text.contains("@writer"), "names the literal typed: {text}");
+        assert!(
+            text.contains("pinged nobody"),
+            "states what happened: {text}"
+        );
     }
 
     /// A runtime being replaced refuses the prompt *before* it is journaled

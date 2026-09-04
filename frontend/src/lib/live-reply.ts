@@ -8,6 +8,46 @@
 // As a closure over a ref it could only be exercised by driving the whole shell;
 // as a rule with a name it can be asserted transition by transition.
 
+import { hostMessageId, isHostMessageId, type ChatMessage } from "./chat";
+
+/**
+ * Whether a live `agent_reply` frame is a duplicate of something already in
+ * the recent tail of a transcript — never render it if so (PR #2052 review).
+ *
+ * Two checks, because one alone fails in a different direction each:
+ *
+ * - **Identity first.** Every frame carries a durable id via its own `seq`
+ *   (`hostMessageId(String(event.seq))`, the same value `liveReplyIdentity`
+ *   spreads into the row it renders as `messageId`). A row already bearing
+ *   that exact id is unambiguously this same event, rendered before —
+ *   whatever its content, it is always a duplicate.
+ * - **Content, but only against an unreconciled row.** The operator's own
+ *   turn is rendered locally, immediately, under an ephemeral `m<n>` id from
+ *   the awaited POST response; the backend also journals and broadcasts that
+ *   same reply, and the SSE echo can arrive first, mid-await, before the
+ *   POST resolves and reconciles that row to its durable id. In that narrow
+ *   window identity cannot recognise the echo as the same message — only
+ *   content can. Scoping this check to `!isHostMessageId(m.id)` is what
+ *   keeps it from over-firing once that window closes: two *different*
+ *   events that merely share wording — an operator repeating the same
+ *   ambiguous `@name` produces two B-101 notices with identical text — both
+ *   carry durable ids from the start, so neither is `!isHostMessageId`, and
+ *   content matching never gets a chance to conflate them. Before this
+ *   distinction existed, content matching alone silently dropped the second
+ *   one outright, which is a stronger failure than a duplicate render: this
+ *   check exists to prevent noise, not to swallow a genuinely new refusal.
+ */
+export function isDuplicateLiveReply(
+  recentTail: readonly Pick<ChatMessage, "id" | "from" | "text">[],
+  event: { seq: number; text: string },
+  from: ChatMessage["from"],
+): boolean {
+  const eventId = hostMessageId(String(event.seq));
+  return recentTail.some(
+    (m) => m.id === eventId || (!isHostMessageId(m.id) && m.from === from && m.text === event.text),
+  );
+}
+
 /**
  * The one field {@link PendingSyncPosts.capture} needs off a live `agent_reply`
  * frame. A local shape rather than importing the hook's event type, matching
@@ -16,6 +56,45 @@
  */
 export interface LiveReplyFrame {
   chatId: string;
+  /**
+   * The frame's `agentId`, when its type carries one (`AgentReplyEvent`
+   * always does). Read only by {@link PendingSyncPosts.ended}, to tell a held
+   * system-attributed frame the settled response duplicates from one it
+   * never will — see that method's doc for why the distinction only matters
+   * for this one attribution.
+   */
+  agentId?: string;
+  /**
+   * The frame's own reply text, when its type carries one (`AgentReplyEvent`
+   * always does). Read only by {@link PendingSyncPosts.ended}, compared
+   * against the settled response's own reply text(s) for the same reason
+   * `agentId` is.
+   */
+  text?: string;
+}
+
+/**
+ * Whose voice a live `agent_reply` frame renders as: the runtime's own
+ * centred system pill, or a named teammate's bubble (issue #101 / B-101
+ * review, PR #2052).
+ *
+ * `SYSTEM_AUTHOR` on the Rust side (`crate::ports::SYSTEM_AUTHOR`, the string
+ * `"system"`) is the one `agentId` that names the runtime itself rather than
+ * a roster agent — a mention-ambiguity notice is journaled under it precisely
+ * so a reader can tell "the runtime is reporting its own refusal" from "a
+ * teammate replied". `fromHistory` (`lib/chat.ts`) already makes this same
+ * distinction for a rehydrated row (`entry.author === "system"`); this is the
+ * **live**-path twin of that rule.
+ *
+ * Extracted for the same reason every rule in this module is (see the file
+ * doc above): inlined as a closure inside `renderAgentReply`, a regression to
+ * a hard-coded `"company"` shows up nowhere but a live screenshot taken
+ * during a detached send, between the SSE frame landing and the next history
+ * reload silently correcting it — and no test would ever see it (tinysweeper
+ * review). Named, it can be asserted directly.
+ */
+export function liveReplyAttribution(agentId: string): "system" | "company" {
+  return agentId === "system" ? "system" : "company";
 }
 
 /**
@@ -155,19 +234,43 @@ export class PendingSyncPosts<F extends LiveReplyFrame = LiveReplyFrame> {
   }
 
   /**
-   * The synchronous POST resolved with a body; its reply is already rendered.
+   * The synchronous POST resolved with a body; `responseTexts` is every reply
+   * line that body itself carried.
    *
-   * Whatever {@link capture} held for this thread was, by the same reasoning,
-   * a live echo of that same reply — the awaited response is authoritative, so
-   * the held frames are discarded rather than replayed.
+   * A held frame attributed to the operator's own turn (any `agentId` other
+   * than `SYSTEM_AUTHOR`) is discarded unconditionally, as it always was: it
+   * is, by the same reasoning as the class doc, a live echo of that same
+   * reply, and the awaited response is authoritative for it.
+   *
+   * **A held *system*-attributed frame needs `responseTexts` to answer the
+   * same question, because the blanket assumption is false for it** (Codex
+   * review, PR #2052). Some system-authored lines ARE folded into
+   * `channel_responses` the same way any reply is — `system_notice`'s
+   * approval-overflow and `"Acknowledged."` fallback among them — and for
+   * those the assumption above still holds. Others never are: B-101's
+   * mention-ambiguity note is deliberately journaled outside that pipeline
+   * (`post_mention_ambiguity_note`'s own doc: "Journaled, not returned in the
+   * POST response"), specifically so it reaches an API poster who renders no
+   * chip at all. Discarding every held system frame here would silently
+   * swallow that note on a synchronous send; rendering every one instead
+   * would double-render whichever ones the response DOES carry, next to the
+   * identical `"company"` bubble `ChatView` appends from `responseTexts`
+   * itself. So a held system frame is discarded only when its text is
+   * present in `responseTexts` — the response already carries it — and
+   * released, for the caller to render, when it is not — the response never
+   * will.
    *
    * Scoped to a POST that *resolved*. A POST that threw resolved nothing and
    * belongs in {@link failed}; sending it here discards a reply the console is
    * never going to be handed again.
    */
-  ended(threadId: string): void {
+  ended(threadId: string, responseTexts: readonly string[] = []): F[] {
     this.threads.delete(threadId);
+    const held = this.held.get(threadId) ?? [];
     this.held.delete(threadId);
+    return held.filter(
+      (frame) => frame.agentId === "system" && !responseTexts.includes(frame.text ?? ""),
+    );
   }
 
   /**
@@ -206,6 +309,16 @@ export class PendingSyncPosts<F extends LiveReplyFrame = LiveReplyFrame> {
    * identity — is this thread's POST still unresolved — never by how long it
    * has been unresolved. See {@link detached} for why that distinction is the
    * whole fix.
+   *
+   * Holds a system-attributed frame exactly like any other while a POST is in
+   * flight — earlier code exempted it here instead (Codex review, PR #2052),
+   * which fixed the case that motivated it (the ambiguity note lost to
+   * `ended`'s blanket discard) but broke a different one: a `system_notice`
+   * fallback the response body DOES carry then rendered twice, once from this
+   * bypass and once from `ChatView`'s own append of `responseTexts`. See
+   * {@link ended}'s doc for why the fix belongs on release, where the
+   * response's own text is available to reconcile against, not on capture,
+   * where it never was.
    */
   capture(frame: F): boolean {
     if (!this.suppressesLiveReply(frame.chatId)) return false;

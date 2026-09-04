@@ -1,4 +1,4 @@
-import { MessageSquareReply } from "lucide-react";
+import { MessageSquareReply, TriangleAlert } from "lucide-react";
 
 import type { TaskStatus } from "@/api/tasks";
 import type { CognitionState, TurnStep } from "@/api/types";
@@ -67,6 +67,14 @@ interface Props {
   resolveAttachmentUrl?: (nodeId: string) => Promise<string>;
   /** Board task id -> live state for card-linked background turns (#1758). */
   taskStatusByTaskId?: Readonly<Record<string, TaskStatus>>;
+  /**
+   * Sends a line whose POST never completed again (B-099), by its id.
+   *
+   * Absent on a surface that cannot resend — the thread panel's rows today — in
+   * which case the failed row still says so and simply offers no button. Saying
+   * nothing is the bug; saying it with no way out is merely less good.
+   */
+  onRetrySend?: (messageId: string) => void;
   /** Shared shell clock for elapsed background-work copy. */
   now?: number;
   /**
@@ -244,6 +252,7 @@ export function MessageRow({
   reviewingCardIds,
   resolveAttachmentUrl,
   taskStatusByTaskId,
+  onRetrySend,
   now = Date.now(),
   cognition,
   onRedeemBudgetPause,
@@ -326,7 +335,34 @@ export function MessageRow({
             placeholder={echoMarkerFor(message, sender, cognition)}
           />
         )}
-        <Markdown mentions={message.mentions} className="text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1">{message.text}</Markdown>
+        <Markdown
+          mentions={message.mentions}
+          className={cn(
+            "text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1",
+            // A line that never left the browser is dimmed, so the difference
+            // between sent and not-sent is visible in the text itself and not
+            // only in a note under it (B-099). Muted rather than struck
+            // through: the words are still the operator's own draft, and Retry
+            // means they may yet be delivered.
+            //
+            // `!== undefined` rather than truthy: an `ApiError` can carry an
+            // empty `message` when the host's envelope sends `error: ""`
+            // (`httpError`'s `envelope?.error ?? statusMessage(res)` keeps an
+            // empty string as-is, since `??` only falls back on nullish). A
+            // truthy check would silently hide the failed styling, the notice,
+            // and the Retry control for exactly that response (CodeRabbit
+            // review).
+            message.sendFailed !== undefined && "text-muted-foreground",
+          )}
+        >
+          {message.text}
+        </Markdown>
+        {message.sendFailed !== undefined && (
+          <FailedSendNotice
+            reason={message.sendFailed || "something went wrong"}
+            onRetry={onRetrySend ? () => onRetrySend(message.id) : undefined}
+          />
+        )}
 
         {message.attachments && message.attachments.length > 0 && (
           <MessageAttachments
@@ -402,6 +438,53 @@ export function MessageRow({
         offersReactions={!readOnly}
       />
     </article>
+  );
+}
+
+/**
+ * The failure notice on a line that never left the browser (B-099).
+ *
+ * Attached under the message it belongs to rather than appended as its own
+ * transcript row, which is the whole point: a sibling line scrolls away from
+ * the bubble it describes, and a long enough message pushes it off screen
+ * entirely, leaving something that reads as sent and was not. This cannot be
+ * separated from its message, because it is drawn by the message's own row.
+ *
+ * It is a `role="status"` rather than an `alert`: a failed send is worth
+ * announcing, and it is not an interruption — the operator is looking at the
+ * transcript they just posted into.
+ *
+ * **Retry is the escape, and it is manual.** A throw is ambiguous (see
+ * `ChatView`'s `send`): the host may have journaled the message before the
+ * request died, so a resend can post the same instruction twice. That is the
+ * operator's trade to make, and it is the reason this is a button rather than a
+ * background retry loop.
+ *
+ * Exported so `ThreadPanel`'s own `Line` can render the identical notice for a
+ * failed threaded reply (Codex review, PR #2052) instead of growing a second
+ * copy of this markup the way `senderOf` already warns against for sender
+ * resolution.
+ */
+export function FailedSendNotice({ reason, onRetry }: { reason: string; onRetry?: () => void }) {
+  return (
+    <div
+      role="status"
+      className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1"
+    >
+      <TriangleAlert className="size-3.5 shrink-0 text-destructive" aria-hidden />
+      <span className="min-w-0 text-2xs text-destructive">Not sent — {reason}</span>
+      {onRetry && (
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-5 px-1.5 text-2xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+          onClick={onRetry}
+        >
+          Retry
+        </Button>
+      )}
+    </div>
   );
 }
 

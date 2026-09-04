@@ -7,8 +7,10 @@ import type { MessageIntent } from "@/api/tasks";
 import type { AttachmentDto, CognitionState, TurnStep } from "@/api/types";
 import type { ChatMessage } from "@/lib/chat";
 import type { TeamMember } from "@/lib/team";
+import { cn } from "@/lib/utils";
 import { BudgetPauseNoticeCard } from "./BudgetPauseNoticeCard";
 import { EchoPlaceholder, echoMarkerFor } from "./EchoPlaceholder";
+import { FailedSendNotice } from "./MessageRow";
 import { MessageAttachments } from "./MessageAttachments";
 import { StepTimeline } from "./StepTimeline";
 import { MessageComposer } from "./MessageComposer";
@@ -201,6 +203,14 @@ interface Props {
   onRedeemBudgetPause?: (agentId: string, noticeMessageId: string) => void;
   redeemingBudgetPauseAgent?: string | null;
   latestBudgetPauseMessageIdByAgent?: Map<string, string>;
+  /**
+   * Retries a reply that failed to send from *this thread's* composer
+   * (B-099). `MessageRow` gets the same prop of the same name; without it a
+   * threaded reply's `sendFailed` field had nowhere to go, because `Line` is
+   * its own renderer and never received it — a failed reply read as
+   * delivered, with no way to send it again (Codex review, PR #2052).
+   */
+  onRetrySend?: (messageId: string) => void;
 }
 
 /**
@@ -238,6 +248,7 @@ export function ThreadPanel({
   onRedeemBudgetPause,
   redeemingBudgetPauseAgent,
   latestBudgetPauseMessageIdByAgent,
+  onRetrySend,
 }: Props) {
   // Absent `inlineReplyIds` counts everything, which is what every caller did
   // before the prop existed: a panel that cannot know what the channel
@@ -269,6 +280,7 @@ export function ThreadPanel({
           onRedeemBudgetPause={onRedeemBudgetPause}
           redeemingBudgetPauseAgent={redeemingBudgetPauseAgent}
           latestBudgetPauseMessageIdByAgent={latestBudgetPauseMessageIdByAgent}
+          onRetrySend={onRetrySend}
         />
         <div className="flex items-center gap-2 px-4 py-2">
           <span className="text-xs font-medium text-muted-foreground">
@@ -288,6 +300,7 @@ export function ThreadPanel({
             cognition={cognition}
             onRedeemBudgetPause={onRedeemBudgetPause}
             redeemingBudgetPauseAgent={redeemingBudgetPauseAgent}
+            onRetrySend={onRetrySend}
             latestBudgetPauseMessageIdByAgent={latestBudgetPauseMessageIdByAgent}
           />
         ))}
@@ -394,6 +407,7 @@ function Line({
   onRedeemBudgetPause,
   redeemingBudgetPauseAgent,
   latestBudgetPauseMessageIdByAgent,
+  onRetrySend,
 }: {
   channel: Channel;
   members: TeamMember[];
@@ -406,6 +420,7 @@ function Line({
   onRedeemBudgetPause?: (agentId: string, noticeMessageId: string) => void;
   redeemingBudgetPauseAgent?: string | null;
   latestBudgetPauseMessageIdByAgent?: Map<string, string>;
+  onRetrySend?: (messageId: string) => void;
 }) {
   // Four arguments, not three: `youAvatar` is the last parameter, and omitting
   // it left your own line with no avatar to seed from but the name "You" —
@@ -461,7 +476,24 @@ function Line({
             {formatTime(message.at)}
           </span>
         </div>
-        <Markdown mentions={message.mentions} className="text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1">{message.text}</Markdown>
+        <Markdown
+          mentions={message.mentions}
+          className={cn(
+            "text-sm leading-6 break-words prose-p:my-0 prose-pre:my-1.5 prose-ul:my-1 prose-ol:my-1 prose-headings:my-1",
+            // Same rule and the same reason as `MessageRow` (B-099): a threaded
+            // reply that never left the browser must not read as delivered just
+            // because this panel draws replies with its own renderer.
+            message.sendFailed !== undefined && "text-muted-foreground",
+          )}
+        >
+          {message.text}
+        </Markdown>
+        {message.sendFailed !== undefined && (
+          <FailedSendNotice
+            reason={message.sendFailed || "something went wrong"}
+            onRetry={onRetrySend ? () => onRetrySend(message.id) : undefined}
+          />
+        )}
         {message.attachments && message.attachments.length > 0 && (
           <MessageAttachments
             attachments={message.attachments}

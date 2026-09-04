@@ -85,7 +85,17 @@ describe("clearReceipt is generation-guarded (issue #1935 review)", () => {
     // The three callbacks that still clear the receipt keep the #1935 guard:
     // they take the generation their own `onSendStart` returned and hand it to
     // `clearReceipt`, so a stale cross-company clear is a no-op.
-    expect(appShell).toMatch(/const onSendEnd = useCallback\(\s*\n\s*\(threadId: string, gen\?: number\) =>/);
+    //
+    // `onSendEnd` also gained a third, unrelated parameter (issue #101 review,
+    // PR #2052) — the settled response's own reply text(s), which `ended`
+    // needs to tell a held system frame the response duplicates from one it
+    // never will. The regex tolerates it (`(?:, responseTexts\?: readonly
+    // string\[\])?`) rather than pinning its exact name: this test's whole
+    // job is the generation guard, and a future rename of that third param
+    // should not have to touch this file.
+    expect(appShell).toMatch(
+      /const onSendEnd = useCallback\(\s*\n\s*\(threadId: string, gen\?: number(?:, responseTexts\?: readonly string\[\])?\) =>/,
+    );
     expect(appShell).toMatch(/const onSendStale = useCallback\(\s*\n\s*\(threadId: string, gen\?: number\) =>/);
     expect(appShell).toMatch(/const onSendFailed = useCallback\(\s*\n\s*\(threadId: string, gen\?: number\) =>/);
   });
@@ -148,10 +158,12 @@ describe("ChatView's send surface generation-tags its receipt clears", () => {
 
   it("forwards that generation to all three terminal outcomes", () => {
     // `gen` pinned by position, with the argument list left open: #2044 added
-    // a fourth (`chatId`) and the generation being third is the whole of what
-    // this asserts. Its own contract is `appShell`'s signature check above.
+    // a fourth (`chatId`) to `onSendDetached`, and `onSendEnd` gained a third
+    // of its own (`responseTexts`, issue #101 review, PR #2052 — see the
+    // `appShell` signature check above for why). The generation being second
+    // is the whole of what this asserts.
     expect(chatViewTsx).toMatch(/onSendDetached\?\.\(stateKey, answer\.turnId, gen[,)]/);
-    expect(chatViewTsx).toMatch(/onSendEnd\?\.\(stateKey, gen\);/);
+    expect(chatViewTsx).toMatch(/onSendEnd\?\.\(stateKey, gen(?:, responseTexts)?\);/);
     expect(chatViewTsx).toMatch(/onSendFailed\?\.\(stateKey, gen\);/);
   });
 
