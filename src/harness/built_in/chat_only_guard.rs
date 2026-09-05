@@ -120,16 +120,12 @@ mod tests {
     /// special-token wrapper around `tool_calls` / `invoke` / `parameter`.
     #[test]
     fn guard_replaces_the_reported_dsml_markup() {
-        let leaked = "\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n\
+        let leaked = "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n\
              <\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"workspace_search\">\n\
              <\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter name=\"query\" string=\"true\">team.md</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter>\n\
              </\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n\
-             </\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>";
-        // Prefix the opening delimiter with `<` — the module docs' literal
-        // reproduces the report's copy/pasted markup, which already opens on
-        // the special glyphs; build the real tag text here instead of via a
-        // long raw string to keep the escapes legible.
-        let leaked = format!("<{leaked}");
+             </\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>"
+            .to_string();
         assert_eq!(guard_suppressed_reply(leaked), FALLBACK_REPLY);
     }
 
