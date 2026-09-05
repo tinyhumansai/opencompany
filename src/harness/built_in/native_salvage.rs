@@ -1067,6 +1067,28 @@ mod tests {
         assert_eq!(cleaned, text);
     }
 
+    /// A call closes but one of its arguments does not: the model was cut off
+    /// mid-parameter. Dispatching the call anyway with a partial (or empty)
+    /// argument object would run a tool against inputs the model never
+    /// finished writing — reject the whole invoke instead (Codex review on
+    /// #2093).
+    #[test]
+    fn an_invoke_with_an_unclosed_parameter_is_rejected_whole() {
+        let text = concat!(
+            "<invoke name=\"read_ledger\">",
+            "<parameter name=\"ledger\">tasks</parameter>",
+            "<parameter name=\"query\">unfinished",
+            "</invoke>",
+        );
+        let (cleaned, calls) = recover(text);
+
+        assert!(
+            calls.is_empty(),
+            "an incomplete argument object must not dispatch"
+        );
+        assert_eq!(cleaned, text, "left verbatim, like an unclosed invoke");
+    }
+
     /// The decoration must be a dialect's marker, not any run of letters: an
     /// ordinary word starting with the keyword is not a tag.
     #[test]
