@@ -1039,6 +1039,14 @@ mod tests {
         assert_eq!(cleaned, text);
     }
 
+    /// Temporary: the exact text the patched build failed to salvage.
+    #[test]
+    fn tmp_live_leak_is_recovered() {
+        let text = "<tool_calls>\n<tool_calls>\n<invoke name=\"read_ledger\">\n<parameter name=\"ledger\">tasks</parameter>\n</invoke>\n</tool_calls>";
+        let (cleaned, calls) = recover(text);
+        assert_eq!(calls.len(), 1, "cleaned = {cleaned:?}");
+    }
+
     /// The smoking gun, verbatim from the 1/9 QA round: a `function_call:`
     /// marker, a `call` name key, and prose on either side.
     #[test]
