@@ -48,6 +48,13 @@ pub mod capability_budget;
 #[cfg(feature = "chargebee")]
 pub mod chargebee;
 pub mod chat_seed;
+/// Guarding a chat-only (`suppress_tools`) turn's reply against the tool-call
+/// markup its frozen-at-turn-1 system prompt can still provoke, since that
+/// prompt still advertises tool briefs the turn's own tool schema no longer
+/// carries (#2094). Applied after [`native_salvage`], which is deliberately
+/// inert on this same turn shape — see [`chat_only_guard`]'s module docs for
+/// why the two do not overlap.
+mod chat_only_guard;
 mod checkpoint;
 pub mod composio;
 /// Issue #410: how a Composio action catalogue is narrowed and rendered for an
