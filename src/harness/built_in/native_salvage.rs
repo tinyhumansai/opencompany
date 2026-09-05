@@ -452,7 +452,11 @@ fn tag_call_candidates(
 
 /// The `<parameter name="…">…</parameter>` children of one call body, as its
 /// arguments object — or `None` if any of them is left unclosed.
-fn tag_call_arguments(body: &str) -> Option<Value> {
+///
+/// `schema` is the call's own JSON Schema `parameters` when the recovery has
+/// one, consulted per-parameter to type a body the dialect left undeclared —
+/// see [`parameter_value`].
+fn tag_call_arguments(body: &str, schema: Option<&Value>) -> Option<Value> {
     let mut arguments = Map::new();
     let mut from = 0usize;
 
@@ -467,9 +471,12 @@ fn tag_call_arguments(body: &str) -> Option<Value> {
         let Some(name) = attr(open.attrs, "name") else {
             continue;
         };
+        let declared_type = schema
+            .and_then(|schema| schema.pointer(&format!("/properties/{name}/type")))
+            .and_then(Value::as_str);
         arguments.insert(
             name,
-            parameter_value(&body[open.after..close.start], open.attrs),
+            parameter_value(&body[open.after..close.start], open.attrs, declared_type),
         );
     }
 
@@ -483,7 +490,17 @@ fn tag_call_arguments(body: &str) -> Option<Value> {
 /// dialect says which is which with `string="true"`, and that wins outright —
 /// without it a query of `2026` becomes a number and a strictly-typed tool
 /// rejects a call the model got right.
-fn parameter_value(raw: &str, attrs: &str) -> Value {
+///
+/// That still leaves Claude's own bare form with nothing to declare it either
+/// way, so `declared_type` — the call's own tool schema, read by
+/// [`tag_call_arguments`] — is the second and preferred source: a parameter
+/// the schema itself types `"string"` is a string whatever it looks like,
+/// because guessing from the text alone breaks in the opposite direction just
+/// as often — a numeric-looking `query` coerced to a JSON number is exactly as
+/// wrong as a page index that should have been one (Codex review on #2093).
+/// Anything else — a schema saying otherwise, or none at all — falls back to
+/// the parse-or-string guess this module always used.
+fn parameter_value(raw: &str, attrs: &str, declared_type: Option<&str>) -> Value {
     // Declared a string: the model's bytes are the value, leading and
     // trailing whitespace included — trimming here would silently edit
     // content the dialect explicitly said not to reinterpret (CodeRabbit
@@ -492,6 +509,9 @@ fn parameter_value(raw: &str, attrs: &str) -> Value {
         return Value::String(raw.to_string());
     }
     let trimmed = raw.trim();
+    if declared_type == Some("string") {
+        return Value::String(trimmed.to_string());
+    }
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => value,
         Err(_) => Value::String(trimmed.to_string()),
