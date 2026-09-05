@@ -392,11 +392,20 @@ fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
         if !known.contains(&name) {
             continue;
         }
+        // An invoke whose body cut off mid-parameter is the same "model was
+        // cut off" case the unclosed-tag check above exists for, one level
+        // in: an incomplete argument object is not the call the model wrote,
+        // and dispatching it anyway would run a tool against inputs nobody
+        // finished (Codex review on #2093). Reject the whole invoke rather
+        // than the one parameter — a partial argument set is worse than none.
+        let Some(arguments) = tag_call_arguments(&text[open.after..close.start]) else {
+            continue;
+        };
         found.push(Candidate {
             start: open.start,
             end: close.after,
             name,
-            arguments: tag_call_arguments(&text[open.after..close.start]),
+            arguments,
         });
     }
 
@@ -404,16 +413,19 @@ fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
 }
 
 /// The `<parameter name="…">…</parameter>` children of one call body, as its
-/// arguments object.
-fn tag_call_arguments(body: &str) -> Value {
+/// arguments object — or `None` if any of them is left unclosed.
+fn tag_call_arguments(body: &str) -> Option<Value> {
     let mut arguments = Map::new();
     let mut from = 0usize;
 
     while let Some(open) = find_tag(body, from, PARAMETER_TAG, false) {
         // Unclosed, so where this argument ends is unknown — and so is whether
-        // anything after it belongs to this parameter or the next.
+        // anything after it belongs to this parameter or the next. The call
+        // it belongs to is incomplete, not just this parameter: reject it
+        // rather than dispatch a tool call with an argument object the model
+        // never finished writing.
         let Some(close) = find_tag(body, open.after, PARAMETER_TAG, true) else {
-            break;
+            return None;
         };
         from = close.after;
         let Some(name) = attr(open.attrs, "name") else {
@@ -425,7 +437,7 @@ fn tag_call_arguments(body: &str) -> Value {
         );
     }
 
-    Value::Object(arguments)
+    Some(Value::Object(arguments))
 }
 
 /// One `<parameter>` body as a JSON value.
