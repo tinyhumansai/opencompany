@@ -427,9 +427,7 @@ fn tag_call_arguments(body: &str) -> Option<Value> {
         // it belongs to is incomplete, not just this parameter: reject it
         // rather than dispatch a tool call with an argument object the model
         // never finished writing.
-        let Some(close) = find_tag(body, open.after, PARAMETER_TAG, true) else {
-            return None;
-        };
+        let close = find_tag(body, open.after, PARAMETER_TAG, true)?;
         from = close.after;
         let Some(name) = attr(open.attrs, "name") else {
             continue;
