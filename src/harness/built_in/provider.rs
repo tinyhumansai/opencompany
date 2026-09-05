@@ -2654,7 +2654,7 @@ mod tests {
             }]
         });
         let offered = std::collections::BTreeSet::from(["read_ledger".to_string()]);
-        let err = model_response_from_payload_offering(payload, &offered)
+        let err = model_response_from_payload_offering(payload, &offered, &std::collections::BTreeMap::new())
             .expect_err("a reasoning-only turn must not parse as success");
         let msg = err.to_string();
         assert!(
@@ -2690,7 +2690,8 @@ mod tests {
                     }
                 }]
             });
-            let resp = model_response_from_payload_offering(payload, &offered);
+            let resp =
+                model_response_from_payload_offering(payload, &offered, &std::collections::BTreeMap::new());
             let calls = resp.map(|r| r.message.tool_calls.len()).unwrap_or(0);
             assert_eq!(
                 calls, 0,
@@ -2719,7 +2720,7 @@ mod tests {
             }]
         });
         let offered = std::collections::BTreeSet::from(["read_ledger".to_string()]);
-        let resp = model_response_from_payload_offering(payload, &offered)
+        let resp = model_response_from_payload_offering(payload, &offered, &std::collections::BTreeMap::new())
             .expect("the refusal turn still parses");
 
         assert!(
@@ -2753,7 +2754,7 @@ mod tests {
         });
         let offered =
             std::collections::BTreeSet::from(["read_ledger".to_string(), approval.to_string()]);
-        let err = model_response_from_payload_offering(payload, &offered)
+        let err = model_response_from_payload_offering(payload, &offered, &std::collections::BTreeMap::new())
             .expect_err("the whole recovered batch must be refused");
 
         assert!(
