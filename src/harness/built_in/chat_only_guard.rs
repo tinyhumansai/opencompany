@@ -131,7 +131,9 @@ mod tests {
 
     #[test]
     fn guard_replaces_a_bare_tool_call_tag() {
-        let leaked = r#"<tool_call id="call_1">{"name":"workspace_search","arguments":{}}</tool_call>"#.to_string();
+        let leaked =
+            r#"<tool_call id="call_1">{"name":"workspace_search","arguments":{}}</tool_call>"#
+                .to_string();
         assert_eq!(guard_suppressed_reply(leaked), FALLBACK_REPLY);
     }
 
@@ -143,8 +145,8 @@ mod tests {
 
     #[test]
     fn guard_replaces_a_plain_text_function_call_marker() {
-        let leaked = r#"function_call:{"call":"read_ledger","arguments":{"ledger":"tasks"}}"#
-            .to_string();
+        let leaked =
+            r#"function_call:{"call":"read_ledger","arguments":{"ledger":"tasks"}}"#.to_string();
         assert_eq!(guard_suppressed_reply(leaked), FALLBACK_REPLY);
     }
 
