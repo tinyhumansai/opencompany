@@ -1928,6 +1928,8 @@ impl ChatModel<()> for TenantProvider {
             &request.tools,
             &request.tool_choice,
         );
+        let schemas =
+            crate::harness::native_salvage::authorized_tool_schemas(&request.tools, &request.tool_choice);
         // Always this harness's real id — `self.scope.id` is meaningful
         // whether or not this is the company's *default* harness (the
         // default's own `[harness.inference]` beats the company mapping the
