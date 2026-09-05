@@ -1173,7 +1173,7 @@ fn model_response_from_payload_offering(
         && finished_or_unstated
         && !offered.is_empty()
         && let Some((cleaned, recovered)) =
-            crate::harness::native_salvage::recover_text_tool_calls(&content, offered)
+            crate::harness::native_salvage::recover_text_tool_calls(&content, offered, schemas)
     {
         // The same fail-closed batch check the parsed path gets. Applied to the
         // recovered batch too, or a text response pairing `request_approval`
