@@ -52,6 +52,40 @@
 //! and correctly: `{"name":"Alice","input":"hi"}` is an ordinary model reply,
 //! and a parser with no idea which tools exist cannot tell it from a call.
 //!
+//! # The tag dialects
+//!
+//! The leak has a second shape, and it is not JSON at all: a model writing its
+//! call as **markup**, either Claude's `<invoke name="…"><parameter name="…">`
+//! form or a vendor dialect that wraps those same tags in a marker glyph —
+//! DeepSeek's is
+//!
+//! ```text
+//! <｜｜DSML｜｜tool_calls>
+//! <｜｜DSML｜｜invoke name="workspace_search">
+//! <｜｜DSML｜｜parameter name="query" string="true">team</｜｜DSML｜｜parameter>
+//! </｜｜DSML｜｜invoke>
+//! </｜｜DSML｜｜tool_calls>
+//! ```
+//!
+//! observed in company chat against a `chat-v1`-tier model. Neither shape has a
+//! `{` in it, so the object scan below never sees a candidate and the whole
+//! turn's tool calls are lost — the agent then narrates results it never
+//! received.
+//!
+//! tinyagents *can* parse the undecorated form
+//! (`tool_calling::parse::TOOL_CALL_OPEN_TAGS`), which is a large part of why
+//! this gap read as covered. It is not: that parser is reachable only through
+//! OpenHuman's `ToolDispatcher`, and this turn path never asks it anything (see
+//! above). The decorated form it would miss regardless — its open-tag table
+//! matches `<invoke` literally, and the marker sits between the `<` and the
+//! keyword.
+//!
+//! So the scan here matches a tag keyword through an optional **decoration**:
+//! the run between `<` and the keyword, which must be short, unbroken, and
+//! carry at least one non-ASCII character. That last condition is what keeps
+//! `<invoker>` and `<parameterise>` from matching — a dialect marks its markers,
+//! and an ASCII run in that position is an ordinary tag name.
+//!
 //! # What licenses the widening here
 //!
 //! This runs where the turn's own tool schemas are in hand. A candidate is
@@ -154,6 +188,24 @@ const BARE_CALL_ALLOWED_KEYS: &[&str] = &["id", "type", "index"];
 /// Matched case-insensitively, longest first so `function_call:` wins over
 /// `call:`.
 const CALL_MARKERS: &[&str] = &["function_call:", "tool_call:", "functioncall:", "call:"];
+
+/// The tag keyword naming one call in the markup dialects.
+const INVOKE_TAG: &str = "invoke";
+
+/// The tag keyword naming one argument of a markup-dialect call.
+const PARAMETER_TAG: &str = "parameter";
+
+/// The envelope some dialects wrap their calls in. It carries no call of its
+/// own; it is matched only so the leftover tags come out of the narrative with
+/// the calls they wrapped.
+const TOOL_CALLS_TAG: &str = "tool_calls";
+
+/// How long a decoration between `<` and a tag keyword may be, in bytes.
+///
+/// `｜｜DSML｜｜` is 14. The cap is what keeps a scan for `<…invoke` from
+/// reaching across a paragraph of prose to a keyword that has nothing to do
+/// with the `<` it started from.
+const MAX_TAG_DECORATION: usize = 32;
 
 /// The names this turn actually **authorized** the model to call, as the set
 /// the recovery validates against.
