@@ -375,15 +375,16 @@ fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
     let mut from = 0usize;
 
     while let Some(open) = find_tag(text, from, INVOKE_TAG, false) {
-        // Advanced past the opening tag whatever happens below, so a tag this
-        // rejects cannot be rematched on the next pass.
-        from = open.after;
         // An unclosed tag is left verbatim rather than guessed at: the model
         // was cut off mid-call, and inventing its end would run a tool against
-        // arguments nobody finished writing.
+        // arguments nobody finished writing. Nothing after it can be a call
+        // either — its own end is missing, so any later `</invoke>` is as
+        // likely to be this one's as the next one's.
         let Some(close) = find_tag(text, open.after, INVOKE_TAG, true) else {
             break;
         };
+        // Past the whole call whatever the checks below decide, so a tag this
+        // rejects cannot be rematched on the next pass.
         from = close.after;
         let Some(name) = attr(open.attrs, "name") else {
             continue;
@@ -409,7 +410,8 @@ fn tag_call_arguments(body: &str) -> Value {
     let mut from = 0usize;
 
     while let Some(open) = find_tag(body, from, PARAMETER_TAG, false) {
-        from = open.after;
+        // Unclosed, so where this argument ends is unknown — and so is whether
+        // anything after it belongs to this parameter or the next.
         let Some(close) = find_tag(body, open.after, PARAMETER_TAG, true) else {
             break;
         };
