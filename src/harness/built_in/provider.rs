@@ -963,6 +963,7 @@ fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResp
 fn model_response_from_payload_offering(
     payload: serde_json::Value,
     offered: &std::collections::BTreeSet<String>,
+    schemas: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> TaResult<ModelResponse> {
     // Content may be a plain string OR an array of `{type:"text",text:…}`
     // parts; tolerate both.
