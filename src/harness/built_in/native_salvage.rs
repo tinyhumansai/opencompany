@@ -871,6 +871,7 @@ fn json_object_spans(text: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn belt() -> BTreeSet<String> {
         ["read_ledger", "list_desks", "write_file"]
@@ -887,6 +888,147 @@ mod tests {
             // Nothing recovered: the caller leaves the content untouched.
             None => (text.to_string(), Vec::new()),
         }
+    }
+
+    /// The DeepSeek leak, verbatim from company chat: the whole call written as
+    /// marker-decorated markup, wrapped in an envelope, with the model's own
+    /// sentence in front of it.
+    #[test]
+    fn a_decorated_invoke_dialect_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "Let me check the ledger.\n\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"read_ledger\">\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter name=\"ledger\" string=\"true\">tasks",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>",
+        ));
+
+        assert_eq!(calls.len(), 1, "one call recovered");
+        assert_eq!(calls[0].name, "read_ledger");
+        assert_eq!(calls[0].arguments, json!({ "ledger": "tasks" }));
+        // The narrative survives; not one tag of the markup does.
+        assert_eq!(cleaned, "Let me check the ledger.");
+    }
+
+    /// The same dialect writing several calls in one envelope — what the
+    /// operator actually saw: four searches, none of which ran.
+    #[test]
+    fn every_call_in_one_decorated_envelope_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "Checking.\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"list_desks\">\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"read_ledger\">\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter name=\"ledger\" string=\"true\">risks",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>",
+        ));
+
+        assert_eq!(
+            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            ["list_desks", "read_ledger"],
+            "both calls, in the order written"
+        );
+        // A parameterless tag call is a call with no arguments, the way a
+        // `function`-keyed object with none is.
+        assert_eq!(calls[0].arguments, json!({}));
+        assert_eq!(calls[1].arguments, json!({ "ledger": "risks" }));
+        assert_eq!(cleaned, "Checking.");
+        // Both halves of each cycle read the same id, or the result answers no
+        // call. See the module docs.
+        assert_eq!(calls[0].id, "salvaged_call_0");
+        assert_eq!(calls[1].id, "salvaged_call_1");
+    }
+
+    /// The undecorated form — Claude's own markup, which a model trained on it
+    /// writes whatever endpoint it is served from.
+    #[test]
+    fn a_bare_invoke_tag_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "One moment.\n",
+            "<invoke name=\"read_ledger\">",
+            "<parameter name=\"ledger\">tasks</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({ "ledger": "tasks" }));
+        assert_eq!(cleaned, "One moment.");
+    }
+
+    /// A structured argument only survives by being read back as JSON, and a
+    /// `string="true"` body must not be.
+    #[test]
+    fn a_parameter_body_is_json_unless_declared_a_string() {
+        let (_, calls) = recover(concat!(
+            "<invoke name=\"write_file\">",
+            "<parameter name=\"content\">{\"rows\":[1,2]}</parameter>",
+            "<parameter name=\"path\" string=\"true\">2026</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            json!({ "content": { "rows": [1, 2] }, "path": "2026" }),
+            "the object parses; the declared string stays a string"
+        );
+    }
+
+    /// The enclosing call owns its own argument: a JSON object in a
+    /// `<parameter>` body must not also be recovered as a call beside it.
+    #[test]
+    fn a_json_body_inside_a_call_is_not_a_second_call() {
+        let (_, calls) = recover(concat!(
+            "<invoke name=\"write_file\">",
+            "<parameter name=\"content\">",
+            "function_call:{\"call\":\"read_ledger\",\"arguments\":{\"ledger\":\"tasks\"}}",
+            "</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(
+            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            ["write_file"],
+            "only the call that was actually made"
+        );
+    }
+
+    /// Belt membership decides here exactly as it does for the object shapes:
+    /// the tag says a call was written, not that this turn offered it.
+    #[test]
+    fn an_invoke_naming_an_unoffered_tool_is_left_alone() {
+        let text = "<invoke name=\"drop_database\"><parameter name=\"id\">1</parameter></invoke>";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty(), "nothing recovered");
+        assert_eq!(cleaned, text, "and the reply is untouched");
+    }
+
+    /// A model cut off mid-call leaves a tag with no end. Guessing where it
+    /// stopped would run a tool against arguments nobody finished writing.
+    #[test]
+    fn an_unclosed_invoke_is_left_verbatim() {
+        let text = "<invoke name=\"read_ledger\"><parameter name=\"ledger\">tas";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, text);
+    }
+
+    /// The decoration must be a dialect's marker, not any run of letters: an
+    /// ordinary word starting with the keyword is not a tag.
+    #[test]
+    fn an_ascii_lookalike_tag_is_not_a_call() {
+        let text = "<invoker name=\"read_ledger\">whatever</invoker>";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty(), "`<invoker>` is not `<invoke>`");
+        assert_eq!(cleaned, text);
     }
 
     /// The smoking gun, verbatim from the 1/9 QA round: a `function_call:`
