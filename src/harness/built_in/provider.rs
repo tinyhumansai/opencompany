@@ -946,7 +946,11 @@ fn raw_tool_call_requested(payload: &serde_json::Value) -> bool {
 /// probe, and every payload-shape test — gets exactly the wire parse and no
 /// text recovery.
 fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResponse> {
-    model_response_from_payload_offering(payload, &std::collections::BTreeSet::new())
+    model_response_from_payload_offering(
+        payload,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 /// [`model_response_from_payload`], plus the tool names **this turn offered the
@@ -959,6 +963,7 @@ fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResp
 fn model_response_from_payload_offering(
     payload: serde_json::Value,
     offered: &std::collections::BTreeSet<String>,
+    schemas: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> TaResult<ModelResponse> {
     // Content may be a plain string OR an array of `{type:"text",text:…}`
     // parts; tolerate both.
@@ -1168,7 +1173,7 @@ fn model_response_from_payload_offering(
         && finished_or_unstated
         && !offered.is_empty()
         && let Some((cleaned, recovered)) =
-            crate::harness::native_salvage::recover_text_tool_calls(&content, offered)
+            crate::harness::native_salvage::recover_text_tool_calls(&content, offered, schemas)
     {
         // The same fail-closed batch check the parsed path gets. Applied to the
         // recovered batch too, or a text response pairing `request_approval`
@@ -1449,6 +1454,10 @@ impl ChatModel<()> for HostedProvider {
             &request.tools,
             &request.tool_choice,
         );
+        let schemas = crate::harness::native_salvage::authorized_tool_schemas(
+            &request.tools,
+            &request.tool_choice,
+        );
 
         let base_url = self.config.base_url.trim_end_matches('/');
         let url = format!("{base_url}/chat/completions");
@@ -1513,7 +1522,7 @@ impl ChatModel<()> for HostedProvider {
         let payload: serde_json::Value = response.json().await.map_err(|e| {
             InferenceError::Model(format!("hosted inference response was not JSON: {e}"))
         })?;
-        model_response_from_payload_offering(payload, &offered)
+        model_response_from_payload_offering(payload, &offered, &schemas)
     }
 }
 
@@ -1921,6 +1930,10 @@ impl ChatModel<()> for TenantProvider {
             &request.tools,
             &request.tool_choice,
         );
+        let schemas = crate::harness::native_salvage::authorized_tool_schemas(
+            &request.tools,
+            &request.tool_choice,
+        );
         // Always this harness's real id — `self.scope.id` is meaningful
         // whether or not this is the company's *default* harness (the
         // default's own `[harness.inference]` beats the company mapping the
@@ -1953,7 +1966,7 @@ impl ChatModel<()> for TenantProvider {
         // its own, so keeping the last *successful* model is strictly more
         // accurate than advertising one that never ran.
         *self.model.write().unwrap() = Some(crate::metering::ModelSlug::classify(&plan.model));
-        model_response_from_payload_offering(payload, &offered)
+        model_response_from_payload_offering(payload, &offered, &schemas)
     }
 }
 
@@ -2645,8 +2658,12 @@ mod tests {
             }]
         });
         let offered = std::collections::BTreeSet::from(["read_ledger".to_string()]);
-        let err = model_response_from_payload_offering(payload, &offered)
-            .expect_err("a reasoning-only turn must not parse as success");
+        let err = model_response_from_payload_offering(
+            payload,
+            &offered,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("a reasoning-only turn must not parse as success");
         let msg = err.to_string();
         assert!(
             msg.contains("neither"),
@@ -2681,7 +2698,11 @@ mod tests {
                     }
                 }]
             });
-            let resp = model_response_from_payload_offering(payload, &offered);
+            let resp = model_response_from_payload_offering(
+                payload,
+                &offered,
+                &std::collections::BTreeMap::new(),
+            );
             let calls = resp.map(|r| r.message.tool_calls.len()).unwrap_or(0);
             assert_eq!(
                 calls, 0,
@@ -2710,8 +2731,12 @@ mod tests {
             }]
         });
         let offered = std::collections::BTreeSet::from(["read_ledger".to_string()]);
-        let resp = model_response_from_payload_offering(payload, &offered)
-            .expect("the refusal turn still parses");
+        let resp = model_response_from_payload_offering(
+            payload,
+            &offered,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("the refusal turn still parses");
 
         assert!(
             resp.message.tool_calls.is_empty(),
@@ -2744,8 +2769,12 @@ mod tests {
         });
         let offered =
             std::collections::BTreeSet::from(["read_ledger".to_string(), approval.to_string()]);
-        let err = model_response_from_payload_offering(payload, &offered)
-            .expect_err("the whole recovered batch must be refused");
+        let err = model_response_from_payload_offering(
+            payload,
+            &offered,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("the whole recovered batch must be refused");
 
         assert!(
             err.to_string().contains("approval boundary"),

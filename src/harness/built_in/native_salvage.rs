@@ -52,6 +52,40 @@
 //! and correctly: `{"name":"Alice","input":"hi"}` is an ordinary model reply,
 //! and a parser with no idea which tools exist cannot tell it from a call.
 //!
+//! # The tag dialects
+//!
+//! The leak has a second shape, and it is not JSON at all: a model writing its
+//! call as **markup**, either Claude's `<invoke name="…"><parameter name="…">`
+//! form or a vendor dialect that wraps those same tags in a marker glyph —
+//! DeepSeek's is
+//!
+//! ```text
+//! <｜｜DSML｜｜tool_calls>
+//! <｜｜DSML｜｜invoke name="workspace_search">
+//! <｜｜DSML｜｜parameter name="query" string="true">team</｜｜DSML｜｜parameter>
+//! </｜｜DSML｜｜invoke>
+//! </｜｜DSML｜｜tool_calls>
+//! ```
+//!
+//! observed in company chat against a `chat-v1`-tier model. Neither shape has a
+//! `{` in it, so the object scan below never sees a candidate and the whole
+//! turn's tool calls are lost — the agent then narrates results it never
+//! received.
+//!
+//! tinyagents *can* parse the undecorated form
+//! (`tool_calling::parse::TOOL_CALL_OPEN_TAGS`), which is a large part of why
+//! this gap read as covered. It is not: that parser is reachable only through
+//! OpenHuman's `ToolDispatcher`, and this turn path never asks it anything (see
+//! above). The decorated form it would miss regardless — its open-tag table
+//! matches `<invoke` literally, and the marker sits between the `<` and the
+//! keyword.
+//!
+//! So the scan here matches a tag keyword through an optional **decoration**:
+//! the run between `<` and the keyword, which must be short, unbroken, and
+//! carry at least one non-ASCII character. That last condition is what keeps
+//! `<invoker>` and `<parameterise>` from matching — a dialect marks its markers,
+//! and an ASCII run in that position is an ordinary tag name.
+//!
 //! # What licenses the widening here
 //!
 //! This runs where the turn's own tool schemas are in hand. A candidate is
@@ -105,7 +139,7 @@
 //! same synthesized id is what avoids it.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 use tinyinference::model::ToolChoice;
@@ -155,6 +189,24 @@ const BARE_CALL_ALLOWED_KEYS: &[&str] = &["id", "type", "index"];
 /// `call:`.
 const CALL_MARKERS: &[&str] = &["function_call:", "tool_call:", "functioncall:", "call:"];
 
+/// The tag keyword naming one call in the markup dialects.
+const INVOKE_TAG: &str = "invoke";
+
+/// The tag keyword naming one argument of a markup-dialect call.
+const PARAMETER_TAG: &str = "parameter";
+
+/// The envelope some dialects wrap their calls in. It carries no call of its
+/// own; it is matched only so the leftover tags come out of the narrative with
+/// the calls they wrapped.
+const TOOL_CALLS_TAG: &str = "tool_calls";
+
+/// How long a decoration between `<` and a tag keyword may be, in bytes.
+///
+/// `｜｜DSML｜｜` is 16 bytes — the marker glyph is three bytes each. The cap is
+/// what keeps a scan for `<…invoke` from reaching across a paragraph of prose
+/// to a keyword that has nothing to do with the `<` it started from.
+const MAX_TAG_DECORATION: usize = 32;
+
 /// The names this turn actually **authorized** the model to call, as the set
 /// the recovery validates against.
 ///
@@ -187,6 +239,31 @@ pub fn authorized_tool_names(tools: &[ToolSchema], choice: &ToolChoice) -> BTree
     }
 }
 
+/// The authorized tools' own JSON Schema `parameters`, keyed by name.
+///
+/// A markup-dialect `<parameter>` body is text on the wire whatever the
+/// argument's real type is (see [`parameter_value`]), and a dialect marks the
+/// exception (`string="true"`) rather than the rule — Claude's own bare form
+/// marks nothing at all. Without the tool's own declared type, a scalar-
+/// looking body is a guess either way: coerce it and a strictly-typed
+/// *string* parameter gets a number; leave it a string and a strictly-typed
+/// *number* parameter gets one instead. The schema is the one thing that
+/// actually knows, so the recovery consults it before guessing (Codex review
+/// on #2093). Same authorization rule as [`authorized_tool_names`] — this is
+/// that same computation, carrying the schema instead of just the name.
+pub fn authorized_tool_schemas(
+    tools: &[ToolSchema],
+    choice: &ToolChoice,
+) -> BTreeMap<String, Value> {
+    authorized_tool_names(tools, choice)
+        .into_iter()
+        .filter_map(|name| {
+            let schema = tools.iter().find(|tool| tool.name == name)?;
+            Some((name, schema.parameters.clone()))
+        })
+        .collect()
+}
+
 /// Recover tool calls a model wrote into `content` as text, when the turn's
 /// structured `tool_calls` came back empty.
 ///
@@ -195,15 +272,18 @@ pub fn authorized_tool_names(tools: &[ToolSchema], choice: &ToolChoice) -> BTree
 /// which case the caller must leave `content` exactly as it was.
 ///
 /// `offered` is what licenses reading an object out of prose at all; with an
-/// empty set this always returns `None`.
+/// empty set this always returns `None`. `schemas` is consulted only to type
+/// a markup-dialect `<parameter>` body — see [`authorized_tool_schemas`] — and
+/// an empty map just falls back to this module's parse-or-string guess.
 pub fn recover_text_tool_calls(
     content: &str,
     offered: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
 ) -> Option<(String, Vec<ToolCall>)> {
     if offered.is_empty() || content.is_empty() {
         return None;
     }
-    let (cleaned, calls) = salvage(content, offered)?;
+    let (cleaned, calls) = salvage(content, offered, schemas)?;
     tracing::warn!(
         recovered = calls.len(),
         tools = ?calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
@@ -229,9 +309,12 @@ fn salvaged_call_id(index: usize) -> String {
 /// Returns the narrative with the recovered calls (and their markers and now-
 /// empty code fences) removed, or `None` when nothing was recovered — in which
 /// case the caller must return the original text untouched.
-fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall>)> {
-    let mut calls = Vec::new();
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+fn salvage(
+    text: &str,
+    known: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
+) -> Option<(String, Vec<ToolCall>)> {
+    let mut found: Vec<Candidate> = Vec::new();
 
     for (start, end) in json_object_spans(text) {
         let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) else {
@@ -244,23 +327,349 @@ fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall
         let Some((name, arguments)) = as_known_call(&value, known, marked) else {
             continue;
         };
-        calls.push(ToolCall {
-            id: salvaged_call_id(calls.len()),
+        found.push(Candidate {
+            start: cut,
+            end,
             name,
             arguments,
+        });
+    }
+
+    found.extend(tag_call_candidates(text, known, schemas));
+
+    // Left to right, and never twice over the same bytes: a JSON object written
+    // as a `<parameter>` body is that call's argument, not a second call
+    // beside it. The tag span opens first, so ordering by start is what makes
+    // the enclosing call win.
+    found.sort_by_key(|candidate| candidate.start);
+
+    let mut calls = Vec::new();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut consumed = 0usize;
+    for candidate in found {
+        if candidate.start < consumed {
+            continue;
+        }
+        consumed = candidate.end;
+        calls.push(ToolCall {
+            id: salvaged_call_id(calls.len()),
+            name: candidate.name,
+            arguments: candidate.arguments,
             // Recovered from a well-formed object whose arguments already
             // resolved to a JSON object, so there is nothing to declare
             // malformed. `Some(_)` here is the provider's channel for "the
             // model asked for this and its body would not parse".
             invalid: None,
         });
-        cuts.push((cut, end));
+        cuts.push((candidate.start, candidate.end));
     }
 
     if calls.is_empty() {
         return None;
     }
+    // Only once something was recovered: an envelope tag on a turn that
+    // recovered nothing belongs to whatever the model was actually writing, and
+    // deleting it would edit a reply this module never understood. And only an
+    // envelope that actually wraps a recovered call — a reply that documents
+    // this syntax in prose, with an unrelated recovered call elsewhere in the
+    // same message, keeps its example verbatim (Codex review on #2093).
+    cuts.extend(envelope_tag_spans(text, &cuts));
+    cuts.sort_by_key(|(start, _)| *start);
     Some((cut_and_tidy(text, &cuts), calls))
+}
+
+/// One recovery under consideration: the bytes it would remove, and the call
+/// they would become.
+struct Candidate {
+    /// Where the removal starts — the object's own start, extended over a
+    /// marker, or the opening tag.
+    start: usize,
+    /// One past the last byte of the removal.
+    end: usize,
+    name: String,
+    arguments: Value,
+}
+
+/// A located tag: where it starts, where the text after its `>` resumes, and
+/// the attribute run between the keyword and the `>`.
+struct Tag<'a> {
+    start: usize,
+    after: usize,
+    attrs: &'a str,
+}
+
+/// Every `<invoke name="…">…</invoke>` call to a **known** tool in `text`,
+/// left to right, in either the bare or a decorated dialect.
+///
+/// An `<invoke>` is an unambiguous call marker in the way the `function` key
+/// is, so a parameterless one recovers with empty arguments rather than needing
+/// the bare-object check the `name`-keyed JSON shape needs. Belt membership is
+/// still required: the tag says *a* call, the belt says *this* call.
+fn tag_call_candidates(
+    text: &str,
+    known: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
+) -> Vec<Candidate> {
+    let mut found = Vec::new();
+    let mut from = 0usize;
+
+    while let Some(open) = find_tag(text, from, INVOKE_TAG, false) {
+        // An unclosed tag is left verbatim rather than guessed at: the model
+        // was cut off mid-call, and inventing its end would run a tool against
+        // arguments nobody finished writing. Nothing after it can be a call
+        // either — its own end is missing, so any later `</invoke>` is as
+        // likely to be this one's as the next one's.
+        let Some(close) = find_tag(text, open.after, INVOKE_TAG, true) else {
+            break;
+        };
+        // Past the whole call whatever the checks below decide, so a tag this
+        // rejects cannot be rematched on the next pass.
+        from = close.after;
+        let Some(name) = attr(open.attrs, "name") else {
+            continue;
+        };
+        if !known.contains(&name) {
+            continue;
+        }
+        // An invoke whose body cut off mid-parameter is the same "model was
+        // cut off" case the unclosed-tag check above exists for, one level
+        // in: an incomplete argument object is not the call the model wrote,
+        // and dispatching it anyway would run a tool against inputs nobody
+        // finished (Codex review on #2093). Reject the whole invoke rather
+        // than the one parameter — a partial argument set is worse than none.
+        let Some(arguments) =
+            tag_call_arguments(&text[open.after..close.start], schemas.get(&name))
+        else {
+            continue;
+        };
+        found.push(Candidate {
+            start: open.start,
+            end: close.after,
+            name,
+            arguments,
+        });
+    }
+
+    found
+}
+
+/// The `<parameter name="…">…</parameter>` children of one call body, as its
+/// arguments object — or `None` if any of them is left unclosed.
+///
+/// `schema` is the call's own JSON Schema `parameters` when the recovery has
+/// one, consulted per-parameter to type a body the dialect left undeclared —
+/// see [`parameter_value`].
+fn tag_call_arguments(body: &str, schema: Option<&Value>) -> Option<Value> {
+    let mut arguments = Map::new();
+    let mut from = 0usize;
+
+    while let Some(open) = find_tag(body, from, PARAMETER_TAG, false) {
+        // Unclosed, so where this argument ends is unknown — and so is whether
+        // anything after it belongs to this parameter or the next. The call
+        // it belongs to is incomplete, not just this parameter: reject it
+        // rather than dispatch a tool call with an argument object the model
+        // never finished writing.
+        let close = find_tag(body, open.after, PARAMETER_TAG, true)?;
+        from = close.after;
+        let Some(name) = attr(open.attrs, "name") else {
+            continue;
+        };
+        let declared_type = schema
+            .and_then(|schema| schema.pointer(&format!("/properties/{name}/type")))
+            .and_then(Value::as_str);
+        arguments.insert(
+            name,
+            parameter_value(&body[open.after..close.start], open.attrs, declared_type),
+        );
+    }
+
+    Some(Value::Object(arguments))
+}
+
+/// One `<parameter>` body as a JSON value.
+///
+/// The body is text on the wire whatever the argument's declared type is, so a
+/// structured argument only survives by being read back as JSON. DeepSeek's
+/// dialect says which is which with `string="true"`, and that wins outright —
+/// without it a query of `2026` becomes a number and a strictly-typed tool
+/// rejects a call the model got right.
+///
+/// That still leaves Claude's own bare form with nothing to declare it either
+/// way, so `declared_type` — the call's own tool schema, read by
+/// [`tag_call_arguments`] — is the second and preferred source: a parameter
+/// the schema itself types `"string"` is a string whatever it looks like,
+/// because guessing from the text alone breaks in the opposite direction just
+/// as often — a numeric-looking `query` coerced to a JSON number is exactly as
+/// wrong as a page index that should have been one (Codex review on #2093).
+/// Anything else — a schema saying otherwise, or none at all — falls back to
+/// the parse-or-string guess this module always used.
+fn parameter_value(raw: &str, attrs: &str, declared_type: Option<&str>) -> Value {
+    // Declared a string: the model's bytes are the value, leading and
+    // trailing whitespace included — trimming here would silently edit
+    // content the dialect explicitly said not to reinterpret (CodeRabbit
+    // review on #2093).
+    if attr(attrs, "string").is_some_and(|declared| declared.eq_ignore_ascii_case("true")) {
+        return Value::String(raw.to_string());
+    }
+    let trimmed = raw.trim();
+    if declared_type == Some("string") {
+        return Value::String(trimmed.to_string());
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => Value::String(trimmed.to_string()),
+    }
+}
+
+/// The spans of every `<tool_calls>` / `</tool_calls>` envelope pair that
+/// actually wraps one of `cuts`, so the wrapper does not outlive the calls it
+/// wrapped — and a pair enclosing none of them, such as one documenting the
+/// syntax in unrelated prose, is left untouched (Codex review on #2093).
+fn envelope_tag_spans(text: &str, cuts: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut from = 0usize;
+    while let Some(open) = find_tag(text, from, TOOL_CALLS_TAG, false) {
+        // An envelope open with no matching close is left as-is, the same as
+        // an invoke or parameter cut short: nothing after it can be told
+        // apart from the next envelope's own close.
+        let Some(close) = find_tag(text, open.after, TOOL_CALLS_TAG, true) else {
+            break;
+        };
+        from = close.after;
+        let wraps_recovery = cuts
+            .iter()
+            .any(|&(start, end)| start >= open.after && end <= close.start);
+        if wraps_recovery {
+            spans.push((open.start, open.after));
+            spans.push((close.start, close.after));
+        }
+    }
+    spans
+}
+
+/// The next `<keyword …>` (or `</keyword>`) at or after `from`.
+fn find_tag<'a>(text: &'a str, from: usize, keyword: &str, closing: bool) -> Option<Tag<'a>> {
+    let mut search = from;
+    while let Some(offset) = text.get(search..)?.find('<') {
+        let start = search + offset;
+        // One byte past this `<`, so a `<` that opens nothing does not stall
+        // the scan on itself.
+        search = start + 1;
+        if let Some(tag) = tag_at(text, start, keyword, closing) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// Read the tag `keyword` opens at `start`, or `None` if that is not the tag.
+fn tag_at<'a>(text: &'a str, start: usize, keyword: &str, closing: bool) -> Option<Tag<'a>> {
+    let rest = text.get(start + 1..)?;
+    let rest = match closing {
+        true => rest.strip_prefix('/')?,
+        // A closing tag is not an opening one, so `</invoke>` must not answer
+        // a search for `<invoke>` — otherwise a call's own end reads as the
+        // start of another and the scan never terminates the span.
+        false if rest.starts_with('/') => return None,
+        false => rest,
+    };
+    let rest = undecorated(rest, keyword)?.strip_prefix(keyword)?;
+    let stop = rest.find('>')?;
+    let attrs = &rest[..stop];
+    // The keyword has to end where the tag name ends: `<invoker>` is not an
+    // `<invoke>` tag with the attribute `r`.
+    if attrs
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    // A closing tag carries no attributes. Anything in that position means this
+    // is not the tag it looks like.
+    if closing && !attrs.trim().is_empty() {
+        return None;
+    }
+    // A `<` inside what was taken for an attribute run means the `>` belongs to
+    // a later tag and this one was never closed.
+    if attrs.contains('<') {
+        return None;
+    }
+    let after = text.len() - rest[stop + 1..].len();
+    Some(Tag {
+        start,
+        after,
+        attrs,
+    })
+}
+
+/// `rest` positioned at `keyword`, skipping a dialect's decoration if one sits
+/// in front of it.
+///
+/// The decoration must be short, unbroken, and carry a non-ASCII character —
+/// the marker glyph a dialect brands its tags with. Without that last
+/// condition every `<parameterise>` in an ordinary sentence becomes a
+/// `<parameter>` tag. See the module docs.
+fn undecorated<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
+    if rest.starts_with(keyword) {
+        return Some(rest);
+    }
+    // Bounded by the cap: a `<` with no keyword anywhere near it costs a short
+    // window rather than a scan to the end of the message. `rest` is the
+    // whole tail after the `<`, and `find_tag` calls in here once per `<` in
+    // the text, so an unbounded `find` here is one full scan of the remaining
+    // message per stray `<` (CodeRabbit review on #2093).
+    let window_end = MAX_TAG_DECORATION + keyword.len();
+    let window = match rest.char_indices().find(|&(index, _)| index >= window_end) {
+        Some((index, _)) => &rest[..index],
+        None => rest,
+    };
+    let at = window.find(keyword)?;
+    let decoration = &rest[..at];
+    if decoration.len() > MAX_TAG_DECORATION
+        || decoration
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '>' || ch == '<')
+        || decoration.is_ascii()
+    {
+        return None;
+    }
+    Some(&rest[at..])
+}
+
+/// The value of the `name="…"` style attribute `attr` in a tag's attribute run.
+///
+/// Both quote styles, because a dialect that writes its tags by hand is not
+/// bound to either. An attribute whose name is the tail of another
+/// (`string` inside `substring`) does not match: the character in front of it
+/// must not continue a word.
+fn attr(attrs: &str, name: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(offset) = attrs.get(from..)?.find(name) {
+        let at = from + offset;
+        from = at + name.len();
+        let standalone = attrs[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_' && ch != '-');
+        if !standalone {
+            continue;
+        }
+        let Some(rest) = attrs[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let quote = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => quote,
+            _ => continue,
+        };
+        let value = &rest[quote.len_utf8()..];
+        let Some(end) = value.find(quote) else {
+            continue;
+        };
+        return Some(value[..end].to_string());
+    }
+    None
 }
 
 /// Interpret one JSON value as a call to a tool in `known`.
@@ -561,6 +970,7 @@ fn json_object_spans(text: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn belt() -> BTreeSet<String> {
         ["read_ledger", "list_desks", "write_file"]
@@ -572,11 +982,266 @@ mod tests {
     /// What the provider does with a text-only response: hand the content and
     /// the turn's offered tools to the recovery.
     fn recover(text: &str) -> (String, Vec<ToolCall>) {
-        match recover_text_tool_calls(text, &belt()) {
+        recover_with_schemas(text, &BTreeMap::new())
+    }
+
+    /// [`recover`], with a per-tool JSON Schema `parameters` map to type an
+    /// undeclared markup `<parameter>` body against.
+    fn recover_with_schemas(
+        text: &str,
+        schemas: &BTreeMap<String, Value>,
+    ) -> (String, Vec<ToolCall>) {
+        match recover_text_tool_calls(text, &belt(), schemas) {
             Some((cleaned, calls)) => (cleaned, calls),
             // Nothing recovered: the caller leaves the content untouched.
             None => (text.to_string(), Vec::new()),
         }
+    }
+
+    /// The DeepSeek leak, verbatim from company chat: the whole call written as
+    /// marker-decorated markup, wrapped in an envelope, with the model's own
+    /// sentence in front of it.
+    #[test]
+    fn a_decorated_invoke_dialect_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "Let me check the ledger.\n\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"read_ledger\">\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter name=\"ledger\" string=\"true\">tasks",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>",
+        ));
+
+        assert_eq!(calls.len(), 1, "one call recovered");
+        assert_eq!(calls[0].name, "read_ledger");
+        assert_eq!(calls[0].arguments, json!({ "ledger": "tasks" }));
+        // The narrative survives; not one tag of the markup does.
+        assert_eq!(cleaned, "Let me check the ledger.");
+    }
+
+    /// The same dialect writing several calls in one envelope — what the
+    /// operator actually saw: four searches, none of which ran.
+    #[test]
+    fn every_call_in_one_decorated_envelope_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "Checking.\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"list_desks\">\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke name=\"read_ledger\">\n",
+            "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter name=\"ledger\" string=\"true\">risks",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}parameter>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}invoke>\n",
+            "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}tool_calls>",
+        ));
+
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["list_desks", "read_ledger"],
+            "both calls, in the order written"
+        );
+        // A parameterless tag call is a call with no arguments, the way a
+        // `function`-keyed object with none is.
+        assert_eq!(calls[0].arguments, json!({}));
+        assert_eq!(calls[1].arguments, json!({ "ledger": "risks" }));
+        assert_eq!(cleaned, "Checking.");
+        // Both halves of each cycle read the same id, or the result answers no
+        // call. See the module docs.
+        assert_eq!(calls[0].id, "salvaged_call_0");
+        assert_eq!(calls[1].id, "salvaged_call_1");
+    }
+
+    /// An envelope tag that documents the syntax in prose, with no recovered
+    /// call inside it, is not this module's to edit — only a recovered call
+    /// elsewhere in the same message is (Codex review on #2093).
+    #[test]
+    fn an_envelope_tag_around_no_recovered_call_survives() {
+        let text = concat!(
+            "Here is the syntax: <tool_calls><invoke name=\"unlisted_tool\">",
+            "</invoke></tool_calls>\n",
+            "Now actually calling it.\n",
+            "<invoke name=\"list_desks\"></invoke>",
+        );
+        let (cleaned, calls) = recover(text);
+
+        assert_eq!(calls.len(), 1, "only the real call is recovered");
+        assert_eq!(calls[0].name, "list_desks");
+        assert!(
+            cleaned.contains("<tool_calls><invoke name=\"unlisted_tool\">"),
+            "the documented example must survive verbatim: {cleaned:?}"
+        );
+        assert!(
+            !cleaned.contains("list_desks"),
+            "the real call is still removed: {cleaned:?}"
+        );
+    }
+
+    /// The undecorated form — Claude's own markup, which a model trained on it
+    /// writes whatever endpoint it is served from.
+    #[test]
+    fn a_bare_invoke_tag_is_recovered() {
+        let (cleaned, calls) = recover(concat!(
+            "One moment.\n",
+            "<invoke name=\"read_ledger\">",
+            "<parameter name=\"ledger\">tasks</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({ "ledger": "tasks" }));
+        assert_eq!(cleaned, "One moment.");
+    }
+
+    /// A structured argument only survives by being read back as JSON, and a
+    /// `string="true"` body must not be.
+    #[test]
+    fn a_parameter_body_is_json_unless_declared_a_string() {
+        let (_, calls) = recover(concat!(
+            "<invoke name=\"write_file\">",
+            "<parameter name=\"content\">{\"rows\":[1,2]}</parameter>",
+            "<parameter name=\"path\" string=\"true\">2026</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            json!({ "content": { "rows": [1, 2] }, "path": "2026" }),
+            "the object parses; the declared string stays a string"
+        );
+    }
+
+    /// Claude's own bare markup has no `string="true"` escape at all, so a
+    /// numeric-looking `query` would otherwise become a JSON number and a
+    /// strictly-typed *string* parameter would reject the call outright. The
+    /// tool's own schema is what tells the recovery which way to guess right
+    /// (Codex review on #2093).
+    #[test]
+    fn a_schema_typed_string_parameter_is_not_coerced_to_a_number() {
+        let schemas = BTreeMap::from([(
+            "read_ledger".to_string(),
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+            }),
+        )]);
+        let (_, calls) = recover_with_schemas(
+            concat!(
+                "<invoke name=\"read_ledger\">",
+                "<parameter name=\"query\">2026</parameter>",
+                "</invoke>",
+            ),
+            &schemas,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            json!({ "query": "2026" }),
+            "the schema says string, so the digits stay a string"
+        );
+    }
+
+    /// A parameter the schema does not mention at all falls back to this
+    /// module's ordinary parse-or-string guess, exactly as with no schema.
+    #[test]
+    fn a_parameter_absent_from_the_schema_still_gets_the_parse_or_string_guess() {
+        let schemas = BTreeMap::from([(
+            "read_ledger".to_string(),
+            json!({ "type": "object", "properties": {} }),
+        )]);
+        let (_, calls) = recover_with_schemas(
+            concat!(
+                "<invoke name=\"read_ledger\">",
+                "<parameter name=\"limit\">5</parameter>",
+                "</invoke>",
+            ),
+            &schemas,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({ "limit": 5 }));
+    }
+
+    /// The enclosing call owns its own argument: a JSON object in a
+    /// `<parameter>` body must not also be recovered as a call beside it.
+    #[test]
+    fn a_json_body_inside_a_call_is_not_a_second_call() {
+        let (_, calls) = recover(concat!(
+            "<invoke name=\"write_file\">",
+            "<parameter name=\"content\">",
+            "function_call:{\"call\":\"read_ledger\",\"arguments\":{\"ledger\":\"tasks\"}}",
+            "</parameter>",
+            "</invoke>",
+        ));
+
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["write_file"],
+            "only the call that was actually made"
+        );
+    }
+
+    /// Belt membership decides here exactly as it does for the object shapes:
+    /// the tag says a call was written, not that this turn offered it.
+    #[test]
+    fn an_invoke_naming_an_unoffered_tool_is_left_alone() {
+        let text = "<invoke name=\"drop_database\"><parameter name=\"id\">1</parameter></invoke>";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty(), "nothing recovered");
+        assert_eq!(cleaned, text, "and the reply is untouched");
+    }
+
+    /// A model cut off mid-call leaves a tag with no end. Guessing where it
+    /// stopped would run a tool against arguments nobody finished writing.
+    #[test]
+    fn an_unclosed_invoke_is_left_verbatim() {
+        let text = "<invoke name=\"read_ledger\"><parameter name=\"ledger\">tas";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, text);
+    }
+
+    /// A call closes but one of its arguments does not: the model was cut off
+    /// mid-parameter. Dispatching the call anyway with a partial (or empty)
+    /// argument object would run a tool against inputs the model never
+    /// finished writing — reject the whole invoke instead (Codex review on
+    /// #2093).
+    #[test]
+    fn an_invoke_with_an_unclosed_parameter_is_rejected_whole() {
+        let text = concat!(
+            "<invoke name=\"read_ledger\">",
+            "<parameter name=\"ledger\">tasks</parameter>",
+            "<parameter name=\"query\">unfinished",
+            "</invoke>",
+        );
+        let (cleaned, calls) = recover(text);
+
+        assert!(
+            calls.is_empty(),
+            "an incomplete argument object must not dispatch"
+        );
+        assert_eq!(cleaned, text, "left verbatim, like an unclosed invoke");
+    }
+
+    /// The decoration must be a dialect's marker, not any run of letters: an
+    /// ordinary word starting with the keyword is not a tag.
+    #[test]
+    fn an_ascii_lookalike_tag_is_not_a_call() {
+        let text = "<invoker name=\"read_ledger\">whatever</invoker>";
+        let (cleaned, calls) = recover(text);
+
+        assert!(calls.is_empty(), "`<invoker>` is not `<invoke>`");
+        assert_eq!(cleaned, text);
     }
 
     /// The smoking gun, verbatim from the 1/9 QA round: a `function_call:`
@@ -703,7 +1368,7 @@ mod tests {
     #[test]
     fn a_turn_that_offered_no_tools_never_recovers() {
         let raw = "{\"call\":\"read_ledger\",\"arguments\":{\"ledger\":\"tasks\"}}";
-        assert!(recover_text_tool_calls(raw, &BTreeSet::new()).is_none());
+        assert!(recover_text_tool_calls(raw, &BTreeSet::new(), &BTreeMap::new()).is_none());
     }
 
     /// A fenced code block the narrative actually needs is not collateral.
