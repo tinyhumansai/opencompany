@@ -929,7 +929,10 @@ mod tests {
         ));
 
         assert_eq!(
-            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
             ["list_desks", "read_ledger"],
             "both calls, in the order written"
         );
@@ -992,7 +995,10 @@ mod tests {
         ));
 
         assert_eq!(
-            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
             ["write_file"],
             "only the call that was actually made"
         );
