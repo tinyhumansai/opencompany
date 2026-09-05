@@ -1109,6 +1109,58 @@ mod tests {
         );
     }
 
+    /// Claude's own bare markup has no `string="true"` escape at all, so a
+    /// numeric-looking `query` would otherwise become a JSON number and a
+    /// strictly-typed *string* parameter would reject the call outright. The
+    /// tool's own schema is what tells the recovery which way to guess right
+    /// (Codex review on #2093).
+    #[test]
+    fn a_schema_typed_string_parameter_is_not_coerced_to_a_number() {
+        let schemas = BTreeMap::from([(
+            "read_ledger".to_string(),
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+            }),
+        )]);
+        let (_, calls) = recover_with_schemas(
+            concat!(
+                "<invoke name=\"read_ledger\">",
+                "<parameter name=\"query\">2026</parameter>",
+                "</invoke>",
+            ),
+            &schemas,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            json!({ "query": "2026" }),
+            "the schema says string, so the digits stay a string"
+        );
+    }
+
+    /// A parameter the schema does not mention at all falls back to this
+    /// module's ordinary parse-or-string guess, exactly as with no schema.
+    #[test]
+    fn a_parameter_absent_from_the_schema_still_gets_the_parse_or_string_guess() {
+        let schemas = BTreeMap::from([(
+            "read_ledger".to_string(),
+            json!({ "type": "object", "properties": {} }),
+        )]);
+        let (_, calls) = recover_with_schemas(
+            concat!(
+                "<invoke name=\"read_ledger\">",
+                "<parameter name=\"limit\">5</parameter>",
+                "</invoke>",
+            ),
+            &schemas,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({ "limit": 5 }));
+    }
+
     /// The enclosing call owns its own argument: a JSON object in a
     /// `<parameter>` body must not also be recovered as a call beside it.
     #[test]
