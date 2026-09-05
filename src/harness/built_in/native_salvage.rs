@@ -239,6 +239,28 @@ pub fn authorized_tool_names(tools: &[ToolSchema], choice: &ToolChoice) -> BTree
     }
 }
 
+/// The authorized tools' own JSON Schema `parameters`, keyed by name.
+///
+/// A markup-dialect `<parameter>` body is text on the wire whatever the
+/// argument's real type is (see [`parameter_value`]), and a dialect marks the
+/// exception (`string="true"`) rather than the rule — Claude's own bare form
+/// marks nothing at all. Without the tool's own declared type, a scalar-
+/// looking body is a guess either way: coerce it and a strictly-typed
+/// *string* parameter gets a number; leave it a string and a strictly-typed
+/// *number* parameter gets one instead. The schema is the one thing that
+/// actually knows, so the recovery consults it before guessing (Codex review
+/// on #2093). Same authorization rule as [`authorized_tool_names`] — this is
+/// that same computation, carrying the schema instead of just the name.
+pub fn authorized_tool_schemas(tools: &[ToolSchema], choice: &ToolChoice) -> BTreeMap<String, Value> {
+    authorized_tool_names(tools, choice)
+        .into_iter()
+        .filter_map(|name| {
+            let schema = tools.iter().find(|tool| tool.name == name)?;
+            Some((name, schema.parameters.clone()))
+        })
+        .collect()
+}
+
 /// Recover tool calls a model wrote into `content` as text, when the turn's
 /// structured `tool_calls` came back empty.
 ///
@@ -247,15 +269,18 @@ pub fn authorized_tool_names(tools: &[ToolSchema], choice: &ToolChoice) -> BTree
 /// which case the caller must leave `content` exactly as it was.
 ///
 /// `offered` is what licenses reading an object out of prose at all; with an
-/// empty set this always returns `None`.
+/// empty set this always returns `None`. `schemas` is consulted only to type
+/// a markup-dialect `<parameter>` body — see [`authorized_tool_schemas`] — and
+/// an empty map just falls back to this module's parse-or-string guess.
 pub fn recover_text_tool_calls(
     content: &str,
     offered: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
 ) -> Option<(String, Vec<ToolCall>)> {
     if offered.is_empty() || content.is_empty() {
         return None;
     }
-    let (cleaned, calls) = salvage(content, offered)?;
+    let (cleaned, calls) = salvage(content, offered, schemas)?;
     tracing::warn!(
         recovered = calls.len(),
         tools = ?calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
