@@ -32,7 +32,7 @@ enum Command {
         /// `bind` key of `config.toml`, then `127.0.0.1:8080`.
         #[arg(long)]
         bind: Option<String>,
-        /// Optional OpenHuman checkout path to report in `/spec`.
+        /// Optional OpenHuman checkout path. `/spec` reports only that one is set.
         #[arg(long)]
         openhuman_root: Option<PathBuf>,
         /// A company to load and register at boot (a manifest file or a
@@ -52,7 +52,7 @@ enum Command {
     },
     /// Print a JSON runtime specification.
     Spec {
-        /// Optional OpenHuman checkout path to report.
+        /// Optional OpenHuman checkout path. Reported as a boolean, not a path.
         #[arg(long)]
         openhuman_root: Option<PathBuf>,
     },
