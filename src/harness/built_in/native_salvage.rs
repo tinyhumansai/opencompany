@@ -402,7 +402,11 @@ struct Tag<'a> {
 /// is, so a parameterless one recovers with empty arguments rather than needing
 /// the bare-object check the `name`-keyed JSON shape needs. Belt membership is
 /// still required: the tag says *a* call, the belt says *this* call.
-fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
+fn tag_call_candidates(
+    text: &str,
+    known: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
+) -> Vec<Candidate> {
     let mut found = Vec::new();
     let mut from = 0usize;
 
@@ -430,7 +434,9 @@ fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
         // and dispatching it anyway would run a tool against inputs nobody
         // finished (Codex review on #2093). Reject the whole invoke rather
         // than the one parameter — a partial argument set is worse than none.
-        let Some(arguments) = tag_call_arguments(&text[open.after..close.start]) else {
+        let Some(arguments) =
+            tag_call_arguments(&text[open.after..close.start], schemas.get(&name))
+        else {
             continue;
         };
         found.push(Candidate {
