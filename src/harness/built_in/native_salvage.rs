@@ -337,8 +337,11 @@ fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall
     }
     // Only once something was recovered: an envelope tag on a turn that
     // recovered nothing belongs to whatever the model was actually writing, and
-    // deleting it would edit a reply this module never understood.
-    cuts.extend(envelope_tag_spans(text));
+    // deleting it would edit a reply this module never understood. And only an
+    // envelope that actually wraps a recovered call — a reply that documents
+    // this syntax in prose, with an unrelated recovered call elsewhere in the
+    // same message, keeps its example verbatim (Codex review on #2093).
+    cuts.extend(envelope_tag_spans(text, &cuts));
     cuts.sort_by_key(|(start, _)| *start);
     Some((cut_and_tidy(text, &cuts), calls))
 }
