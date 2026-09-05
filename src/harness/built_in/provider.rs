@@ -1454,6 +1454,8 @@ impl ChatModel<()> for HostedProvider {
             &request.tools,
             &request.tool_choice,
         );
+        let schemas =
+            crate::harness::native_salvage::authorized_tool_schemas(&request.tools, &request.tool_choice);
 
         let base_url = self.config.base_url.trim_end_matches('/');
         let url = format!("{base_url}/chat/completions");
@@ -1518,7 +1520,7 @@ impl ChatModel<()> for HostedProvider {
         let payload: serde_json::Value = response.json().await.map_err(|e| {
             InferenceError::Model(format!("hosted inference response was not JSON: {e}"))
         })?;
-        model_response_from_payload_offering(payload, &offered)
+        model_response_from_payload_offering(payload, &offered, &schemas)
     }
 }
 
