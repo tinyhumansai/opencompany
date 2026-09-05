@@ -202,9 +202,9 @@ const TOOL_CALLS_TAG: &str = "tool_calls";
 
 /// How long a decoration between `<` and a tag keyword may be, in bytes.
 ///
-/// `｜｜DSML｜｜` is 14. The cap is what keeps a scan for `<…invoke` from
-/// reaching across a paragraph of prose to a keyword that has nothing to do
-/// with the `<` it started from.
+/// `｜｜DSML｜｜` is 16 bytes — the marker glyph is three bytes each. The cap is
+/// what keeps a scan for `<…invoke` from reaching across a paragraph of prose
+/// to a keyword that has nothing to do with the `<` it started from.
 const MAX_TAG_DECORATION: usize = 32;
 
 /// The names this turn actually **authorized** the model to call, as the set
