@@ -451,13 +451,17 @@ fn tag_call_arguments(body: &str) -> Option<Value> {
 /// without it a query of `2026` becomes a number and a strictly-typed tool
 /// rejects a call the model got right.
 fn parameter_value(raw: &str, attrs: &str) -> Value {
-    let raw = raw.trim();
+    // Declared a string: the model's bytes are the value, leading and
+    // trailing whitespace included — trimming here would silently edit
+    // content the dialect explicitly said not to reinterpret (CodeRabbit
+    // review on #2093).
     if attr(attrs, "string").is_some_and(|declared| declared.eq_ignore_ascii_case("true")) {
         return Value::String(raw.to_string());
     }
-    match serde_json::from_str::<Value>(raw) {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => value,
-        Err(_) => Value::String(raw.to_string()),
+        Err(_) => Value::String(trimmed.to_string()),
     }
 }
 
