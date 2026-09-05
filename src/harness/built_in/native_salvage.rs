@@ -979,7 +979,13 @@ mod tests {
     /// What the provider does with a text-only response: hand the content and
     /// the turn's offered tools to the recovery.
     fn recover(text: &str) -> (String, Vec<ToolCall>) {
-        match recover_text_tool_calls(text, &belt()) {
+        recover_with_schemas(text, &BTreeMap::new())
+    }
+
+    /// [`recover`], with a per-tool JSON Schema `parameters` map to type an
+    /// undeclared markup `<parameter>` body against.
+    fn recover_with_schemas(text: &str, schemas: &BTreeMap<String, Value>) -> (String, Vec<ToolCall>) {
+        match recover_text_tool_calls(text, &belt(), schemas) {
             Some((cleaned, calls)) => (cleaned, calls),
             // Nothing recovered: the caller leaves the content untouched.
             None => (text.to_string(), Vec::new()),
