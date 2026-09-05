@@ -332,7 +332,7 @@ fn salvage(
         });
     }
 
-    found.extend(tag_call_candidates(text, known));
+    found.extend(tag_call_candidates(text, known, schemas));
 
     // Left to right, and never twice over the same bytes: a JSON object written
     // as a `<parameter>` body is that call's argument, not a second call
