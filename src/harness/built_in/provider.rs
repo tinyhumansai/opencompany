@@ -946,7 +946,11 @@ fn raw_tool_call_requested(payload: &serde_json::Value) -> bool {
 /// probe, and every payload-shape test — gets exactly the wire parse and no
 /// text recovery.
 fn model_response_from_payload(payload: serde_json::Value) -> TaResult<ModelResponse> {
-    model_response_from_payload_offering(payload, &std::collections::BTreeSet::new())
+    model_response_from_payload_offering(
+        payload,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 /// [`model_response_from_payload`], plus the tool names **this turn offered the
