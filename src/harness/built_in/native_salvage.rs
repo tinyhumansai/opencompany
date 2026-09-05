@@ -558,7 +558,17 @@ fn undecorated<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
     if rest.starts_with(keyword) {
         return Some(rest);
     }
-    let at = rest.find(keyword)?;
+    // Bounded by the cap: a `<` with no keyword anywhere near it costs a short
+    // window rather than a scan to the end of the message. `rest` is the
+    // whole tail after the `<`, and `find_tag` calls in here once per `<` in
+    // the text, so an unbounded `find` here is one full scan of the remaining
+    // message per stray `<` (CodeRabbit review on #2093).
+    let window_end = MAX_TAG_DECORATION + keyword.len();
+    let window = match rest.char_indices().find(|&(index, _)| index >= window_end) {
+        Some((index, _)) => &rest[..index],
+        None => rest,
+    };
+    let at = window.find(keyword)?;
     let decoration = &rest[..at];
     if decoration.len() > MAX_TAG_DECORATION
         || decoration
