@@ -461,15 +461,27 @@ fn parameter_value(raw: &str, attrs: &str) -> Value {
     }
 }
 
-/// The spans of every `<tool_calls>` / `</tool_calls>` envelope tag, so the
-/// wrapper does not outlive the calls it wrapped.
-fn envelope_tag_spans(text: &str) -> Vec<(usize, usize)> {
+/// The spans of every `<tool_calls>` / `</tool_calls>` envelope pair that
+/// actually wraps one of `cuts`, so the wrapper does not outlive the calls it
+/// wrapped — and a pair enclosing none of them, such as one documenting the
+/// syntax in unrelated prose, is left untouched (Codex review on #2093).
+fn envelope_tag_spans(text: &str, cuts: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
-    for closing in [false, true] {
-        let mut from = 0usize;
-        while let Some(tag) = find_tag(text, from, TOOL_CALLS_TAG, closing) {
-            spans.push((tag.start, tag.after));
-            from = tag.after;
+    let mut from = 0usize;
+    while let Some(open) = find_tag(text, from, TOOL_CALLS_TAG, false) {
+        // An envelope open with no matching close is left as-is, the same as
+        // an invoke or parameter cut short: nothing after it can be told
+        // apart from the next envelope's own close.
+        let Some(close) = find_tag(text, open.after, TOOL_CALLS_TAG, true) else {
+            break;
+        };
+        from = close.after;
+        let wraps_recovery = cuts
+            .iter()
+            .any(|&(start, end)| start >= open.after && end <= close.start);
+        if wraps_recovery {
+            spans.push((open.start, open.after));
+            spans.push((close.start, close.after));
         }
     }
     spans
