@@ -251,7 +251,10 @@ pub fn authorized_tool_names(tools: &[ToolSchema], choice: &ToolChoice) -> BTree
 /// actually knows, so the recovery consults it before guessing (Codex review
 /// on #2093). Same authorization rule as [`authorized_tool_names`] — this is
 /// that same computation, carrying the schema instead of just the name.
-pub fn authorized_tool_schemas(tools: &[ToolSchema], choice: &ToolChoice) -> BTreeMap<String, Value> {
+pub fn authorized_tool_schemas(
+    tools: &[ToolSchema],
+    choice: &ToolChoice,
+) -> BTreeMap<String, Value> {
     authorized_tool_names(tools, choice)
         .into_iter()
         .filter_map(|name| {
@@ -984,7 +987,10 @@ mod tests {
 
     /// [`recover`], with a per-tool JSON Schema `parameters` map to type an
     /// undeclared markup `<parameter>` body against.
-    fn recover_with_schemas(text: &str, schemas: &BTreeMap<String, Value>) -> (String, Vec<ToolCall>) {
+    fn recover_with_schemas(
+        text: &str,
+        schemas: &BTreeMap<String, Value>,
+    ) -> (String, Vec<ToolCall>) {
         match recover_text_tool_calls(text, &belt(), schemas) {
             Some((cleaned, calls)) => (cleaned, calls),
             // Nothing recovered: the caller leaves the content untouched.
