@@ -306,7 +306,11 @@ fn salvaged_call_id(index: usize) -> String {
 /// Returns the narrative with the recovered calls (and their markers and now-
 /// empty code fences) removed, or `None` when nothing was recovered — in which
 /// case the caller must return the original text untouched.
-fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall>)> {
+fn salvage(
+    text: &str,
+    known: &BTreeSet<String>,
+    schemas: &BTreeMap<String, Value>,
+) -> Option<(String, Vec<ToolCall>)> {
     let mut found: Vec<Candidate> = Vec::new();
 
     for (start, end) in json_object_spans(text) {
