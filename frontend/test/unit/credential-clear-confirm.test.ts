@@ -33,8 +33,20 @@ const { HostingView } = await import("@/views/HostingView");
 let container: HTMLDivElement;
 let root: Root;
 
+/**
+ * A client that answers `/auth/me` as an admin.
+ *
+ * The role is stated rather than left to a stub with no `get`: `HostingView`
+ * withholds Disconnect from a non-admin, and an unanswerable `/auth/me` reads
+ * as non-admin. A fixture that did not say would be asserting a member's view
+ * of a confirmation flow only an admin can reach.
+ */
 function client(): OpenCompanyClient {
-  return { scopeFor: () => "/api/v1/company" } as unknown as OpenCompanyClient;
+  return {
+    scopeFor: () => "/api/v1/company",
+    get: () =>
+      Promise.resolve({ id: "u1", email: "a@b.c", role: "admin", company: "acme" }),
+  } as unknown as OpenCompanyClient;
 }
 
 function button(label: string): HTMLButtonElement {

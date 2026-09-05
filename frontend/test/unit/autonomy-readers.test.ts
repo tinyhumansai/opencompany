@@ -118,7 +118,7 @@ describe("a policy written on the settings page", () => {
   function Both({ api, seen }: { api: OpenCompanyClient; seen: string[] }): ReactNode {
     const status = useAutonomy(api, "acme");
     seen.push(status?.mode ?? "unknown");
-    return createElement(PolicySettings, { client: api, company: "acme" });
+    return createElement(PolicySettings, { client: api, company: "acme", canManage: true });
   }
 
   async function mount(api: OpenCompanyClient, seen: string[]) {

@@ -3,9 +3,10 @@ import { Check, Loader2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { clearSearch, getSearch, saveSearch, type SearchStatus } from "@/api/search";
-import { me as fetchMe } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
+import { AdminOnlyNotice } from "@/components/admin-only-notice";
 import { PageHeader } from "@/components/page-header";
+import { useCanManage } from "@/hooks/use-can-manage";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { GrantNamespace } from "@/components/grant-namespace";
 import { Badge } from "@/components/ui/badge";
@@ -90,15 +91,13 @@ export function SearchView({ client, company }: Props) {
   const [status, setStatus] = useState<SearchStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // Whether this viewer may widen the company's tool grants (issue #1796).
+  // Whether this viewer may change where this company's teammates search.
   //
-  // Resolved the way `OAuthView` resolves the same question, and defaulted
-  // CLOSED for the same reason: every write behind the control is admin-only,
-  // so an unresolved role must not render an enabled button. Courtesy, not
-  // enforcement — the host refuses a non-admin's `PUT` whatever this says. What
-  // it prevents is offering an operator an action whose only possible outcome
-  // is a 403 toast, which on this page would replace one dead end with another.
-  const [canManage, setCanManage] = useState(false);
+  // Governs the whole page, not just the grant control: `PUT …/search` and
+  // `DELETE …/search/key` are both `AdminScopedCompany`. The footnote at the
+  // bottom of this page has always said the choice is an administrator's; until
+  // this gate existed, the page said that under an enabled provider picker.
+  const canManage = useCanManage(client, company);
 
   const [provider, setProvider] = useState("managed");
   const [apiKey, setApiKey] = useState("");
@@ -120,22 +119,6 @@ export function SearchView({ client, company }: Props) {
     } catch (err) {
       setLoadError(reason(err));
     }
-  }, [client, company]);
-
-  useEffect(() => {
-    let live = true;
-    void (async () => {
-      let admin = false;
-      try {
-        admin = (await fetchMe(client, company)).role === "admin";
-      } catch {
-        // No user plane on this host, or not signed in — treat as non-admin.
-      }
-      if (live) setCanManage(admin);
-    })();
-    return () => {
-      live = false;
-    };
   }, [client, company]);
 
   useEffect(() => {
@@ -250,6 +233,19 @@ export function SearchView({ client, company }: Props) {
       {header}
       <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
 
+        {!canManage && (
+          <AdminOnlyNotice
+            testId="search-read-only"
+            title="Only an admin can change where this company searches"
+          >
+            Whatever a teammate types into a search reaches the provider selected
+            here, under that provider&rsquo;s own retention policy &mdash; and the
+            calls are billed to whichever account the key belongs to. Both are the
+            company&rsquo;s to decide, so an admin decides them. You can see which
+            index answers today.
+          </AdminOnlyNotice>
+        )}
+
         {!status.inBuild ? (
           <Alert data-testid="search-not-in-build">
             <TriangleAlert className="size-4" />
@@ -302,6 +298,7 @@ export function SearchView({ client, company }: Props) {
                   value={provider}
                   onValueChange={(v) => v && setProvider(String(v))}
                   items={labels}
+                  disabled={!canManage}
                 >
                   <SelectTrigger id="search-provider" data-testid="search-provider">
                     <SelectValue />
@@ -319,7 +316,10 @@ export function SearchView({ client, company }: Props) {
                 </p>
               </div>
 
-              {byo && provider !== "searxng" ? (
+              {/* Withheld from a member, not disabled — the same rule the API
+                token follows on the Hosting page. A disabled password box is
+                still somewhere to aim a paste. */}
+              {canManage && byo && provider !== "searxng" ? (
                 <div className="space-y-2">
                   <Label htmlFor="search-key">API key</Label>
                   <Input
@@ -348,6 +348,7 @@ export function SearchView({ client, company }: Props) {
                     data-testid="search-endpoint"
                     placeholder="https://searx.example.com"
                     value={endpoint}
+                    disabled={!canManage}
                     onChange={(e) => setEndpoint(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
@@ -359,11 +360,13 @@ export function SearchView({ client, company }: Props) {
             </div>
 
             <div className="flex items-center gap-2">
-              <Button onClick={() => void onSave()} disabled={busy} data-testid="search-save">
-                {busy ? <Loader2 className="mr-2 size-4 animate-spin" /> : null}
-                Save
-              </Button>
-              {status.provider !== "managed" ? (
+              {canManage ? (
+                <Button onClick={() => void onSave()} disabled={busy} data-testid="search-save">
+                  {busy ? <Loader2 className="mr-2 size-4 animate-spin" /> : null}
+                  Save
+                </Button>
+              ) : null}
+              {canManage && status.provider !== "managed" ? (
                 <Button
                   variant="outline"
                   onClick={() => void onClear()}

@@ -12,6 +12,7 @@ import {
   setPolicy,
 } from "@/api/policy";
 import { listWorkflowToolSlugs } from "@/api/workflows";
+import { AdminOnlyNotice } from "@/components/admin-only-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -260,6 +261,18 @@ export function gatedBy(list: string[], target: string): boolean {
 interface Props {
   client: OpenCompanyClient;
   company: string | null;
+  /**
+   * Whether this viewer may change the policy.
+   *
+   * Both writes behind this card call `require_admin`, so `false` renders the
+   * tiers and the deadline as a statement of what the company's policy IS,
+   * with nothing on the card that offers to change it.
+   *
+   * Required, and deliberately not defaulted, for the reason `GrantNamespace`
+   * gives: a caller that has not worked out the viewer's role must not get an
+   * enabled control by omission.
+   */
+  canManage: boolean;
 }
 
 /**
@@ -285,7 +298,7 @@ interface Props {
  *   edits, but editing `[policy]` in `company.toml` clears it. An operator who
  *   cannot see that would be surprised by a redeploy.
  */
-export function PolicySettings({ client, company }: Props) {
+export function PolicySettings({ client, company, canManage }: Props) {
   const [status, setStatus] = useState<PolicyStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -947,6 +960,16 @@ export function PolicySettings({ client, company }: Props) {
           </div>
         ) : (
           <>
+            {!canManage && (
+              <AdminOnlyNotice
+                testId="policy-read-only"
+                title="Only an admin can change this company's approval policy"
+              >
+                The tier decides how much every teammate here may do without asking
+                first, so it is the company&rsquo;s to set rather than any one
+                member&rsquo;s. You can see which tier is in force.
+              </AdminOnlyNotice>
+            )}
             <div className="rounded-md border border-status-blocked/30 bg-status-blocked-soft p-3 text-xs text-muted-foreground">
               Policy-based approval prompts are disabled. Teammates ask through{" "}
               <code>request_approval</code>; read-only mode and the emergency stop still
@@ -972,7 +995,7 @@ export function PolicySettings({ client, company }: Props) {
                       tierButtons.current[index] = el;
                     }}
                     type="button"
-                    disabled={saving}
+                    disabled={saving || !canManage}
                     onClick={() => chooseTier(tier)}
                     role="radio"
                     aria-checked={active}
@@ -1060,14 +1083,16 @@ export function PolicySettings({ client, company }: Props) {
                   step="1"
                   inputMode="numeric"
                   value={draftDeadline}
-                  disabled={saving}
+                  disabled={saving || !canManage}
                   className="max-w-32"
                   onChange={(event) => setDraftDeadline(event.target.value)}
                 />
                 <span className="text-sm text-muted-foreground">hours</span>
-                <Button size="sm" disabled={saving} onClick={() => void saveDeadline()}>
-                  Save deadline
-                </Button>
+                {canManage && (
+                  <Button size="sm" disabled={saving} onClick={() => void saveDeadline()}>
+                    Save deadline
+                  </Button>
+                )}
               </div>
             </div>
 
@@ -1137,16 +1162,18 @@ export function PolicySettings({ client, company }: Props) {
                   <code>[policy]</code> in <code>company.toml</code> clears it —
                   version control wins when it speaks.
                 </p>
-                <Button
-                  ref={resetButtonRef}
-                  size="sm"
-                  variant="outline"
-                  disabled={saving}
-                  onClick={() => requestReset()}
-                >
-                  <RotateCcw className="mr-1 h-3 w-3" />
-                  Use the manifest's policy
-                </Button>
+                {canManage && (
+                  <Button
+                    ref={resetButtonRef}
+                    size="sm"
+                    variant="outline"
+                    disabled={saving}
+                    onClick={() => requestReset()}
+                  >
+                    <RotateCcw className="mr-1 h-3 w-3" />
+                    Use the manifest&apos;s policy
+                  </Button>
+                )}
               </div>
             )}
             <AlertDialog

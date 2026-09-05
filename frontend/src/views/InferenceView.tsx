@@ -1,10 +1,7 @@
-import { useEffect, useState } from "react";
-import { Info } from "lucide-react";
-
-import { me as fetchMe } from "@/api/auth";
 import type { OpenCompanyClient } from "@/api/client";
+import { AdminOnlyNotice } from "@/components/admin-only-notice";
 import { PageHeader } from "@/components/page-header";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { useCanManage } from "@/hooks/use-can-manage";
 import { InferenceSection } from "@/views/connections/InferenceSection";
 
 interface Props {
@@ -26,25 +23,8 @@ interface Props {
  */
 export function InferenceView({ client, company }: Props) {
   // Changing the model or the key changes what every teammate's turn costs, so
-  // it is an admin's (issue #403). Courtesy only — the host answers 403 whatever
-  // this says.
-  const [canManage, setCanManage] = useState(false);
-
-  useEffect(() => {
-    let live = true;
-    void (async () => {
-      let admin = false;
-      try {
-        admin = (await fetchMe(client, company)).role === "admin";
-      } catch {
-        // No user plane on this host, or not signed in — treat as non-admin.
-      }
-      if (live) setCanManage(admin);
-    })();
-    return () => {
-      live = false;
-    };
-  }, [client, company]);
+  // it is an admin's.
+  const canManage = useCanManage(client, company);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -59,14 +39,13 @@ export function InferenceView({ client, company }: Props) {
       />
       <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 space-y-6 overflow-y-auto px-4 py-6">
         {!canManage && (
-          <Alert data-testid="inference-read-only">
-            <Info className="size-4" />
-            <AlertTitle>Only an admin can change this company&apos;s model</AlertTitle>
-            <AlertDescription>
-              The model and its key decide what every teammate&apos;s turn costs, so an admin sets
-              them. You can see what is configured.
-            </AlertDescription>
-          </Alert>
+          <AdminOnlyNotice
+            testId="inference-read-only"
+            title="Only an admin can change this company's model"
+          >
+            The model and its key decide what every teammate&apos;s turn costs, so an admin sets
+            them. You can see what is configured.
+          </AdminOnlyNotice>
         )}
 
         <InferenceSection client={client} company={company} canManage={canManage} />

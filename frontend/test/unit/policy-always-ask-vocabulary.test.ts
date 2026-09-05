@@ -137,7 +137,7 @@ afterEach(async () => {
 
 async function mount(client: OpenCompanyClient) {
   await act(async () => {
-    root.render(createElement(PolicySettings, { client, company: "acme" }));
+    root.render(createElement(PolicySettings, { client, company: "acme", canManage: true }));
   });
 }
 
@@ -650,6 +650,49 @@ describe("policy tier changes", () => {
     });
     expect(document.body.textContent).toContain("Give teammates more autonomy?");
     expect(toasts.error).toHaveBeenCalled();
+  });
+
+  it("disables every tier control for a member and states why", async () => {
+    const client = makeClient();
+    await act(async () => {
+      root.render(
+        createElement(PolicySettings, { client, company: "acme", canManage: false }),
+      );
+    });
+
+    expect(container.textContent).toContain(
+      "Only an admin can change this company's approval policy",
+    );
+
+    const radios = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+    );
+    expect(radios.length).toBeGreaterThan(0);
+    expect(radios.every((radio) => radio.disabled)).toBe(true);
+
+    const full = radios.find((radio) => radio.textContent?.includes("Full"));
+    await act(async () => {
+      full?.click();
+    });
+    expect(document.body.textContent).not.toContain("Give teammates more autonomy?");
+    expect((client.put as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+
+  it("withholds the deadline save control from a member", async () => {
+    const client = makeClient();
+    await act(async () => {
+      root.render(
+        createElement(PolicySettings, { client, company: "acme", canManage: false }),
+      );
+    });
+
+    const buttons = Array.from(container.querySelectorAll("button")).map(
+      (button) => button.textContent,
+    );
+    expect(buttons).not.toContain("Save deadline");
+    expect(
+      container.querySelector<HTMLInputElement>("#approval-deadline")?.disabled,
+    ).toBe(true);
   });
 });
 

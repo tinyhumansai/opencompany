@@ -111,7 +111,7 @@ afterEach(async () => {
 
 async function mount(client: OpenCompanyClient) {
   await act(async () => {
-    root.render(createElement(PolicySettings, { client, company: "acme" }));
+    root.render(createElement(PolicySettings, { client, company: "acme", canManage: true }));
     await Promise.resolve();
   });
 }
@@ -291,7 +291,7 @@ describe("changing the autonomy tier", () => {
     // choice was reviewed against "acme"'s policy and must not apply to the
     // new one.
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "other" }));
+      root.render(createElement(PolicySettings, { client, company: "other", canManage: true }));
       await Promise.resolve();
     });
     expect(document.querySelector("[data-testid=policy-tier-confirm]")).toBeNull();
@@ -314,7 +314,7 @@ describe("changing the autonomy tier", () => {
 
     // The scope moves to another company while the PUT is in flight.
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "other" }));
+      root.render(createElement(PolicySettings, { client, company: "other", canManage: true }));
       await Promise.resolve();
     });
 
@@ -621,6 +621,50 @@ describe("changing the spend cap", () => {
   });
 });
 
+describe("the operator's role", () => {
+  it("disables every tier control for a member and states why", async () => {
+    const { client, put } = makeClient(status("supervised"));
+    await act(async () => {
+      root.render(
+        createElement(PolicySettings, { client, company: "acme", canManage: false }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain(
+      "Only an admin can change this company's approval policy",
+    );
+
+    const full = container.querySelector<HTMLButtonElement>(
+      "[data-testid=policy-tier-full]",
+    )!;
+    expect(full.disabled).toBe(true);
+
+    await act(async () => {
+      full.click();
+    });
+    expect(document.querySelector("[data-testid=policy-tier-confirm]")).toBeNull();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("withholds the manifest-reset control from a member even when overridden", async () => {
+    const { client, del } = makeClient(overridden("readonly", "full"));
+    await act(async () => {
+      root.render(
+        createElement(PolicySettings, { client, company: "acme", canManage: false }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(
+      [...container.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("manifest's policy"),
+      ),
+    ).toBe(false);
+    expect(del).not.toHaveBeenCalled();
+  });
+});
+
 describe("loading the policy", () => {
   it("clears the previous company's policy when a company-switch read fails", async () => {
     const { client } = makeClient(status("supervised"));
@@ -638,7 +682,7 @@ describe("loading the policy", () => {
       },
     } as unknown as OpenCompanyClient;
     await act(async () => {
-      root.render(createElement(PolicySettings, { client: failing, company: "other" }));
+      root.render(createElement(PolicySettings, { client: failing, company: "other", canManage: true }));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -664,12 +708,12 @@ describe("loading the policy", () => {
     } as unknown as OpenCompanyClient;
 
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "acme" }));
+      root.render(createElement(PolicySettings, { client, company: "acme", canManage: true }));
       await Promise.resolve();
     });
     // Move to another company while "acme"'s read is still in flight.
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "other" }));
+      root.render(createElement(PolicySettings, { client, company: "other", canManage: true }));
       await Promise.resolve();
     });
 
@@ -713,7 +757,7 @@ describe("loading the policy", () => {
     } as unknown as OpenCompanyClient;
 
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "acme" }));
+      root.render(createElement(PolicySettings, { client, company: "acme", canManage: true }));
       await Promise.resolve();
     });
     await act(async () => {
@@ -726,7 +770,7 @@ describe("loading the policy", () => {
 
     // The operator switches companies while the save is still pending.
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "other" }));
+      root.render(createElement(PolicySettings, { client, company: "other", canManage: true }));
       await Promise.resolve();
     });
 
@@ -770,7 +814,7 @@ describe("loading the policy", () => {
     } as unknown as OpenCompanyClient;
 
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "acme" }));
+      root.render(createElement(PolicySettings, { client, company: "acme", canManage: true }));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -783,7 +827,7 @@ describe("loading the policy", () => {
         .click();
     });
     await act(async () => {
-      root.render(createElement(PolicySettings, { client, company: "other" }));
+      root.render(createElement(PolicySettings, { client, company: "other", canManage: true }));
       await Promise.resolve();
     });
 
