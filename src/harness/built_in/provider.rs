@@ -1962,7 +1962,7 @@ impl ChatModel<()> for TenantProvider {
         // its own, so keeping the last *successful* model is strictly more
         // accurate than advertising one that never ran.
         *self.model.write().unwrap() = Some(crate::metering::ModelSlug::classify(&plan.model));
-        model_response_from_payload_offering(payload, &offered)
+        model_response_from_payload_offering(payload, &offered, &schemas)
     }
 }
 
