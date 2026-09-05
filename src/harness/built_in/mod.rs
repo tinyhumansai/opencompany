@@ -1194,7 +1194,14 @@ impl CompanyAgent {
                 // was — no turn can observe a `switched` verdict this projection
                 // doesn't match.
                 let seed = match (&chat_seed, turn_company.as_ref()) {
-                    (Some(request), Some(company)) => request.build(company, incoming).await,
+                    // `self.agent_id` is the viewer the seed is attributed
+                    // against (issue #1956): this agent's own prior replies stay
+                    // assistant turns, and every teammate's — plus the runtime's
+                    // own notices — arrive as labelled user turns instead of
+                    // collapsing into its first person.
+                    (Some(request), Some(company)) => {
+                        request.build(company, incoming, &self.agent_id).await
+                    }
                     _ => Vec::new(),
                 };
                 tracing::debug!(
