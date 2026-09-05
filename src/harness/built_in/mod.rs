@@ -1730,8 +1730,23 @@ impl CompanyAgent {
         // B-120). `reply?` here would have discarded `usages` on every hard
         // failure — a wall-clock ceiling, a provider fault, an auth error —
         // and those attempts had already burned every token they read back.
+        //
+        // Issue #2094: this turn's frozen-at-turn-1 system prompt still
+        // advertises tool briefs a `suppress_tools` turn's own request no
+        // longer carries, so the model can write a tool call out as text
+        // instead of answering — and `native_salvage` deliberately does not
+        // catch it (its `authorized_tool_names` is empty on exactly this turn
+        // shape, on purpose: recovering here would execute a call this turn
+        // never authorized). Guard the reply text itself before it reaches
+        // the operator. `overrides` is `Copy`, so reading it here — after
+        // being handed to `agent.set_next_turn_overrides` well above — is the
+        // same suppression this turn actually ran with, not a stale copy.
         let outcome = reply.map(|reply| TurnOutcome {
-            reply,
+            reply: if overrides.suppress_tools {
+                chat_only_guard::guard_suppressed_reply(reply)
+            } else {
+                reply
+            },
             steps,
             hit_iteration_cap,
             // This is the built_in harness, not the ACP fold — the only
