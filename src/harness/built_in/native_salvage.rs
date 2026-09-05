@@ -988,6 +988,31 @@ mod tests {
         assert_eq!(calls[1].id, "salvaged_call_1");
     }
 
+    /// An envelope tag that documents the syntax in prose, with no recovered
+    /// call inside it, is not this module's to edit — only a recovered call
+    /// elsewhere in the same message is (Codex review on #2093).
+    #[test]
+    fn an_envelope_tag_around_no_recovered_call_survives() {
+        let text = concat!(
+            "Here is the syntax: <tool_calls><invoke name=\"unlisted_tool\">",
+            "</invoke></tool_calls>\n",
+            "Now actually calling it.\n",
+            "<invoke name=\"list_desks\"></invoke>",
+        );
+        let (cleaned, calls) = recover(text);
+
+        assert_eq!(calls.len(), 1, "only the real call is recovered");
+        assert_eq!(calls[0].name, "list_desks");
+        assert!(
+            cleaned.contains("<tool_calls><invoke name=\"unlisted_tool\">"),
+            "the documented example must survive verbatim: {cleaned:?}"
+        );
+        assert!(
+            !cleaned.contains("list_desks"),
+            "the real call is still removed: {cleaned:?}"
+        );
+    }
+
     /// The undecorated form — Claude's own markup, which a model trained on it
     /// writes whatever endpoint it is served from.
     #[test]
