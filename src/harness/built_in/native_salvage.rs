@@ -417,7 +417,10 @@ fn tag_call_arguments(body: &str) -> Value {
         let Some(name) = attr(open.attrs, "name") else {
             continue;
         };
-        arguments.insert(name, parameter_value(&body[open.after..close.start], open.attrs));
+        arguments.insert(
+            name,
+            parameter_value(&body[open.after..close.start], open.attrs),
+        );
     }
 
     Value::Object(arguments)
@@ -504,7 +507,11 @@ fn tag_at<'a>(text: &'a str, start: usize, keyword: &str, closing: bool) -> Opti
         return None;
     }
     let after = text.len() - rest[stop + 1..].len();
-    Some(Tag { start, after, attrs })
+    Some(Tag {
+        start,
+        after,
+        attrs,
+    })
 }
 
 /// `rest` positioned at `keyword`, skipping a dialect's decoration if one sits
@@ -521,7 +528,9 @@ fn undecorated<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
     let at = rest.find(keyword)?;
     let decoration = &rest[..at];
     if decoration.len() > MAX_TAG_DECORATION
-        || decoration.chars().any(|ch| ch.is_whitespace() || ch == '>' || ch == '<')
+        || decoration
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '>' || ch == '<')
         || decoration.is_ascii()
     {
         return None;
