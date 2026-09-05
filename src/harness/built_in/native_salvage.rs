@@ -139,7 +139,7 @@
 //! same synthesized id is what avoids it.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 use tinyinference::model::ToolChoice;
