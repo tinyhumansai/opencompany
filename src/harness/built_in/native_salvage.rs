@@ -1310,7 +1310,7 @@ mod tests {
     #[test]
     fn a_turn_that_offered_no_tools_never_recovers() {
         let raw = "{\"call\":\"read_ledger\",\"arguments\":{\"ledger\":\"tasks\"}}";
-        assert!(recover_text_tool_calls(raw, &BTreeSet::new()).is_none());
+        assert!(recover_text_tool_calls(raw, &BTreeSet::new(), &BTreeMap::new()).is_none());
     }
 
     /// A fenced code block the narrative actually needs is not collateral.
