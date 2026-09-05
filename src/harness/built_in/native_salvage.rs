@@ -282,8 +282,7 @@ fn salvaged_call_id(index: usize) -> String {
 /// empty code fences) removed, or `None` when nothing was recovered — in which
 /// case the caller must return the original text untouched.
 fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall>)> {
-    let mut calls = Vec::new();
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut found: Vec<Candidate> = Vec::new();
 
     for (start, end) in json_object_spans(text) {
         let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) else {
@@ -296,23 +295,273 @@ fn salvage(text: &str, known: &BTreeSet<String>) -> Option<(String, Vec<ToolCall
         let Some((name, arguments)) = as_known_call(&value, known, marked) else {
             continue;
         };
-        calls.push(ToolCall {
-            id: salvaged_call_id(calls.len()),
+        found.push(Candidate {
+            start: cut,
+            end,
             name,
             arguments,
+        });
+    }
+
+    found.extend(tag_call_candidates(text, known));
+
+    // Left to right, and never twice over the same bytes: a JSON object written
+    // as a `<parameter>` body is that call's argument, not a second call
+    // beside it. The tag span opens first, so ordering by start is what makes
+    // the enclosing call win.
+    found.sort_by_key(|candidate| candidate.start);
+
+    let mut calls = Vec::new();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut consumed = 0usize;
+    for candidate in found {
+        if candidate.start < consumed {
+            continue;
+        }
+        consumed = candidate.end;
+        calls.push(ToolCall {
+            id: salvaged_call_id(calls.len()),
+            name: candidate.name,
+            arguments: candidate.arguments,
             // Recovered from a well-formed object whose arguments already
             // resolved to a JSON object, so there is nothing to declare
             // malformed. `Some(_)` here is the provider's channel for "the
             // model asked for this and its body would not parse".
             invalid: None,
         });
-        cuts.push((cut, end));
+        cuts.push((candidate.start, candidate.end));
     }
 
     if calls.is_empty() {
         return None;
     }
+    // Only once something was recovered: an envelope tag on a turn that
+    // recovered nothing belongs to whatever the model was actually writing, and
+    // deleting it would edit a reply this module never understood.
+    cuts.extend(envelope_tag_spans(text));
+    cuts.sort_by_key(|(start, _)| *start);
     Some((cut_and_tidy(text, &cuts), calls))
+}
+
+/// One recovery under consideration: the bytes it would remove, and the call
+/// they would become.
+struct Candidate {
+    /// Where the removal starts — the object's own start, extended over a
+    /// marker, or the opening tag.
+    start: usize,
+    /// One past the last byte of the removal.
+    end: usize,
+    name: String,
+    arguments: Value,
+}
+
+/// A located tag: where it starts, where the text after its `>` resumes, and
+/// the attribute run between the keyword and the `>`.
+struct Tag<'a> {
+    start: usize,
+    after: usize,
+    attrs: &'a str,
+}
+
+/// Every `<invoke name="…">…</invoke>` call to a **known** tool in `text`,
+/// left to right, in either the bare or a decorated dialect.
+///
+/// An `<invoke>` is an unambiguous call marker in the way the `function` key
+/// is, so a parameterless one recovers with empty arguments rather than needing
+/// the bare-object check the `name`-keyed JSON shape needs. Belt membership is
+/// still required: the tag says *a* call, the belt says *this* call.
+fn tag_call_candidates(text: &str, known: &BTreeSet<String>) -> Vec<Candidate> {
+    let mut found = Vec::new();
+    let mut from = 0usize;
+
+    while let Some(open) = find_tag(text, from, INVOKE_TAG, false) {
+        // Advanced past the opening tag whatever happens below, so a tag this
+        // rejects cannot be rematched on the next pass.
+        from = open.after;
+        // An unclosed tag is left verbatim rather than guessed at: the model
+        // was cut off mid-call, and inventing its end would run a tool against
+        // arguments nobody finished writing.
+        let Some(close) = find_tag(text, open.after, INVOKE_TAG, true) else {
+            break;
+        };
+        from = close.after;
+        let Some(name) = attr(open.attrs, "name") else {
+            continue;
+        };
+        if !known.contains(&name) {
+            continue;
+        }
+        found.push(Candidate {
+            start: open.start,
+            end: close.after,
+            name,
+            arguments: tag_call_arguments(&text[open.after..close.start]),
+        });
+    }
+
+    found
+}
+
+/// The `<parameter name="…">…</parameter>` children of one call body, as its
+/// arguments object.
+fn tag_call_arguments(body: &str) -> Value {
+    let mut arguments = Map::new();
+    let mut from = 0usize;
+
+    while let Some(open) = find_tag(body, from, PARAMETER_TAG, false) {
+        from = open.after;
+        let Some(close) = find_tag(body, open.after, PARAMETER_TAG, true) else {
+            break;
+        };
+        from = close.after;
+        let Some(name) = attr(open.attrs, "name") else {
+            continue;
+        };
+        arguments.insert(name, parameter_value(&body[open.after..close.start], open.attrs));
+    }
+
+    Value::Object(arguments)
+}
+
+/// One `<parameter>` body as a JSON value.
+///
+/// The body is text on the wire whatever the argument's declared type is, so a
+/// structured argument only survives by being read back as JSON. DeepSeek's
+/// dialect says which is which with `string="true"`, and that wins outright —
+/// without it a query of `2026` becomes a number and a strictly-typed tool
+/// rejects a call the model got right.
+fn parameter_value(raw: &str, attrs: &str) -> Value {
+    let raw = raw.trim();
+    if attr(attrs, "string").is_some_and(|declared| declared.eq_ignore_ascii_case("true")) {
+        return Value::String(raw.to_string());
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => value,
+        Err(_) => Value::String(raw.to_string()),
+    }
+}
+
+/// The spans of every `<tool_calls>` / `</tool_calls>` envelope tag, so the
+/// wrapper does not outlive the calls it wrapped.
+fn envelope_tag_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for closing in [false, true] {
+        let mut from = 0usize;
+        while let Some(tag) = find_tag(text, from, TOOL_CALLS_TAG, closing) {
+            spans.push((tag.start, tag.after));
+            from = tag.after;
+        }
+    }
+    spans
+}
+
+/// The next `<keyword …>` (or `</keyword>`) at or after `from`.
+fn find_tag<'a>(text: &'a str, from: usize, keyword: &str, closing: bool) -> Option<Tag<'a>> {
+    let mut search = from;
+    while let Some(offset) = text.get(search..)?.find('<') {
+        let start = search + offset;
+        // One byte past this `<`, so a `<` that opens nothing does not stall
+        // the scan on itself.
+        search = start + 1;
+        if let Some(tag) = tag_at(text, start, keyword, closing) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// Read the tag `keyword` opens at `start`, or `None` if that is not the tag.
+fn tag_at<'a>(text: &'a str, start: usize, keyword: &str, closing: bool) -> Option<Tag<'a>> {
+    let rest = text.get(start + 1..)?;
+    let rest = match closing {
+        true => rest.strip_prefix('/')?,
+        // A closing tag is not an opening one, so `</invoke>` must not answer
+        // a search for `<invoke>` — otherwise a call's own end reads as the
+        // start of another and the scan never terminates the span.
+        false if rest.starts_with('/') => return None,
+        false => rest,
+    };
+    let rest = undecorated(rest, keyword)?.strip_prefix(keyword)?;
+    let stop = rest.find('>')?;
+    let attrs = &rest[..stop];
+    // The keyword has to end where the tag name ends: `<invoker>` is not an
+    // `<invoke>` tag with the attribute `r`.
+    if attrs
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    // A closing tag carries no attributes. Anything in that position means this
+    // is not the tag it looks like.
+    if closing && !attrs.trim().is_empty() {
+        return None;
+    }
+    // A `<` inside what was taken for an attribute run means the `>` belongs to
+    // a later tag and this one was never closed.
+    if attrs.contains('<') {
+        return None;
+    }
+    let after = text.len() - rest[stop + 1..].len();
+    Some(Tag { start, after, attrs })
+}
+
+/// `rest` positioned at `keyword`, skipping a dialect's decoration if one sits
+/// in front of it.
+///
+/// The decoration must be short, unbroken, and carry a non-ASCII character —
+/// the marker glyph a dialect brands its tags with. Without that last
+/// condition every `<parameterise>` in an ordinary sentence becomes a
+/// `<parameter>` tag. See the module docs.
+fn undecorated<'a>(rest: &'a str, keyword: &str) -> Option<&'a str> {
+    if rest.starts_with(keyword) {
+        return Some(rest);
+    }
+    let at = rest.find(keyword)?;
+    let decoration = &rest[..at];
+    if decoration.len() > MAX_TAG_DECORATION
+        || decoration.chars().any(|ch| ch.is_whitespace() || ch == '>' || ch == '<')
+        || decoration.is_ascii()
+    {
+        return None;
+    }
+    Some(&rest[at..])
+}
+
+/// The value of the `name="…"` style attribute `attr` in a tag's attribute run.
+///
+/// Both quote styles, because a dialect that writes its tags by hand is not
+/// bound to either. An attribute whose name is the tail of another
+/// (`string` inside `substring`) does not match: the character in front of it
+/// must not continue a word.
+fn attr(attrs: &str, name: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(offset) = attrs.get(from..)?.find(name) {
+        let at = from + offset;
+        from = at + name.len();
+        let standalone = attrs[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_' && ch != '-');
+        if !standalone {
+            continue;
+        }
+        let Some(rest) = attrs[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let quote = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => quote,
+            _ => continue,
+        };
+        let value = &rest[quote.len_utf8()..];
+        let Some(end) = value.find(quote) else {
+            continue;
+        };
+        return Some(value[..end].to_string());
+    }
+    None
 }
 
 /// Interpret one JSON value as a call to a tool in `known`.
