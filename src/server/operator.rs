@@ -3467,9 +3467,15 @@ pub(crate) async fn refer_committed_replies(
     // back in the next `ReferralInput`, or the answer has no way home. Nothing
     // in the library remembers it."
     origin: Option<tinyhivemind_core::referral::ReferralOrigin>,
-    // Depth of the reply being offered. A first-level reply is 0; a reply
-    // produced BY a referred turn is 1, which is what lets `max_hops` bound
-    // the chain instead of being inert.
+    // Depth of the reply being offered — NOT of the child it might spawn.
+    //
+    // A reply to an operator message is 0, so every operator message starts a
+    // fresh chain. Otherwise it is the depth of the turn that produced this
+    // reply, which is what makes the count accumulate: the policy compares it
+    // against `max_hops` and hands the child `hop + 1`, and that child's own
+    // replies come back here at that number. Passing a constant here — as this
+    // did — makes every generation claim the same depth, and a bound that never
+    // advances bounds nothing.
     hop: u32,
 ) {
     use tinyhivemind::referral::{ReferralPolicy, ReferralReach, dispatch_referral};
@@ -3521,20 +3527,9 @@ pub(crate) async fn refer_committed_replies(
             &queue,
             ReferralPolicy {
                 enabled: true,
-                // **Two round trips.** A crossing question and the answer
-                // coming home are two hops, not one — a return carries no
-                // origin, so the library counts it as its own step. `2` was
-                // therefore exactly one exchange, and the asker's report, being
-                // one deeper, could never start a second: an answer that missed
-                // the point was the end of the conversation.
-                //
-                // `4` buys the asker one follow-up: ask, answer, ask again,
-                // answer again. That is the shape of an actual clarification —
-                // "you covered layout, but what about the error state?" — and
-                // stopping there is deliberate. A pair of desks that cannot
-                // converge in two exchanges is not going to converge in six,
-                // and every hop is a model call somebody pays for.
-                max_hops: 4,
+                // One constant, shared with the frame that tells the asker how
+                // much of the chain is left — see `REFERRAL_MAX_HOPS`.
+                max_hops: crate::runtime::hivemind::REFERRAL_MAX_HOPS,
                 reach: ReferralReach::Desks,
                 returns: true,
             },

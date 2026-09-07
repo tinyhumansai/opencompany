@@ -2225,23 +2225,8 @@ impl<'a> DelegationRunner<'a> {
                 .as_ref()
                 .is_none_or(|prior| prior.reply.is_none() && !prior.pending);
             if owns_card {
-                // The target as the model named it, reduced to its canonical
-                // id: a desk stays a desk, a teammate stays a teammate.
-                let owner = hand_off_target_of(&delegation)
-                    .and_then(|target| {
-                        crate::runtime::assignee::resolve(self.record, target)
-                            .canonical()
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| member.clone());
-                self.hand_card_over(
-                    card,
-                    delegator,
-                    &member,
-                    &owner,
-                    instruction_of(&delegation),
-                )
-                .await?;
+                self.hand_card_over(card, delegator, &member, instruction_of(&delegation))
+                    .await?;
                 // SPIKE: hand over and STOP. The delegate is not run inside this
                 // attempt — the card now names them, the delegator settles
                 // `Delegated`, and the dispatch edge re-fires for the new owner.
@@ -3035,24 +3020,23 @@ impl<'a> DelegationRunner<'a> {
         card: &mut TaskRecord,
         delegator: &str,
         member: &str,
-        owner: &str,
         instruction: &str,
     ) -> Result<()> {
-        // **Ownership at the granularity it was handed over.**
+        // **An owner is an agent. A desk is a channel, not an owner.**
         //
-        // `member` is the agent that will RUN the card; `owner` is who now owns
-        // it. For a teammate hand-off they are the same. For a DESK hand-off
-        // they are not: the desk owns it and dispatch picks the lead, which is
-        // the invariant `AssigneeResolution::canonical` documents — "a desk
-        // assignment is ownership, and stays a desk assignment". Writing
-        // `member` here erased the desk from the board on the first hand-off,
-        // and `run_task`'s own write guards that exact case with
-        // `links_working_agent()` while this one did not.
+        // `member` is the agent that will run the card, and that is exactly who
+        // now owns it — for a teammate hand-off the teammate, for a desk
+        // hand-off that desk's lead.
         //
-        // It matters more now than it did: `assignee` is the ownership record
-        // the thread's overseer is read from, so clobbering it does not just
-        // mislabel a card — it redirects the conversation.
-        card.assignee = owner.to_string();
+        // This briefly wrote the hand-off target reduced by
+        // `AssigneeResolution::canonical` instead, on the reading that a desk
+        // hand-off should leave the DESK on the card. That put a channel id in
+        // an ownership field: `assignee` is also what the thread's overseer is
+        // read from, so a card handed to a desk named nobody who could answer
+        // for it. `canonical` maps a desk to its own id because it is the
+        // stored-key helper for whatever a card happens to say — not a claim
+        // that a desk is a thing which owns work.
+        card.assignee = member.to_string();
         card.note = Some(append_note(
             card.note.as_deref(),
             delegator,
@@ -9162,20 +9146,20 @@ members = ["brand_strategist", "seo_specialist", "copywriter"]
              attempt, which is what makes the spend attributable to them: {:?}",
             handed.reply
         );
-        // The DESK owns it, the lead works it. `AssigneeResolution::canonical`
-        // states the rule — "a desk assignment is ownership, and stays a desk
-        // assignment — dispatch is what picks the lead" — and `run_task`'s own
-        // write has always honoured it via `links_working_agent()`. This path
-        // did not: it wrote the resolved lead, erasing the desk from the board
-        // on the first hand-off, and this assertion pinned that contradiction.
+        // **An owner is an agent; a desk is a channel.** Handing to a desk hands
+        // the work to that desk's lead, and it is the lead the card names.
         //
-        // `handed.delegate` is still `engineer` just above: owner and worker
-        // are different questions, which is the whole reason a desk assignment
-        // exists.
+        // This assertion previously demanded `eng_desk`, on the reading that a
+        // desk hand-off leaves the DESK owning the card. That put a channel id
+        // in an ownership field — and `assignee` is what the thread's overseer
+        // is read from, so a card handed to a desk named nobody who could
+        // answer for it. `AssigneeResolution::canonical` maps a desk to its own
+        // id because it is the stored-key helper for whatever a card happens to
+        // say, not a claim that a desk owns work.
         assert_eq!(
-            card.assignee, "eng_desk",
-            "a desk hand-off keeps DESK ownership; nested delegation must not \
-             move the card a second time"
+            card.assignee, "engineer",
+            "the desk's lead owns the card; nested delegation must not move it \
+             a second time"
         );
     }
 }

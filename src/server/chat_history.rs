@@ -1224,6 +1224,17 @@ async fn attach_referral_origins(
             }
             None => {
                 if let Some(view) = messages.iter_mut().find(|m| m.id == child_id) {
+                    // Rendering a relay at all is the fallback; rendering the
+                    // note the host appended to it would publish text written
+                    // FOR the asker — "you are the only one who has seen it" —
+                    // in a channel, over the name of an agent that is not even
+                    // on this desk. Only the other desk's own words survive.
+                    if let Some((answer, _)) = view
+                        .text
+                        .split_once(crate::runtime::hivemind::RELAY_NOTE_MARKER)
+                    {
+                        view.text = answer.to_string();
+                    }
                     view.referred_from = Some(origin);
                 }
             }
@@ -3178,6 +3189,64 @@ mod referral_origin_test {
         let origin = referred.referred_from.as_ref().expect("origin");
         assert!(origin.returning, "and it reads as an answer, not an ask");
         assert_eq!(origin.desk_name, "Design");
+    }
+
+    /// **A rendered relay shows the answer and none of the host's note.**
+    ///
+    /// Seen in the console, not reasoned about: the asker's turn died on an
+    /// empty model response, the fallback rendered the relay, and #engineering
+    /// was told "you are the only one who has seen it" by the design desk's
+    /// agent. The note is written FOR the asker and is private to it; the
+    /// fallback exists to preserve the ANSWER, so that is all it may publish.
+    #[tokio::test]
+    async fn a_rendered_relay_keeps_the_answer_and_drops_the_note() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(home.path()).await;
+        let id = CompanyId::new("acme");
+
+        let answer = "use a skeleton, not a spinner";
+        let note = format!(
+            "{}product_designer on the Design desk answered what you asked them. \
+             This did not appear in your channel — you are the only one who has seen it.",
+            crate::runtime::hivemind::RELAY_NOTE_MARKER
+        );
+        // No reply follows, so the fallback renders this relay.
+        for event in referral_leg(
+            "design",
+            "Design",
+            "product_designer",
+            "engineering",
+            "software_engineer",
+            true,
+            &format!("{answer}{note}"),
+        ) {
+            runtime.events().append(&id, event).await.expect("journal");
+        }
+
+        let history = history_for_desk(
+            &runtime,
+            "engineering",
+            "engineering",
+            &Viewer::Operator,
+            None,
+            50,
+            true,
+        )
+        .await
+        .expect("history");
+        let relayed = history
+            .iter()
+            .find(|m| m.referred_from.is_some())
+            .expect("the relay renders, because nothing else carries the answer");
+
+        assert_eq!(
+            relayed.text, answer,
+            "the other desk's own words, and only those"
+        );
+        assert!(
+            !relayed.text.contains("only one who has seen it"),
+            "a note addressed to the asker is not published to the channel"
+        );
     }
 
     /// **The fail-safe half: a relay renders while the report is still missing.**

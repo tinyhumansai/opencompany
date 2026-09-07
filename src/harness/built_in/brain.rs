@@ -11877,8 +11877,9 @@ members = ["eng1", "eng2"]
 
         let after = only_card(&provider.tasks).await;
         assert_eq!(
-            after.assignee, "eng_desk",
-            "the delegate must be linked as the assignee, not left blank under the delegator"
+            after.assignee, "engineer",
+            "the delegate — an agent — must be linked as the assignee, not left blank \
+             under the delegator"
         );
         assert_eq!(
             after.column, "in_review",
@@ -11902,12 +11903,11 @@ members = ["eng1", "eng2"]
         // …and while the delegate was working, the card showed THEM working it:
         // its second turn ran against a card already reassigned and still in
         // progress, not one parked in a terminal column.
-        // The DESK is the owner and its lead is the worker — `canonical`'s rule,
-        // which `hand_card_over` now honours instead of writing the lead over
-        // the desk assignment.
+        // Owner and worker are the same agent: the desk's lead. The board shows
+        // a teammate working it, never a channel id.
         assert_eq!(
             provider.board()[1],
-            ("in_progress".to_string(), "eng_desk".to_string()),
+            ("in_progress".to_string(), "engineer".to_string()),
             "the delegate must be shown working the card while they work it"
         );
     }
@@ -12061,8 +12061,8 @@ members = ["eng1", "eng2"]
             "the card settles from the hand-off that owns it"
         );
         assert_eq!(
-            after.assignee, "eng_desk",
-            "the owner is the desk the card was handed to"
+            after.assignee, "engineer",
+            "the owner is an agent: the lead of the desk the card was handed to"
         );
         let note = after.note.expect("note");
         // The protection #213 added, reached a stronger way. It used to be

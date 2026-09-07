@@ -782,6 +782,29 @@ mod test {
             framed.contains("report back") && framed.contains("ask them again"),
             "both endings are stated, so choosing is the asker's: {framed}"
         );
+        assert!(
+            framed.contains("exchange 1 of 2"),
+            "and the asker is told how much room is left: {framed}"
+        );
+
+        // **The last exchange offers one ending, not two.** Inviting a
+        // follow-up the policy will refuse is worse than never inviting one:
+        // the question gets journaled in the channel and never delivered, so it
+        // reads as though the other desk had ignored it.
+        referral.child_hop = REFERRAL_MAX_HOPS;
+        let last = returned_answer(&record, &referral);
+        assert!(
+            last.contains("exchange 2 of 2") && last.contains("last exchange"),
+            "the asker is told this is the end: {last}"
+        );
+        assert!(
+            !last.contains("@#product_design"),
+            "and is not invited to write a question that cannot be delivered: {last}"
+        );
+        assert!(
+            last.contains("could not get it"),
+            "an unmet need is escalated to a person instead of vanishing: {last}"
+        );
     }
 
     /// **The chain deepens, and therefore ends.**
@@ -1326,6 +1349,51 @@ impl tinyhivemind::referral::ReferralQueue for JournalReferralQueue {
     }
 }
 
+/// How many child turns one referral chain may produce.
+///
+/// **Two round trips.** A crossing question and the answer coming home are two
+/// hops, not one — a return carries no origin, so the library counts it as its
+/// own step. `2` was therefore exactly one exchange, and the asker's report,
+/// being one deeper, could never start a second: an answer that missed the
+/// point was the end of the conversation.
+///
+/// `4` buys the asker one follow-up: ask, answer, ask again, answer again. That
+/// is the shape of an actual clarification — "you covered layout, but what
+/// about the error state?" — and stopping there is deliberate. A pair of desks
+/// that cannot converge in two exchanges is not going to converge in six, and
+/// every hop is a model call somebody pays for.
+///
+/// **One constant, two readers.** The policy bounds the chain and
+/// [`returned_answer`] tells the asker how much of it is left. Those must
+/// agree: an asker invited to ask again by a frame the policy then refuses is
+/// worse off than one never invited, because the question it writes is
+/// journaled in its channel and never delivered — so it reads to everyone as
+/// though the other desk had been asked and had not bothered to answer.
+pub(crate) const REFERRAL_MAX_HOPS: u32 = 4;
+
+/// Separates the other desk's actual answer from the note addressed to the
+/// asker, in a returning relay.
+///
+/// # Why the two have to be separable
+///
+/// The relay is normally dropped from the projection, so the note is private to
+/// the asker and can say things only the asker should read. But the drop is
+/// conditional: if the asker's report never lands — a failed turn, an empty
+/// model response — the relay renders instead, because a line in the wrong
+/// voice is a smaller failure than an answer nobody can see.
+///
+/// That fallback used to publish the note along with it. An operator watching
+/// #engineering was told "you are the only one who has seen it" by an agent
+/// that is not on their desk. So the answer goes FIRST and everything the host
+/// added goes after this marker, and the projection renders only what precedes
+/// it — which is exactly the other desk's own words, the thing the fallback
+/// exists to preserve.
+///
+/// Written to be unmistakable rather than pretty: a bare `---` is a markdown
+/// rule an answer may legitimately contain, and truncating on one would eat
+/// half of it.
+pub(crate) const RELAY_NOTE_MARKER: &str = "\n\n[referral-note]\n";
+
 /// What the asker is handed when an answer comes home.
 ///
 /// # Why the answer is framed rather than passed through
@@ -1356,9 +1424,49 @@ fn returned_answer(record: &CompanyRecord, referral: &tinyhivemind::referral::Re
     let who = agent_label(record, &referral.source_id);
     let desk = desk_label(record, &referral.from.desk_id);
     let back = &referral.from.desk_id;
+
+    // Where this sits in the exchange, stated rather than implied. The asker's
+    // own asks are in its channel and the earlier answers are in its context,
+    // so it can already see WHAT happened; what it cannot see is how much room
+    // is left, and that is the one fact that changes what it should do next.
+    //
+    // A turn offers its own replies at the depth it was created at, so this one
+    // may ask again exactly when that depth is still under the bound.
+    let round = referral.child_hop.div_ceil(2);
+    let rounds = REFERRAL_MAX_HOPS.div_ceil(2);
+    let ending = if referral.child_hop < REFERRAL_MAX_HOPS {
+        [
+            "Decide which of these the answer deserves:",
+            "- It covers the question: report back in your channel, in your own words, what they said. Do not paste it back verbatim.",
+            &format!(
+                "- Something important is still missing: ask them again. Begin your reply with @#{back} and put the ONE thing still open in a single short line."
+            ),
+            "Ask again only for a real gap, not for more detail on what they already covered.",
+        ]
+        .join("\n")
+    } else {
+        // Do not offer what the policy will refuse. A question written here is
+        // journaled in the channel and never delivered, so it reads to everyone
+        // as though that desk had been asked and had not bothered to reply.
+        [
+            &format!(
+                "This was the last exchange available with {desk} — asking again will not reach them, so do not try."
+            ),
+            "Report back in your channel, in your own words, what they said.",
+            "If something you needed is still missing, say plainly what it is and that you could not get it, so a person can decide what to do.",
+        ]
+        .join("\n")
+    };
+
+    // Answer first, host note after the marker — see `RELAY_NOTE_MARKER`. The
+    // order is load-bearing, not stylistic: the projection keeps the prefix.
     format!(
-        "{who} on #{desk} answered what you asked them:\n\n{}\n\n         ---\n         This did not appear in your channel — you are the only one who has seen it.          Decide which of these the answer deserves:\n         - It covers the question: report back in your channel, in your own words,          what they said. Do not paste it back verbatim.\n         - Something important is still missing: ask them again. Begin your reply          with @#{back} and put the ONE thing still open in a single short line.\n         Ask again only for a real gap, not for more detail on what they already covered.",
-        referral.content
+        "{answer}{RELAY_NOTE_MARKER}\
+         {who} on the {desk} desk answered what you asked them. This is exchange \
+         {round} of {rounds} with them.\n\
+         This did not appear in your channel — you are the only one who has seen it.\n\
+         {ending}",
+        answer = referral.content,
     )
 }
 
