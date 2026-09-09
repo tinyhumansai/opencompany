@@ -239,15 +239,12 @@ export function MessageComposer({
   suppressed,
 }: Props) {
   const [draft, setDraft] = useState("");
-  // The single file staged for the next send (issue #1682). v1 carries one
-  // attachment per message, so a fresh pick replaces the last rather than
-  // appending — the wire (`Vec<Attachment>`) already allows more when the UI
-  // grows to it. Held WITH the scope-bound delete that must clean it up (see
-  // `PendingAttachment`).
-  const [pending, setPending] = useState<PendingAttachment | null>(null);
+  // Up to the server's bounded maximum of twenty files can ride one message.
+  // Each keeps the delete callback for the company scope that owns its node.
+  const [pending, setPending] = useState<PendingAttachment[]>([]);
   // Mirrors `pending` for the unmount cleanup below, which needs the latest
   // value inside a closure captured once at mount.
-  const pendingRef = useRef<PendingAttachment | null>(null);
+  const pendingRef = useRef<PendingAttachment[]>([]);
   // Whether this instance is still mounted, checked after every `await`
   // (issue #1682, codex review finding). Without it, an upload that lands
   // after the operator has already navigated away resolves into a
@@ -273,6 +270,7 @@ export function MessageComposer({
   const [uploading, setUploading] = useState(false);
   const [attachError, setAttachError] = useState<string>();
   const fileInput = useRef<HTMLInputElement>(null);
+  const [dragDepth, setDragDepth] = useState(0);
   // What the draft currently resolves to. Reconciled on every edit, so editing
   // or backspacing through a chip un-mentions it rather than leaving a ping
   // for somebody whose name is no longer in the message.
@@ -404,13 +402,18 @@ export function MessageComposer({
   // upload stays live on the server, charged against the workspace quota
   // forever. Centralized here so every one of those paths — not just the
   // Remove button — clears the same way.
-  function clearPending() {
+  function clearPending(nodeId?: string) {
     // The node was created under the company whose delete is stored beside it
     // (see `PendingAttachment`) — never the latest callback, which may already
     // be bound to a scope this node does not belong to.
-    pendingRef.current?.delete?.(pendingRef.current.reference.nodeId);
-    pendingRef.current = null;
-    setPending(null);
+    const removed = nodeId
+      ? pendingRef.current.filter((item) => item.reference.nodeId === nodeId)
+      : pendingRef.current;
+    for (const item of removed) item.delete?.(item.reference.nodeId);
+    pendingRef.current = nodeId
+      ? pendingRef.current.filter((item) => item.reference.nodeId !== nodeId)
+      : [];
+    setPending(pendingRef.current);
   }
 
   // Unmounting still holding a pending attachment (closing the thread panel,
@@ -421,7 +424,7 @@ export function MessageComposer({
   // mounted still frees the node in the company that owns it.
   useEffect(() => {
     return () => {
-      pendingRef.current?.delete?.(pendingRef.current.reference.nodeId);
+      for (const item of pendingRef.current) item.delete?.(item.reference.nodeId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount-only, see above
   }, []);
@@ -478,7 +481,7 @@ export function MessageComposer({
     const result = onSend(
       text,
       deliverableChoice ? intent : undefined,
-      pending ? [pending.reference] : undefined,
+      pending.length > 0 ? pending.map((item) => item.reference) : undefined,
       // Preserve absent-versus-empty: a loaded directory that resolves no
       // spans intentionally sends [] to suppress host fallback extraction.
       mentionables ? sending : undefined,
@@ -489,8 +492,8 @@ export function MessageComposer({
     // the shell's optimistic bubble already carries it — WITHOUT deleting the
     // node yet (unlike `clearPending`): whether it is actually claimed is
     // still pending on `result` below.
-    pendingRef.current = null;
-    setPending(null);
+    pendingRef.current = [];
+    setPending([]);
     setAttachError(undefined);
     // If the caller reports whether the send journaled (issue #1682, codex
     // review round 4), clean up an attachment only on an explicit `false` —
@@ -498,45 +501,40 @@ export function MessageComposer({
     // drop, a timeout — the message may have landed anyway) and `true`
     // (definitely landed) both leave the node alone. A caller that returns
     // `void` has nothing to reconcile here.
-    if (inFlight && result instanceof Promise) {
+    if (inFlight.length > 0 && result instanceof Promise) {
       void result.then((sent) => {
-        if (sent === false) inFlight.delete?.(inFlight.reference.nodeId);
+        if (sent === false) {
+          for (const item of inFlight) item.delete?.(item.reference.nodeId);
+        }
       });
     }
   }
 
-  /** Upload the picked file and stage its reference as the pending chip. */
-  async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    // Reset the input so re-picking the same file fires `change` again.
-    e.target.value = "";
-    if (!file || !uploadAttachment) return;
-    // A fresh pick replaces the staged one (v1 carries a single attachment) —
-    // the replaced upload must be cleaned up, not silently orphaned.
-    if (pendingRef.current) clearPending();
+  /** Upload picked or dropped files sequentially and stage every successful one. */
+  async function addFiles(files: File[]) {
+    if (!uploadAttachment || files.length === 0) return;
+    const room = Math.max(0, 20 - pendingRef.current.length);
+    const selected = files.filter((file) => file.size > 0).slice(0, room);
+    if (selected.length === 0) {
+      setAttachError(room === 0 ? "A message can carry at most 20 files." : "Empty files and folders can't be attached.");
+      return;
+    }
     setUploading(true);
     setAttachError(undefined);
     try {
-      const reference = await uploadAttachment(file);
-      // The upload went to the scope whose `uploadAttachment` this closure
-      // captured. If the composer unmounted, OR the scope moved while the
-      // upload was in flight, no chip can hold this reference and no send will
-      // claim it — the next send would post an old company's node id to the
-      // new one. Free the node through the callback bound to the company that
-      // owns it, and do not stage it (codex review finding).
-      if (!mountedRef.current || scopeDeleteRef.current !== deleteAttachment) {
-        // No chip left to hold the reference and no unmount left to fire, so
-        // this continuation is the only place that can still free the node it
-        // just landed (codex review finding on #1682).
-        deleteAttachment?.(reference.nodeId);
-        return;
+      for (const file of selected) {
+        const reference = await uploadAttachment(file);
+        if (!mountedRef.current || scopeDeleteRef.current !== deleteAttachment) {
+          deleteAttachment?.(reference.nodeId);
+          continue;
+        }
+        const staged: PendingAttachment = { reference, delete: deleteAttachment };
+        pendingRef.current = [...pendingRef.current, staged];
+        setPending(pendingRef.current);
       }
-      // Store the delete bound to THIS render's scope beside the reference:
-      // the upload went to that company, so cleanup must target it too, even
-      // if the scope moves before the chip is cleared (see `PendingAttachment`).
-      const staged: PendingAttachment = { reference, delete: deleteAttachment };
-      pendingRef.current = staged;
-      setPending(staged);
+      if (files.length > selected.length) {
+        setAttachError("Some files were skipped: messages accept 20 non-empty files.");
+      }
     } catch (err) {
       if (!mountedRef.current) return;
       // The filename is operator content — the message says an upload failed
@@ -545,6 +543,30 @@ export function MessageComposer({
     } finally {
       if (mountedRef.current) setUploading(false);
     }
+  }
+
+  async function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    await addFiles(files);
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    if (disabled || !uploadAttachment) return;
+    const files = Array.from(e.clipboardData.items)
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (files.length === 0) return;
+    // A screenshot copied from the clipboard is a real attachment. Prevent the
+    // browser from inserting a useless object replacement character or local
+    // filename, while ordinary text paste keeps its native behaviour.
+    e.preventDefault();
+    void addFiles(files);
+  }
+
+  function carriesFiles(event: React.DragEvent): boolean {
+    return !disabled && Array.from(event.dataTransfer.types).includes("Files");
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -617,7 +639,37 @@ export function MessageComposer({
       // compact copy stays unlabelled so the tour can't anchor on the wrong one.
       data-tour={compact ? undefined : "chat-composer"}
     >
-      <div className="relative rounded-xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
+      <div
+        className={cn(
+          "relative rounded-xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40",
+          dragDepth > 0 && "border-primary ring-2 ring-primary/40",
+        )}
+        onDragEnter={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          setDragDepth((depth) => depth + 1);
+        }}
+        onDragOver={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+        }}
+        onDragLeave={(event) => {
+          if (!carriesFiles(event)) return;
+          setDragDepth((depth) => Math.max(0, depth - 1));
+        }}
+        onDrop={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          setDragDepth(0);
+          void addFiles(Array.from(event.dataTransfer.files));
+        }}
+      >
+        {dragDepth > 0 && (
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-card/90 text-sm font-medium text-primary">
+            Drop files to attach them
+          </div>
+        )}
         {pickerOpen && (
           <MentionPicker
             entries={rows}
@@ -646,25 +698,29 @@ export function MessageComposer({
 
         {/* The staged attachment (issue #1682), shown above the box the moment
             its upload lands and cleared on send or removal. One chip in v1. */}
-        {pending && (
-          <div className="flex items-center gap-2 border-b px-3 py-1.5">
-            <Paperclip className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-            <span className="min-w-0 truncate text-xs font-medium" title={pending.reference.name}>
-              {pending.reference.name}
-            </span>
-            <span className="shrink-0 text-2xs text-muted-foreground">
-              {formatBytes(pending.reference.size)}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="ml-auto size-6 shrink-0 text-muted-foreground"
-              aria-label={`Remove ${pending.reference.name}`}
-              title="Remove attachment"
-              onClick={clearPending}
-            >
-              <X className="size-3.5" />
-            </Button>
+        {pending.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 border-b px-3 py-1.5">
+            {pending.map((item) => (
+              <span key={item.reference.nodeId} className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md bg-muted px-2 py-1">
+                <Paperclip className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                <span className="min-w-0 truncate text-xs font-medium" title={item.reference.name}>
+                  {item.reference.name}
+                </span>
+                <span className="shrink-0 text-2xs text-muted-foreground">
+                  {formatBytes(item.reference.size)}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-5 shrink-0 text-muted-foreground"
+                  aria-label={`Remove ${item.reference.name}`}
+                  title="Remove attachment"
+                  onClick={() => clearPending(item.reference.nodeId)}
+                >
+                  <X className="size-3" />
+                </Button>
+              </span>
+            ))}
           </div>
         )}
         {attachError && (
@@ -694,6 +750,7 @@ export function MessageComposer({
           ref={input}
           value={draft}
           onChange={onChange}
+          onPaste={onPaste}
           onKeyDown={onKeyDown}
           // A click or an arrow can move the caret into (or out of) an existing
           // `@name` without changing the text, so the query is re-read on
@@ -814,6 +871,7 @@ export function MessageComposer({
               <input
                 ref={fileInput}
                 type="file"
+                multiple
                 className="hidden"
                 aria-hidden
                 tabIndex={-1}

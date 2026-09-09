@@ -69,6 +69,32 @@ async function pick(file: File) {
   });
 }
 
+async function drop(files: File[]) {
+  const target = container.querySelector('[data-tour="chat-composer"] > div') as HTMLDivElement;
+  const event = new Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "dataTransfer", {
+    value: { types: ["Files"], files },
+  });
+  await act(async () => {
+    target.dispatchEvent(event);
+  });
+  return event;
+}
+
+async function paste(files: File[]) {
+  const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+  const event = new Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      items: files.map((file) => ({ kind: "file", getAsFile: () => file })),
+    },
+  });
+  await act(async () => {
+    textarea.dispatchEvent(event);
+  });
+  return event;
+}
+
 async function type(text: string) {
   const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
   const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
@@ -122,6 +148,62 @@ describe("composer paperclip (issue #1682)", () => {
     expect(container.textContent).not.toContain("diagram.png");
   });
 
+  it("accepts multiple dropped files and sends every stored reference", async () => {
+    const second: AttachmentDto = {
+      nodeId: "node-2",
+      name: "notes.txt",
+      mime: "text/plain",
+      size: 12,
+    };
+    upload = vi.fn().mockResolvedValueOnce(reference).mockResolvedValueOnce(second);
+    await render();
+
+    const event = await drop([
+      new File([new Uint8Array([1, 2, 3])], "diagram.png", { type: "image/png" }),
+      new File(["hello"], "notes.txt", { type: "text/plain" }),
+    ]);
+    expect(event.defaultPrevented).toBe(true);
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("diagram.png");
+    expect(container.textContent).toContain("notes.txt");
+
+    await type("two files");
+    await act(async () => {
+      (container.querySelector('[aria-label="Send"]') as HTMLButtonElement).click();
+    });
+    expect(sent).toHaveBeenLastCalledWith(
+      "two files",
+      undefined,
+      [reference, second],
+      undefined,
+    );
+  });
+
+  it("uploads an image pasted from the clipboard and stages it as an attachment", async () => {
+    await render();
+    const event = await paste([
+      new File([new Uint8Array([137, 80, 78, 71])], "clipboard.png", { type: "image/png" }),
+    ]);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledWith(expect.objectContaining({ name: "clipboard.png" }));
+    expect(container.textContent).toContain("diagram.png");
+  });
+
+  it("leaves ordinary pasted text to the browser", async () => {
+    await render();
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: { items: [{ kind: "string", getAsFile: () => null }] },
+    });
+    await act(async () => textarea.dispatchEvent(event));
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(upload).not.toHaveBeenCalled();
+  });
+
   // Codex review finding on #1682: an upload lands on the server the instant
   // it succeeds, before the operator has sent anything. Removing, replacing
   // or abandoning it used to just drop the local reference and leave the
@@ -140,7 +222,7 @@ describe("composer paperclip (issue #1682)", () => {
       expect(del).toHaveBeenCalledExactlyOnceWith("node-1");
     });
 
-    it("deletes the replaced upload, not the new one, when a fresh pick supersedes it", async () => {
+    it("keeps separately picked files together until send", async () => {
       const second: AttachmentDto = {
         nodeId: "node-2",
         name: "photo.png",
@@ -155,10 +237,9 @@ describe("composer paperclip (issue #1682)", () => {
       await pick(new File([new Uint8Array([1, 2, 3])], "diagram.png", { type: "image/png" }));
       await pick(new File([new Uint8Array([4, 5, 6])], "photo.png", { type: "image/png" }));
 
-      expect(del).toHaveBeenCalledExactlyOnceWith("node-1");
-      // The new chip is the one that survives.
+      expect(del).not.toHaveBeenCalled();
       expect(container.textContent).toContain("photo.png");
-      expect(container.textContent).not.toContain("diagram.png");
+      expect(container.textContent).toContain("diagram.png");
     });
 
     it("deletes a still-pending attachment when the composer unmounts", async () => {
