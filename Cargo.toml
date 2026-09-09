@@ -52,7 +52,7 @@ required-features = ["openhuman", "mcp"]
 # plugin-host surfaces are enabled. Optional: `src/harness/pages_tools.rs` only
 # compiles under the `openhuman` feature (all of `src/harness/` does), so this
 # links only there — the default build stays offline and unaffected.
-swc_core = { version = "77", optional = true, features = [
+swc_core = { version = "78", optional = true, features = [
     "ecma_ast",
     "ecma_parser",
     "ecma_parser_typescript",

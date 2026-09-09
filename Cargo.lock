@@ -5358,9 +5358,9 @@ dependencies = [
 
 [[package]]
 name = "swc_core"
-version = "77.0.3"
+version = "78.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3091e904b9a20b8e26c22f748dc7408a7a6c571f45302ef4686a833efc9e0fda"
+checksum = "2b3e1cf21711152ac57d0ade1fea33bf8f1cc974f7bc1f668ac0252252876803"
 dependencies = [
  "swc_allocator",
  "swc_atoms",
@@ -5509,9 +5509,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_transforms_typescript"
-version = "55.0.0"
+version = "55.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523651c4ea2d6e7a53c5b8f07e8ae5fb33894970cc96c2f1b534992afcc32fe2"
+checksum = "f6ff33eb8a13dced33261de7778097e18ac33e2ff0ffe7b071f1837b54679d61"
 dependencies = [
  "bytes-str",
  "rustc-hash",
@@ -5527,9 +5527,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_utils"
-version = "35.0.0"
+version = "35.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6fb39737b1c2bde685c5d85799aa04107548de69087a77c690a3ca8bbfc5100"
+checksum = "a0cf1613b3f833d4713998914154e8335eacbec9a3ceb328ee37dc7618cdb468"
 dependencies = [
  "dragonbox_ecma",
  "indexmap",
