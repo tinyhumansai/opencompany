@@ -9,6 +9,32 @@ import type { AppSpec, CompanyStatus } from "@/api/types";
 import { HostsProvider } from "@/connections/HostsContext";
 
 /**
+ * These exercise the create/reset flow itself, so they need the build where the
+ * product offers it.
+ *
+ * `canCreateCompanies` is `!COMPANY_SWITCHING_HIDDEN && carriesPlatformBearer`
+ * (b8a3e2e97), and `COMPANY_SWITCHING_HIDDEN` ships `true` — so in the shipped
+ * tree every trigger below is hidden and the dialog's own preflight never runs.
+ * Left unmocked, these files would assert against controls the product
+ * deliberately does not render, which is what broke them: they would be pinning
+ * the flag rather than the flow.
+ *
+ * The *hide* is not weakened by this. It has its own coverage, deliberately
+ * unmocked, in `product-scope-hidden-surfaces.test.ts` ("company creation is
+ * gone from every trigger, not just the switcher"), which is where a regression
+ * in the gate belongs. What is left here is the flow underneath it — including
+ * the #1894 pre-archive guard, whose whole job is to keep a reset from
+ * archiving a company before it knows the replacement has a usable admin. That
+ * logic is still in the tree and still worth failing a build over the day the
+ * flag flips back.
+ */
+vi.mock("@/product-scope", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/product-scope")>()),
+  COMPANY_SWITCHING_HIDDEN: false,
+}));
+
+
+/**
  * Codex review on #1828 (PR comment 3864628314): `switchCompany`'s only
  * caller that already holds fresh data for the company it is entering —
  * `onCompanyCreated`, right after a create or reset provisions the
