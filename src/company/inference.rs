@@ -376,6 +376,26 @@ fn is_managed_choice(provider: &str) -> bool {
     matches!(provider.trim(), LEGACY_MANAGED | "tinyhumans")
 }
 
+/// The provider kind **as the operator chose it**, before [`normalize_provider`]
+/// folds the managed alias into `openrouter`.
+///
+/// [`normalize_provider`] answers "where does this config resolve to", which is
+/// the right question on every request path and the wrong one for the console:
+/// the managed route and a plain `openrouter` route resolve identically, so
+/// normalizing on the way *out* made "Managed (TinyHumans)" unselectable —
+/// saving it stored `managed`, reading it back reported `openrouter`, and the
+/// card's provider select (seeded from that answer verbatim) snapped straight
+/// back to OpenRouter along with the Connect-TinyHumans button that only the
+/// managed route offers. This is the read-back half of that pair: the operator's
+/// own word for the route, canonicalized to [`LEGACY_MANAGED`] so the console has
+/// exactly one spelling to render, and never used to decide an endpoint.
+pub fn selected_kind(provider: &str) -> &str {
+    if is_managed_choice(provider) {
+        return LEGACY_MANAGED;
+    }
+    normalize_provider(provider)
+}
+
 /// OpenRouter's OpenAI-compatible base URL — used when the `openrouter`
 /// provider names no explicit `base_url`.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -436,8 +456,15 @@ pub struct RuntimeInference {
 /// redacts the credential.
 #[derive(Clone, Debug)]
 pub struct InferenceDecl {
-    /// Provider slug — one of [`INFERENCE_PROVIDERS`].
+    /// Provider slug — one of [`INFERENCE_PROVIDERS`]. Normalized: the managed
+    /// alias has already been folded into `openrouter` here, because this is
+    /// the field every resolution and attribution path reads.
     pub provider: String,
+    /// The kind the operator actually selected, before normalization — see
+    /// [`selected_kind`]. Differs from [`Self::provider`] only for the managed
+    /// route, and exists so the console can render and re-offer the choice that
+    /// was made rather than the one it resolves to.
+    selected_provider: String,
     /// Resolved OpenAI-compatible base URL (never empty for a valid config).
     pub base_url: String,
     /// Abstract-tier → concrete model id. Empty means every tier passes
@@ -463,6 +490,15 @@ pub struct InferenceDecl {
 }
 
 impl InferenceDecl {
+    /// The provider kind as the operator selected it — [`Self::provider`] for
+    /// every route but the managed one, which reports `managed`.
+    ///
+    /// For display and for re-offering the choice only. Anything deciding an
+    /// endpoint, a credential or an attribution wants [`Self::provider`].
+    pub fn selected_provider(&self) -> &str {
+        &self.selected_provider
+    }
+
     /// The outbound credential, unresolved. Callers on the request path want
     /// [`bearer`](Self::bearer); this is for status and fingerprinting.
     pub fn credential(&self) -> &Credential {
@@ -669,6 +705,7 @@ pub fn decl_for_probe(
     env_default: Option<&EnvDefault>,
 ) -> InferenceDecl {
     let provider = provider.trim().to_string();
+    let selected_provider = selected_kind(&provider).to_string();
     let (base_url, credential, proxied) = resolve_endpoint(
         &provider,
         base_url,
@@ -677,6 +714,7 @@ pub fn decl_for_probe(
     );
     InferenceDecl {
         provider,
+        selected_provider,
         base_url,
         models: BTreeMap::new(),
         source: InferenceSource::Runtime,
@@ -917,6 +955,7 @@ pub async fn resolve_effective_scoped(
 ) -> Result<Option<InferenceDecl>> {
     // 1. Runtime override (console) wins.
     if let Some(runtime) = load_runtime_config_scoped(company, secrets, scope).await? {
+        let selected_provider = selected_kind(&runtime.provider).to_string();
         let provider = normalize_provider(&runtime.provider).to_string();
         reject_unknown_provider(&provider, "the stored runtime inference config")?;
         let key = load_key_scoped(company, secrets, None, scope).await?;
@@ -924,6 +963,7 @@ pub async fn resolve_effective_scoped(
             resolve_endpoint(&provider, runtime.base_url.as_deref(), key, env_default);
         return Ok(Some(InferenceDecl {
             provider,
+            selected_provider,
             base_url,
             models: runtime.models,
             source: InferenceSource::Runtime,
@@ -935,8 +975,9 @@ pub async fn resolve_effective_scoped(
 
     // 2. Manifest `[inference]`.
     if manifest.is_set() {
-        let provider =
-            normalize_provider(manifest.provider.as_deref().unwrap_or_default()).to_string();
+        let declared = manifest.provider.as_deref().unwrap_or_default();
+        let selected_provider = selected_kind(declared).to_string();
+        let provider = normalize_provider(declared).to_string();
         reject_unknown_provider(&provider, "`[inference].provider`")?;
         let key =
             load_key_scoped(company, secrets, manifest.api_key_secret.as_deref(), scope).await?;
@@ -944,6 +985,7 @@ pub async fn resolve_effective_scoped(
             resolve_endpoint(&provider, manifest.base_url.as_deref(), key, env_default);
         return Ok(Some(InferenceDecl {
             provider,
+            selected_provider,
             base_url,
             models: manifest.models.clone(),
             source: InferenceSource::Manifest,
@@ -969,6 +1011,17 @@ pub async fn resolve_effective_scoped(
             resolve_endpoint(DEFAULT_PROVIDER, None, key, Some(env));
         return Ok(Some(InferenceDecl {
             provider: DEFAULT_PROVIDER.to_string(),
+            // Nothing is declared and the platform's own endpoint is answering:
+            // that *is* the managed route, and it is what the console's
+            // "Managed (TinyHumans)" means. Saying `openrouter` here is the
+            // second way the managed choice used to vanish — the console sends a
+            // keyless managed save as a revert (a managed brain with no key of
+            // its own is the platform default, not an override), so the operator
+            // pressed Save on Managed and this arm answered with the name of the
+            // provider underneath it. The arm below, for a host with no platform
+            // default at all, has always reported `managed` for the same reason;
+            // these two now agree.
+            selected_provider: LEGACY_MANAGED.to_string(),
             base_url,
             models: BTreeMap::new(),
             source: InferenceSource::Default,
@@ -1261,6 +1314,129 @@ mod tests {
         );
     }
 
+    /// A company that declares nothing and rides the platform's endpoint is on
+    /// the managed route, and says so.
+    ///
+    /// The console sends a keyless managed save as a *revert* — a managed brain
+    /// with no key of its own is the platform default rather than an override —
+    /// so this arm is what answers the operator immediately after they choose
+    /// "Managed (TinyHumans)" and press Save. Answering `openrouter` (the
+    /// provider underneath the platform endpoint) is the second way that choice
+    /// used to disappear from the card, and the one a stored-override fix alone
+    /// does not reach.
+    #[tokio::test]
+    async fn the_platform_default_reports_itself_as_the_managed_route() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let env = EnvDefault {
+            base_url: "https://env.example/openai/v1".into(),
+            credential: Credential::from_value("platform-key"),
+        };
+        let decl = resolve_effective(&company, &Inference::default(), Some(&env), &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decl.selected_provider(), LEGACY_MANAGED);
+        assert_eq!(
+            decl.provider, DEFAULT_PROVIDER,
+            "and it still resolves to, and is billed as, proxied OpenRouter"
+        );
+        assert!(decl.is_proxied());
+        assert_eq!(decl.telemetry_slug(), "subscription");
+        assert_eq!(decl.source, InferenceSource::Default);
+    }
+
+    /// The operator's own choice survives the round trip, so a console can echo
+    /// it back.
+    ///
+    /// `provider` answers "where does this resolve to", which is the right
+    /// question everywhere but the read-back: `managed` and `openrouter` resolve
+    /// identically, so reporting the resolved kind made "Managed (TinyHumans)"
+    /// impossible to hold on screen — the console seeds its provider select from
+    /// the status verbatim, so a `managed` save that read back `openrouter`
+    /// snapped the select (and the managed-only Connect button with it) straight
+    /// back. The two facts are now separate fields rather than one field asked
+    /// two questions.
+    #[tokio::test]
+    async fn a_saved_managed_choice_reads_back_as_managed() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        let env = EnvDefault {
+            base_url: "https://env.example/openai/v1".into(),
+            credential: Credential::from_value("platform-key"),
+        };
+        save_runtime_config(
+            &company,
+            &secrets,
+            &RuntimeInference {
+                provider: LEGACY_MANAGED.to_string(),
+                base_url: None,
+                models: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let decl = resolve_effective(&company, &Inference::default(), Some(&env), &secrets)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decl.selected_provider(),
+            LEGACY_MANAGED,
+            "the console asked what was chosen"
+        );
+        assert_eq!(
+            decl.provider, DEFAULT_PROVIDER,
+            "and resolution is unchanged — every request path still sees OpenRouter"
+        );
+        assert!(decl.is_proxied());
+        assert_eq!(decl.telemetry_slug(), "subscription");
+    }
+
+    /// Every other route reports one answer to both questions, so nothing but
+    /// the managed alias can drift between them.
+    #[tokio::test]
+    async fn a_non_aliased_choice_reads_back_unchanged() {
+        let company = CompanyId::new("acme");
+        let secrets = MemSecrets::default();
+        for kind in ["openrouter", "ollama", "openai_compatible"] {
+            save_runtime_config(
+                &company,
+                &secrets,
+                &RuntimeInference {
+                    provider: kind.to_string(),
+                    base_url: Some("http://127.0.0.1:9/v1".into()),
+                    models: BTreeMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+            let decl = resolve_effective(&company, &Inference::default(), None, &secrets)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(decl.selected_provider(), kind);
+            assert_eq!(decl.provider, kind);
+        }
+    }
+
+    /// `tinyhumans` is the wizard's spelling of the same route. It has to
+    /// canonicalize to the one spelling the console renders, or the select is
+    /// handed a value its own provider table has no row for and falls back.
+    #[test]
+    fn both_spellings_of_the_managed_route_canonicalize() {
+        assert_eq!(selected_kind(LEGACY_MANAGED), LEGACY_MANAGED);
+        assert_eq!(selected_kind("tinyhumans"), LEGACY_MANAGED);
+        assert_eq!(selected_kind("  managed  "), LEGACY_MANAGED);
+        assert_eq!(selected_kind("openrouter"), "openrouter");
+        assert_eq!(
+            selected_kind(""),
+            DEFAULT_PROVIDER,
+            "naming nothing is not naming the managed route"
+        );
+    }
+
     /// A committed manifest still saying `provider = "managed"` resolves as
     /// proxied OpenRouter rather than failing. It was valid when written, and the
     /// intent — "the platform's brain" — is exactly what proxied OpenRouter is.
@@ -1280,6 +1456,12 @@ mod tests {
         assert!(decl.is_proxied());
         assert_eq!(decl.base_url, "https://env.example/openai/v1");
         assert_eq!(bearer(&decl).await.as_deref(), Some("platform-key"));
+        assert_eq!(
+            decl.selected_provider(),
+            LEGACY_MANAGED,
+            "the alias resolves onto OpenRouter without the console losing which \
+             route was actually named"
+        );
         assert!(
             validate_inference(&inference(LEGACY_MANAGED)).is_empty(),
             "and it still validates"

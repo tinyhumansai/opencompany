@@ -236,6 +236,115 @@ pub fn stamped_conversation_is(origin: Option<&str>, desk: &str) -> bool {
 /// predicate rather than writing the carve-out again — writing it twice and
 /// forgetting it a third time is what let a thread-less parked blocker read as
 /// pending in `#general`.
+/// One channel this agent can read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Channel {
+    /// The desk id the journal stores rows under.
+    pub id: String,
+    /// The desk's display name — `chat_history::owns` matches either.
+    pub name: String,
+    /// How the cue names this channel to the agent.
+    pub label: String,
+}
+
+/// Every channel this agent can read: each desk it sits on, its own DM, and
+/// the company's General line.
+///
+/// Enumerated the way [`CompanyRecord::agent_desk_tools`] enumerates desks —
+/// manifest desks first, then operator-created overlay desks, deduplicated —
+/// so a teammate seated through the console is in its own session exactly as a
+/// manifest member is.
+pub fn agent_channels(record: &CompanyRecord, agent_id: &str) -> Vec<Channel> {
+    let mut seen = std::collections::HashSet::new();
+    let mut channels = Vec::new();
+
+    let manifest = record
+        .manifest
+        .group_chats
+        .iter()
+        .map(|chat| chat.id.clone());
+    let overlay = record.overlay_desks.iter().map(|desk| desk.id.clone());
+    for desk_id in manifest.chain(overlay) {
+        if !seen.insert(desk_id.clone()) {
+            continue;
+        }
+        if !record
+            .effective_desk_members(&desk_id)
+            .iter()
+            .any(|member| member == agent_id)
+        {
+            continue;
+        }
+        let name = desk_display_name(record, &desk_id);
+        channels.push(Channel {
+            label: format!("#{}", name),
+            id: desk_id,
+            name,
+        });
+    }
+
+    // This agent's own direct line — under **both** spellings it is journaled
+    // under, because the console and the route disagree and both are correct.
+    //
+    // `dmThreadId` (`views/room/channels.ts`) posts a DM under the teammate's
+    // **bare id**; `dm:<id>` is the console's channel key and is *also* a
+    // documented key on the chat route (`assignee::dm_key`), which a teammate
+    // whose id is a General spelling is always addressed by. A session that
+    // listed only one of them would miss every DM keyed the other way — which
+    // is the whole of the operator's own line to this agent.
+    //
+    // Keyed on the id and never the name: renaming somebody must not move their
+    // DM or orphan its history (issue #364).
+    for (label, id) in [
+        ("dm", agent_id.to_string()),
+        (
+            "dm",
+            format!("{}{agent_id}", crate::runtime::assignee::DM_PREFIX),
+        ),
+    ] {
+        if seen.insert(id.clone()) {
+            channels.push(Channel {
+                label: label.to_string(),
+                name: id.clone(),
+                id,
+            });
+        }
+    }
+
+    // The company's own line. Not a desk (issue #1743) unless a blueprint
+    // declared one under a General spelling, in which case the loop above
+    // already claimed it and this is a no-op.
+    let general = tinyhivemind_core::chat::GENERAL_DESK.to_string();
+    if seen.insert(general.clone()) {
+        channels.push(Channel {
+            label: "#general".to_string(),
+            name: general.clone(),
+            id: general,
+        });
+    }
+
+    channels
+}
+
+/// The desk's display name, falling back to its id.
+fn desk_display_name(record: &CompanyRecord, desk_id: &str) -> String {
+    record
+        .manifest
+        .group_chats
+        .iter()
+        .find(|chat| chat.id == desk_id)
+        .map(|chat| chat.name.clone())
+        .or_else(|| {
+            record
+                .overlay_desks
+                .iter()
+                .find(|desk| desk.id == desk_id)
+                .map(|desk| desk.name.clone())
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| desk_id.to_string())
+}
+
 pub fn owns(desk_id: &str, desk_name: &str, event: &CompanyEvent) -> bool {
     let stored = match event {
         CompanyEvent::AgentReply { chat_id, .. } => Some(chat_id.as_str()),
@@ -359,6 +468,69 @@ pub struct ReferralConversation {
     pub lines: Vec<ReferralLine>,
 }
 
+/// One line of a private aside, in the order it was said.
+///
+/// No `author_label`: unlike a referral, both sides of an aside sit on the desk
+/// being read, so the console already knows their names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsideLine {
+    /// The agent that wrote it.
+    pub author_id: String,
+    /// What they said, with the `!aside @peer` head already stripped.
+    pub text: String,
+}
+
+/// A private exchange between members of one desk, folded onto the move it rode
+/// under.
+///
+/// The same idiom as [`ReferralConversation`] and for the same reason: it is
+/// detail behind a line, not part of the desk's own conversation. It differs in
+/// who may read it — an operator reads every row in full (`Audience::admits`
+/// admits `Viewer::Operator` unconditionally), because privacy here is between
+/// agents and is a deliberation device, never a security boundary. Collapsing it
+/// is a rendering choice, not an access-control one, and nothing here withholds
+/// anything from the person reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsideConversation {
+    /// Everyone in it — the author first, then who they addressed.
+    pub members: Vec<String>,
+    /// The exchange, oldest first. Its length is the collapsed label's count.
+    pub lines: Vec<AsideLine>,
+}
+
+#[cfg(test)]
+impl MessageView {
+    /// A bare row, for tests that exercise the folds rather than the projection.
+    ///
+    /// Test-only on purpose: the real constructor is `From<StoredEvent>` and has
+    /// to stay the only way a view is built from a journal, or a projection
+    /// concern could be skipped by a caller that assembled one by hand.
+    pub(crate) fn for_test(id: &str, author: &str, text: &str, audience: Vec<String>) -> Self {
+        Self {
+            id: id.to_owned(),
+            channel: author.to_owned(),
+            admin_only: false,
+            cue_author: author.to_owned(),
+            author: author.to_owned(),
+            cue_text: text.to_owned(),
+            text: text.to_owned(),
+            at_millis: 0.0,
+            mine: false,
+            by_person: false,
+            referred_from: None,
+            referral_conversation: None,
+            aside_audience: audience,
+            aside_conversation: None,
+            steps: Vec::new(),
+            task_id: None,
+            parent_id: None,
+            reactions: Vec::new(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
 /// Who is reading a desk history. `mine` is relative to this.
 ///
 /// There is no `From<StoredEvent> for MessageView`, and there cannot be:
@@ -374,6 +546,68 @@ pub enum Viewer {
     User(String),
 }
 
+/// The label a message with no nameable human author carries in an agent's cue.
+///
+/// Safe to sit in the same namespace as roster ids and user ids: a manifest
+/// refuses the reserved ids (`company/manifest.rs`), and a minted user id is
+/// not this word. Nothing a message *body* can say matters either, because
+/// bodies are nested under their own speaker's label by
+/// `chat_seed::prefix_every_line`.
+pub const CUE_OPERATOR_LABEL: &str = "operator";
+
+/// The signed-in person behind a message, when there is one.
+///
+/// `Some(id)` for a [`ActorKind::User`] actor and nothing else. An agent-sent
+/// message (a crossing referral arrives as one) and a machine credential both
+/// answer `None` — neither names a person.
+pub fn cue_author_id(by: &Option<Actor>) -> Option<String> {
+    match by {
+        // CodeRabbit: an agent-authored crossing arrives as an
+        // `OperatorMessage` too (the `ActorKind::Agent` arm a few lines below
+        // this function's own callers, in `MessageView::project`) — this
+        // matched only `User` and fell through to the `operator` fallback for
+        // that arm, so the raw view and the cue line both attributed the
+        // teammate's own line to "operator". Both actor kinds name a real
+        // sender; only a machine credential (`None`, or neither kind) has
+        // nobody to name.
+        Some(actor) if matches!(actor.kind, ActorKind::User | ActorKind::Agent) => {
+            Some(actor.id.clone())
+        }
+        _ => None,
+    }
+}
+
+/// **What an agent is told to call the sender** — a stable id, not a screen name.
+///
+/// This is the single source of truth for that string. `chat_seed::operator_label`
+/// delegates to it, [`MessageView::cue_author`] is projected from it, and the
+/// per-agent session route ships it to the console, so the byline an agent was
+/// handed, the one the seed writes and the one an operator reads in the raw
+/// view cannot drift apart.
+///
+/// # Why an id and not the display name the console shows
+///
+/// Two reasons, and the second is the one that matters.
+///
+/// Resolving a name costs a store read per distinct author, on a projection
+/// that runs inside the per-company cycle lock and whose whole design note is
+/// that it must not do avoidable I/O.
+///
+/// And a display name is **neither unique nor unforgeable**. The label becomes
+/// a per-line attribution prefix ([`prefix_every_line`](crate::harness::built_in::chat_seed),
+/// issues #1956 / #2075), so a person who set their display name to a
+/// teammate's id would have their own lines prefixed as if that teammate had
+/// said them. An id cannot be chosen, so it cannot be chosen to impersonate.
+///
+/// The console is under the opposite constraint — it shows a person to other
+/// people, and an id is not a name there — which is why `author_labels` walks
+/// the display ladder and lands on `"someone"`. The two answers are different
+/// on purpose; what must never happen is a surface claiming to show one and
+/// showing the other.
+pub fn cue_author(by: &Option<Actor>) -> String {
+    cue_author_id(by).unwrap_or_else(|| CUE_OPERATOR_LABEL.to_string())
+}
+
 /// One message in a desk history, independent of transport. Mirrors
 /// `frontend/src/lib/chat.ts`. The GraphQL `Message` type and the REST
 /// `chat/history` JSON shape both project from this.
@@ -385,8 +619,33 @@ pub struct MessageView {
     pub channel: String,
     /// The author label.
     pub author: String,
+    /// **What an agent is told to call this row's author** — see
+    /// [`cue_author`].
+    ///
+    /// Deliberately not [`Self::author`]: that one is the display name a
+    /// *person* reads, and the two resolve differently on purpose. Projected
+    /// here so the per-agent session route can ship the agent's own byline to
+    /// the console without the console guessing at it — a raw view that showed
+    /// the display name while claiming to show the cue would be asserting the
+    /// agent saw something it did not.
+    ///
+    /// Mirrors `agent_session::body_of` arm for arm; the two are pinned
+    /// together by `cue_author_matches_the_envelope_the_agent_is_handed`.
+    pub cue_author: String,
     /// The message text.
     pub text: String,
+    /// **What the agent was actually handed for this row** — the text before
+    /// [`readable_moves`] rewrote it into operator-facing prose.
+    ///
+    /// Same reasoning as [`Self::cue_author`], applied to the other half of
+    /// the cue line: `render_cues` in `agent_session.rs` prepends
+    /// `[channel · author] text` using the **pre-rewrite** body (`body_of`
+    /// reads the stored event directly, never a projected `MessageView`), so
+    /// a surface that claims to show what the model saw — the raw-turns view
+    /// — must not feed it [`Self::text`], which has already had `!support
+    /// #topic ^3` turned into prose. Equal to [`Self::text`] on every row
+    /// `readable_moves` does not touch.
+    pub cue_text: String,
     /// When it was journaled, epoch millis.
     pub at_millis: f64,
     /// Whether it is the operator's own message.
@@ -419,6 +678,14 @@ pub struct MessageView {
     pub referred_from: Option<ReferredFrom>,
     /// The crossing this report brought home, when it brought one.
     pub referral_conversation: Option<ReferralConversation>,
+    /// The addressees of this row when it is a private aside, else empty.
+    ///
+    /// Fold input, not output: `fold_asides` reads it to know which rows to
+    /// collect, and no DTO carries it — what the console renders is the folded
+    /// [`Self::aside_conversation`] on the row the aside rode under.
+    pub aside_audience: Vec<String>,
+    /// The private exchange this move carried, when it carried one.
+    pub aside_conversation: Option<AsideConversation>,
     /// Whether this row may reach only administrators (issue #1781 review,
     /// Codex P1).
     ///
@@ -656,12 +923,18 @@ impl MessageView {
                 task_id,
                 parent,
                 mentions,
+                audience,
                 ..
             } => MessageView {
                 id,
                 channel: agent_id.clone(),
                 admin_only: agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR,
+                // `body_of`'s `AgentReply` arm names the agent, so this does.
+                cue_author: agent_id.clone(),
                 author: agent_id,
+                // `body_of`'s `AgentReply` arm hands the agent `text.clone()`
+                // untouched — clone before `readable_moves` consumes it below.
+                cue_text: text.clone(),
                 text: readable_moves(text),
                 at_millis,
                 mine: false,
@@ -670,6 +943,8 @@ impl MessageView {
                 // Set by the referral fold in `history_for_desk`, never here.
                 referred_from: None,
                 referral_conversation: None,
+                aside_audience: audience,
+                aside_conversation: None,
                 steps,
                 task_id,
                 parent_id: parent.map(|seq| seq.value().to_string()),
@@ -741,10 +1016,20 @@ impl MessageView {
                     // Set by the referral fold in `history_for_desk`, never here.
                     referred_from: None,
                     referral_conversation: None,
+                    aside_audience: Vec::new(),
+                    aside_conversation: None,
                     id,
                     channel: voice,
                     admin_only: false,
+                    // The agent's byline for this row, resolved by the one
+                    // function that decides it. NOT `author` above: that is the
+                    // display name a person reads, and it lands on "someone"
+                    // where this lands on the user id.
+                    cue_author: cue_author(&by),
                     author,
+                    // `body_of`'s `OperatorMessage` arm applies no rewrite
+                    // either, so the cue and the rendered text agree here.
+                    cue_text: text.clone(),
                     text,
                     at_millis,
                     mine,
@@ -803,7 +1088,14 @@ impl MessageView {
                 id,
                 channel: crate::ports::SYSTEM_AUTHOR.to_string(),
                 admin_only: false,
+                // `body_of` hands an agent no structural marker, so nothing
+                // ever reads this — named rather than left to drift.
+                cue_author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 author: crate::ports::SYSTEM_AUTHOR.to_string(),
+                // `body_of` never delivers this marker to an agent (see the
+                // comment on `cue_author` above); equal to `text` for the same
+                // reason that one is named rather than left to drift.
+                cue_text: dispatch_marker_text(&column),
                 text: dispatch_marker_text(&column),
                 at_millis,
                 mine: false,
@@ -811,6 +1103,8 @@ impl MessageView {
                 // Set by the referral fold in `history_for_desk`, never here.
                 referred_from: None,
                 referral_conversation: None,
+                aside_audience: Vec::new(),
+                aside_conversation: None,
                 steps: Vec::new(),
                 task_id: Some(task_id),
                 // Rendered the same way an `OperatorMessage`'s parent is, a few
@@ -826,7 +1120,13 @@ impl MessageView {
                 id,
                 channel: crate::ports::SYSTEM_AUTHOR.to_string(),
                 admin_only: false,
+                // `body_of` hands an agent no structural marker, so nothing
+                // ever reads this — named rather than left to drift.
+                cue_author: crate::ports::SYSTEM_AUTHOR.to_string(),
                 author: crate::ports::SYSTEM_AUTHOR.to_string(),
+                // `body_of` never delivers this fallback marker to an agent
+                // either — same reasoning as the arm above.
+                cue_text: format!("{other:?}"),
                 text: format!("{other:?}"),
                 at_millis,
                 mine: false,
@@ -834,6 +1134,8 @@ impl MessageView {
                 // Set by the referral fold in `history_for_desk`, never here.
                 referred_from: None,
                 referral_conversation: None,
+                aside_audience: Vec::new(),
+                aside_conversation: None,
                 steps: Vec::new(),
                 task_id: None,
                 parent_id: None,
@@ -1221,7 +1523,100 @@ pub async fn history_for_desk(
 
     drop_dead_cards(runtime, &mut messages).await?;
     attach_referral_origins(runtime, desk_id, &mut messages).await?;
+    fold_asides(&mut messages);
     Ok(messages)
+}
+
+/// Fold each private aside onto the move it rode under.
+///
+/// A seat writes its move and may add one `!aside @peer` line beneath it; the
+/// host journals that line as its own row carrying an `audience`. Left alone it
+/// renders in the transcript as an ordinary message with the raw marker still in
+/// its body — which is both a leak of the grammar into the operator's view and a
+/// misreading of what happened, since the row was never addressed to the room.
+///
+/// So the aside rows are lifted out of the transcript and hung on the nearest
+/// preceding desk-visible row by the same author — the move they rode under.
+///
+/// **An orphan is kept, never dropped.** An aside with no move above it (the
+/// author's first row, or a history page that begins mid-exchange) stays where it
+/// is as an ordinary row. A rendered line in the wrong shape is a cosmetic
+/// defect; a dropped one is a lost message, and this projection already refuses
+/// that trade for referrals one function below.
+pub(crate) fn fold_asides(messages: &mut Vec<MessageView>) {
+    if messages
+        .iter()
+        .all(|message| message.aside_audience.is_empty())
+    {
+        return;
+    }
+    let mut folded = Vec::with_capacity(messages.len());
+    for message in std::mem::take(messages) {
+        if message.aside_audience.is_empty() {
+            folded.push(message);
+            continue;
+        }
+        // The move this aside rode under: the nearest row above it that this same
+        // seat wrote in the open. Searching by author rather than by adjacency
+        // keeps the pairing right when two seats aside in the same round.
+        let anchor = folded.iter_mut().rev().find(|earlier| {
+            // Same seat, and speaking in the open: an orphaned aside kept
+            // above must not become the anchor for the one below it.
+            earlier.author == message.author && earlier.aside_audience.is_empty()
+        });
+        let Some(anchor) = anchor else {
+            // Orphan: no move of ours above it. Keep the row.
+            folded.push(message);
+            continue;
+        };
+        let line = AsideLine {
+            author_id: message.author.clone(),
+            text: aside_body(&message.text),
+        };
+        match &mut anchor.aside_conversation {
+            Some(conversation) => {
+                for member in &message.aside_audience {
+                    if !conversation.members.contains(member) {
+                        conversation.members.push(member.clone());
+                    }
+                }
+                conversation.lines.push(line);
+            }
+            slot @ None => {
+                let mut members = vec![message.author.clone()];
+                members.extend(message.aside_audience.iter().cloned());
+                *slot = Some(AsideConversation {
+                    members,
+                    lines: vec![line],
+                });
+            }
+        }
+    }
+    *messages = folded;
+}
+
+/// `!aside @peer the body` -> `the body`.
+///
+/// The marker and the addressee are what the collapsed chip's header already
+/// says; leaving them in the body is the leak this fold exists to close.
+/// `line_kind` cannot do it — `MOVE_KINDS` deliberately omits `aside`, because a
+/// marker the fold discards is not a move anybody made — so the strip is here.
+fn aside_body(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("!aside") else {
+        return text.to_string();
+    };
+    let mut rest = rest.trim_start();
+    // Every leading `@name`, not just the first: an aside may name more than one
+    // peer when a desk raised `max_members`.
+    while let Some(after_at) = rest.strip_prefix('@') {
+        let cut = after_at.find(char::is_whitespace).unwrap_or(after_at.len());
+        rest = after_at[cut..].trim_start();
+    }
+    // Trailing space too: the head strip is the only thing standing between the
+    // authored line and a chat bubble, and a bubble padded with the whitespace
+    // that used to separate `@peer` from the body is a rendering artefact.
+    rest.trim_end().to_string()
 }
 
 /// Fold each `ReferralEnqueued` marker onto the message it caused
@@ -1759,6 +2154,109 @@ fn is_admin_only_event(event: &CompanyEvent) -> bool {
 
 #[cfg(test)]
 mod test {
+    use super::{AsideConversation, MessageView, aside_body, fold_asides};
+
+    /// A desk-visible row by `author`, or an aside when `to` names somebody.
+    fn row(id: &str, author: &str, text: &str, to: &[&str]) -> MessageView {
+        MessageView {
+            id: id.to_owned(),
+            channel: author.to_owned(),
+            admin_only: false,
+            cue_author: author.to_owned(),
+            author: author.to_owned(),
+            cue_text: text.to_owned(),
+            text: text.to_owned(),
+            at_millis: 0.0,
+            mine: false,
+            by_person: false,
+            referred_from: None,
+            referral_conversation: None,
+            aside_audience: to.iter().map(|id| (*id).to_owned()).collect(),
+            aside_conversation: None,
+            steps: Vec::new(),
+            task_id: None,
+            parent_id: None,
+            reactions: Vec::new(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_aside_folds_onto_the_move_it_rode_under() {
+        let mut messages = vec![
+            row("1", "exchanges", "!propose #swap the clicky variant", &[]),
+            row(
+                "2",
+                "exchanges",
+                "!aside @refunds the difference is -$16.63",
+                &["refunds"],
+            ),
+            row("3", "refunds", "!support #swap ^1", &[]),
+        ];
+        fold_asides(&mut messages);
+
+        // The aside is lifted out of the transcript...
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "3"],
+            "the aside row no longer stands in the desk's own conversation"
+        );
+        // ...and hangs on its author's move, with the marker head stripped.
+        let Some(AsideConversation { members, lines }) = &messages[0].aside_conversation else {
+            panic!("the move carries the aside");
+        };
+        assert_eq!(members, &["exchanges".to_owned(), "refunds".to_owned()]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "the difference is -$16.63");
+        assert!(
+            !lines[0].text.contains("!aside"),
+            "the grammar never reaches the operator's view"
+        );
+    }
+
+    #[test]
+    fn an_orphan_aside_is_kept_rather_than_dropped() {
+        // No move above it — a page that begins mid-exchange. A line in the wrong
+        // shape beats a line nobody can read.
+        let mut messages = vec![row(
+            "1",
+            "exchanges",
+            "!aside @refunds mid-page",
+            &["refunds"],
+        )];
+        fold_asides(&mut messages);
+        assert_eq!(messages.len(), 1, "the row survives");
+        assert!(messages[0].aside_conversation.is_none());
+    }
+
+    #[test]
+    fn an_aside_never_hangs_on_another_seats_move() {
+        let mut messages = vec![
+            row("1", "refunds", "!propose #refund take the return", &[]),
+            row(
+                "2",
+                "exchanges",
+                "!aside @refunds are you sure?",
+                &["refunds"],
+            ),
+        ];
+        fold_asides(&mut messages);
+        // `exchanges` has no move above it, so its aside stays put rather than
+        // being attributed to the seat that happened to speak last.
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].aside_conversation.is_none());
+    }
+
+    #[test]
+    fn aside_body_strips_every_addressee_and_leaves_other_text_alone() {
+        assert_eq!(aside_body("!aside @a @b the point"), "the point");
+        assert_eq!(aside_body("  !aside   @a   spaced  "), "spaced");
+        // Not an aside: untouched, including a marker this host does not police.
+        assert_eq!(aside_body("!propose #x y"), "!propose #x y");
+        assert_eq!(aside_body("plain prose"), "plain prose");
+    }
+
     use super::*;
     use crate::ports::tasks::{
         COLUMN_DONE, COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_PLANNING,

@@ -29,6 +29,7 @@ import { EchoPlaceholder, echoMarkerFor } from "./EchoPlaceholder";
 import {
   CardChip,
   ReferralChip,
+  AsideConversation,
   ReferralConversation,
   StepTimeline,
 } from "./StepTimeline";
@@ -480,6 +481,9 @@ export function MessageRow({
             reads as its own conversation. */}
         {message.referralConversation && (
           <ReferralConversation crossing={message.referralConversation} />
+        )}
+        {message.asideConversation && (
+          <AsideConversation aside={message.asideConversation} />
         )}
         {message.taskId && (
           <div className="flex flex-wrap items-center gap-2">

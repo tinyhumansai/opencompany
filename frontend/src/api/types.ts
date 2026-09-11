@@ -398,6 +398,88 @@ export interface ReferralConversationDto {
   lines: ReferralLineDto[];
 }
 
+export interface AsideLineDto {
+  authorId: string;
+  text: string;
+}
+
+/** A private exchange between members of one desk, folded onto the move it rode
+ *  under. The operator reads it in full — collapsing is presentation, not
+ *  access control. */
+export interface AsideConversationDto {
+  /** Everyone in it — the author first, then who they addressed. */
+  members: string[];
+  lines: AsideLineDto[];
+}
+
+/**
+ * One line of an agent's session: a chat row plus where it was said.
+ *
+ * The session view is one continuous stream across every channel an agent can
+ * read, so a row that does not say which channel it came from is unreadable —
+ * two teammates answering in two desks would interleave with nothing to tell
+ * them apart. Everything else is a plain {@link ChatHistoryMessageDto}, which
+ * is what lets `fromHistory` map it and the room's own components render it,
+ * referral and aside collapses included.
+ */
+export interface AgentSessionMessageDto extends ChatHistoryMessageDto {
+  /** The channel as the rail names it — `#Brand`, `#general`, `dm`. */
+  sessionChannel: string;
+  /** The desk id behind that label, so a row can link to its conversation. */
+  sessionChannelId: string;
+  /**
+   * **What the agent was told to call this row's author.**
+   *
+   * Not {@link ChatHistoryMessageDto.author}, and not a substitute for it. That
+   * one is the display name a *person* reads, walking the ladder chosen name →
+   * a name derived from the login identity → `"someone"`. This one is what the
+   * runtime puts in the cue line the model is handed, and it is a **stable id**
+   * — the signed-in user's id, or `"operator"` for a machine credential.
+   *
+   * The two differ on purpose. An agent's byline becomes a per-line attribution
+   * prefix, so it has to be unique and unforgeable; a display name is neither,
+   * and a person who set theirs to a teammate's id could otherwise have their
+   * lines prefixed as if that teammate had said them. A person reading a
+   * transcript needs the opposite — a name, not a key.
+   *
+   * Only the raw view reads it, and only because it claims to show the string
+   * the model received. Optional: a host predating the field omits it, and the
+   * honest fallback there is the display name with no claim attached.
+   */
+  cueAuthor?: string;
+  /**
+   * **The text the model was actually handed for this row** — before the
+   * host's move-marker rewrite turned it into operator-facing prose (e.g.
+   * `!support #topic ^3` becoming a sentence).
+   *
+   * Same reasoning as {@link cueAuthor}, for the other half of the cue line:
+   * the raw view claims to show the string the model received, and
+   * {@link ChatHistoryMessageDto.text} has already been rewritten for a
+   * person to read. Equal to `text` on every row the rewrite did not touch.
+   * Optional for the same reason `cueAuthor` is — a host predating the field
+   * omits it, and the honest fallback is the rendered text with no claim
+   * attached.
+   */
+  cueText?: string;
+  /**
+   * **The openhuman session this agent's turns belong to** —
+   * `{company}:{agentId}`.
+   *
+   * Minted host-side by `openhuman_session_key` (`src/harness/session_key.rs`),
+   * the one function that names a session, and the same string stamped onto the
+   * live session's `event_context`. Never rebuilt here: a `${company}:${id}`
+   * in TypeScript would be a second spelling of a session's name, and a second
+   * spelling is one that can drift from the one the runtime actually answers to.
+   *
+   * Carried per row rather than in an envelope because the route answers a bare
+   * array and every caller indexes it; see the Rust DTO for the full reasoning.
+   * Every row of one response carries the same value. Optional: a host
+   * predating the field omits it, and the honest thing then is to show no
+   * session name rather than a guessed one.
+   */
+  openhumanSessionKey?: string;
+}
+
 export interface ReferredFromDto {
   deskId: string;
   deskName: string;
@@ -430,6 +512,7 @@ export interface ChatHistoryMessageDto {
   text: string;
   referredFrom?: ReferredFromDto;
   referralConversation?: ReferralConversationDto;
+  asideConversation?: AsideConversationDto;
   atMillis: number;
   mine: boolean;
   /**

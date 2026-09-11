@@ -569,6 +569,38 @@ pub struct CompanyManifest {
     /// How this company relates to the global baseline ([`crate::globals`]).
     #[serde(default)]
     pub globals: Globals,
+    /// `[speech]` — whether this company's agents speak by tool call.
+    #[serde(default)]
+    pub speech: Speech,
+}
+
+/// `[speech]` — whether talking is a tool call rather than a turn's return text.
+///
+/// # Why this is company-level and not per-desk
+///
+/// [`hive.aside`](GroupChatHive) and `hive.referral` are nested under a desk
+/// because they are properties of a *deliberation on that desk*. Speech is a
+/// property of an agent's **session**, which since the session became
+/// continuous spans every desk it sits on plus its DM plus the company's
+/// General line. A per-desk knob would let one agent speak by tool call on one
+/// desk and by return text on another inside one unbroken session — which is
+/// exactly the incoherence the continuous session exists to remove.
+///
+/// # Off by default, and never silencing
+///
+/// A company that does not set this behaves byte-for-byte as it did. A company
+/// that does still has the old path underneath it: an agent that answers
+/// without calling a speech tool has its return text journaled as before, and
+/// the omission is counted rather than dropped. Going quiet because a model
+/// forgot to call a tool is not an acceptable failure mode, so it is not one
+/// this knob can produce.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Speech {
+    /// Whether `desk_post` / `desk_dm` / `desk_close` / `desk_read` are
+    /// registered on every agent's belt.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// `[globals]` — this company's relationship to the global baseline.

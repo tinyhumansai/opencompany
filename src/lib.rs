@@ -78,6 +78,12 @@ pub mod product;
 pub mod runner;
 pub mod runtime;
 pub mod server;
+/// The name an agent's openhuman session answers to — `{company}:{agent_id}`.
+/// Ungated: it is a pure formatter with no openhuman dependency, minted once
+/// here so the harness builder (behind `openhuman`) and
+/// `src/server/operator.rs` (compiled in every build) read the same function.
+/// Re-exported at [`crate::harness::session_key`] for existing callers.
+pub mod session_key;
 pub mod store;
 /// The process-wide environment lock every env-mutating unit test in this crate
 /// serialises on. Test-only: it compiles into the lib test binary and nowhere

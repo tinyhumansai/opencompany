@@ -115,6 +115,38 @@ pub struct ChatSeedRequest {
 }
 
 impl ChatSeedRequest {
+    /// The rows this agent has not yet been handed, across every channel it can
+    /// read (see [`agent_session`](super::agent_session)).
+    ///
+    /// Lives here rather than at the call site because this is the type that
+    /// already carries the journal, the store and the turn's own boundary —
+    /// the three things a delta walk needs — so asking it keeps the harness
+    /// seam one call wide, exactly as [`Self::build`] does for the seed.
+    ///
+    /// `None` when the company record cannot be read: a host with no manifest
+    /// in hand cannot say which desks this agent sits on, and guessing would
+    /// either starve the session or hand it a desk it is not on. The caller
+    /// then leaves the session untouched.
+    pub async fn session_delta(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        state: &super::agent_session::AgentSessionState,
+    ) -> Option<super::agent_session::SessionPlan> {
+        let record = self.store.load(company).await.ok()??;
+        Some(
+            super::agent_session::prepare_delta(
+                &self.events,
+                company,
+                &record,
+                agent_id,
+                state,
+                self.current_message_seq,
+            )
+            .await,
+        )
+    }
+
     /// The attributed projection, mapped onto the `(role, content)` ladder the
     /// agent runtime takes.
     ///
@@ -184,7 +216,9 @@ impl ChatSeedRequest {
                     },
                     SessionAuthor::Operator => SeedEntry {
                         role: "user",
-                        speaker: Speaker::Operator(OPERATOR_LABEL.to_string()),
+                        speaker: Speaker::Operator(
+                            crate::server::chat_history::CUE_OPERATOR_LABEL.to_string(),
+                        ),
                         text: message.content,
                         parent: None,
                     },
@@ -585,29 +619,24 @@ fn prefix_every_line(label: &str, text: &str) -> String {
 /// How a human is named in a seed.
 ///
 /// The signed-in user's id when there is one, so two people on a desk are two
-/// speakers; [`OPERATOR_LABEL`] for a machine credential or a message journaled
+/// speakers; [`CUE_OPERATOR_LABEL`](crate::server::chat_history::CUE_OPERATOR_LABEL)
+/// for a machine credential or a message journaled
 /// before attribution existed, which is the same answer
 /// [`chat_history::MessageView::project`] gives that case.
 ///
 /// **Not the display name the console shows.** Resolving one costs a store read
 /// per distinct author, and this projection runs inside the per-company cycle
 /// lock on a path whose whole design note is that it must not do avoidable I/O.
-/// An id is stable, unique and already unforgeable (see [`OPERATOR_LABEL`]);
+/// An id is stable, unique and already unforgeable (see
+/// [`CUE_OPERATOR_LABEL`](crate::server::chat_history::CUE_OPERATOR_LABEL));
 /// a colleague's screen name is neither of the last two.
-fn operator_label(by: &Option<crate::ports::types::Actor>) -> String {
-    match by {
-        Some(actor) if actor.kind == crate::ports::types::ActorKind::User => actor.id.clone(),
-        _ => OPERATOR_LABEL.to_string(),
-    }
+pub(super) fn operator_label(by: &Option<crate::ports::types::Actor>) -> String {
+    // Delegated rather than duplicated. The console's raw view renders this
+    // exact string, shipped on the session route as `MessageView::cue_author`,
+    // so a second copy of the rule here is a second copy that can drift from
+    // what an operator is shown the agent was handed.
+    crate::server::chat_history::cue_author(by)
 }
-
-/// The label a message with no resolvable human author carries.
-///
-/// Safe to sit in the same namespace as roster ids and user ids: a manifest
-/// refuses the reserved ids (`company/manifest.rs`), and a minted user id is
-/// not this word. Nothing a *body* can say matters here, because bodies are
-/// nested under their own speaker's label by [`prefix_every_line`].
-const OPERATOR_LABEL: &str = "operator";
 
 /// Keeps each root's **first** reply and drops the rest (issue #1890 D part 3).
 ///
@@ -1243,7 +1272,7 @@ mod tests {
     fn op_entry(text: &str) -> SeedEntry {
         SeedEntry {
             role: "user",
-            speaker: Speaker::Operator(OPERATOR_LABEL.to_string()),
+            speaker: Speaker::Operator(crate::server::chat_history::CUE_OPERATOR_LABEL.to_string()),
             text: text.to_string(),
             parent: None,
         }

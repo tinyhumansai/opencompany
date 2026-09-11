@@ -302,6 +302,7 @@ async fn company_agent(
         &[],
         None,
         false,
+        /* speech_enabled */ false,
     )
     .expect("agent builds");
 
@@ -318,10 +319,17 @@ async fn company_agent(
     CompanyAgent {
         agent_id: "ceo".to_string(),
         role: "Chief Executive".to_string(),
+        session_key: crate::harness::session_key::openhuman_session_key(
+            &crate::ports::CompanyId::new("test"),
+            "ceo",
+        ),
         budget_usd_daily,
         step_labels: crate::harness::steps::StepLabels::from_tools(agent.tools()),
         agent: tokio::sync::Mutex::new(agent),
         bound_chat: tokio::sync::Mutex::new(None),
+        session: tokio::sync::Mutex::new(
+            crate::harness::built_in::agent_session::AgentSessionState::default(),
+        ),
     }
 }
 

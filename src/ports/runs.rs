@@ -270,7 +270,17 @@ pub struct RunRecord {
     /// carries a plain string here, still load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
-    /// The desk/teammate the card was dispatched to.
+    /// The desk/teammate the card was dispatched to — and, for a chat turn, the
+    /// teammate the host expects to answer it.
+    ///
+    /// A chat turn recorded its own *channel* here until the console needed a
+    /// name on the reload leg: `for_chat(.., desk, desk)` meant every chat run
+    /// read `agent_id == chat_id`, so a console that had lost its receipt could
+    /// only render a bare "Working…". It now carries the resolved responder.
+    ///
+    /// Optimistic, like the row itself: the brain's per-message rung may pick a
+    /// different seat, and the turn's first live frame supersedes this. A
+    /// company with nobody resolvable still records the desk.
     pub agent_id: String,
     /// The conversation this attempt belongs to, when one raised it
     /// (issue #983) — the only handle a card-less chat turn has.

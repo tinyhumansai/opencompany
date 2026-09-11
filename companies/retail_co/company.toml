@@ -148,6 +148,21 @@ turn_budget = 12
 quorum = 2
 blind_round = true
 
+[group_chat.hive.aside]
+# The private agent-to-agent line: a seat may add ONE `!aside @peer` line under
+# its move. Off unless a desk asks — `AsidePolicy::DEFAULT` permits nothing,
+# deliberately, because the mechanism does not get the benefit of the doubt.
+#
+# Every person and the operator still read every row in full. This is a
+# deliberation device, never a security boundary: an exchange no human could
+# audit is the covert channel the design exists to avoid. A peer outside the
+# aside still sees that it happened, who was in it, and where it settled.
+#
+# Defaults left alone: a pair (`max_members = 1`, excluding the author), two
+# rows (`max_messages = 2` — a question and an answer), and `must_surface`,
+# which makes a pair deposit one desk-visible line before opening another.
+enabled = true
+
 [group_chat.hive.referral]
 enabled = true
 reach = "desks"
@@ -185,6 +200,21 @@ turn_budget = 12
 quorum = 2
 blind_round = true
 
+[group_chat.hive.aside]
+# The private agent-to-agent line: a seat may add ONE `!aside @peer` line under
+# its move. Off unless a desk asks — `AsidePolicy::DEFAULT` permits nothing,
+# deliberately, because the mechanism does not get the benefit of the doubt.
+#
+# Every person and the operator still read every row in full. This is a
+# deliberation device, never a security boundary: an exchange no human could
+# audit is the covert channel the design exists to avoid. A peer outside the
+# aside still sees that it happened, who was in it, and where it settled.
+#
+# Defaults left alone: a pair (`max_members = 1`, excluding the author), two
+# rows (`max_messages = 2` — a question and an answer), and `must_surface`,
+# which makes a pair deposit one desk-visible line before opening another.
+enabled = true
+
 [group_chat.hive.referral]
 enabled = true
 reach = "desks"
@@ -209,6 +239,21 @@ enabled = true
 turn_budget = 12
 quorum = 2
 blind_round = true
+
+[group_chat.hive.aside]
+# The private agent-to-agent line: a seat may add ONE `!aside @peer` line under
+# its move. Off unless a desk asks — `AsidePolicy::DEFAULT` permits nothing,
+# deliberately, because the mechanism does not get the benefit of the doubt.
+#
+# Every person and the operator still read every row in full. This is a
+# deliberation device, never a security boundary: an exchange no human could
+# audit is the covert channel the design exists to avoid. A peer outside the
+# aside still sees that it happened, who was in it, and where it settled.
+#
+# Defaults left alone: a pair (`max_members = 1`, excluding the author), two
+# rows (`max_messages = 2` — a question and an answer), and `must_surface`,
+# which makes a pair deposit one desk-visible line before opening another.
+enabled = true
 
 [group_chat.hive.referral]
 enabled = true

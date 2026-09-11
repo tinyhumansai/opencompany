@@ -81,6 +81,75 @@ fn desk_lines(log: &MemoryLog) -> Vec<String> {
         .collect()
 }
 
+/// The whole path, in one test: a room writes an aside, and an operator reading
+/// that desk gets it as a collapsed conversation on the move it rode under.
+///
+/// The two halves of this were already covered separately — the tests below
+/// prove an aside is journaled with an audience, and `chat_history::test` proves
+/// the fold groups such rows. Neither noticed that the projection had no way to
+/// tell an aside from an ordinary reply, so the row reached the console verbatim
+/// with `!aside @scout` still in its body. This is the seam, and it is the one
+/// place the defect could hide.
+#[tokio::test]
+async fn an_aside_reaches_the_operator_as_a_collapsed_conversation() {
+    use crate::server::chat_history::{MessageView, fold_asides};
+
+    let (log, _) = run(
+        &aside_manifest(),
+        &[
+            (
+                "planner",
+                "!propose #stage Stage the rollout.\n!aside @scout is the canary quota still 5%?",
+            ),
+            ("scout", "!support #stage ^3 Agreed, and it is reversible."),
+            (
+                "critic",
+                "!support #stage ^3 Staging bounds the blast radius.",
+            ),
+        ],
+    )
+    .await;
+
+    // Build the operator's view the way the projection does: every journaled row
+    // on this desk, carrying whatever audience it was stored under.
+    let mut messages: Vec<MessageView> = log
+        .addressed_replies("eng")
+        .into_iter()
+        .enumerate()
+        .map(|(index, (author, text, audience))| {
+            MessageView::for_test(&index.to_string(), &author, &text, audience)
+        })
+        .collect();
+    let before = messages.len();
+    fold_asides(&mut messages);
+
+    assert_eq!(
+        messages.len(),
+        before - 1,
+        "the aside no longer stands as a row of its own: {messages:#?}"
+    );
+    let folded: Vec<_> = messages
+        .iter()
+        .filter_map(|m| m.aside_conversation.as_ref().map(|a| (&m.author, a)))
+        .collect();
+    assert_eq!(folded.len(), 1, "exactly one collapsed conversation");
+    let (anchor_author, conversation) = folded[0];
+    assert_eq!(
+        anchor_author, "planner",
+        "it hangs on its own author's move"
+    );
+    assert_eq!(
+        conversation.members,
+        vec!["planner".to_owned(), "scout".to_owned()],
+        "author first, then who was addressed"
+    );
+    assert_eq!(conversation.lines.len(), 1);
+    assert_eq!(
+        conversation.lines[0].text, "is the canary quota still 5%?",
+        "and the grammar never reaches the operator"
+    );
+}
+
 #[tokio::test]
 async fn an_authorized_aside_is_journaled_to_its_addressee_only() {
     let (log, _) = run(

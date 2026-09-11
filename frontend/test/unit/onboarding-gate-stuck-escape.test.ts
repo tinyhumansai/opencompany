@@ -690,7 +690,7 @@ describe("a hung setup-roster read does not strand the operator either", () => {
     // `RouteLoading`, forever, without the timeout.
     expect(container.textContent).toContain("Loading");
     expect(container.textContent).not.toContain("Continue to the console");
-    expect(container.textContent).not.toContain("Skip for now");
+    expect(container.textContent).not.toContain("Skip setup");
 
     // `readRoster`'s first attempt hits SETUP_ROSTER_TIMEOUT_MS (20s) and
     // retries once (round 19); the mock hangs on every call, so the retry
@@ -708,10 +708,10 @@ describe("a hung setup-roster read does not strand the operator either", () => {
     // enough to flip `setupChecked` and release the hold. With admin true and
     // the funnel still incomplete, `shouldShowOnboardingGate` now has
     // everything it needs and renders the gate — including its own
-    // always-available "Skip for now" escape — instead of a loader that never
+    // always-available "Skip setup" escape — instead of a loader that never
     // resolves.
     expect(rosterCalls.count).toBe(2);
-    expect(container.textContent).toContain("Skip for now");
+    expect(container.textContent).toContain("Skip setup");
   });
 });
 
@@ -825,6 +825,6 @@ describe("a setup-roster read that only looked hung gets a second chance", () =>
     // keeps it on its first internal screen, so this asserts the dialog
     // mounted at all rather than which question it reached.
     expect(document.querySelector('[data-testid="setup-dialog"]')).not.toBeNull();
-    expect(document.body.textContent).not.toContain("Skip for now");
+    expect(document.body.textContent).not.toContain("Skip setup");
   });
 });

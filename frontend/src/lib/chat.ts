@@ -227,6 +227,14 @@ export interface ChatMessage {
   /** The crossing this report brought home, rendered as one collapsed line. */
   referralConversation?: import("@/api/types").ReferralConversationDto;
   /**
+   * The private aside behind this line, rendered as one collapsed line.
+   *
+   * Carried the same way `referralConversation` is, and for the same reason:
+   * only the host knows an aside produced this message, so it rides the message
+   * rather than being inferred from the text here.
+   */
+  asideConversation?: import("@/api/types").AsideConversationDto;
+  /**
    * Who reacted to this line with what — one row per person per emoji, not a
    * count (issue #364).
    *
@@ -584,6 +592,7 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       // caused this line, and nothing here may infer it.
       referredFrom: entry.referredFrom,
       referralConversation: entry.referralConversation,
+      asideConversation: entry.asideConversation,
       // Reactions come through whoever the host said reacted; nothing is
       // inferred here, `mine` included.
       reactions: entry.reactions?.length ? entry.reactions : undefined,

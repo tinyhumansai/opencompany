@@ -36,6 +36,51 @@ to built-ins and the operator channel — never a boot failure
 crate so co-located hosts can link instead of RPC" workstream below —
 delivered, not pending.
 
+### One teammate, one named session
+
+An openhuman `Agent` is, in the vendored crate's own words, a *"stateful agent
+session — the single execution tier"*. OpenCompany holds one per `(company,
+agent_id)` behind a mutex, because a `turn` takes `&mut self` and a session must
+serialise its own turns. So every teammate already **is** an openhuman session;
+what it lacked until now was a name.
+
+`AgentBuilder` defaults `event_session_id` to the literal `"standalone"` and
+`event_channel` to `"internal"`, and this crate set neither. Those two fields
+are the identity every `DomainEvent` a session publishes is tagged with —
+`AgentTurnStarted`, `AgentTurnCompleted`, `AgentError` — plus the
+`PromptEnforcementContext` a blocked prompt is reported against. Every agent of
+every company on the process therefore announced itself as the same session,
+and a subscriber could not tell whose turn had started, whose had failed, or
+whose prompt had been refused.
+
+That cost nothing while one turn ran at a time. It stops being free with
+[openhuman#6208], which gave the library host an explicit `HostKind::Library`
+(caller-supplied inference, no app login, no fake `Session::local`) and replaced
+the conversation store's process-wide mutex with per-root lifecycle, per-root
+metadata and per-thread transcript locks — then proved 100 overlapping turns on
+distinct session ids against one live core. Concurrency is precisely the
+condition under which an unlabelled event stream stops being readable.
+
+Every session is now named `{company}:{agent_id}` on channel `opencompany`,
+minted by `harness::session_key::openhuman_session_key` and stamped at build
+time. Company first, because the process is multi-tenant and an `agent_id` is
+unique only within its own company. The key is a pure function of the two ids
+so that a roster rebuild — which fires whenever any of its freshness
+fingerprints moves, including a persona edit or a budget change — cannot rename
+a live session under a subscriber.
+
+The confined workflow copilot is named the same way. It does not come off the
+roster, so it does not inherit the roster's call, and an unnamed session there
+would put the one turn that runs under a *confinement* back in the crowd.
+
+A DM between teammates is therefore a hop from one named openhuman session to
+another: the row leaves the sender's session and is picked up by the
+recipient's own session on its next turn, through the watermark delta in
+[runtime/speech.md](../runtime/speech.md). Both ends are logged at `debug` as
+`from_session` / `to_session`, which is the only place both are known at once.
+
+[openhuman#6208]: https://github.com/tinyhumansai/openhuman/pull/6208
+
 ### Cost metering seam (partial — pending openhuman#4940)
 
 openhuman surfaces a completed turn's token/cost totals only through a

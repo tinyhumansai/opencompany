@@ -213,8 +213,30 @@ async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, Ap
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InferenceStatusDto {
-    /// Provider kind (`managed` / `openrouter` / `openai_compatible` / `ollama`).
+    /// Provider kind (`managed` / `openrouter` / `openai_compatible` / `ollama`)
+    /// **as the operator selected it**, not as it resolves.
+    ///
+    /// The two differ only for the managed route, and reporting the resolved
+    /// kind here is what made "Managed (TinyHumans)" impossible to select: the
+    /// card seeds its provider select from this field verbatim (deliberately —
+    /// it is what keeps the select and the header beside it from ever naming
+    /// different providers), so a `managed` save that read back as `openrouter`
+    /// snapped the select to OpenRouter and took the Connect-TinyHumans button,
+    /// which only the managed route offers, with it. The save had landed; there
+    /// was simply no way to see it. See
+    /// [`selected_kind`](inference::selected_kind).
     provider: String,
+    /// Whether the saved config rides the platform's subscription proxy rather
+    /// than a credential this tenant supplied.
+    ///
+    /// The console used to re-derive this from `provider` and `keyConfigured`
+    /// (`!(provider == "openrouter" && keyConfigured)`) — a restatement of
+    /// [`InferenceDecl::is_proxied`](inference::InferenceDecl::is_proxied) that
+    /// only held while `provider` was the *resolved* kind. Now that it is the
+    /// selected one, that derivation would read a managed company with its own
+    /// OpenRouter key as proxied and point it at top-up links for an account its
+    /// turns are not billed to. Reported rather than re-derived.
+    proxied: bool,
     /// The stable telemetry slug (`managed` / `openrouter` / `byok` / `ollama`).
     slug: String,
     /// Resolved OpenAI-compatible base URL — the endpoint requests actually
@@ -634,7 +656,8 @@ async fn effective_status_with(
         .collect();
     Ok(match decl {
         Some(d) => InferenceStatusDto {
-            provider: d.provider.clone(),
+            provider: d.selected_provider().to_string(),
+            proxied: d.is_proxied(),
             slug: d.telemetry_slug().to_string(),
             base_url,
             models: d.models.clone(),
@@ -650,6 +673,9 @@ async fn effective_status_with(
         },
         None => InferenceStatusDto {
             provider: "managed".to_string(),
+            // `decl` is `None` because this deployment has no platform default
+            // to inherit, so there is no subscription to ride.
+            proxied: false,
             slug: "managed".to_string(),
             base_url,
             models: BTreeMap::new(),
@@ -2291,9 +2317,22 @@ base_url = "https://byo.example/v1"
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{raw}");
-        // The legacy name aliases through to what it now means.
-        assert_eq!(resp["status"]["provider"], "openrouter");
-        assert_eq!(resp["status"]["slug"], "openrouter");
+        // The choice is echoed back as it was made. This used to read
+        // `"openrouter"` — the alias resolved — which is what made the managed
+        // route unselectable from the console: the card seeds its provider
+        // select straight from this field, so saving `managed` and reading back
+        // `openrouter` snapped the select (and the managed-only Connect button)
+        // back to OpenRouter every time. Where it resolves to is still reported,
+        // on the two fields that answer that question.
+        assert_eq!(resp["status"]["provider"], "managed");
+        assert_eq!(
+            resp["status"]["slug"], "openrouter",
+            "attribution follows the endpoint, not the label"
+        );
+        assert_eq!(
+            resp["status"]["proxied"], false,
+            "a key of its own is what takes a managed company off the subscription"
+        );
         assert_eq!(resp["status"]["source"], "runtime");
         assert_eq!(resp["status"]["keyConfigured"], true);
         // A key means the tenant's own OpenRouter account pays.
@@ -2329,9 +2368,73 @@ base_url = "https://byo.example/v1"
 
         let (_, dto, raw) = send(&state, "GET", "/api/v1/company/inference", None).await;
         assert_eq!(dto["keyConfigured"], false);
+        // The selection outlives the key: clearing the credential is not a way
+        // of un-choosing the route, and a plain read has to report the same
+        // thing the write did or the console will drift from it on reload.
+        assert_eq!(dto["provider"], "managed");
+        assert_eq!(
+            dto["proxied"], true,
+            "with the key gone it is back on the subscription"
+        );
+        assert_eq!(dto["slug"], "subscription");
         for token in [TOKEN, ROTATED] {
             assert!(!raw.contains(token), "GET leaked a token: {raw}");
         }
+    }
+
+    /// Saving the managed brain has to be *visible*, not merely stored.
+    ///
+    /// The write always landed — `PUT` persisted `managed` verbatim — but every
+    /// read reported the resolved kind, and `normalize_provider` folds the
+    /// managed alias onto `openrouter`. The console seeds its provider select
+    /// from this field verbatim (which is what keeps the select and the header
+    /// beside it from naming different providers), so the operator pressed Save,
+    /// got "Inference updated", and watched the card go straight back to
+    /// OpenRouter — taking the Connect-TinyHumans button, which only the managed
+    /// route renders, with it.
+    ///
+    /// A save that cannot be observed is indistinguishable from one that did not
+    /// happen, so this asserts the round trip on both the mutation response and
+    /// a fresh read, from a company already saved on another provider.
+    #[tokio::test]
+    async fn switching_to_managed_reads_back_as_managed_rather_than_its_alias() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        // Start somewhere else, so "unchanged" and "reverted to OpenRouter"
+        // cannot pass for the same answer.
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({ "provider": "openrouter" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (status, resp, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({ "provider": "managed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(
+            resp["status"]["provider"], "managed",
+            "the save answers with the choice that was made"
+        );
+
+        let (_, dto, raw) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(
+            dto["provider"], "managed",
+            "and it survives a reload: {raw}"
+        );
+        // Resolution is untouched — this is a read-back fix, not a routing one.
+        assert_eq!(dto["slug"], "subscription");
+        assert_eq!(dto["proxied"], true);
+        assert_eq!(dto["source"], "runtime");
     }
 
     #[tokio::test]

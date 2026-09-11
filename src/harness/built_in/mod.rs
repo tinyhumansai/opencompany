@@ -35,6 +35,10 @@
 //! offline [`MockProvider`](provider::MockProvider) does not, so test turns stay
 //! inert.
 
+/// One agent, one session: the watermark that replaced the per-chat
+/// clear-and-reseed, and the cue block that carries a channel's identity into a
+/// merged transcript. See [`agent_session`].
+pub mod agent_session;
 pub mod approval_tool;
 /// Issue #775: the fail-closed shell audit wrapper — one intent line appended
 /// (and fsynced) *before* a command runs, refusing the command outright when
@@ -650,6 +654,19 @@ pub struct CompanyAgent {
     /// `None` for an uncapped teammate — and for every overlay teammate, which
     /// carries no per-agent cap in v1.
     pub budget_usd_daily: Option<f64>,
+    /// The name that embedded session answers to on openhuman's event bus —
+    /// `{company}:{agent_id}`, minted by
+    /// [`openhuman_session_key`](crate::harness::session_key::openhuman_session_key)
+    /// and stamped onto the [`Agent`] at build time.
+    ///
+    /// Held here as well as on the session because openhuman keeps
+    /// `event_session_id` `pub(super)`: a session cannot be asked its own name
+    /// from outside the crate. The two consumers that need it — the speech
+    /// tools, which name the destination session when one teammate leaves a DM
+    /// in another's, and anything reporting a turn — would otherwise each
+    /// re-derive it, and a DM is only reportable as a hop between sessions if
+    /// both ends spell the session the same way.
+    pub session_key: String,
     /// The embedded openhuman session. A [`Mutex`] because a `turn` takes
     /// `&mut self` and one agent must serialise its own turns.
     agent: Mutex<Agent>,
@@ -683,6 +700,13 @@ pub struct CompanyAgent {
     /// thread every unparented line hangs in, which is every line in a company
     /// that has never threaded.
     bound_chat: Mutex<Option<(String, Option<EventSeq>)>>,
+    /// How far through the company journal this agent's session has been
+    /// carried — the watermark that replaced the per-chat clear-and-reseed.
+    ///
+    /// See [`agent_session`]. Held beside `bound_chat` rather than inside it
+    /// because it is deliberately **not** keyed on a conversation: surviving a
+    /// channel switch is the whole point of it.
+    session: Mutex<agent_session::AgentSessionState>,
 }
 
 /// The graceful reply returned when a turn yields the transient empty-response
@@ -1301,42 +1325,164 @@ impl CompanyAgent {
         // chat-only reductions cannot clobber each other.
         let mut overrides = oh::agent::harness::session::TurnOverrides::default();
 
-        // Per-conversation history isolation. One `Agent` is reused for every
-        // chat of this `(company, agent_id)` pair, so its in-memory `history`
-        // would otherwise replay a prior thread's transcript into an unrelated
-        // one — the operator opens a new chat, types "hi", and the reply is
-        // grounded in the previous task. Bind the agent to the incoming chat
-        // thread: on a switch, clear the history and re-seed from THAT thread's
-        // own durable transcript. Runs inside the `agent` critical section,
-        // which already serialises this agent's turns.
+        // One agent, one session (see `agent_session`).
+        //
+        // This used to be per-conversation history isolation: one `Agent` is
+        // reused for every chat of this `(company, agent_id)` pair, and its
+        // in-memory `history` was CLEARED and re-seeded from the incoming
+        // desk's own transcript whenever the chat changed. That kept two
+        // conversations from bleeding into each other, and it also meant an
+        // agent had no continuous existence — it could not notice that the
+        // question just asked in a DM is the one it answered on a desk an hour
+        // ago, because between the two it had been emptied.
+        //
+        // The session is now continuous. Instead of clearing, the agent is
+        // handed the rows it has **not yet seen**, across every channel it can
+        // read, each cued with where it was said. `agent_session` owns the
+        // watermark and the cue rendering; this block is the seam that asks it.
+        //
+        // What is NOT given up is who may read what: `agent_session` applies
+        // the aside audience narrowing, so a private exchange this agent is not
+        // party to still never reaches it. Channel isolation is deliberately
+        // dropped; audience isolation is not.
+        //
+        // Runs inside the `agent` critical section, which already serialises
+        // this agent's turns.
+        let mut session_cues: Option<String> = None;
+        // Codex P1: a session delta's `next_state` must not land in
+        // `self.session` until the turn it was cued into actually succeeds.
+        // The rows it marks delivered are handed to the model as this turn's
+        // cue text — but if `agent.turn` never runs, or returns `Err`, the
+        // model never actually read them, and committing anyway would have
+        // the next turn's delta walk skip straight past rows nothing was ever
+        // shown. Held here and only written back once `reply` is `Ok`, well
+        // below.
+        let mut pending_session_commit: Option<agent_session::AgentSessionState> = None;
         if let Some(incoming) = turn_chat_id.as_deref() {
             let incoming_root = thread_root;
             let mut bound = self.bound_chat.lock().await;
             let switched = bound.as_ref().map(|(chat, root)| (chat.as_str(), *root))
                 != Some((incoming, incoming_root));
-            if switched {
-                tracing::debug!(
-                    from = bound.as_ref().map(|(chat, _)| chat.as_str()).unwrap_or("<none>"),
-                    from_thread = ?bound.as_ref().and_then(|(_, root)| *root),
-                    to = incoming,
-                    to_thread = ?incoming_root,
-                    "[harness] chat switched — resetting agent history and re-binding to the incoming thread"
-                );
-                agent.clear_history();
-                // Prefer OpenCompany's own EventLog-derived seed (issue #1840).
-                // OpenHuman never writes a file transcript for an OC `chat_id`, so
-                // `seed_resume_from_thread_transcript` always misses and the reply
-                // starts blind (the #1725/#1730 regression). Project it HERE, now
-                // that `switched` is confirmed true — not by the caller for every
-                // turn — because the projection walks the company journal and is
-                // costly on the filesystem backend (`chat_seed::build_chat_seed`'s
-                // docs); building it unconditionally meant every ordinary
-                // same-desk reply paid for a journal scan its `switched == false`
-                // branch below would just throw away (codex review finding). This
-                // still runs inside the same `bound_chat`-locked section as the
-                // switch decision, so it is exactly as atomic as the eager build
-                // was — no turn can observe a `switched` verdict this projection
-                // doesn't match.
+            let mut session = self.session.lock().await;
+
+            // A chat-only turn keeps its reduction (#1725 / #1730).
+            //
+            // The fast path already runs a greeting with no tools, no memory
+            // retrieval and no prior task's goal, on the grounds that a bare
+            // "hi" should not inherit the machinery of the task before it. A
+            // continuous session must not quietly undo that: an agent's live
+            // history carries the **raw tool results** of whatever it was last
+            // doing, and replaying a fetched page into an unrelated greeting is
+            // the exact screenshot bug #1730 closed.
+            //
+            // So a chat-only turn re-seeds instead of continuing. It still
+            // remembers the conversation — the seed is this desk's own
+            // transcript, which is prose — it simply does not carry the agentic
+            // residue of an unrelated task. That is the same trade the three
+            // other reductions on this path already make.
+            let chat_only = crate::runtime::delegation::is_chat_only_turn();
+            // A turn that brings its own context carries nothing of its own.
+            //
+            // `history_seed: false` is the hive episode's flag, and its
+            // documented reason applies with more force to a continuous
+            // session than it did to a seed: a deliberating turn is handed an
+            // attributed, **visibility-filtered** transcript by the episode
+            // prompt, and live history would hand the same desk's lines back
+            // unattributed and in the assistant role. A blind opening round
+            // stops being blind, `^N` citations lose the attribution they are
+            // read against, and — the case that actually broke — a second
+            // episode in one cycle inherits the first one's already-carried
+            // vote, which is precisely what `EpisodeScope` exists to prevent.
+            //
+            // So the history is emptied and nothing is seeded in its place.
+            // The prompt is the context, entire.
+            let brings_own_context = !chat.history_seed;
+            //
+            // A session with no watermark is handled one level down:
+            // `prepare_delta` answers `ColdStart` for it, which lands on the
+            // same re-seed. Deliberately NOT folded into a `cold` flag here —
+            // an earlier revision did, and conflating "no watermark" with "no
+            // history" is what let an unrelated task's raw tool output survive
+            // a re-seed, because the clear below was skipped for an agent that
+            // had plenty of history and merely no watermark yet.
+            //
+            // A session with no watermark is a re-seed too, and is decided here
+            // rather than left to `prepare_delta`'s `ColdStart`: the delta is
+            // only asked for when the journal and the company record are both
+            // wired, and a host without them would otherwise never re-seed at
+            // all — leaving whatever was last in the live history to answer the
+            // next chat turn.
+            let mut reseed = !brings_own_context && (chat_only || session.watermark.is_none());
+            if brings_own_context {
+                if !agent.history().is_empty() {
+                    agent.clear_history();
+                }
+                overrides.suppress_transcript_autoload = true;
+                *session = agent_session::AgentSessionState::default();
+            }
+            if !reseed
+                && !brings_own_context
+                && let (Some(request), Some(company)) = (&chat_seed, turn_company.as_ref())
+            {
+                match request
+                    .session_delta(company, &self.agent_id, &session)
+                    .await
+                {
+                    Some(agent_session::SessionPlan::Delta {
+                        envelopes,
+                        next_state,
+                    }) => {
+                        // NOT committed here (Codex P1): writing `*session =
+                        // next_state` at this point marks every envelope's row
+                        // delivered before `agent.turn` has even been called,
+                        // let alone succeeded. Queued in
+                        // `pending_session_commit` instead, and only written
+                        // back once `reply` comes back `Ok`, far below — a
+                        // turn that fails after this never marks these rows
+                        // seen, so the next attempt's delta still hands them
+                        // over.
+                        session_cues = agent_session::render_cues(&envelopes);
+                        tracing::debug!(
+                            chat = incoming,
+                            delivered = envelopes.len(),
+                            cued = session_cues.is_some(),
+                            "[harness] session delta — continuing without clearing history"
+                        );
+                        pending_session_commit = Some(next_state);
+                    }
+                    Some(agent_session::SessionPlan::Reinitialize { reason }) => {
+                        tracing::debug!(
+                            chat = incoming,
+                            ?reason,
+                            "[harness] session delta unavailable — falling back to the recent-window seed"
+                        );
+                        reseed = true;
+                    }
+                    // No journal wired on this host: nothing to continue from,
+                    // and nothing to re-seed from either. Leave the session as
+                    // it is and let the turn run on its accumulated history.
+                    None => {}
+                }
+            }
+
+            if reseed {
+                // A re-seed is the one path that still empties the session. It
+                // happens on a chat-only turn, on a cold start, and when the
+                // agent has been away longer than the delta walk can bound
+                // (`GapTooLarge` / `TooManyUnseen`) — where a recent window is
+                // honestly better context than a partial replay of a history it
+                // can no longer reconstruct.
+                //
+                // Guarded on the history itself rather than on any derived
+                // "is this cold" flag: what makes the clear necessary is that
+                // there IS something to clear, and nothing else.
+                if !agent.history().is_empty() {
+                    agent.clear_history();
+                }
+                // OpenCompany's own EventLog-derived seed (issue #1840).
+                // OpenHuman never writes a file transcript for an OC `chat_id`,
+                // so `seed_resume_from_thread_transcript` always misses and the
+                // reply starts blind (the #1725/#1730 regression).
                 let seed = match (&chat_seed, turn_company.as_ref()) {
                     // `self.agent_id` is the viewer the seed is attributed
                     // against (issue #1956): this agent's own prior replies stay
@@ -1377,11 +1523,11 @@ impl CompanyAgent {
                         }
                     }
                 };
-                // On a switch the agent-latest transcript is the WRONG thread, so
-                // never let the turn's fallback auto-resume run: our explicit
-                // correct-thread seed (or a transcript hit) has already set
-                // `cached_transcript_messages`; a miss must start fresh, NOT reload
-                // the previous chat's transcript and re-leak it (the exact
+                // After a re-seed the agent-latest transcript is the WRONG
+                // thread, so never let the turn's fallback auto-resume run: our
+                // explicit correct-thread seed (or a transcript hit) has already
+                // set `cached_transcript_messages`; a miss must start fresh, NOT
+                // reload the previous chat's transcript and re-leak it (the exact
                 // screenshot bug). Keep this true regardless of which seed path ran.
                 overrides.suppress_transcript_autoload = true;
                 tracing::debug!(
@@ -1389,36 +1535,68 @@ impl CompanyAgent {
                     seeded,
                     "[harness] thread-transcript re-seed result"
                 );
-                *bound = Some((incoming.to_string(), incoming_root));
+                // The seed just built only covers `incoming` — the turn's own
+                // channel — so only that channel's catch-up may be recorded.
+                // `reseeded` keeps this session's prior (company-wide)
+                // watermark exactly so an unseen row on some OTHER channel
+                // does not silently become "already delivered" underneath it;
+                // see its doc comment.
+                *session = session.reseeded(chat.message_seq);
             }
+
+            let _ = switched;
+            *bound = Some((incoming.to_string(), incoming_root));
         } else {
             // Unthreaded turn (a dispatched background task or a workflow
             // agent node): it still runs against this agent's shared,
             // in-memory `history` — the same field a chat turn reads and
             // extends — but carries no chat thread to bind that history to.
-            // Left alone, `bound_chat` keeps pointing at whichever chat was
-            // bound before this turn ran, so if the operator's next message
-            // lands on that same thread, `switched` above reads `false` and
-            // skips the clear-and-reseed entirely, silently grounding the
-            // reply in whatever this background turn just appended (the
-            // cross-context leak review found). Invalidate the binding so
-            // the next chat-routed turn is *always* treated as a switch,
-            // regardless of which thread it lands on.
             //
-            // Deliberately does NOT clear `history` here: a single
-            // background task can span several unthreaded turns in a row
-            // (e.g. a steered continuation), and those legitimately depend
-            // on the history accumulated between them. The clear already
-            // happens on the switch branch above, the next time a chat turn
-            // actually claims the binding.
+            // Before the session was continuous this invalidated the binding so
+            // the next chat turn would always be treated as a switch and clear.
+            // There is no clear to arrange any more: a background turn is
+            // simply more session, and the next chat turn continues through the
+            // same watermark. The binding is still dropped so the ambient
+            // channel does not claim a conversation this turn was not in.
             let mut bound = self.bound_chat.lock().await;
             if bound.is_some() {
-                tracing::debug!(
-                    "[harness] unthreaded turn — invalidating chat binding so the next chat turn rebinds"
-                );
+                tracing::debug!("[harness] unthreaded turn — dropping the chat binding");
                 *bound = None;
             }
+            // And the conversational session restarts after it.
+            //
+            // A background task is work this agent did, but it is not something
+            // it *said* — it names no conversation, journals no chat line, and
+            // what it leaves in the live history is the raw output of whatever
+            // tools it ran. Carrying that forward would put a fetched page into
+            // the next thing an operator types, which is the cross-context leak
+            // this branch was originally written to prevent.
+            //
+            // Dropping the watermark makes the next chat turn re-seed from the
+            // journal — prose, attributed, and including anything the task
+            // actually journaled. So the agent still knows what it did; it
+            // simply does not carry the residue of doing it.
+            let mut session = self.session.lock().await;
+            *session = agent_session::AgentSessionState::default();
         }
+
+        // The text this turn actually runs on: the cue block, then the message.
+        //
+        // Inbound is a **cued turn, not a tool result** — deliberately, and
+        // matching the reference implementation this shape came from, where
+        // outbound is a tool call and inbound is a plain hidden turn carrying a
+        // text cue. It is also the cheaper half: OpenHuman's resume path
+        // already speaks `(role, content)`, so a cued turn needs no new
+        // plumbing, whereas a synthesised tool result would need a fabricated
+        // call id with no matching call and would confuse `fold_steps`.
+        //
+        // Borrowed when there are no cues, which is the ordinary same-channel
+        // reply — that turn pays nothing for this.
+        let turn_text: std::borrow::Cow<'_, str> = match &session_cues {
+            Some(cues) => std::borrow::Cow::Owned(format!("{cues}\n{message}")),
+            None => std::borrow::Cow::Borrowed(message),
+        };
+        let message: &str = turn_text.as_ref();
 
         // Reduced-scope chat turn. When the delegation runner marked this turn
         // chat-only (an explicit "Just chatting" or a high-confidence greeting —
@@ -1885,6 +2063,18 @@ impl CompanyAgent {
         // the operator. `overrides` is `Copy`, so reading it here — after
         // being handed to `agent.set_next_turn_overrides` well above — is the
         // same suppression this turn actually ran with, not a stale copy.
+        //
+        // The deferred session-delta commit (Codex P1, above): only `Ok`
+        // means the model actually ran with the cued rows in its context, so
+        // only `Ok` may mark them delivered. An `Err` leaves
+        // `pending_session_commit` to drop here unwritten — `self.session`
+        // stays exactly where it was before this turn, and the next attempt's
+        // delta walk hands the same rows over again.
+        if reply.is_ok()
+            && let Some(next_state) = pending_session_commit.take()
+        {
+            *self.session.lock().await = next_state;
+        }
         let outcome = reply.map(|reply| TurnOutcome {
             reply: if overrides.suppress_tools {
                 chat_only_guard::guard_suppressed_reply(reply)
@@ -4084,6 +4274,10 @@ impl HarnessPool {
         let agent = CompanyAgent {
             agent_id: confine::CONFINED_AGENT_ID.to_string(),
             role: "Workflow copilot".to_string(),
+            session_key: crate::harness::session_key::openhuman_session_key(
+                company,
+                confine::CONFINED_AGENT_ID,
+            ),
             // A confined turn carries no manifest teammate, so there is no
             // per-agent daily cap to read; the company-wide ceiling above is the
             // one that applies to it.
@@ -4091,6 +4285,7 @@ impl HarnessPool {
             step_labels: steps::StepLabels::from_tools(confined.tools()),
             agent: Mutex::new(confined),
             bound_chat: Mutex::new(None),
+            session: Mutex::new(agent_session::AgentSessionState::default()),
         };
 
         let stream_ctx = Some(crate::turn_stream::TurnStreamCtx {
@@ -4478,23 +4673,62 @@ impl HarnessPool {
         // cut on a byte boundary. `operator_words` for the reason its own docs
         // give — `message` here is the composed text and carries the cycle's
         // briefings, which are not what anybody asked for.
+        // Whether this turn said anything through a speech tool. Owned here so
+        // it outlives the task-local scope below: the tool sets it inside the
+        // turn, and the reply path reads it after.
+        // What this turn says through the speech tools. Owned here so it
+        // outlives the task-local scope below: the tools write it inside the
+        // turn, and the reply path reads it after.
+        let speech = crate::runtime::delegation::new_turn_speech();
         let (outcome, turn_costs) = crate::runtime::delegation::with_task_hint(
             crate::runtime::delegation::operator_words(message).to_string(),
-            crate::runtime::delegation::with_turn_conversation(
-                turn_chat,
-                deps.approval_requests.turn_scoped(agent.run_with_steer(
-                    &augmented,
-                    steer,
-                    stream_ctx,
-                    run_sink.clone(),
-                    chat_seed_request,
-                    // The caller's own, not read off `live` (#1890 I). A turn can
-                    // have a conversation and stream nothing.
-                    chat,
-                )),
+            crate::runtime::delegation::with_turn_speech(
+                speech.clone(),
+                crate::runtime::delegation::with_turn_conversation(
+                    turn_chat,
+                    deps.approval_requests.turn_scoped(agent.run_with_steer(
+                        &augmented,
+                        steer,
+                        stream_ctx,
+                        run_sink.clone(),
+                        chat_seed_request,
+                        // The caller's own, not read off `live` (#1890 I). A turn can
+                        // have a conversation and stream nothing.
+                        chat,
+                    )),
+                ),
             ),
         )
         .await;
+        // What the turn said through `desk_post` / `desk_close` becomes its
+        // reply.
+        //
+        // This is the crate's rule applied literally: a tool call is a request
+        // to speak, and the host appends. The appending host is the reply path
+        // below, because it is the one that carries the folded steps, the live
+        // frame, the resolved mentions and the board-card correlation — so a
+        // post routed through it produces the same bubble a plain answer does,
+        // rather than a poorer one written by a tool that holds none of that.
+        //
+        // The return text is discarded when the turn spoke, because with
+        // `[speech]` on it is private thinking (the tool descriptions say so in
+        // as many words). It is kept when the turn did NOT speak: an agent that
+        // forgot to call the tool must still be heard, and going silent for a
+        // missing tool call is not an acceptable failure mode.
+        let mut outcome = outcome;
+        if let Ok(turn) = outcome.as_mut() {
+            let said = speech.utterances();
+            if !said.is_empty() {
+                turn.reply = said.join("\n\n");
+            } else if speech.spoke() {
+                // A `desk_dm`-only turn. The DM is journaled under its own
+                // narrowed audience, and the channel gets nothing — which is
+                // the honest record: the room is told an exchange happened by
+                // the elided row, not by a bubble reprinting private thinking.
+                turn.reply = String::new();
+            }
+        }
+        let outcome = outcome;
         // Issue B-120: bank what the turn spent BEFORE its result is unwrapped.
         //
         // Both consumers of `turn_costs` used to sit below a `?` on this very
@@ -5467,14 +5701,20 @@ pub(crate) fn build_roster(
                 .unwrap_or(&[]),
             effective_instructions.as_deref(),
             is_orchestrator,
+            company.manifest.speech.enabled,
         )?;
         roster.push(Arc::new(CompanyAgent {
             agent_id: manifest_agent.id.clone(),
             role: manifest_agent.role.clone(),
+            session_key: crate::harness::session_key::openhuman_session_key(
+                &company.id,
+                &manifest_agent.id,
+            ),
             budget_usd_daily: effective_budget,
             step_labels: steps::StepLabels::from_tools(agent.tools()),
             agent: Mutex::new(agent),
             bound_chat: Mutex::new(None),
+            session: Mutex::new(agent_session::AgentSessionState::default()),
         }));
     }
 
@@ -5554,14 +5794,20 @@ pub(crate) fn build_roster(
                 .unwrap_or(&[]),
             effective_instructions.as_deref(),
             /* is_orchestrator */ false,
+            company.manifest.speech.enabled,
         )?;
         roster.push(Arc::new(CompanyAgent {
             agent_id: manifest_agent.id.clone(),
             role: manifest_agent.role.clone(),
+            session_key: crate::harness::session_key::openhuman_session_key(
+                &company.id,
+                &manifest_agent.id,
+            ),
             budget_usd_daily: effective_budget,
             step_labels: steps::StepLabels::from_tools(agent.tools()),
             agent: Mutex::new(agent),
             bound_chat: Mutex::new(None),
+            session: Mutex::new(agent_session::AgentSessionState::default()),
         }));
     }
 
@@ -6559,6 +6805,50 @@ description = "Builds the product."
         let ids: Vec<_> = roster.iter().map(|a| a.agent_id.as_str()).collect();
         assert_eq!(ids, vec!["ceo", "engineer"]);
         assert_eq!(roster[0].role, "Chief Executive");
+    }
+
+    /// Every teammate is a **named** openhuman session.
+    ///
+    /// `AgentBuilder` defaults `event_session_id` to the literal
+    /// `"standalone"`, and this crate did not set it — so every agent of every
+    /// company on the process published `AgentTurnStarted`,
+    /// `AgentTurnCompleted` and `AgentError` under one shared id. That was
+    /// invisible while one turn ran at a time; openhuman's library host now
+    /// overlaps many sessions on one core, and an event stream nobody can
+    /// attribute is what that costs.
+    ///
+    /// Asserted on [`CompanyAgent::session_key`] rather than on the built
+    /// session, because openhuman keeps `event_session_id()` `pub(super)` — a
+    /// session cannot be asked its own name from outside that crate. The field
+    /// and the `.event_context` call are filled from the same function, so this
+    /// pins the name the roster hands out; `session_key`'s own unit tests pin
+    /// the shape.
+    #[tokio::test]
+    async fn every_roster_teammate_gets_its_own_openhuman_session_name() {
+        let rec = record();
+        let fx = fixture();
+        let roster = build_roster(&rec, &fx.deps, &[], &HashMap::new()).expect("roster builds");
+
+        for agent in &roster {
+            assert_eq!(
+                agent.session_key,
+                crate::harness::session_key::openhuman_session_key(&rec.id, &agent.agent_id),
+                "{} was not named for its company and id",
+                agent.agent_id
+            );
+        }
+
+        let names: std::collections::HashSet<&str> =
+            roster.iter().map(|a| a.session_key.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            roster.len(),
+            "two teammates shared a session name — which is the `standalone`              collision this exists to end: {names:?}"
+        );
+        assert!(
+            !names.contains("standalone"),
+            "a teammate is still on the builder's unnamed default"
+        );
     }
 
     /// Context routing: the resolution that feeds a persona, and the fingerprint
@@ -12537,6 +12827,7 @@ description = "Builds the product."
             &[],
             None,
             is_orchestrator,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         agent.tools().iter().map(|t| t.name().to_string()).collect()
@@ -12660,6 +12951,7 @@ description = "Builds the product."
             &[],
             None,
             true,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let args = serde_json::json!({});
@@ -13292,11 +13584,32 @@ description = "Builds the product."
             )
             .await
             .expect("second chat turn");
-            assert_eq!(
-                log.reads(),
-                reads_after_first,
-                "a same-desk, non-switch chat turn must not re-read the \
-                 journal to build a seed the switch check will discard"
+            // The property this pins CHANGED when the session became
+            // continuous, and the change is the feature rather than a
+            // regression against it.
+            //
+            // It used to assert **zero** further reads: a same-desk turn was
+            // not a switch, so no seed was built, so the journal was not
+            // touched. An agent now asks what it missed on every chat turn —
+            // that question is the whole of "one session", and its answer
+            // cannot be cached, because another teammate may have said
+            // something on another desk a moment ago.
+            //
+            // What must still hold is the bound. The delta walks **backwards
+            // from the tail and stops at the watermark**, so a quiet company
+            // costs one page and a busy one costs no more than
+            // `SESSION_SCAN_LIMIT`. That is what the original test was
+            // protecting — the fs backend's whole-journal scan — and it is
+            // what this asserts now.
+            let delta_reads = log.reads() - reads_after_first;
+            assert!(
+                delta_reads > 0,
+                "a chat turn must ask what it missed; that is the session"
+            );
+            assert!(
+                delta_reads <= reads_after_first,
+                "the delta must cost no more than the seed it replaced: \
+                 {delta_reads} reads against {reads_after_first}"
             );
         }
 
@@ -13525,10 +13838,19 @@ description = "Builds the product."
             pool.run(&rec.id, "ceo", "second", &fx.deps, thread)
                 .await
                 .expect("second chat turn");
-            assert_eq!(
-                log.reads(),
-                reads_after_first,
-                "a second turn in the same thread is not a switch"
+            // Bounded, not zero — see the sibling test above for why the
+            // property changed. A second turn in the same thread is still not
+            // a switch, and still re-seeds nothing; what it now does is ask
+            // whether anything was said elsewhere while it was answering here.
+            let delta_reads = log.reads() - reads_after_first;
+            assert!(
+                delta_reads > 0,
+                "a chat turn must ask what it missed; that is the session"
+            );
+            assert!(
+                delta_reads <= reads_after_first,
+                "the delta must cost no more than the seed it replaced: \
+                 {delta_reads} reads against {reads_after_first}"
             );
         }
 

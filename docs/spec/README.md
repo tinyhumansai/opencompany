@@ -94,6 +94,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/hivemind-deliberation.md](runtime/hivemind-deliberation.md) | The four mechanisms that make a hive desk deliberate rather than vote: the per-member move grammar and its enforcement, desk memory, speaker diversity, and what happens when a member's turn fails |
 | [runtime/hivemind-referral.md](runtime/hivemind-referral.md) | Cross-desk referral: when a deliberating desk may put one question to another desk, how the answer comes home without carrying a vote with it, and the `hive.referral` manifest keys |
 | [runtime/hivemind-asides.md](runtime/hivemind-asides.md) | Private asides: when two members of one desk may say something the rest of it cannot read, why the row is elided rather than removed, and the `hive.aside` manifest keys |
+| [runtime/speech.md](runtime/speech.md) | One agent, one session: the watermark that replaced the per-chat clear-and-reseed, the channel cue that makes a merged transcript readable, and the `[speech]` block that turns talking into a tool call |
 | [runtime/harnesses.md](runtime/harnesses.md) | Named execution engines: `built_in` vs `acp`, transports, per-agent binding |
 | [runtime/harnesses-acp.md](runtime/harnesses-acp.md) | The ACP transports in detail: `local` vs `runner`, readiness probing, resuming a teammate's session across a restart, and streaming its execution state while the turn runs |
 | [runtime/providers.md](runtime/providers.md) | Inference providers, dual-mode OpenRouter, per-harness credentials |

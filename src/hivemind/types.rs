@@ -753,6 +753,34 @@ pub fn desk_federation(
     if !home.config.referral.enabled() {
         return None;
     }
+    let desks = company_desks(record);
+    let federation = super::referral::HiveFederation {
+        agents: desks
+            .iter()
+            .flat_map(|desk| desk.members.iter())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|id| {
+                let seat = member_of(record, id);
+                (seat.id, seat.label)
+            })
+            .collect(),
+        desks,
+    };
+    if federation.peers_of(&home.id).is_empty() {
+        return None;
+    }
+    Some(federation)
+}
+
+/// Every desk in the company, with its active roster members.
+///
+/// Split out of [`desk_federation`] because that function gates on the home
+/// desk's referral opt-in before it enumerates anything, and a speaker's own
+/// other conversations are not a referral: an agent seated on two desks reads
+/// both whether or not either desk may ask the other a question.
+#[must_use]
+pub fn company_desks(record: &CompanyRecord) -> Vec<super::referral::FederationDesk> {
     // Manifest desks and console-created (`overlay_desks`) desks, deduplicated
     // on id — the same union `effective_desk_members` already treats as the
     // single source of truth for who is on a desk. Built from manifest first
@@ -788,23 +816,7 @@ pub fn desk_federation(
             description,
         })
         .collect();
-    let federation = super::referral::HiveFederation {
-        agents: desks
-            .iter()
-            .flat_map(|desk| desk.members.iter())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(|id| {
-                let seat = member_of(record, id);
-                (seat.id, seat.label)
-            })
-            .collect(),
-        desks,
-    };
-    if federation.peers_of(&home.id).is_empty() {
-        return None;
-    }
-    Some(federation)
+    desks
 }
 
 /// One seat, built from whichever roster half declares the teammate.

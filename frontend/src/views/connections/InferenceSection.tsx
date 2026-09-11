@@ -604,12 +604,28 @@ export function InferenceSection({
   /**
    * Whether the **saved** config rides the platform's subscription proxy.
    *
-   * The same test `wouldSaveProxied` below applies to the draft, minus the key
+   * The same fact `wouldSaveProxied` below computes for the draft, minus the key
    * the operator is currently typing — which is exactly the difference the
    * catalog effect has to notice. Hoisted here because that effect runs before
    * `wouldSaveProxied` is computed.
+   *
+   * Read off the host instead of restated here as `!(provider === "openrouter"
+   * && keyConfigured)`. That restatement was only ever correct because
+   * `status.provider` carried the *resolved* kind, so a managed company with its
+   * own OpenRouter key arrived here spelled `openrouter`; now that the field
+   * carries the operator's selection, the same expression would call that
+   * company proxied and send it to top-up links for an account its turns are not
+   * billed to.
+   *
+   * The old derivation survives as the fallback, and is still exactly right
+   * there: a host that does not send `proxied` is a host predating both fields,
+   * so its `provider` *is* the resolved kind and the restatement holds against
+   * it. This console reaches remote hosts it did not ship with (the host
+   * switcher, the ssh connector), so that case is a real one rather than a
+   * defensive `??`. `true` before status loads, as before.
    */
-  const savedIsProxied = !(status?.provider === "openrouter" && status.keyConfigured);
+  const savedIsProxied =
+    status?.proxied ?? !(status?.provider === "openrouter" && status.keyConfigured);
 
   /**
    * Whether typing a key has pointed the draft at a *different endpoint* than

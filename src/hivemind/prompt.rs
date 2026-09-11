@@ -274,6 +274,14 @@ pub struct EpisodePrompt<'a> {
     /// The other desks this seat may put a question to, when the desk opted in
     /// to referral. Empty otherwise, and the block is then not rendered at all.
     peers: Vec<(String, String, Option<String>)>,
+    /// This seat's *other* conversations — every other desk it is seated on and
+    /// its own direct line — each already projected for it, newest window last.
+    ///
+    /// Empty for a seat with nowhere else to be, and the block is then not
+    /// rendered at all. These rows are context and never floor: they are outside
+    /// the fold `step` runs, so nothing here can move an option towards a
+    /// decision on this desk.
+    elsewhere: &'a [(String, Vec<SessionMessage>)],
     /// The episode's watermark — `EpisodeDriver::run`'s `trigger` — or `None`
     /// for a caller that never set one.
     ///
@@ -304,6 +312,7 @@ impl<'a> EpisodePrompt<'a> {
             recall: &[],
             unspoken: &[],
             peers: Vec::new(),
+            elsewhere: &[],
             trigger: None,
         }
     }
@@ -369,6 +378,17 @@ impl<'a> EpisodePrompt<'a> {
         self
     }
 
+    /// Give this seat the conversations it is part of elsewhere.
+    ///
+    /// Each entry is `(label, rows)` where the rows were projected for **this
+    /// member** — `Viewer::Agent`, never the operator — so an aside it is not in
+    /// arrives elided rather than readable, exactly as it would on its own desk.
+    #[must_use]
+    pub fn with_elsewhere(mut self, elsewhere: &'a [(String, Vec<SessionMessage>)]) -> Self {
+        self.elsewhere = elsewhere;
+        self
+    }
+
     /// Render exactly what this turn is allowed to see.
     #[must_use]
     pub fn render(&self, turn: &HiveTurn, visible: &[SessionMessage]) -> String {
@@ -385,7 +405,7 @@ impl<'a> EpisodePrompt<'a> {
             Phase::Deliberate => self.deliberate_protocol(),
         };
         format!(
-            "You are @{}, the {} on the {} desk. {sight}\n\n{}{}{}\n\n{protocol}\n\n{}{}{}{}{}\
+            "You are @{}, the {} on the {} desk. {sight}\n\n{}{}{}\n\n{protocol}\n\n{}{}{}{}{}{}\
              Shared attributed transcript:\n{}\n\nYour one line:",
             self.member.id,
             self.member.role,
@@ -397,6 +417,7 @@ impl<'a> EpisodePrompt<'a> {
             self.floor(&standings),
             self.missing(),
             self.peers(),
+            self.elsewhere(),
             self.last_line(visible),
             render_transcript(visible, self.trigger, Some(&self.member.id)),
         )
@@ -546,6 +567,45 @@ impl<'a> EpisodePrompt<'a> {
             .join("\n");
         format!(
             "Other desks you may put ONE question to, by writing their handle in your line:\n             {listed}\n             Ask only for a fact this desk does not hold and cannot check for itself, and ask it              EARLY — a room that has already backed an answer has voted past whatever comes back.              Exactly one member of that desk answers, and their answer arrives as a message you              can read and cite; it is not a vote, and it supports nothing here until one of us              spends a line on it.\n\n",
+        )
+    }
+
+    /// This seat's other conversations, as context it may quote and never as
+    /// floor it may count.
+    ///
+    /// Every row here was written somewhere outside the fold `step` runs — on
+    /// another desk this member sits on, or on its own direct line — so quoting
+    /// one moves no option towards a decision here. That is the same bargain an
+    /// aside strikes and a referral's answer strikes: information crosses a
+    /// boundary, support never does. A member that wants the room to act on
+    /// something it read elsewhere spends its own line saying so, on this desk.
+    ///
+    /// Rendered per conversation rather than merged into one list, because two
+    /// desks number their rows independently and a merged `[7]` would name two
+    /// different messages.
+    fn elsewhere(&self) -> String {
+        let blocks: Vec<String> = self
+            .elsewhere
+            .iter()
+            .filter(|(_, messages)| !messages.is_empty())
+            .map(|(label, messages)| {
+                format!(
+                    "{label}:\n{}",
+                    // No trigger: the episode watermark belongs to *this* desk,
+                    // and drawing its divider through another desk's rows would
+                    // claim a boundary that conversation never had.
+                    render_transcript(messages, None, Some(&self.member.id)),
+                )
+            })
+            .collect();
+        if blocks.is_empty() {
+            return String::new();
+        }
+        format!(
+            "Elsewhere you are part of. Reference only: these rows are not on this desk's \
+             floor, so citing one settles nothing here. If something below matters to the \
+             question in front of you, say it yourself in your own line.\n\n{}\n\n",
+            blocks.join("\n\n"),
         )
     }
 

@@ -104,7 +104,16 @@ export interface RunSummary {
    * the fallback in `openTurnsFromRuns` does with it.
    */
   threadRoot?: number;
-  /** The desk/teammate it was dispatched to. */
+  /**
+   * The desk/teammate it was dispatched to — and for a chat turn, the teammate
+   * the host expects to answer.
+   *
+   * A chat turn used to record its *channel* here, so every one of them read
+   * `agentId === chatId`. It now carries the responder the host resolved, which
+   * is what lets a reloaded console name the teammate instead of showing a bare
+   * "Working…". Optimistic: the brain may pick another seat, and the turn's
+   * first live frame supersedes it.
+   */
   agentId: string;
   /** Which attempt at the card this is — **1-based**; the first run is `1`. */
   attempt: number;

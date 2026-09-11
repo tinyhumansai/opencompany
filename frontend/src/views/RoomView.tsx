@@ -10,7 +10,7 @@ import {
   type SetStateAction,
 } from "react";
 import { createPortal } from "react-dom";
-import { TriangleAlert } from "lucide-react";
+import { Loader2, MessageSquare, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { me as fetchMe } from "@/api/auth";
@@ -26,11 +26,13 @@ import {
   type AttachmentDto,
   type CognitionState,
   type DecideApproval,
+  type AgentSessionMessageDto,
   type OperatorChannelDto,
   type TeamMemberDto,
   type Verdict,
   isDetachedChat,
 } from "@/api/types";
+import { useHashFlag } from "@/hooks/use-hash-flag";
 import { Button } from "@/components/ui/button";
 import { PageHeader } from "@/components/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -74,6 +76,7 @@ import {
 } from "./room/mentions";
 import { echoCause } from "./room/EchoPlaceholder";
 import { MessageTimeline } from "./room/MessageTimeline";
+import { RawTurns } from "./room/RawTurns";
 import { ThreadPanel } from "./room/ThreadPanel";
 import { useLocalScope } from "@/connections/ConnectionContext";
 import * as room from "@/room/store";
@@ -1080,6 +1083,53 @@ export function RoomView({
       directMessageForId(members, generalSub ?? resolvedSub ?? decodedSub) ??
       firstChannel(sections))
     : null;
+
+  /**
+   * The teammate whose raw turns this conversation can show, if any.
+   *
+   * A DM has exactly one agent on the other end, so "the raw turns" names
+   * something. A `#channel` has several and the Operator feed has none, so
+   * there is no such control there — a toggle that has to pick one of four
+   * agents for you is worse than no toggle.
+   */
+  const rawAgentId = channel?.kind === "dm" ? (channel.member?.id ?? null) : null;
+  /**
+   * Whether the transcript is showing raw turns instead of chat.
+   *
+   * An address (`#/chat/<id>?raw`), not component state, for the reason `?edit`
+   * is one on the agent page: "look at what it actually saw" is a link one
+   * operator sends another, and Back closes it. `useHashView` strips everything
+   * from `?` onward before it resolves a segment, so this rides the chat route
+   * without the router ever seeing it.
+   */
+  const [rawRequested, setRawRequested] = useHashFlag("raw");
+  const showRaw = rawRequested && !!rawAgentId;
+  const [rawRows, setRawRows] = useState<AgentSessionMessageDto[]>([]);
+  const [rawLoad, setRawLoad] = useState<RawLoad>("loading");
+  // The same stale-response guard the Session tab carries (issue #1671): a read
+  // started before the operator switched DMs must not commit its rows under the
+  // next teammate's name.
+  const rawGenerationRef = useRef(0);
+  useEffect(() => {
+    if (!showRaw || !rawAgentId) return;
+    const generation = (rawGenerationRef.current += 1);
+    setRawLoad("loading");
+    void (async () => {
+      try {
+        const rows = await fetchDmRawTurns(client, rawAgentId, company);
+        if (generation !== rawGenerationRef.current) return;
+        setRawRows(rows);
+        setRawLoad("ready");
+      } catch (error) {
+        if (generation !== rawGenerationRef.current) return;
+        // A host without the per-agent session route is a host without this
+        // surface, not a failure — saying so invites no debugging, and a red
+        // error box does.
+        const status = (error as { status?: number } | null)?.status;
+        setRawLoad(status === 404 ? "unsupported" : "error");
+      }
+    })();
+  }, [showRaw, rawAgentId, client, company]);
 
   /**
    * A bare `#/chat` is resolved **into the hash**, so which conversation is open
@@ -2812,6 +2862,9 @@ export function RoomView({
               membersOpen={membersOpen}
               onToggleMembers={() => setMembersOpen((o) => !o)}
               onOpenRail={roomRail.reveal}
+              rawAvailable={!!rawAgentId}
+              raw={showRaw}
+              onToggleRaw={() => setRawRequested(!showRaw)}
             />
 
             <div className="flex min-h-0 flex-1">
@@ -2828,6 +2881,14 @@ export function RoomView({
                     </span>
                   </p>
                 )}
+                {showRaw && rawAgentId ? (
+                  <RawTranscript
+                    load={rawLoad}
+                    rows={rawRows}
+                    agentId={rawAgentId}
+                    agentName={channelTitle(channel)}
+                  />
+                ) : (
                 <MessageTimeline
                   channel={channel}
                   items={items}
@@ -2852,6 +2913,10 @@ export function RoomView({
                   // Thread-panel receipts are out of v1 (issue #1934): excluded here
                   // the same way `liveSteps` is when a thread is open.
                   receipt={openThreadId ? undefined : receipt}
+                  // Who the host expects to answer, for the leg that has no
+                  // receipt to read: a reload keeps the open-turn row and
+                  // nothing else, and the row is what carries this.
+                  turnAgentId={openTurn?.agentId}
                   agentNames={agentNames}
                   onOpenThread={setOpenThreadId}
                   onReact={react}
@@ -2880,6 +2945,7 @@ export function RoomView({
                   redeemingBudgetPauseAgent={redeemingBudgetPauseAgent}
                   latestBudgetPauseMessageIdByAgent={budgetPauseMessageIdByAgent}
                 />
+                )}
                 {budgetProximity && (
                   <p
                     role="status"
@@ -3349,6 +3415,143 @@ function EmptyPane({
         </Button>
       )}
       {after}
+    </div>
+  );
+}
+
+/** How many of a teammate's turns one read of its session brings back. */
+const RAW_TURN_PAGE = 200;
+
+type RawLoad = "loading" | "ready" | "unsupported" | "error";
+
+/**
+ * Whether a session row belongs to the DM with `agentId`.
+ *
+ * Both spellings, because the host lists both: `chat_history::agent_channels`
+ * registers a teammate's DM under its **bare** id (what `dmThreadId` posts to,
+ * after issue #364 re-keyed DMs) *and* under `dm:<id>` (the console's channel
+ * key and a documented route key). Matching one would silently drop every line
+ * keyed the other way — including, depending on which wrote it, the whole of
+ * the operator's own side of the conversation.
+ */
+function inDmWith(row: AgentSessionMessageDto, agentId: string): boolean {
+  return (
+    row.sessionChannelId === agentId || row.sessionChannelId === `dm:${agentId}`
+  );
+}
+
+/**
+ * How many merged-channel pages one DM's raw-turns read will walk before
+ * giving up on filling {@link RAW_TURN_PAGE}. Bounds the read the same way
+ * `SESSION_SCAN_LIMIT` bounds the host's own delta walk — a DM that has gone
+ * quiet for a very long time gets whatever history it can find within a few
+ * pages, not an unbounded fetch loop.
+ */
+const RAW_TURN_PAGE_WALK_LIMIT = 10;
+
+/**
+ * This DM's own raw turns, walked back page by page until there are
+ * {@link RAW_TURN_PAGE} of them or the host's history runs out.
+ *
+ * `GET .../session` answers the agent's **merged, cross-channel** stream,
+ * capped at `limit` — so one page of it can be entirely some other desk's
+ * traffic while this DM sits just past the cut (Codex P2: 200 newer rows on
+ * `#general` make an older, non-empty DM read as empty). Filtering one page
+ * for `agentId` is therefore not enough; this pages backward with `before`,
+ * the same cursor `chat/history` pagination already uses, collecting this
+ * channel's rows until the window is full or a short page says the host has
+ * no more history to give.
+ */
+async function fetchDmRawTurns(
+  client: OpenCompanyClient,
+  agentId: string,
+  company: string | null | undefined,
+): Promise<AgentSessionMessageDto[]> {
+  const collected: AgentSessionMessageDto[] = [];
+  let before: string | undefined;
+  for (let page = 0; page < RAW_TURN_PAGE_WALK_LIMIT; page += 1) {
+    const rows = await client.agentSession(agentId, company, {
+      limit: RAW_TURN_PAGE,
+      before,
+    });
+    // Oldest-first, same order the route answers in: an earlier page's rows
+    // belong in front of what is already collected, not behind it.
+    collected.unshift(...rows.filter((row) => inDmWith(row, agentId)));
+    if (rows.length < RAW_TURN_PAGE || collected.length >= RAW_TURN_PAGE) break;
+    const oldest = rows[0]?.id;
+    if (!oldest || oldest === before) break;
+    before = oldest;
+  }
+  return collected.length > RAW_TURN_PAGE
+    ? collected.slice(collected.length - RAW_TURN_PAGE)
+    : collected;
+}
+
+/**
+ * The transcript, as the turns the teammate actually took.
+ *
+ * Scoped to **this conversation**, not to the teammate's whole session. A
+ * toggle changes how the thing in front of you is drawn; it must not quietly
+ * change what the thing is, and flipping a DM into a stream that also carries
+ * `#general` would do exactly that. The cross-channel view has its own address
+ * — the Session tab on the teammate's page — and says so below.
+ */
+function RawTranscript({
+  load,
+  rows,
+  agentId,
+  agentName,
+}: {
+  load: RawLoad;
+  rows: AgentSessionMessageDto[];
+  agentId: string;
+  agentName: string;
+}) {
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+      {load === "loading" && (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" aria-hidden />
+          Reading {agentName}&apos;s turns…
+        </p>
+      )}
+      {load === "unsupported" && (
+        <p className="text-sm text-muted-foreground">
+          This host does not keep a per-agent session yet, so there are no turns
+          to show. The conversation itself is unaffected — switch back to Chat.
+        </p>
+      )}
+      {load === "error" && (
+        <p className="text-sm text-muted-foreground">
+          {agentName}&apos;s turns could not be read. They are still there — this
+          is a failed request, not an empty history.
+        </p>
+      )}
+      {load === "ready" && rows.length === 0 && (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <MessageSquare className="size-4 shrink-0" aria-hidden />
+          Nothing has been said in this conversation yet.
+        </p>
+      )}
+      {load === "ready" && rows.length > 0 && (
+        <>
+          {/* No channel badges: every row here is this one DM, and a badge
+              repeating the same word down the page is noise. The whole-session
+              view turns them on, because there they are the only thing telling
+              two desks apart. */}
+          <RawTurns rows={rows} agentId={agentId} />
+          <p className="mt-4 text-xs text-muted-foreground">
+            These are {agentName}&apos;s turns in this conversation.{" "}
+            <a
+              className="underline underline-offset-4"
+              href={`#/company/agent/${encodeURIComponent(agentId)}?tab=session&raw`}
+            >
+              Everything it has said and heard
+            </a>{" "}
+            spans every channel it can read.
+          </p>
+        </>
+      )}
     </div>
   );
 }

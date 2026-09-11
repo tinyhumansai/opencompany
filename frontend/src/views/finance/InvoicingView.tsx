@@ -13,6 +13,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { ChargebeeForm } from "@/views/finance/ChargebeeForm";
+import { ChargebeeCreditsBanner } from "@/views/finance/ChargebeeCreditsBanner";
+import { ChargebeePitch } from "@/views/finance/ChargebeePitch";
 import { ConnectionPanel } from "@/views/finance/ConnectionPanel";
 import { chargebeeHealth, startsExpanded } from "@/views/finance/health";
 import { grantNamespace } from "@/components/grant-namespace";
@@ -83,7 +85,14 @@ export function InvoicingView({ client, company }: Props) {
       setStatusError(null);
       if (!expandedSeeded.current) {
         expandedSeeded.current = true;
-        setExpanded(startsExpanded(chargebeeHealth(next)));
+        // An unconnected company now meets `ChargebeePitch` instead of a
+        // credential form, and the form is what its "I already have a site"
+        // button opens — so the panel opening itself underneath the pitch would
+        // pre-empt that click and put two competing starting points on one
+        // screen. `startsExpanded` is unchanged and still right for the wallet
+        // page, which has no pitch in front of it.
+        const seeded = chargebeeHealth(next);
+        setExpanded(startsExpanded(seeded) && seeded.state !== "not_configured");
       }
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : String(err));
@@ -179,11 +188,29 @@ export function InvoicingView({ client, company }: Props) {
 
   const health = chargebeeHealth(status);
   const usable = health.state === "connected" || health.state === "not_granted";
+  /*
+    Whether this company has yet to decide on Chargebee at all.
+
+    `not_configured` is the only state the pitch belongs in. `not_in_build` is a
+    host that cannot run Chargebee however persuasive the page is — pitching a
+    migration there would sell something this binary cannot deliver — and the
+    other two states are companies that already migrated, who get the one-line
+    credits strip instead. See `health.ts` for the four.
+  */
+  const undecided = health.state === "not_configured";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="invoicing-view">
       {header}
       <div className="min-h-0 w-full flex-1 space-y-6 overflow-y-auto px-4 py-6">
+        {/*
+          The decision, then the machinery. A company that has not connected
+          gets the case for Chargebee first and the credential form behind a
+          button; one that has connected gets its invoices, with the reward it
+          earned reduced to a single line. Neither ever sees the other's
+          surface — see `ChargebeePitch` and `ChargebeeCreditsBanner`.
+        */}
+        {undecided ? <ChargebeePitch onConnect={() => setExpanded(true)} /> : <ChargebeeCreditsBanner />}
 
         <ConnectionPanel
           title="Chargebee"
@@ -223,6 +250,15 @@ export function InvoicingView({ client, company }: Props) {
           />
         </ConnectionPanel>
 
+        {/*
+          No invoice table while the company is still deciding. It can only ever
+          render its own `not_configured` error here — "Connect Chargebee above"
+          — which is a second, weaker copy of what the pitch is already saying,
+          under a row of filters that filter nothing and a Send-invoice button
+          that cannot send one. An empty table is not honest neutrality; it is
+          three dead controls.
+        */}
+        {undecided ? null : (
         <Card>
           <CardContent className="space-y-4">
             <div className="flex flex-wrap items-end gap-3">
@@ -337,6 +373,7 @@ export function InvoicingView({ client, company }: Props) {
             ) : null}
           </CardContent>
         </Card>
+        )}
       </div>
 
       <SendInvoiceDialog

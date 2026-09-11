@@ -1,5 +1,14 @@
 import { useState } from "react";
-import { Check, CircleDot, Copy, Hash, Lock, PanelLeft, Users } from "lucide-react";
+import {
+  Braces,
+  Check,
+  CircleDot,
+  Copy,
+  Hash,
+  Lock,
+  PanelLeft,
+  Users,
+} from "lucide-react";
 
 import { AgentAvatarButton } from "@/components/agent-profile-sheet";
 import { TeammateAvatar } from "@/components/teammate-avatar";
@@ -20,6 +29,18 @@ interface Props {
    * follows for a control that would do nothing.
    */
   onOpenRail?: () => void;
+  /**
+   * Whether this conversation can be shown as the agent's raw turns.
+   *
+   * A DM has exactly one teammate on the other end, so "the raw turns" names
+   * something. A `#channel` has several and a system feed has none, so the
+   * control is absent there rather than present and ambiguous — the same rule
+   * the member pane follows for the Operator feed.
+   */
+  rawAvailable?: boolean;
+  /** Whether the raw view is the one currently on screen. */
+  raw?: boolean;
+  onToggleRaw?: () => void;
 }
 
 /**
@@ -41,6 +62,9 @@ export function ChatHeader({
   membersOpen,
   onToggleMembers,
   onOpenRail,
+  rawAvailable = false,
+  raw = false,
+  onToggleRaw,
 }: Props) {
   const [copied, setCopied] = useState(false);
   const title = channelTitle(channel);
@@ -103,6 +127,30 @@ export function ChatHeader({
           </span>
         )}
       </div>
+
+      {/* The raw turns for the teammate on the other end of this DM: what it
+          was handed, what it said, and every tool call unfolded.
+
+          It sits here rather than only on the teammate's Session tab because
+          this is where you are when the question occurs to you. "Why did it
+          answer that" is asked mid-conversation, and a control for it that
+          lives two navigations away is a control nobody finds. */}
+      {rawAvailable && onToggleRaw && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(
+            "h-7 gap-1.5 rounded-full border px-2.5 text-xs",
+            raw ? "bg-accent" : "bg-muted/60",
+          )}
+          onClick={onToggleRaw}
+          aria-pressed={raw}
+          data-testid="chat-raw-toggle"
+        >
+          <Braces className="size-3.5" aria-hidden />
+          <span>Raw turns</span>
+        </Button>
+      )}
 
       {/* Issue #1757: the Operator system channel is a read-only report feed
           with no members, so it offers no agent pane. */}

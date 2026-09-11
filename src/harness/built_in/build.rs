@@ -301,6 +301,14 @@ pub fn build_agent(
     routed_context: &[(String, String)],
     instructions: Option<&str>,
     is_orchestrator: bool,
+    // Whether this company's `[speech]` block turns talking into a tool call.
+    //
+    // A `bool` resolved by the caller rather than a `&CompanyManifest` read
+    // here, on exactly the precedent `is_orchestrator` above sets: this
+    // function builds one agent from parts its caller has already decided, and
+    // handing it the whole manifest so it could re-derive one flag would give
+    // it a second, drifting opinion about the company.
+    speech_enabled: bool,
 ) -> crate::Result<Agent> {
     let memory: Arc<dyn Memory> = Arc::new(OcMemory::new(
         company.clone(),
@@ -362,6 +370,31 @@ pub fn build_agent(
             events,
             deps.store.clone(),
         )));
+    }
+    // Talking as a tool call (`[speech] enabled`). Off unless the manifest says
+    // so, and on every roster agent's belt when it is — speaking is not a
+    // capability one teammate has and another does not, so there is no grant
+    // for it to be scoped by, exactly as with the two intrinsic tools above.
+    //
+    // Needs the journal: these tools ARE the append, so without an `EventLog`
+    // there is nothing for them to do and registering them would advertise a
+    // voice the host cannot give. A company in that configuration keeps the
+    // return-text path, which is the same fallback an un-called tool gets.
+    // CodeRabbit: `speech_enabled` alone is the manifest's opt-in; whether the
+    // tools actually got wired also needs a journal to append to (the comment
+    // above). The persona brief below must agree with THIS — the AND, not the
+    // flag alone — or a company with no `EventLog` gets a brief instructing it
+    // to call tools that were never registered.
+    let speech_wired = speech_enabled && deps.events.is_some();
+    if speech_wired && let Some(events) = deps.events.clone() {
+        tools.extend(crate::harness::speech_tools::speech_belt(
+            crate::harness::speech_tools::SpeechContext::new(
+                company.clone(),
+                manifest_agent.id.clone(),
+                events,
+                deps.store.clone(),
+            ),
+        ));
     }
     // Installed-MCP-registry surface (`mcp_registry_list_tools` /
     // `mcp_registry_tool_call`) — distinct from the per-server `mcp:<name>`
@@ -884,6 +917,19 @@ pub fn build_agent(
     // write, and what it does is not guessable from the fact that it renders.
     persona.push_str(MENTION_BRIEF);
 
+    // How this company talks, when it talks by calling a tool.
+    //
+    // Placed high, beside the mention brief, because it is a rule about every
+    // reply rather than a note about one namespace — and because the failure it
+    // prevents is silent: an agent that never learns about `desk_post` just
+    // answers in text, the reply path journals it, and nothing reports that the
+    // feature did nothing. Gated on the same condition that wired the tools
+    // (`speech_wired`, not the bare `speech_enabled` flag — Codex/CodeRabbit),
+    // so the brief can never describe a voice this agent was not given.
+    if speech_wired {
+        persona.push_str(&crate::harness::speech_tools::speech_brief());
+    }
+
     // A short, STATIC brief — never a tree snapshot. A snapshot baked into the
     // system prompt would be stale the moment the operator edits a note, which
     // is exactly what hitting the store per call avoids.
@@ -1268,6 +1314,24 @@ pub fn build_agent(
         ))
         .model_name(model)
         .workspace_dir(workspace)
+        // One teammate, one *named* openhuman session.
+        //
+        // The builder defaults this pair to `("standalone", "internal")`, and
+        // this crate never set it — so every agent of every company on the
+        // process published `AgentTurnStarted`, `AgentTurnCompleted`,
+        // `AgentError` and its prompt-enforcement context under one shared
+        // session id. That was survivable only because one turn ran at a time.
+        // openhuman's library host now runs many sessions over one core
+        // concurrently, and an unlabelled event stream is exactly what stops
+        // being readable when turns overlap.
+        //
+        // See [`session_key`](crate::harness::session_key) for the shape and
+        // for why it must be a pure function of the two ids rather than
+        // anything a roster rebuild disturbs.
+        .event_context(
+            crate::harness::session_key::openhuman_session_key(company, &manifest_agent.id),
+            crate::harness::session_key::SESSION_CHANNEL,
+        )
         .agent_definition_name(agent_definition_name)
         .auto_save(false)
         .build()
@@ -2119,6 +2183,138 @@ mod tests {
         }
     }
 
+    /// Build one agent with `[speech]` on or off and a journal wired, and
+    /// return its live tool names.
+    ///
+    /// The journal is the half `built_tool_names` leaves out (`events: None`),
+    /// and it is not optional here: the speech tools **are** the append, so a
+    /// host with no `EventLog` registers none of them by design.
+    fn built_tool_names_with_speech(speech_enabled: bool) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deps = pin_deps(dir.path().to_path_buf());
+        deps.events = Some(Arc::new(crate::store::FsEventLog::new(dir.path())));
+        let manifest_agent = ManifestAgent {
+            global: false,
+            id: "designer".to_string(),
+            role: "Designer".to_string(),
+            name: None,
+            description: None,
+            tier: None,
+            harness: None,
+            tools: None,
+            delegates_to: Vec::new(),
+            context: None,
+            budget_usd_daily: None,
+            prompt: None,
+            prompt_files: Vec::new(),
+            prompt_files_resolved: Vec::new(),
+            classes: Vec::new(),
+            ledgers: None,
+            can_declare_ledgers: true,
+            model: None,
+        };
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            ApprovalPolicy::new(&Policy::default(), None),
+            &deps,
+            &["*".to_string()],
+            &[],
+            &[],
+            None,
+            false,
+            speech_enabled,
+        )
+        .expect("agent builds");
+        let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// `[speech] enabled` is what puts a voice on the belt, and nothing else is.
+    ///
+    /// Pinned by name because the whole knob is "does this company talk by
+    /// calling a tool", and a company that did not ask for it must keep the
+    /// belt it had — an agent that suddenly grows four tools it was never told
+    /// about is a behaviour change nobody opted into.
+    #[test]
+    fn speech_tools_are_registered_only_when_the_manifest_asks() {
+        let off = built_tool_names_with_speech(false);
+        for tool in crate::harness::speech_tools::SPEECH_TOOLS {
+            assert!(
+                !off.contains(&tool.to_string()),
+                "{tool} must not be on the belt of a company that did not ask for it: {off:?}"
+            );
+        }
+
+        let on = built_tool_names_with_speech(true);
+        for tool in crate::harness::speech_tools::SPEECH_TOOLS {
+            assert!(
+                on.contains(&tool.to_string()),
+                "{tool} must be on the belt when `[speech] enabled`: {on:?}"
+            );
+        }
+    }
+
+    /// CodeRabbit: `speech_enabled` is the manifest's opt-in, but the tools
+    /// ARE the append (module doc, above) — with no `EventLog` wired there is
+    /// nothing to append to, so `speech_wired` (not the bare flag) must gate
+    /// both the belt and the persona brief. Before this, `[speech] enabled =
+    /// true` on a host with no journal still told the agent to call tools
+    /// that were never registered.
+    #[test]
+    fn speech_tools_stay_off_the_belt_with_no_journal_even_when_the_manifest_asks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deps = pin_deps(dir.path().to_path_buf());
+        assert!(
+            deps.events.is_none(),
+            "this test exercises the no-journal case; pin_deps must still default to it"
+        );
+        let manifest_agent = ManifestAgent {
+            global: false,
+            id: "designer".to_string(),
+            role: "Designer".to_string(),
+            name: None,
+            description: None,
+            tier: None,
+            harness: None,
+            tools: None,
+            delegates_to: Vec::new(),
+            context: None,
+            budget_usd_daily: None,
+            prompt: None,
+            prompt_files: Vec::new(),
+            prompt_files_resolved: Vec::new(),
+            classes: Vec::new(),
+            ledgers: None,
+            can_declare_ledgers: true,
+            model: None,
+        };
+        let agent = build_agent(
+            &CompanyId::new("acme"),
+            "Acme",
+            &manifest_agent,
+            ApprovalPolicy::new(&Policy::default(), None),
+            &deps,
+            &["*".to_string()],
+            &[],
+            &[],
+            None,
+            false,
+            /* speech_enabled */ true,
+        )
+        .expect("agent builds");
+        let names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
+        for tool in crate::harness::speech_tools::SPEECH_TOOLS {
+            assert!(
+                !names.contains(&tool.to_string()),
+                "{tool} must stay off the belt with no journal, even with `[speech] enabled`: \
+                 {names:?}"
+            );
+        }
+    }
+
     /// Build one agent under `grants` and return its live tool names, sorted, so
     /// a snapshot compares byte-stably against a literal.
     fn built_tool_names(grants: &[&str], is_orchestrator: bool) -> Vec<String> {
@@ -2168,6 +2364,7 @@ mod tests {
             &[],
             None,
             is_orchestrator,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -2220,6 +2417,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -2271,6 +2469,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         toolbelt::native_capabilities_on_belt(agent.tools())
@@ -2348,6 +2547,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -2447,6 +2647,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -2493,6 +2694,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
         let mut names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -2946,6 +3148,7 @@ mod tests {
             &[],
             None,
             false,
+            false,
         )
         .expect("agent builds");
         let names: Vec<String> = agent.tools().iter().map(|t| t.name().to_string()).collect();
@@ -3013,6 +3216,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
 
@@ -3282,6 +3486,7 @@ mod tests {
             &[],
             None,
             false,
+            /* speech_enabled */ false,
         )
         .expect("agent builds");
 
@@ -3410,6 +3615,7 @@ mod tests {
                 &[],
                 None,
                 is_orchestrator,
+                /* speech_enabled */ false,
             )
             .expect("agent builds")
             .agent_config()

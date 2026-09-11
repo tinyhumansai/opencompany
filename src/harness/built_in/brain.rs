@@ -3939,7 +3939,13 @@ impl HarnessBrain {
                             composed.clone(),
                         )
                         .in_thread(thread_root)
-                        .with_memory(memory);
+                        .with_memory(memory)
+                        // Every desk in the company, so a seat that also sits
+                        // elsewhere reads its own other conversations. Ungated,
+                        // unlike the federation above: this hands a member what
+                        // it can already see, not permission to ask anyone
+                        // anything.
+                        .with_context_desks(crate::hivemind::company_desks(&self.record()));
                         if let Some(federation) = federation {
                             driver = driver.with_federation(federation, &runner);
                         }

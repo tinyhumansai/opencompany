@@ -28,7 +28,7 @@ import {
 
 import { TeammateAvatar } from "@/components/teammate-avatar";
 
-import type { ReferralConversationDto } from "@/api/types";
+import type { AsideConversationDto, ReferralConversationDto } from "@/api/types";
 
 import {
   AWAITING_APPROVAL_LABEL,
@@ -39,6 +39,69 @@ import {
 } from "@/api/types";
 import { consoleHref } from "@/lib/console-paths";
 import { cn } from "@/lib/utils";
+
+/**
+ * A private aside, collapsed onto the move it rode under.
+ *
+ * Same idiom as {@link ReferralConversation}, deliberately — both are detail
+ * behind a line rather than part of the desk's own conversation. What differs is
+ * what the collapse means. A referral's rows are dropped host-side, so expanding
+ * is the only way to read them at all. An aside is withheld from *agents*
+ * outside it and never from a person: `Audience::admits` admits every operator
+ * unconditionally, because privacy here is a deliberation device and not a
+ * security boundary. So this collapse is tidiness — it stops a two-seat sidebar
+ * reading like the room's own voice — and expanding reveals nothing the reader
+ * was not already entitled to.
+ *
+ * Closed by default, and the count is the point of the closed state: it says how
+ * much was said without saying it.
+ */
+export function AsideConversation({ aside }: { aside: AsideConversationDto }) {
+  const [open, setOpen] = useState(false);
+  const count = aside.lines.length;
+  if (count === 0) return null;
+  // Everyone but the author, who is this row's own speaker and already named.
+  const addressed = aside.members.slice(1);
+
+  return (
+    <div className="mt-1 w-full max-w-[85%] sm:max-w-[75%]">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground transition-colors hover:bg-accent/60"
+      >
+        {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+        <span>
+          aside {addressed.map((id) => `@${id}`).join(", ")} · {count} message
+          {count === 1 ? "" : "s"}
+        </span>
+      </button>
+      {open && (
+        // Dashed, where a referral's is solid: the border is the one cue that
+        // this was said beside the room rather than across a desk boundary.
+        <ol className="mt-0.5 flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 px-2.5 py-2">
+          {aside.lines.map((line, i) => (
+            // `AsideLineDto` carries no id of its own (issue: tinysweeper
+            // review), so the index alone is not a stable key if the lines
+            // are ever reordered or merged. Pairing it with the author keeps
+            // a reordered author's rows from swapping component instances
+            // with an unrelated author's.
+            <li key={`${line.authorId}-${i}`} className="flex gap-2">
+              <TeammateAvatar name={line.authorId} className="mt-0.5 size-5 shrink-0" />
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span className="text-2xs leading-none font-semibold">{line.authorId}</span>
+                <span className="text-2xs leading-relaxed whitespace-pre-wrap text-muted-foreground">
+                  {line.text}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
 
 /**
  * The scrubbed processing steps behind a company reply, rendered above its

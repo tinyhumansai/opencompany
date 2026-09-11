@@ -68,6 +68,28 @@ async function showInvoicing(company: string) {
   });
 }
 
+/**
+ * Opens the credential form.
+ *
+ * An unconfigured company now opens on `ChargebeePitch` — the case for
+ * migrating — with the form one click behind "I already have a Chargebee site",
+ * so every test below has to make that click before it has a field to type in.
+ * The switch behaviour this suite is actually about is unchanged; only the way
+ * in is, and a helper is where that belongs so a later redesign of the entry
+ * point touches one line rather than three tests.
+ */
+async function openCredentialForm() {
+  const already = container.querySelector<HTMLButtonElement>(
+    '[data-testid="chargebee-already-have"]',
+  );
+  // Absent on a company that is already connected — there the panel is the
+  // page's own surface and there is nothing to open.
+  if (!already) return;
+  await act(async () => {
+    already.click();
+  });
+}
+
 function apiKeyBox(): HTMLInputElement {
   const box = container.querySelector<HTMLInputElement>('[data-testid="billing-api-key"]');
   if (!box) throw new Error("the API key input is not on the page");
@@ -100,22 +122,32 @@ afterEach(() => {
 });
 
 describe("invoicing credentials across a company switch", () => {
-  it("opens the credential form on an unconfigured company", () => {
+  it("offers the pitch first on an unconfigured company, with the form one click behind it", async () => {
     // The precondition every assertion below rests on, and a behaviour in its
-    // own right: an unconfigured provider is the one state this form fixes, so
-    // the panel arrives expanded rather than making the operator find it.
-    return showInvoicing("acme").then(() => {
-      expect(apiKeyBox()).not.toBeNull();
-    });
+    // own right. It used to be "the panel arrives expanded rather than making
+    // the operator find it" — right while this page opened on a credential
+    // form, and wrong once it opens on the case for migrating: a panel that
+    // expanded itself under the pitch would put two competing starting points
+    // on one screen and pre-empt the button that is the pitch's own way in.
+    // What must stay true is that the form is never more than that one click
+    // away for somebody who already has a site and came here to paste a key.
+    await showInvoicing("acme");
+    expect(container.querySelector('[data-testid="chargebee-pitch"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="billing-api-key"]')).toBeNull();
+
+    await openCredentialForm();
+    expect(apiKeyBox()).not.toBeNull();
   });
 
   it("drops a typed-but-unsaved credential when the company changes", async () => {
     await showInvoicing("acme");
+    await openCredentialForm();
     await type(apiKeyBox(), "cb_live_for_acme");
     expect(apiKeyBox().value).toBe("cb_live_for_acme");
 
     // The operator switches company without saving.
     await showInvoicing("globex");
+    await openCredentialForm();
 
     // The key must NOT still be sitting in the box, where the next Save would
     // send it to globex.
@@ -126,12 +158,15 @@ describe("invoicing credentials across a company switch", () => {
     // A `key` that only changed once — or a clear that ran on mount only —
     // would pass the test above and fail this one.
     await showInvoicing("acme");
+    await openCredentialForm();
     await type(apiKeyBox(), "cb_live_for_acme");
     await showInvoicing("globex");
+    await openCredentialForm();
     await type(apiKeyBox(), "cb_live_for_globex");
     expect(apiKeyBox().value).toBe("cb_live_for_globex");
 
     await showInvoicing("acme");
+    await openCredentialForm();
     expect(apiKeyBox().value).toBe("");
   });
 });

@@ -117,7 +117,16 @@ export function OnboardingGate({
   waived?: readonly GateStepId[];
   /** Called after an in-gate action that may have moved the funnel. */
   onRefresh: () => void;
-  /** "Skip for now" — de-emphasized, and always available (issue #1844). */
+  /**
+   * "Skip setup" — de-emphasized, always available (issue #1844), and now
+   * durable.
+   *
+   * The shell writes a per-company `localStorage` marker for this, unlike the
+   * session marker every in-gate link writes: step 3 has no waiver, so a
+   * founder whose workflow run parks on an approval had no answer to give and
+   * met the same unfinishable checklist on every new tab. See `skipGate` in
+   * `app-shell.tsx` and the dismissal half of `onboarding/state.ts`.
+   */
   onSkip: () => void;
   /**
    * Stands the gate down and navigates to a console route (bug B-006).
@@ -222,7 +231,7 @@ export function OnboardingGate({
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             Three quick steps, in any order. Once all three are done, this screen never
-            comes back.
+            comes back — and you can skip it for good below.
           </p>
         </div>
       </header>
@@ -306,8 +315,24 @@ export function OnboardingGate({
 
       <footer className="border-t px-6 py-4 sm:px-10">
         <div className="mx-auto flex max-w-4xl items-center justify-end">
+          {/*
+            "for good", not "for now". This used to write a `sessionStorage`
+            marker, so the gate came back on the next tab — defensible while
+            every step was finishable, and not once step 3 was. `WorkflowStep`
+            has no waiver of its own (the integration step grew one for bugs
+            B-001/B-020), and `workflow_run_succeeded` only reads true for a
+            real run that reached `Succeeded` — a run parked on an approval
+            leaves the step honestly unticked with nothing the founder can do
+            about it here. An unfinishable checklist that re-prompts forever is
+            the trap; this is the way out of it. Following a link out of the
+            gate is still session-scoped — see `leaveGateFor` in
+            `app-shell.tsx`.
+          */}
+          <span className="mr-3 text-xs text-muted-foreground">
+            You can finish these later from the console.
+          </span>
           <Button variant="ghost" size="sm" onClick={onSkip} data-testid="gate-skip">
-            Skip for now
+            Skip setup
           </Button>
         </div>
       </footer>

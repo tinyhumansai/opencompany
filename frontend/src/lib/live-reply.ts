@@ -368,6 +368,19 @@ export type OpenTurn = {
    * history read against a desk that does not exist (CodeRabbit on #2044).
    */
   chatId: string;
+  /**
+   * Who the host expects to answer, when it recorded one.
+   *
+   * The reload leg's only way to name a teammate. A receipt names whoever the
+   * first live frame named, but a receipt is client state — a reload throws it
+   * away, and this row is all that is left. Without it the re-armed indicator
+   * can say nothing but a bare "Working…".
+   *
+   * Optimistic, exactly as the host's own row is: the brain may still pick a
+   * different seat, and the first frame of the resumed turn overwrites it.
+   * Absent from a host that does not record it, which reads as before.
+   */
+  agentId?: string;
 };
 
 /** The per-thread rows the fold produces — the same shape as {@link OpenTurn}. */
@@ -380,6 +393,8 @@ export interface OpenRunRow {
   /** The thread within `chatId`, when the host resolved one. */
   threadRoot?: number;
   status: string;
+  /** Who the host expects to answer. See {@link OpenTurn.agentId}. */
+  agentId?: string;
 }
 
 /**
@@ -436,7 +451,16 @@ export function openTurnsFromRuns(runs: readonly OpenRunRow[]): Record<string, O
     const queued = run.status === "pending";
     const key = turnStateKey(run.chatId, run.threadRoot);
     const list = byThread.get(key);
-    const row = { turnId: run.id, queued, chatId: run.chatId };
+    // The key is omitted rather than set to `undefined` when the host named
+    // nobody. `mergeOpenTurns` folds a re-arm onto an existing row by spreading
+    // it, and a present-but-undefined key would erase a name the POST leg had
+    // already put there — an absent one leaves it standing.
+    const row = {
+      turnId: run.id,
+      queued,
+      chatId: run.chatId,
+      ...(run.agentId ? { agentId: run.agentId } : {}),
+    };
     if (list) list.push(row);
     else byThread.set(key, [row]);
   }

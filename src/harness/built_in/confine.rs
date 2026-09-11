@@ -327,6 +327,15 @@ pub fn build_confined_agent(
         ))
         .model_name(model)
         .workspace_dir(workspace)
+        // Named like every other session (see `build_agent`'s own note). The
+        // copilot does not come off the roster, so it does not inherit that
+        // call — and an unnamed session here would put the one turn that runs
+        // under a *confinement* back on the shared `standalone` id, which is
+        // the last turn anybody wants to lose in the crowd.
+        .event_context(
+            crate::harness::session_key::openhuman_session_key(company, CONFINED_AGENT_ID),
+            crate::harness::session_key::SESSION_CHANNEL,
+        )
         .agent_definition_name(CONFINED_AGENT_ID.to_string())
         .auto_save(false)
         .build()

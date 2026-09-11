@@ -119,6 +119,17 @@ hive = { enabled = true, turn_budget = 6, quorum = 2, blind_round = true,
                                    # accepted for documentation only and
                                    # restricts nothing. See runtime/hivemind.md
 
+[speech]                           # NEW: do agents speak by calling a tool?
+enabled = true                     # off by default. On, every agent's belt
+                                   # gains desk_post / desk_dm / desk_close /
+                                   # desk_read, and a turn's return text becomes
+                                   # private thinking. A turn that calls none of
+                                   # them still has its text journaled, so this
+                                   # can never silence anybody.
+                                   # Company-level, not per-desk: speech is a
+                                   # property of an agent's session, which spans
+                                   # every desk it sits on. See runtime/speech.md
+
 [group_chat.hive.referral]         # NEW: may this desk ask ANOTHER desk?
 enabled = true                     # off unless this says so; the whole block
                                    # defaults to referring nothing

@@ -42,6 +42,7 @@ export function WorkingIndicator({
   srLabel,
   steps,
   queued,
+  name,
   className,
 }: {
   /** The stable assistive string, e.g. "Replying…". Never the step label. */
@@ -63,10 +64,27 @@ export function WorkingIndicator({
    * so this deliberately outranks `steps`.
    */
   queued?: boolean;
+  /**
+   * The teammate the host recorded as answering, already resolved to a display
+   * name — never a raw id, on the same terms as the receipt's own rule.
+   *
+   * This is the reload leg's only name. A receipt names whoever the first live
+   * frame named, but a receipt does not survive a reload, and the row that does
+   * could previously say nothing but "Working…". Naming the seat is the
+   * difference between "somebody is on this" and a spinner that could equally
+   * mean the console has lost the turn.
+   *
+   * Not a guess, and so not the ambiguity the note above refuses: it is the
+   * host's own recorded expectation for this run. It ranks BELOW a running
+   * step, which is more specific and more current, and the turn's first frame
+   * replaces it outright.
+   */
+  name?: string;
   className?: string;
 }) {
   const reduced = usePrefersReducedMotion();
   const running = runningStepLabel(steps);
+  const idle = name ? `${name} is working…` : GENERIC_LABEL;
 
   return (
     <span
@@ -94,9 +112,18 @@ export function WorkingIndicator({
       />
       {/* `aria-hidden`, because the stable label below is what should be read. */}
       <span aria-hidden className="truncate">
-        {queued ? QUEUED_LABEL : (running ?? GENERIC_LABEL)}
+        {queued ? QUEUED_LABEL : (running ?? idle)}
       </span>
-      <span className="sr-only">{queued ? QUEUED_LABEL : srLabel}</span>
+      {/* CodeRabbit: the visible line already names the teammate (`idle`,
+          above) once a step settles; the sr-only twin was still falling back
+          to the generic `srLabel` in that same case, so an AT user never got
+          the identity a sighted reader saw. Mirrors the visible fallback
+          order exactly — a running step still outranks the name here too, so
+          this never announces "Amendments is working…" while the visible
+          line (and the live step timeline beside it) is naming a step. */}
+      <span className="sr-only">
+        {queued ? QUEUED_LABEL : !running && name ? idle : srLabel}
+      </span>
     </span>
   );
 }

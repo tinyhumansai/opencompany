@@ -423,6 +423,103 @@ fn message(sequence: u64, agent: &str, content: &str) -> tinyhivemind_hive::Sess
     }
 }
 
+#[test]
+fn a_seat_reads_its_other_conversations_and_is_told_they_are_not_the_floor() {
+    let desk = desk_of(
+        &manifest_with("hive = { quorum = 2, blind_round = false }"),
+        "eng",
+    )
+    .expect("a room");
+    let member = desk.member("critic").expect("critic is seated").clone();
+    let quorum = desk.policy().quorum;
+    let visible = [message(
+        1,
+        "planner",
+        "!propose #ship-friday Ship on Friday.",
+    )];
+    // What the seat is holding from the desk it *also* sits on, plus its own
+    // direct line — each already projected for it by the driver.
+    let elsewhere = vec![
+        (
+            "#returns (Returns)".to_owned(),
+            vec![message(
+                7,
+                "refunds",
+                "The W12 exchange is past its window.",
+            )],
+        ),
+        (
+            "Your direct line (@critic)".to_owned(),
+            vec![message(3, "critic", "Noted, I will raise it.")],
+        ),
+    ];
+    let prompt = EpisodePrompt::new(&member, &desk, "Decide the rollout.", quorum, &[])
+        .with_elsewhere(&elsewhere)
+        .render(
+            &turn("critic", tinyhivemind_hive::Phase::Deliberate),
+            &visible,
+        );
+
+    assert!(
+        prompt.contains("The W12 exchange is past its window."),
+        "the seat reads the other desk it sits on:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("#returns (Returns)") && prompt.contains("Your direct line (@critic)"),
+        "each conversation is labelled and kept separate, so two `[7]`s cannot be \
+         confused for one row:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("not on this desk's floor"),
+        "and is told these rows settle nothing here — information crosses, support \
+         does not:\n{prompt}"
+    );
+    // Its own row elsewhere is still its own: the `(you)` marker is what stops a
+    // seat reading its own words back as somebody else's.
+    assert!(
+        prompt.contains("critic (you): Noted, I will raise it."),
+        "a seat's own row on its own line stays attributed to it:\n{prompt}"
+    );
+}
+
+#[test]
+fn a_seat_with_nowhere_else_renders_no_elsewhere_block() {
+    let desk = desk_of(
+        &manifest_with("hive = { quorum = 2, blind_round = false }"),
+        "eng",
+    )
+    .expect("a room");
+    let member = desk.member("critic").expect("critic is seated").clone();
+    let quorum = desk.policy().quorum;
+    let visible = [message(
+        1,
+        "planner",
+        "!propose #ship-friday Ship on Friday.",
+    )];
+
+    let bare = EpisodePrompt::new(&member, &desk, "Decide the rollout.", quorum, &[]).render(
+        &turn("critic", tinyhivemind_hive::Phase::Deliberate),
+        &visible,
+    );
+    // An entry that projected to nothing is not a heading with nothing under it.
+    let empty = vec![("#returns (Returns)".to_owned(), Vec::new())];
+    let with_empty = EpisodePrompt::new(&member, &desk, "Decide the rollout.", quorum, &[])
+        .with_elsewhere(&empty)
+        .render(
+            &turn("critic", tinyhivemind_hive::Phase::Deliberate),
+            &visible,
+        );
+
+    assert!(
+        !bare.contains("Elsewhere you are part of"),
+        "a seat with nowhere else to be pays nothing for the feature:\n{bare}"
+    );
+    assert_eq!(
+        bare, with_empty,
+        "and neither does one whose other conversations are all empty"
+    );
+}
+
 /// One authorized turn, for rendering a prompt without driving an episode.
 fn turn(agent: &str, phase: tinyhivemind_hive::Phase) -> tinyhivemind_hive::HiveTurn {
     tinyhivemind_hive::HiveTurn {

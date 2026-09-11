@@ -37,8 +37,32 @@ export type UsageMetering = "perTurn" | "perCycle" | "none";
 
 /** The company's effective inference status. Never carries the credential. */
 export interface InferenceStatus {
-  /** Provider kind. */
+  /**
+   * Provider kind **as the operator selected it**, not as the host resolves it.
+   *
+   * `managed` is a legacy alias the host folds onto `openrouter` at resolution,
+   * and this field used to carry that resolved answer — which made the managed
+   * route unselectable from this card: `seedFromStatus` takes this value
+   * verbatim, so saving `managed` and reading back `openrouter` snapped the
+   * select (and the managed-only Connect button) straight back to OpenRouter.
+   * The host now reports the selection; `proxied` carries the resolution fact
+   * this field used to stand in for.
+   */
   provider: string;
+  /**
+   * Whether the *saved* config rides the platform's subscription proxy rather
+   * than a key this company supplied.
+   *
+   * Reported by the host rather than re-derived from `provider` +
+   * `keyConfigured`: that derivation only held while `provider` was the
+   * resolved kind, and would now read a managed company with its own OpenRouter
+   * key as riding a subscription it does not.
+   *
+   * Optional because a host predating this field answers without it, and this
+   * console talks to hosts it did not ship with. Absent means "ask the old
+   * way" — see `savedIsProxied` in `InferenceSection` — not "not proxied".
+   */
+  proxied?: boolean;
   /** Telemetry slug: `managed` | `openrouter` | `byok` | `ollama`. */
   slug: string;
   /** Resolved OpenAI-compatible base URL. */

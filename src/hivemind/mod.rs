@@ -96,8 +96,8 @@ pub use referral::{
 };
 pub use scope::EpisodeScope;
 pub use types::{
-    EpisodeEnding, EpisodeOutcome, HiveConfig, HiveDesk, HiveMember, HivePolicy, desk_episode,
-    desk_federation, effective_hive_config,
+    EpisodeEnding, EpisodeOutcome, HiveConfig, HiveDesk, HiveMember, HivePolicy, company_desks,
+    desk_episode, desk_federation, effective_hive_config,
 };
 
 /// The `agent_id` an episode's closing outcome row is journaled under.

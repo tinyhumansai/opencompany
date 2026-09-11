@@ -80,7 +80,9 @@ console's Inference card or over the API:
 ```bash
 curl -X PUT localhost:8099/api/v1/companies/retail-co/inference \
   -H 'content-type: application/json' \
-  -d "{\"provider\":\"openrouter\",\"base_url\":\"https://openrouter.ai/api/v1\",\"key\":\"$OPENROUTER_API_KEY\"}"
+  -d "{\"provider\":\"openrouter\",\"base_url\":\"https://openrouter.ai/api/v1\",\"key\":\"$OPENROUTER_API_KEY\",
+       \"models\":{\"chat-v1\":\"deepseek/deepseek-v4-flash\",\"reasoning-v1\":\"deepseek/deepseek-v4-flash\",
+       \"agentic-v1\":\"deepseek/deepseek-v4-flash\",\"vision-v1\":\"deepseek/deepseek-v4-flash\"}}"
 ```
 
 **Send the `models` table with the key.** `PUT …/inference` stores the whole

@@ -43,11 +43,14 @@ import { TourController } from "@/tour/TourController";
 import { OnboardingGate } from "@/onboarding/OnboardingGate";
 import { useActivationGate } from "@/onboarding/useActivationGate";
 import {
+  clearGateDismissed,
   clearGateSkipped,
   clearGateStepWaiver,
   clearGateStepWaivers,
+  gateDismissed,
   type GateStepId,
   gateSkippedThisSession,
+  markGateDismissed,
   markGateSkipped,
   markGateStepWaived,
   waivedGateSteps,
@@ -997,7 +1000,27 @@ export function AppShell({
   useEffect(() => {
     setGateSkipped(gateSkippedThisSession(scope));
   }, [scope]);
+  /**
+   * The footer's **Skip setup** — a durable, per-company dismissal.
+   *
+   * It writes both markers on purpose. The session one is what stands the gate
+   * down for *this* render without a reload; the durable one is what stops the
+   * gate being owed again on the next fresh tab. Only this button writes the
+   * durable marker — `leaveGateFor` below still writes the session marker
+   * alone, because following a link into Workflows is the founder going to *do*
+   * a step, not an answer to it.
+   *
+   * Durable because step 3 has no waiver of its own: see the dismissal half of
+   * `onboarding/state.ts` for why an unfinishable step plus a session-scoped
+   * skip is a checklist that reappears forever.
+   */
+  const [gateIsDismissed, setGateIsDismissed] = useState(() => gateDismissed(scope));
+  useEffect(() => {
+    setGateIsDismissed(gateDismissed(scope));
+  }, [scope]);
   const skipGate = useCallback(() => {
+    markGateDismissed(scope);
+    setGateIsDismissed(true);
     markGateSkipped(scope);
     setGateSkipped(true);
   }, [scope]);
@@ -1158,6 +1181,11 @@ export function AppShell({
     if (!status) return;
     if (status.isActivated) {
       clearGateSkipped(scope);
+      // Same housekeeping for the durable dismissal: it cannot matter while the
+      // funnel reads activated, and a stale one would silently speak for a
+      // later incomplete funnel this founder never saw.
+      clearGateDismissed(scope);
+      setGateIsDismissed(false);
       // Same housekeeping, one step down: a waiver cannot matter once the funnel
       // has actually completed, and leaving one behind would let it speak for a
       // later incomplete funnel the founder never answered (see
@@ -3535,6 +3563,7 @@ export function AppShell({
       setupOpen,
       setupChecked,
       skippedThisSession: gateSkipped,
+      dismissed: gateIsDismissed,
       isAdmin: isGateAdmin,
       retrying: activationGate.retrying,
       waived: gateWaived,
@@ -3603,6 +3632,7 @@ export function AppShell({
       checked: activationGate.checked,
       setupOpen,
       skippedThisSession: gateSkipped,
+      dismissed: gateIsDismissed,
       isAdmin: isGateAdmin,
       waived: gateWaived,
     }) &&

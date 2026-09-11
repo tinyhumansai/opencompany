@@ -432,6 +432,13 @@ GET /api/v1/companies/{id}/agents/{agent_id}/budget-pause must-change-password-a
 GET /api/v1/companies/{id}/agents/{agent_id}/budget-pause platform permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/companies/{id}/agents/{agent_id}/budget-pause tenant-non-owner refused:403:forbidden source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/companies/{id}/agents/{agent_id}/budget-pause tenant-owner permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session admin permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session anonymous refused:401:unauthorized source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session member permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session must-change-password-admin refused:403:password_change_required source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session platform permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session tenant-non-owner refused:403:forbidden source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/companies/{id}/agents/{agent_id}/session tenant-owner permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/companies/{id}/approvals admin permitted source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
 GET /api/v1/companies/{id}/approvals anonymous refused:401:unauthorized source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
 GET /api/v1/companies/{id}/approvals member permitted source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
@@ -1020,6 +1027,13 @@ GET /api/v1/company/agents/{agent_id}/budget-pause must-change-password-admin re
 GET /api/v1/company/agents/{agent_id}/budget-pause platform permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/company/agents/{agent_id}/budget-pause tenant-non-owner refused:403:forbidden source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/company/agents/{agent_id}/budget-pause tenant-owner permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session admin permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session anonymous refused:401:unauthorized source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session member permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session must-change-password-admin refused:403:password_change_required source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session platform permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session tenant-non-owner refused:403:forbidden source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
+GET /api/v1/company/agents/{agent_id}/session tenant-owner permitted source=operator access=addressed features=openhuman blast=ordinary note="" wait=-
 GET /api/v1/company/approvals admin permitted source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
 GET /api/v1/company/approvals anonymous refused:401:unauthorized source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
 GET /api/v1/company/approvals member permitted source=operator access=addressed features=openhuman blast=authority note="Members may read pending approvals, filtered to what their role may see." wait=-
