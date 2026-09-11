@@ -2887,6 +2887,35 @@ impl FsSecretStore {
     }
 }
 
+/// Whether an error from the **legacy** secret path means "there is no legacy
+/// file", as opposed to a real IO failure worth surfacing.
+///
+/// `NotFound` is the obvious case. `InvalidFilename` is the one that cost an
+/// incident: [`Bundle::legacy_secret`] slugs the whole key into one path
+/// component with **no length bound**, unlike the canonical `Bundle::secret`,
+/// which is digest-truncated to a fixed budget. A key long enough to overflow
+/// `NAME_MAX` — a 245-character provider name was enough — makes the kernel
+/// answer `ENAMETOOLONG` (`ErrorKind::InvalidFilename`) rather than `ENOENT`.
+///
+/// Surfacing that as a store error had two consequences. [`SecretStore::get`]
+/// turned a plain credential read into a 500 on every route that reads one.
+/// Worse, [`SecretStore::set`]'s clear path had **already written** the
+/// canonical file before it went looking for a legacy file to revoke, so a
+/// credential delete returned 500 with the key truncated to zero bytes and the
+/// provider row still listed — an inconsistent store repairable only by
+/// hand-editing the index.
+///
+/// A name too long to *be* a path component cannot name a file that exists, so
+/// the honest reading of `ENAMETOOLONG` is "absent", exactly like `ENOENT`.
+/// Every other kind still propagates: a permissions failure or a read-only
+/// mount under `secrets/` has to stay loud.
+fn legacy_secret_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename
+    )
+}
+
 #[async_trait]
 impl SecretStore for FsSecretStore {
     async fn get(&self, company: &CompanyId, key: &str) -> Result<Option<SecretValue>> {
@@ -2898,7 +2927,7 @@ impl SecretStore for FsSecretStore {
                 let legacy_path = bundle.legacy_secret(key);
                 match tokio::fs::read_to_string(&legacy_path).await {
                     Ok(value) => Ok(Some(SecretValue(value))),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) if legacy_secret_absent(&e) => Ok(None),
                     Err(e) => Err(io_err(&legacy_path, e)),
                 }
             }
@@ -2924,7 +2953,7 @@ impl SecretStore for FsSecretStore {
             let legacy_path = bundle.legacy_secret(key);
             match tokio::fs::remove_file(&legacy_path).await {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if legacy_secret_absent(&e) => {}
                 Err(e) => return Err(io_err(&legacy_path, e)),
             }
         }
@@ -6440,6 +6469,87 @@ mod test {
             secrets.get(&company, "key-foo").await.unwrap(),
             Some(SecretValue("value-for-key-foo".into()))
         );
+    }
+
+    /// A key whose legacy slug is far past `NAME_MAX`. 300 characters is the
+    /// length that reproduced the incident end to end; the canonical filename
+    /// is digest-truncated and unaffected, so this exercises only the legacy
+    /// fallback.
+    fn over_long_key() -> String {
+        format!("provider/{}/key", "a".repeat(300))
+    }
+
+    #[tokio::test]
+    async fn a_key_too_long_for_a_legacy_path_reads_as_absent() {
+        // `get` used to fall through to `legacy_secret`, take `ENAMETOOLONG`
+        // from the kernel, and return `Err` — 500ing every route that merely
+        // reads a credential, including the add flow's own existence check.
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        let secrets = FsSecretStore::new(&root);
+        let company = CompanyId::new("company-a");
+        let key = over_long_key();
+
+        assert_eq!(
+            secrets.get(&company, &key).await.unwrap(),
+            None,
+            "an unset over-long key must read as absent, not as a store error"
+        );
+
+        secrets
+            .set(&company, &key, SecretValue("sk-not-a-real-key".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            secrets.get(&company, &key).await.unwrap(),
+            Some(SecretValue("sk-not-a-real-key".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_key_too_long_for_a_legacy_path_succeeds() {
+        // The P0: `set` writes the canonical file first, then removes the
+        // legacy one. With an over-long key that removal answered
+        // `ENAMETOOLONG`, so `set` returned `Err` *after* truncating the stored
+        // credential — a 500 on `DELETE` with the key already at zero bytes and
+        // the row still listed.
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        let secrets = FsSecretStore::new(&root);
+        let company = CompanyId::new("company-a");
+        let key = over_long_key();
+
+        secrets
+            .set(&company, &key, SecretValue("sk-not-a-real-key".into()))
+            .await
+            .unwrap();
+        secrets
+            .set(&company, &key, SecretValue(String::new()))
+            .await
+            .expect("clearing an over-long key must not fail after the write lands");
+        // The port has no delete: a clear is a write of the empty string, which
+        // every caller reads as unset. What matters here is that the write and
+        // its result agree — the incident was a 500 over a key that was already
+        // empty on disk.
+        assert_eq!(
+            secrets.get(&company, &key).await.unwrap(),
+            Some(SecretValue(String::new()))
+        );
+    }
+
+    #[test]
+    fn only_absence_like_errors_are_read_as_a_missing_legacy_file() {
+        use std::io::{Error, ErrorKind};
+        assert!(legacy_secret_absent(&Error::from(ErrorKind::NotFound)));
+        assert!(legacy_secret_absent(&Error::from(
+            ErrorKind::InvalidFilename
+        )));
+        // Everything else stays loud: a secrets directory that cannot be read
+        // must not be mistaken for one holding nothing.
+        assert!(!legacy_secret_absent(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!legacy_secret_absent(&Error::from(ErrorKind::Other)));
     }
 
     #[tokio::test]

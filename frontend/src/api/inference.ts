@@ -11,11 +11,38 @@
 // shared `api/types.ts` is needed.
 
 import type { OpenCompanyClient } from "./client";
+import type { ProbeClass, Provider, ProviderHealth, RoutingMode } from "@/inference/types";
 
-/** Provider kinds the console offers. */
+/**
+ * Provider kinds the console offers.
+ *
+ * `"managed"` is deliberately here and is **not** a member of the host's
+ * `INFERENCE_PROVIDERS`, which is the manifest validator's allowlist
+ * (`openrouter`, `openai_compatible`, `ollama`). It is two other things at once:
+ * the sentinel the host answers with for a company that has configured nothing
+ * (`effective_status_with`'s `None` arm), and a legacy alias the host normalizes
+ * onto `openrouter` on the way in (`LEGACY_MANAGED`). The console still offers
+ * the card behind `INFERENCE_MANAGED_HIDDEN`.
+ *
+ * So this union being wider than the host's allowlist is correct, and it is not
+ * the six-copies duplication that `@/inference/catalogue` exists to collapse.
+ * Deleting `"managed"` for tidiness breaks the unconfigured card, which is the
+ * first thing a new operator sees. Two host tests pin the value on the wire:
+ * `unconfigured_company_reports_the_platform_url_not_the_built_in_default` and
+ * `status_defaults_to_managed_then_switches_to_runtime`.
+ */
 export type InferenceProvider = "managed" | "openrouter" | "openai_compatible" | "ollama";
 
-/** Where the effective config came from — drives the source badge. */
+/**
+ * Where the effective config came from — drives the source badge.
+ *
+ * `"default" | "manifest" | "runtime"` are the host's `InferenceSource`.
+ * `"managed"` is the fourth value the same field carries when nothing resolved
+ * at all, and it means something the other three cannot: *a platform endpoint is
+ * not tenant config*. Reporting that case as `"default"` would move the badge
+ * onto a config the tenant never wrote. Same reasoning, and the same tests, as
+ * {@link InferenceProvider} above.
+ */
 export type InferenceSource = "managed" | "default" | "manifest" | "runtime";
 
 /**
@@ -129,6 +156,69 @@ export interface InferenceStatus {
    * say "not in this build" rather than offer a switch that does nothing.
    */
   canRebuildInPlace: boolean;
+  /**
+   * Every provider this company holds, entry zero first.
+   *
+   * **Additive, and it must stay that way.** This interface is the "can this
+   * company think?" oracle for four surfaces that are not about inference at
+   * all — `SetupDialog`, `AgentDetailView`, `CopilotPanel` and
+   * `WorkflowCreateDialog` — so every field above keeps its exact meaning. Add
+   * fields here; do not reshape the ones that are already read elsewhere.
+   *
+   * Optional because an older host does not send it. `undefined` means "this
+   * host did not say", which is not the same as "this company has no
+   * providers" — read it as unknown and fall back to the single-provider
+   * fields, exactly as `designsProfiles` is read.
+   *
+   * A company with one provider reports a list of one. That is the truth, and
+   * already more than the single form ever said.
+   */
+  providers?: Provider[];
+  /**
+   * What the **managed** brain would resolve to, and who pays for it.
+   *
+   * Optional because an older host does not send it. `undefined` is read as
+   * "this host did not say" — the row then falls back to the boolean facts
+   * above rather than claiming a state nobody established.
+   */
+  managed?: ManagedState;
+}
+
+/**
+ * The managed tier's honest state.
+ *
+ * The row for it used to carry a permanent "Always on" badge, inherited from a
+ * design where the same company runs the managed backend. Here it needs a
+ * credential and can resolve to nothing, and a row claiming availability while
+ * agents cannot think is exactly the dishonesty the five-state cognition model
+ * exists to prevent.
+ */
+export interface ManagedState {
+  /**
+   * Which step of the chain answers.
+   *
+   * `instance` and `companyAccount` are separate on purpose: one bills the
+   * company's own TinyHumans account and the other bills whoever runs the
+   * server, and that is the decision an operator is here to make.
+   */
+  source: "provider_key" | "company_account" | "instance" | "none";
+  /** Whether it can be reached at all. */
+  configured: boolean;
+  /** The endpoint managed requests travel to. */
+  baseUrl: string;
+  /**
+   * Whether it is a routing target.
+   *
+   * A provider like any other in this one respect. "Stop routing work here" and
+   * "remove the credential" are different statements, and switching managed off
+   * leaves every step of its chain where it was.
+   *
+   * Optional because an older host does not send it; absent reads as on, which
+   * is what managed always was.
+   */
+  enabled?: boolean;
+  /** What was last learnt about reaching it, if anything. */
+  health?: ProviderHealth;
 }
 
 /** The set-provider body. `key` is write-only (never returned). */
@@ -276,6 +366,316 @@ export function restartInference(
   company: string | null,
 ): Promise<InferenceMutation> {
   return client.post<InferenceMutation>(`${client.scopeFor(company)}/inference/restart`, {});
+}
+
+// ---- the provider list, and writing it ---------------------------------------
+
+/**
+ * What a connect attempt learnt.
+ *
+ * **Never carries the raw upstream error.** That text can echo request material
+ * — headers, fragments of a key — and the sentence it would land in is one
+ * someone screenshots into a ticket. The host logs it and sends the class plus a
+ * chosen sentence instead.
+ */
+export interface ProbeResult {
+  ok: boolean;
+  /** The failure class, absent on success. */
+  class?: ProbeClass;
+  /** One sentence, chosen host-side by the same `describe` the console mirrors. */
+  message?: string;
+  /** How many models the endpoint published. Zero is not a failure. */
+  modelCount: number;
+  /**
+   * Whether the model that was asked about is in that catalog.
+   *
+   * Absent when none was asked about, or when the endpoint publishes no
+   * catalogue to check against. **Absent is not a failure** — an Azure
+   * deployment name is never published by design.
+   */
+  modelKnown?: boolean;
+}
+
+/** Every provider write answers with the whole status, so nothing has to be reconciled. */
+export interface ProviderMutation {
+  status: InferenceStatus;
+  note: string;
+  /** The probe's verdict, when one ran. Absent when there was nothing to check. */
+  probe?: ProbeResult;
+  /** Tiers this change moved or parked, so the console can say which rows changed. */
+  affectedTiers?: string[];
+}
+
+/** The add-provider body. `key` is write-only (never returned). */
+export interface AddProviderInput {
+  /** A catalogue slug, a CLI option slug, or `custom`. */
+  kind: string;
+  /** The operator's name, for a custom provider only. */
+  label?: string;
+  /** The endpoint, for a local runtime or a custom provider. */
+  baseUrl?: string;
+  /** The outbound credential. */
+  key?: string;
+  /**
+   * Add despite a probe failure that would otherwise be destructive.
+   *
+   * Offered only after a **typed probe failure**, never after a slug collision
+   * or a failed key write, and cleared on every retry — so an attempt that fails
+   * for an unrelated reason does not still offer to skip verification.
+   */
+  addAnyway?: boolean;
+}
+
+/** The edit body. Omit a field to leave it; send `key: ""` to clear the key. */
+export interface EditProviderInput {
+  label?: string;
+  baseUrl?: string;
+  models?: Record<string, string>;
+  key?: string;
+}
+
+/** The routing table as the host holds it. */
+export interface RoutesResponse {
+  /** Tier → route string (`acme:gpt-5`, `managed`, `local:llava`). */
+  routes: Record<string, string>;
+  /** The mode these routes describe. **Inferred host-side, never stored.** */
+  mode: RoutingMode;
+  /** Routes naming a provider this company does not hold, as `[tier, slug]`. */
+  orphaned: [string, string][];
+}
+
+/** Connect a provider. */
+export function addProvider(
+  client: OpenCompanyClient,
+  company: string | null,
+  body: AddProviderInput,
+): Promise<ProviderMutation> {
+  return client.post<ProviderMutation>(`${client.scopeFor(company)}/inference/providers`, body);
+}
+
+/** Change a connected provider. The slug is fixed; the kind cannot change. */
+export function editProvider(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+  body: EditProviderInput,
+): Promise<ProviderMutation> {
+  return client.put<ProviderMutation>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}`,
+    body,
+  );
+}
+
+/**
+ * Disconnect a provider.
+ *
+ * Clears its credential, removes the record and resets every route pointing at
+ * it, as one operation. The response names the tiers that moved.
+ */
+export function deleteProvider(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+): Promise<ProviderMutation> {
+  return client.del<ProviderMutation>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}`,
+  );
+}
+
+/**
+ * Switch a provider on or off.
+ *
+ * Distinct from deleting it: a disabled provider keeps its endpoint, its label
+ * and its credential, and is simply not a routing target. Routes pointing at it
+ * are **parked, not scrubbed**, so switching it back on restores them — the
+ * response names which ones.
+ */
+export function setProviderEnabled(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+  enabled: boolean,
+): Promise<ProviderMutation> {
+  return client.post<ProviderMutation>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}/enabled`,
+    { enabled },
+  );
+}
+
+/**
+ * Test an endpoint and a key that are **not stored yet**.
+ *
+ * `POST …/inference/test` probes the *saved* config, which by definition does
+ * not exist at the moment an operator wants to know whether what they have typed
+ * will work.
+ */
+export function probeDraft(
+  client: OpenCompanyClient,
+  company: string | null,
+  body: { baseUrl: string; key?: string; kind?: string },
+): Promise<ProbeResult> {
+  return client.post<ProbeResult>(`${client.scopeFor(company)}/inference/probe`, body);
+}
+
+/**
+ * Switch the managed tier in or out of routing.
+ *
+ * **Not the credential.** Every step of its chain stays where it is; what
+ * changes is whether a workload may be routed there.
+ */
+export function setManagedEnabled(
+  client: OpenCompanyClient,
+  company: string | null,
+  enabled: boolean,
+): Promise<ProviderMutation> {
+  return client.post<ProviderMutation>(`${client.scopeFor(company)}/inference/managed/enabled`, {
+    enabled,
+  });
+}
+
+/**
+ * Check whatever the managed chain resolves to.
+ *
+ * The credential it presents is whichever step answers — which for a company on
+ * the instance identity is the server's, tested against the platform endpoint,
+ * exactly as its turns would. It never deletes anything, whatever the answer.
+ */
+export function testManaged(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<ProbeResult> {
+  return client.post<ProbeResult>(`${client.scopeFor(company)}/inference/managed/test`, {});
+}
+
+/** One provider's own model catalog. */
+export interface ProviderCatalog {
+  /** The endpoint the catalog was read from. */
+  baseUrl: string;
+  /** Every model that endpoint publishes, sorted. Empty when `error` is set. */
+  models: string[];
+  /**
+   * Whether this endpoint's `model` field keys on a **deployment name** rather
+   * than a published model id.
+   *
+   * Azure separates the base model a deployment was made from
+   * (`gpt-5.6-terra-2026-07-09`) from the deployment name (`gpt-5.6-terra`) that
+   * actually routes the request, and `/models` publishes the first while the
+   * request body wants the second. A closed dropdown there makes the only
+   * correct value unreachable, so the field defaults to free text.
+   */
+  freeTextOnly: boolean;
+  /** Why the list is empty, naming the endpoint. */
+  error?: string;
+}
+
+/**
+ * That provider's own catalog — **per provider, not per company**.
+ *
+ * Two providers are two catalogs. `listInferenceModels` answers for the
+ * *configured* endpoint, which was the only question worth asking when a company
+ * had one provider and is a different question now.
+ *
+ * The stored key is presented host-side; the console never sees it.
+ */
+export function listProviderModels(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+): Promise<ProviderCatalog> {
+  return client.get<ProviderCatalog>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}/models`,
+  );
+}
+
+/**
+ * Paste a key for the managed tier — step 1 of its chain.
+ *
+ * Managed has no provider record, so this is not an ordinary add: it resolves
+ * from a chain rather than from a row, and a record for it would collide with
+ * the company's own entry zero. Send `""` to clear the key and fall back down
+ * the chain to the company's account, then the instance's.
+ *
+ * The other half of setting managed up is the hub link flow, which writes the
+ * company **account** rather than a key. That lives on Connections → Account
+ * and is deliberately not duplicated here.
+ */
+export function setManagedKey(
+  client: OpenCompanyClient,
+  company: string | null,
+  key: string,
+): Promise<ProviderMutation> {
+  return client.put<ProviderMutation>(`${client.scopeFor(company)}/inference/managed/key`, { key });
+}
+
+/**
+ * Say which provider an **unset** workload goes through.
+ *
+ * Explicit rather than positional. Without it the default is whatever sorts
+ * first: add three providers, delete the first, and the company's unrouted spend
+ * moves to a different account with nothing on screen having changed to say so.
+ *
+ * Setting one clears the previous one — not as a second call, but because the
+ * host keeps the marker in a single slot holding a single slug.
+ */
+export function setDefaultProvider(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+): Promise<ProviderMutation> {
+  return client.post<ProviderMutation>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}/default`,
+    {},
+  );
+}
+
+/**
+ * Re-check a provider that is already connected.
+ *
+ * One of the three things that feed a row's health, and the only one an operator
+ * can ask for — the others are the add-time probe and the turn path's own 401.
+ * There is deliberately **no poller**: one would cost a request per provider per
+ * interval across every company on the host, to learn something the next real
+ * turn learns for free.
+ *
+ * It never deletes a credential, whatever the answer. An add is a commitment
+ * being made and a rollback undoes it; a test is a question being asked, and
+ * making the button that reports a problem the button that causes one would be a
+ * trap.
+ */
+export function testProvider(
+  client: OpenCompanyClient,
+  company: string | null,
+  slug: string,
+  /** The model a routing row has chosen, so the check answers about that id. */
+  model?: string,
+): Promise<ProbeResult> {
+  return client.post<ProbeResult>(
+    `${client.scopeFor(company)}/inference/providers/${encodeURIComponent(slug)}/test`,
+    model ? { model } : {},
+  );
+}
+
+/** The routing table, its inferred mode, and any route naming a provider that is gone. */
+export function getRoutes(
+  client: OpenCompanyClient,
+  company: string | null,
+): Promise<RoutesResponse> {
+  return client.get<RoutesResponse>(`${client.scopeFor(company)}/inference/routes`);
+}
+
+/**
+ * Replace the routing table.
+ *
+ * A whole-table write, because the modes are whole-table statements: "route
+ * everything through one model" is not four independent edits, and applying it
+ * as four would leave a visible state where two rows have moved and two have not.
+ */
+export function putRoutes(
+  client: OpenCompanyClient,
+  company: string | null,
+  routes: Record<string, string>,
+): Promise<RoutesResponse> {
+  return client.put<RoutesResponse>(`${client.scopeFor(company)}/inference/routes`, { routes });
 }
 
 /** Live-probe the resolved provider (one `ping` turn). */

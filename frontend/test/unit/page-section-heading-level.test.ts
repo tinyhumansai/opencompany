@@ -61,8 +61,12 @@ const PAGES = [
     sections: ["connections/McpServersSection"],
   },
   {
+    // Two sections, one per tab, and both outside `views/` — hence the `../`.
+    // The single-provider form they replace was one section under this page's
+    // h1; the split means there are now two, and they are peers of each other
+    // rather than one nested in the other.
     view: "InferenceView",
-    sections: ["connections/InferenceSection"],
+    sections: ["../inference/ProvidersTab", "../inference/RoutingTab"],
   },
   {
     view: "FeedbackView",

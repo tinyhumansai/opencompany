@@ -6,12 +6,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { OpenCompanyClient } from "@/api/client";
 import type { ComposioStatus } from "@/api/composio";
-import type { InferenceStatus } from "@/api/inference";
 import { INFERENCE_PROVIDERS, SETUP_INFERENCE_OPTIONS } from "@/api/setup";
 import { HostSwitcher, hostSwitcherMenu } from "@/components/host-switcher";
 import { canCreateCompanies, offersCompanyCreation } from "@/components/create-company-dialog";
 import { ComposioSection } from "@/views/connections/ComposioSection";
-import { InferenceSection } from "@/views/connections/InferenceSection";
 import { HostsProvider, type HostsValue } from "@/connections/HostsContext";
 import type { Connection, ConnectionId } from "@/connections/types";
 import { SidebarProvider } from "@/components/ui/sidebar";
@@ -289,130 +287,16 @@ describe("Composio offers this company's own account and nothing else", () => {
   });
 });
 
-function inferenceClient(status: InferenceStatus) {
-  return {
-    scopeFor: (company: string | null) =>
-      company ? `/api/v1/companies/${company}` : "/api/v1/company",
-    // `InferenceModelCatalog` — an object naming the endpoint read, not the
-    // bare array this route used to answer with. These tests are about which
-    // surfaces the card hides, not about the picker, so the stub answers the
-    // host's unreadable-catalog reply: a 200 carrying `error`, with no
-    // `tierVocabulary`. The host never pairs an empty `models` with a
-    // vocabulary — an empty catalog is reported as a failure — so answering
-    // one would be a shape nothing real can produce.
-    get: async (path: string) =>
-      path.endsWith("/inference/models")
-        ? {
-            baseUrl: status.baseUrl,
-            models: [],
-            tierDefaults: {},
-            error: `Could not list models from ${status.baseUrl}: connection refused. Enter model ids directly.`,
-          }
-        : status,
-    put: async () => ({ status, note: "" }),
-    del: async () => ({ status, note: "" }),
-    post: async () => ({ status, note: "" }),
-  } as unknown as OpenCompanyClient;
-}
 
-function inferenceStatus(over: Partial<InferenceStatus> = {}): InferenceStatus {
-  return {
-    provider: "openrouter",
-    slug: "openrouter",
-    baseUrl: "https://openrouter.ai/api/v1",
-    models: {},
-    defaultTierModels: {},
-    source: "runtime",
-    keyConfigured: true,
-    cognition: "echo",
-    usageMetering: "none",
-    restartRequired: false,
-    harnessReachable: true,
-    canRebuildInPlace: true,
-    ...over,
-  };
-}
-
-async function mountInference(status: InferenceStatus) {
-  await act(async () => {
-    root.render(
-      createElement(InferenceSection, {
-        client: inferenceClient(status),
-        company: "acme",
-        canManage: true,
-      }),
-    );
-  });
-}
-
-describe("inference offers the managed route, because it can now be finished", () => {
-  it("offers the managed provider in the list", async () => {
-    await mountInference(inferenceStatus());
-
-    // The list is portalled and only mounts once the select is opened — without
-    // opening it this passes against a tree that offers nothing at all.
-    const trigger = document.querySelector("#inference-provider") as HTMLElement | null;
-    expect(trigger, "no provider select").toBeTruthy();
-    await act(async () => {
-      trigger!.click();
-      trigger!.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-      trigger!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-      trigger!.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    });
-
-    const options = Array.from(document.querySelectorAll("[role='option']")).map((o) =>
-      o.textContent?.trim(),
-    );
-    expect(options.length, "the provider list did not open").toBeGreaterThan(0);
-    // Hidden while choosing it meant leaving to mint a key by hand, which made
-    // OpenRouter the honestly easier option. The key grant removes that errand.
-    expect(options).toContain("Managed (TinyHumans)");
-    expect(options).toContain("OpenRouter");
-  });
-
-  it("shows a value that is a real member of its own option set", async () => {
-    // The property that outlived the hide: the trigger's label and the list's
-    // rows come from one table, so the control can never display a provider
-    // none of its options match.
-    await mountInference(inferenceStatus({ provider: "managed", slug: "managed" }));
-
-    const trigger = document.querySelector("#inference-provider") as HTMLElement;
-    const shown = trigger.textContent ?? "";
-
-    await act(async () => {
-      trigger.click();
-      trigger.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
-      trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-      trigger.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    });
-
-    const options = Array.from(document.querySelectorAll("[role='option']")).map(
-      (o) => o.textContent?.trim() ?? "",
-    );
-    expect(options.length, "the list did not open").toBeGreaterThan(0);
-    expect(options.some((label) => shown.includes(label))).toBe(true);
-  });
-
-  it("reports a company already on the managed route by name", async () => {
-    // The other half of the pair the hide had to balance: a company on this
-    // route must be legible. It always was; now it is selectable too.
-    await mountInference(inferenceStatus({ provider: "managed", slug: "managed" }));
-
-    expect(find("inference-current-provider")!.textContent).toContain("Managed (TinyHumans)");
-  });
-
-  it("offers no connect button on a host with no hub to grant a key", async () => {
-    // The status client here answers every GET with an `InferenceStatus`, so
-    // `hubLink` is undefined — which is what a host predating the field, and a
-    // host with no hub, both look like. Either way the button must not appear:
-    // it could only lead to a 404.
-    await mountInference(inferenceStatus({ provider: "managed", slug: "managed" }));
-
-    expect(find("connect-tinyhumans")).toBeNull();
-    // ...and the paste field is still there, so the page still works.
-    expect(document.querySelector("#inference-key")).not.toBeNull();
-  });
-});
+// The settings half of "offer the managed route" used to be pinned by mounting
+// the single-provider form and opening its Provider select. **That control is
+// retired**: a select over a closed three-element list is what the provider list
+// replaces, and "is Managed offered" is no longer a question about a dropdown —
+// Managed is an unremovable row on the Connected list, always present and always
+// on, so it cannot be hidden by a flag.
+//
+// What the hide could still affect is the wizard, which has its own list and is
+// the first screen of a first run. That half is below and is unchanged.
 
 describe("the wizard's model step offers the managed endpoint too", () => {
   it("offers the managed endpoint as a thing to think with", () => {

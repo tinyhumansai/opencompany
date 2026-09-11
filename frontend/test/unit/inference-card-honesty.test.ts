@@ -6,16 +6,23 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { OpenCompanyClient } from "@/api/client";
 import type { InferenceStatus } from "@/api/inference";
-import { InferenceSection } from "@/views/connections/InferenceSection";
+import { InferenceView } from "@/views/InferenceView";
 
 /**
  * The Inference card must not say two things at once (issues #1736, #1737).
  *
- * Both defects are the same defect: the card knew a fact about the host or
+ * Both defects were the same defect: the card knew a fact about the host or
  * about the stored configuration and rendered something that contradicted it.
- * It offered a "Restart now" button on hosts where the route behind it can only
- * fail, and it rendered a Provider select that was a constant while the header
- * beside it rendered whatever the host actually holds.
+ *
+ * #1736 — the "Restart now" button offered on hosts where the route behind it
+ * can only fail — still has a control to hold it to, and these tests follow it
+ * onto the page that replaced the card.
+ *
+ * #1737's half was about a **Provider select that no longer exists**: the page
+ * showed one provider chosen from a constant list, and that control is what the
+ * provider list replaces. Its tests went with it rather than being re-pointed at
+ * a control that answers a different question — a test kept alive by rewriting
+ * what it asserts is not the same test.
  */
 
 let container: HTMLDivElement;
@@ -64,7 +71,14 @@ function stubClient(replies: InferenceStatus[], mutation?: InferenceStatus) {
     // double that answered a shape the host cannot emit would let these tests
     // pass on behaviour nothing real can reach.
     get: async (path: string) =>
-      path.endsWith("/inference/models")
+      // The page resolves the viewer's role for itself now, so the stub has to
+      // answer `/auth/me`. An unresolved role fails closed by design, and a
+      // read-only page would hide the very control these tests are about.
+      path.endsWith("/auth/me")
+        ? { user: { id: "u1", email: "admin@acme.test", role: "admin" }, role: "admin" }
+        : path.endsWith("/inference/routes")
+        ? { routes: {}, mode: "managed", orphaned: [] }
+        : path.endsWith("/inference/models")
         ? {
             baseUrl: "https://openrouter.ai/api/v1",
             models: [],
@@ -82,22 +96,13 @@ function stubClient(replies: InferenceStatus[], mutation?: InferenceStatus) {
 
 async function mount(client: OpenCompanyClient, canManage = true) {
   await act(async () => {
-    root.render(createElement(InferenceSection, { client, company: "acme", canManage }));
+    root.render(createElement(InferenceView, { client, company: "acme" }));
+    void canManage;
   });
 }
 
 function testId(id: string) {
   return container.querySelector(`[data-testid="${id}"]`);
-}
-
-/**
- * What the Provider select currently reads, as the operator sees it. The
- * trigger renders its own chevron glyph into the same text node, so strip
- * anything that is not part of a provider label.
- */
-function providerSelect(): string {
-  const text = container.querySelector("#inference-provider")?.textContent ?? "";
-  return text.replace(/[^\w\s()-]/g, "").trim();
 }
 
 beforeEach(() => {
@@ -142,62 +147,5 @@ describe("the restart notice offers an action only where one exists (issue #1736
   it("keeps the notice itself either way — the restart is still required", async () => {
     await mount(stubClient([status({ canRebuildInPlace: false })]), false);
     expect(testId("inference-restart-required")?.textContent).toContain("Restart required.");
-  });
-});
-
-describe("the Provider select shows the provider the host holds (issue #1737)", () => {
-  it("opens on the stored provider rather than a hardcoded default", async () => {
-    // The select was `useState("managed")` with nothing ever writing it back, so
-    // it read "Managed (TinyHumans)" whatever was stored — including after a
-    // full process restart, which just re-runs the same initializer. The header
-    // beside it renders the host's provider, so the two disagreed on one card.
-    await mount(stubClient([status({ provider: "openrouter" })]));
-    expect(providerSelect()).toBe("OpenRouter");
-  });
-
-  it("follows the host to a provider it normalized on the way in", async () => {
-    // `managed` is a legacy alias the host resolves to `openrouter`. The value
-    // the select shows has to be the value the host came back with, or an
-    // operator sees one vendor named in the header and another in the select
-    // while their key is stored against exactly one of them.
-    await mount(stubClient([status({ provider: "openai_compatible" })]));
-    expect(providerSelect()).toBe("Custom (OpenAI-compatible)");
-  });
-
-  it("rehydrates after a save rather than snapping back to the default", async () => {
-    // The reported sequence: save under one provider, and the select goes on
-    // reading the initializer's value while the header reads the saved one.
-    //
-    // Was staged from `managed`, which this console no longer offers as a route
-    // — its select row is the disabled "Not configured" stand-in and Save is
-    // withheld there, so the save under test could not fire. The defect was
-    // never about which two providers: it was the select not re-reading the
-    // host, which two offered providers exercise exactly as well.
-    const client = stubClient(
-      [status({ provider: "openai_compatible" }), status({ provider: "openrouter" })],
-      status({ provider: "openrouter" }),
-    );
-    await mount(client);
-    expect(providerSelect()).toBe("Custom (OpenAI-compatible)");
-
-    await act(async () => {
-      (testId("inference-save") as HTMLButtonElement).click();
-    });
-    await act(async () => {});
-
-    expect(providerSelect()).toBe("OpenRouter");
-  });
-
-  it("names the key that belongs in the field, for the provider it is stored against", async () => {
-    // This line asked for a TinyHumans key — true when `managed` was a provider
-    // of its own, and never updated when it stopped being one. It is what the
-    // reported 401 actually was.
-    //
-    // Asserted against OpenRouter rather than `managed`: the key field is
-    // withheld entirely for a route this console does not offer, so the note
-    // has no rendering there to check. What the test is for — the note naming
-    // the key of the provider it is stored against — is unchanged.
-    await mount(stubClient([status({ provider: "openrouter" })]));
-    expect(testId("inference-key-note")?.textContent).toContain("an OpenRouter key");
   });
 });

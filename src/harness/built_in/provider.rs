@@ -57,12 +57,17 @@ pub const DEFAULT_TINYHUMANS_INFERENCE_URL: &str = "https://api.tinyhumans.ai/op
 /// Default hosted model/tier when none is configured.
 pub const DEFAULT_HOSTED_MODEL: &str = "chat-v1";
 
-/// The `HTTP-Referer` attribution header OpenRouter asks BYOK callers to send —
-/// it identifies the app in OpenRouter's dashboard/rankings.
-pub const OPENROUTER_REFERER: &str = "https://opencompany.tinyhumans.ai";
-
-/// The `X-Title` attribution header OpenRouter asks BYOK callers to send.
-pub const OPENROUTER_TITLE: &str = "OpenCompany";
+/// The OpenRouter attribution headers, re-exported from the catalogue so this
+/// module's long-standing spelling keeps resolving.
+///
+/// They used to be defined here, and a *second* pair was written out inline in
+/// [`roster_build`](crate::harness::roster_build) with a different `HTTP-Referer`
+/// — so a company's roster-build traffic and its turn traffic were attributed to
+/// two different apps in OpenRouter's dashboard. Nothing compared them, so
+/// nothing noticed. One constant now, in
+/// [`catalogue`](crate::company::inference::catalogue), with both callers
+/// reading it.
+pub use crate::company::inference::catalogue::{OPENROUTER_REFERER, OPENROUTER_TITLE};
 
 /// The key under which the managed billing/context metadata is stashed on
 /// [`ModelResponse::raw`] so openhuman's crate-native cost pipeline recovers the
@@ -1760,6 +1765,11 @@ fn model_unavailable_advice(
         ),
         (_, None) => "update the company's `[inference].models` mapping".to_string(),
     };
+    // Redacted here rather than at the two call sites, so a third one cannot
+    // reintroduce the leak. An endpoint may carry userinfo, and this sentence is
+    // operator-facing: it reaches the console and gets screenshotted into
+    // tickets.
+    let models_url = crate::company::inference::catalogue::redact_endpoint(models_url);
     Some(format!(
         "the configured inference model is not available from the provider — {where_to_fix}, to \
          one the provider offers (list them with `GET {models_url}`). {error}"
@@ -1780,6 +1790,26 @@ async fn send_plan(
     harness: Option<&str>,
     source: Option<InferenceSource>,
 ) -> anyhow::Result<serde_json::Value> {
+    // **Bearer here, on purpose, for every provider including Anthropic — do not
+    // "fix" this to match the catalogue's `auth_style`.**
+    //
+    // This is the OpenAI-shaped chat path (`POST {base}/chat/completions`), and
+    // for `api.anthropic.com/v1` that reaches Anthropic's **OpenAI SDK
+    // compatibility layer**, which authenticates with `Authorization: Bearer`
+    // and takes no `anthropic-version`. Their *native* API is `POST
+    // /v1/messages` with an entirely different body, and it is the native
+    // endpoints — `GET /v1/models` among them — that want `x-api-key`.
+    //
+    // So `AuthStyle::Anthropic` means "this provider's NATIVE endpoints use
+    // x-api-key", and the only native call this product makes is the catalog
+    // listing (`inference_models::discover_models`). Applying it here would
+    // break a path that currently works.
+    //
+    // Verified at `platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk`.
+    // Note their own caveat: the compatibility layer is "primarily intended to
+    // test and compare model capabilities, and is not considered a long-term or
+    // production-ready solution for most use cases" — it ignores `strict` and
+    // `response_format`, supports no prompt caching, and hoists system messages.
     let mut request = client.post(&plan.url).json(&plan.body);
     if let Some(bearer) = &plan.bearer {
         request = request.bearer_auth(bearer);
@@ -1924,13 +1954,21 @@ impl TenantProvider {
 
     /// Re-resolves the effective config from the secret store and updates the
     /// cached telemetry slug. Errors when no provider is configured at all.
-    async fn resolve(&self) -> anyhow::Result<InferenceDecl> {
-        let decl = inference::resolve_effective_scoped(
+    ///
+    /// `tier` is the abstract tier **this** turn carries, and it is not
+    /// decoration: the company's routing table routes per workload, so resolving
+    /// without it answers "where does this company send work" when the question
+    /// is "where does this company send *this* work". Resolved per turn rather
+    /// than cached for the same reason the credential is — an operator moves a
+    /// row on the Routing tab and the next turn has to honour it.
+    async fn resolve(&self, tier: &str) -> anyhow::Result<InferenceDecl> {
+        let decl = inference::resolve_effective_for_tier(
             &self.company,
             &self.manifest,
             self.env_default.as_ref(),
             self.secrets.as_ref(),
             &self.scope,
+            tier,
         )
         .await
         .map_err(|e| anyhow::anyhow!("resolving inference config: {e}"))?
@@ -1956,6 +1994,7 @@ impl TenantProvider {
             &decl.base_url,
             bearer.as_deref(),
             Some(&self.catalog_scope()),
+            crate::company::inference::catalogue::auth_style_for(&decl.provider),
         )
         .await;
         Ok(decl.with_vocabulary(vocabulary))
@@ -1979,12 +2018,15 @@ impl ChatModel<()> for TenantProvider {
     ///
     /// [`Agent::turn`]: openhuman_core::openhuman::agent::Agent
     async fn invoke(&self, _state: &(), request: ModelRequest) -> TaResult<ModelResponse> {
+        // The tier first, because resolution now depends on it: the routing
+        // table decides per workload, so the decl cannot be resolved before the
+        // workload is known.
+        let model = request.model.as_deref().unwrap_or(DEFAULT_HOSTED_MODEL);
         let decl = self
-            .resolve()
+            .resolve(model)
             .await
             .map_err(|e| InferenceError::Model(e.to_string()))?;
         let messages = wire_messages(&request.messages);
-        let model = request.model.as_deref().unwrap_or(DEFAULT_HOSTED_MODEL);
         let temperature = request.temperature.unwrap_or(0.0);
         let plan = request_plan(
             &decl,

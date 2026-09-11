@@ -36,6 +36,7 @@ use crate::AppState;
 use crate::app::config::EnvSource;
 use crate::company::IMPLICIT_HARNESS_ID;
 use crate::company::Inference;
+use crate::company::inference::catalogue;
 use crate::company::inference::{
     self, EnvDefault, InferenceSource, RuntimeInference, clear_runtime_config, resolve_effective,
     save_runtime_config, store_key, validate_runtime,
@@ -70,6 +71,8 @@ const REBUILT_NOTE: &str = "Saved, and this company's runtime was rebuilt so the
      live now. Agents think with it from their next turn and scheduled workflows fire again — no \
      restart needed.";
 
+mod providers;
+
 /// Builds the inference management route fragment.
 pub fn router() -> Router<AppState> {
     scoped(
@@ -79,6 +82,11 @@ pub fn router() -> Router<AppState> {
     .merge(scoped("/inference/models", get(list_models)))
     .merge(scoped("/inference/test", post(test_config)))
     .merge(scoped("/inference/restart", post(restart_runtime)))
+    // Add, edit, delete, enable/disable, the draft probe and the routing table.
+    // A module of its own because this file is already the read plane plus the
+    // legacy single-provider write, and the seam between "what is configured"
+    // and "change what is configured" is the one worth splitting on.
+    .merge(providers::router())
 }
 
 /// What `GET …/inference/models` answers: the catalog **this company's endpoint**
@@ -132,7 +140,7 @@ struct ModelCatalogDto {
 /// exactly the companies that never configured anything.
 async fn resolved_endpoint(
     runtime: &CompanyRuntime,
-) -> Result<Option<(String, Option<String>)>, ApiError> {
+) -> Result<Option<(String, Option<String>, catalogue::AuthStyle)>, ApiError> {
     let (manifest, _harness_id) = manifest_inference(runtime).await?;
     let secrets = runtime.secrets().as_ref();
     let platform = platform_default(&crate::app::config::ProcessEnv);
@@ -143,7 +151,11 @@ async fn resolved_endpoint(
         return Ok(None);
     };
     let bearer = decl.bearer().await.map_err(ApiError)?;
-    Ok(Some((decl.base_url.clone(), bearer)))
+    // Carried alongside the credential, because the two are one decision: a
+    // value and the header it belongs in. Splitting them is how the catalog
+    // read came to send every provider a bearer.
+    let auth = catalogue::auth_style_for(&decl.provider);
+    Ok(Some((decl.base_url.clone(), bearer, auth)))
 }
 
 /// `GET …/inference/models` — the model catalog of the endpoint **this company**
@@ -157,7 +169,7 @@ async fn resolved_endpoint(
 /// serves.
 async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, ApiError> {
     let runtime = company.runtime.as_ref();
-    let Some((base_url, bearer)) = resolved_endpoint(runtime).await? else {
+    let Some((base_url, bearer, auth)) = resolved_endpoint(runtime).await? else {
         // Nothing resolves — not even a platform default on this host. There is
         // no endpoint to ask, and saying so beats listing some other vendor's
         // catalog as if it were this company's.
@@ -181,6 +193,7 @@ async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, Ap
         &base_url,
         bearer.as_deref(),
         Some(runtime.id().as_ref()),
+        auth,
     )
     .await
     {
@@ -189,7 +202,7 @@ async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, Ap
                 models.iter().map(|model| model.id.as_str()),
             );
             Ok(Json(ModelCatalogDto {
-                base_url,
+                base_url: catalogue::redact_endpoint(&base_url),
                 models,
                 tier_vocabulary: Some(vocabulary.as_str()),
                 tier_defaults: vocabulary.tier_defaults(),
@@ -197,10 +210,15 @@ async fn list_models(company: ScopedCompany) -> Result<Json<ModelCatalogDto>, Ap
             }))
         }
         Err(error) => Ok(Json(ModelCatalogDto {
+            // Redacted, not raw. `reqwest` masks userinfo in its own `Display`,
+            // but this `format!` re-adds it from the endpoint we hold — which
+            // is how a stored `http://user:password@host/v1` came to be printed
+            // in full in a banner an operator screenshots into a ticket.
             error: Some(format!(
-                "Could not list models from {base_url}: {error}. Enter model ids directly."
+                "Could not list models from {endpoint}: {error}. Enter model ids directly.",
+                endpoint = catalogue::redact_endpoint(&base_url)
             )),
-            base_url,
+            base_url: catalogue::redact_endpoint(&base_url),
             models: Vec::new(),
             tier_vocabulary: None,
             tier_defaults: BTreeMap::new(),
@@ -312,6 +330,197 @@ struct InferenceStatusDto {
     /// from the deployment shape: the rebuilder is wired by the binary, and
     /// only the binary knows whether it wired one.
     can_rebuild_in_place: bool,
+    /// Every provider this company holds, entry zero first.
+    ///
+    /// **Additive, and it has to stay that way.** This DTO is the "can this
+    /// company think?" oracle for four surfaces that are not about inference at
+    /// all — the setup dialog, the agent detail view, the copilot panel and the
+    /// workflow create dialog — so every field above keeps its exact meaning. A
+    /// company with one provider reports a list of one, which is the truth and
+    /// already more than the single form ever said.
+    ///
+    /// Carries `key_configured` per entry and **never a credential**. See
+    /// [`ProviderDto`].
+    providers: Vec<ProviderDto>,
+    /// The routing table: abstract tier → the route string an operator types
+    /// (`acme:gpt-5`, `managed`, `local:llava`). A tier absent from the map is
+    /// unset and resolves through the primary — never through a sibling's
+    /// provider.
+    ///
+    /// **Additive, like `providers`.** The four non-inference readers of this
+    /// DTO do not look at it, and every field above keeps its exact meaning.
+    routes: BTreeMap<String, String>,
+    /// What the **managed** brain would resolve to, and who pays for it.
+    managed: ManagedDto,
+}
+
+/// The managed tier's honest state.
+///
+/// It exists because the row for it used to carry a permanent "Always on"
+/// badge, inherited from a design where the same company runs the managed
+/// backend. Here the managed tier needs a credential and can resolve to
+/// nothing — and a row claiming availability while agents cannot think is the
+/// failure the five-state `CognitionState` exists to prevent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedDto {
+    /// `provider_key` / `company_account` / `instance` / `none`.
+    ///
+    /// The last two are kept apart on purpose: one bills the company's own
+    /// account and the other bills whoever runs the server, and an operator
+    /// deciding whether to connect their account needs to know which they are
+    /// on.
+    source: String,
+    /// Whether it can be reached at all. Derived from `source`, carried so the
+    /// console does not re-derive it and disagree.
+    configured: bool,
+    /// The endpoint managed requests travel to — the platform's own.
+    base_url: String,
+    /// Whether it is a routing target.
+    ///
+    /// A provider like any other in this one respect: "stop routing work here"
+    /// and "remove the credential" are different statements, and managed can be
+    /// told the first without the second. Switching it off leaves every step of
+    /// its chain exactly where it was.
+    enabled: bool,
+    /// What was last learnt about reaching it, if anything. Same rule as a
+    /// provider row's: silent until something has actually been learnt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<ProviderHealthDto>,
+}
+
+/// One provider on the wire.
+///
+/// Derives `Serialize` and holds no credential field, which is not a
+/// coincidence: the two facts have to be checked together every time this struct
+/// is edited. The record it is built from
+/// ([`store::Provider`](crate::company::inference::store::Provider)) derives no
+/// `Serialize` at all, precisely so that adding a key to it could not silently
+/// put one on a wire — and this is the shape that *is* serialized, so the rule
+/// lands here as "no key field, ever".
+///
+/// `key_configured` is derived by asking the store whether a value exists,
+/// never by reading a stored flag. A flag goes stale the moment a secret is
+/// cleared by another path, and then this tells the console a key exists that
+/// does not.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderDto {
+    /// Stable, opaque identity. Never shown to an operator.
+    id: String,
+    /// Routing key — what a routing entry names.
+    slug: String,
+    /// Display label.
+    label: String,
+    /// Provider kind.
+    kind: String,
+    /// Resolved OpenAI-compatible base URL.
+    base_url: String,
+    /// Abstract tier → concrete model id.
+    models: BTreeMap<String, String>,
+    /// Whether this is available for routing. Distinct from deleted.
+    enabled: bool,
+    /// Whether a credential is stored. **Never the credential.**
+    key_configured: bool,
+    /// Whether this is the provider an **unset** workload goes through.
+    ///
+    /// The *resolved* answer, not the raw marker: a company that has never said
+    /// reports its first enabled provider here, which is what it has always
+    /// resolved to. So the console can render "which provider is my default"
+    /// without knowing whether it was chosen or inherited — and the operator
+    /// sees the same answer either way.
+    is_default: bool,
+    /// What was last learnt about reaching it, if anything.
+    ///
+    /// Absent when nothing has been learnt, which is the honest answer: a row
+    /// that has never been probed is not a row that is working. The alternative
+    /// — a green tick by default — is the state the design this is ported from
+    /// is in, where a provider whose key was revoked an hour ago looks identical
+    /// to one that works.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<ProviderHealthDto>,
+}
+
+/// What the system last learnt about reaching a provider.
+///
+/// Recorded from things that already happen — the add-time probe, the manual
+/// Test, and the turn path's own 401 — rather than from a poller. A poller costs
+/// a request per provider per interval across every company on this host to
+/// learn something the next real turn learns for free.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderHealthDto {
+    /// `ok`, or the probe class of the last failure.
+    state: String,
+    /// When it was learnt, RFC 3339. Names when the *episode* began rather than
+    /// when it was last retried — see [`store::record_health`].
+    at: String,
+}
+
+/// The provider list for the status DTO.
+///
+/// A projection over [`store::list_providers`] plus the health map. The records
+/// themselves derive no `Serialize`; this is the shape that does, and it holds
+/// no credential field. Those two facts have to be checked together every time
+/// either is edited.
+async fn provider_list(runtime: &CompanyRuntime) -> Result<Vec<ProviderDto>, ApiError> {
+    use crate::company::inference::store;
+
+    let secrets = runtime.secrets().as_ref();
+    let providers = store::list_providers(runtime.id(), secrets)
+        .await
+        .map_err(ApiError)?;
+    let health = store::load_health(runtime.id(), secrets)
+        .await
+        .map_err(ApiError)?;
+    // Resolved through the same function the turn path uses, so the row the
+    // console marks and the provider a turn actually reaches cannot disagree.
+    let marked = store::load_default_slug(runtime.id(), secrets)
+        .await
+        .map_err(ApiError)?;
+    let primary = crate::company::inference::resolve::primary(&providers, marked.as_deref())
+        .map(|p| p.slug.clone());
+    let mut out = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let key_configured = store::provider_key_configured(runtime.id(), secrets, &provider)
+            .await
+            .map_err(ApiError)?;
+        let health = health.get(&provider.slug).map(|h| ProviderHealthDto {
+            state: h.state.clone(),
+            at: h.at.clone(),
+        });
+        out.push(ProviderDto {
+            is_default: primary.as_deref() == Some(provider.slug.as_str()),
+            id: provider.id.as_str().to_string(),
+            slug: provider.slug,
+            label: provider.label,
+            kind: provider.kind,
+            base_url: catalogue::redact_endpoint(&provider.base_url),
+            models: provider.models,
+            enabled: provider.enabled,
+            key_configured,
+            health,
+        });
+    }
+    Ok(out)
+}
+
+/// The routing table for the status DTO: tier → the route string an operator
+/// would type.
+///
+/// On the status read rather than a route of its own because the console renders
+/// the Providers tab and the Routing tab from one load, and a second request for
+/// four strings would be a second thing that can be stale relative to the first.
+async fn routing_table(runtime: &CompanyRuntime) -> Result<BTreeMap<String, String>, ApiError> {
+    use crate::company::inference::store;
+
+    let routes = store::load_routes(runtime.id(), runtime.secrets().as_ref())
+        .await
+        .map_err(ApiError)?;
+    Ok(routes
+        .into_iter()
+        .map(|(tier, route)| (tier, route.to_route_string()))
+        .collect())
 }
 
 /// A mutating response: the resulting status plus the switch reminder.
@@ -623,9 +832,19 @@ async fn effective_status_with(
             |d| d.base_url.clone(),
         ),
     };
+    // This route is `ScopedCompany`, not admin — every console reader gets this
+    // field on every page load. A credential embedded in the endpoint is
+    // refused at every point one can be set, but an endpoint stored before that
+    // rule existed, or one arriving from a `company.toml` or
+    // `OPENCOMPANY_INFERENCE_URL` this host does not own, still has to be safe
+    // to *say*.
+    let base_url = catalogue::redact_endpoint(&base_url);
     // What the company actually booted onto, not what the config implies.
     let cognition = runtime.cognition();
     let restart_required = restart_pending(runtime, decl.is_some());
+    let providers = provider_list(runtime).await?;
+    let routes = routing_table(runtime).await?;
+    let managed = managed_state(runtime, platform).await?;
     // Independent of `decl`: the shipped defaults are the same regardless of
     // what (if anything) this company has configured.
     let default_tier_models: BTreeMap<String, String> = inference::DEFAULT_TIER_MODELS
@@ -647,6 +866,9 @@ async fn effective_status_with(
             harness_reachable: harness_reachable(runtime),
             designs_profiles: designs_profiles(runtime),
             can_rebuild_in_place,
+            providers,
+            routes,
+            managed,
         },
         None => InferenceStatusDto {
             provider: "managed".to_string(),
@@ -666,7 +888,62 @@ async fn effective_status_with(
             harness_reachable: harness_reachable(runtime),
             designs_profiles: designs_profiles(runtime),
             can_rebuild_in_place,
+            providers,
+            routes,
+            managed,
         },
+    })
+}
+
+/// What the managed brain would resolve to for this company.
+///
+/// Reads the three facts and hands them to
+/// [`inference::managed_source`](crate::company::inference::managed_source),
+/// which holds the branching. The inputs are a store read each; the decision is
+/// pure and tested with three booleans.
+async fn managed_state(
+    runtime: &CompanyRuntime,
+    platform: Option<&EnvDefault>,
+) -> Result<ManagedDto, ApiError> {
+    use crate::company::inference::store;
+
+    let secrets = runtime.secrets().as_ref();
+    // Both addresses for the one meaning: the new per-provider slot and the
+    // legacy flat slot it converges from.
+    let inference_key = inference::load_inference_key_scoped(
+        runtime.id(),
+        secrets,
+        inference::MANAGED_SLUG,
+        None,
+        &inference::HarnessScope::default(),
+    )
+    .await
+    .map_err(ApiError)?;
+    let company_account = crate::company::company_key::load(runtime.id(), secrets)
+        .await
+        .map_err(ApiError)?;
+    let source =
+        inference::managed_source(!inference_key.trim().is_empty(), &company_account, platform);
+    let health = store::load_health(runtime.id(), secrets)
+        .await
+        .map_err(ApiError)?
+        .get(inference::MANAGED_SLUG)
+        .map(|h| ProviderHealthDto {
+            state: h.state.clone(),
+            at: h.at.clone(),
+        });
+    Ok(ManagedDto {
+        source: source.as_str().to_string(),
+        configured: source.resolves(),
+        base_url: catalogue::redact_endpoint(
+            &platform
+                .map(|p| p.base_url.clone())
+                .unwrap_or_else(|| inference::PLATFORM_BASE_URL.to_string()),
+        ),
+        enabled: store::managed_enabled(runtime.id(), secrets)
+            .await
+            .map_err(ApiError)?,
+        health,
     })
 }
 
@@ -902,7 +1179,7 @@ async fn unauthenticated_reason(
          fall back on — a request to {base} would carry no Authorization header and be rejected, \
          so none was sent. Save a key that {base} accepts above, or point this company at an \
          endpoint that needs none.",
-        base = decl.base_url
+        base = catalogue::redact_endpoint(&decl.base_url)
     )))
 }
 
@@ -926,7 +1203,8 @@ fn probe_failure(decl: &inference::InferenceDecl, raw: &str) -> (String, &'stati
                  stored against the provider selected when it was saved, so a key for another \
                  vendor fails here even while this card reports one is set. Re-save the key under \
                  {}, or Remove key to fall back. The provider said: {raw}",
-                decl.base_url, decl.provider
+                catalogue::redact_endpoint(&decl.base_url),
+                decl.provider
             ),
             "credential_rejected",
         );
@@ -1023,6 +1301,7 @@ async fn test_config(company: ScopedCompany) -> Response {
                     &decl.base_url,
                     bearer.as_deref(),
                     Some(runtime.id().as_ref()),
+                    catalogue::auth_style_for(&decl.provider),
                 )
                 .await;
                 decl.with_vocabulary(vocabulary)
@@ -1169,6 +1448,32 @@ base_url = "https://byo.example/v1"
         let id = CompanyId::new(name);
         save_record(home, &id, &manifest()).await;
         let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest())
+            .with_id(id.clone())
+            .build()
+            .await
+            .unwrap();
+        let state = AppState::new(AppConfig::default());
+        state.registry().insert(id, std::sync::Arc::new(runtime));
+        crate::server::test_support::seed_fixed_admin(&state, name).await;
+        state
+    }
+
+    /// [`state_with_company`] over a caller-supplied manifest.
+    ///
+    /// The strict `validate()` only runs on a first boot with no persisted
+    /// record (`src/runtime/builder.rs`), and `save_record` writes one first —
+    /// so this can plant a manifest a fresh company would now be refused. That
+    /// is the point: an endpoint stored before the refusal existed is exactly
+    /// the case the redaction half of the rule is for.
+    async fn state_with_manifest(
+        home: &std::path::Path,
+        name: &str,
+        manifest_toml: &str,
+    ) -> AppState {
+        let manifest: CompanyManifest = toml::from_str(manifest_toml).unwrap();
+        let id = CompanyId::new(name);
+        save_record(home, &id, &manifest).await;
+        let runtime = RuntimeBuilder::new(home.to_path_buf(), manifest)
             .with_id(id.clone())
             .build()
             .await
@@ -1824,6 +2129,253 @@ base_url = "https://byo.example/v1"
     }
 
     // ---------------------------------------------------------------------
+    // A credential embedded in an endpoint: refused on the way in, redacted on
+    // the way out. Three paths, because the leak had three.
+    // ---------------------------------------------------------------------
+
+    /// The credential a test endpoint carries. Obviously fake, and asserted on
+    /// by substring everywhere below — a leak anywhere is a leak.
+    const EMBEDDED_PASSWORD: &str = "hunter2";
+    /// Loopback discard: refuses immediately, offline and deterministically.
+    const CREDENTIALED_ENDPOINT: &str = "http://alice:hunter2@127.0.0.1:9/unreachable/v1";
+    const CREDENTIALED_MANIFEST: &str = "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+         [inference]\nprovider = \"openai_compatible\"\n\
+         base_url = \"http://alice:hunter2@127.0.0.1:9/unreachable/v1\"\n";
+
+    /// Path 1 — it is never stored.
+    #[tokio::test]
+    async fn an_endpoint_carrying_a_credential_is_refused_before_anything_is_written() {
+        let home_dir = home();
+        let state = state_with_company_named(home_dir.path(), "credurl-add").await;
+
+        for body in [
+            json!({
+                "kind": "custom",
+                "label": "Acme gateway",
+                "baseUrl": CREDENTIALED_ENDPOINT,
+            }),
+            // The local-runtime category types its own endpoint too.
+            json!({ "kind": "ollama", "baseUrl": CREDENTIALED_ENDPOINT }),
+        ] {
+            let (status, _, raw) = send_as(
+                &state,
+                "credurl-add",
+                "POST",
+                "/api/v1/company/inference/providers",
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {raw}");
+            assert!(
+                !raw.contains(EMBEDDED_PASSWORD),
+                "the refusal echoed the credential it was refusing: {raw}"
+            );
+        }
+
+        // The draft probe refuses it too, rather than putting a basic-auth
+        // credential on the wire to an address the operator named.
+        let (status, _, raw) = send_as(
+            &state,
+            "credurl-add",
+            "POST",
+            "/api/v1/company/inference/probe",
+            Some(json!({ "baseUrl": CREDENTIALED_ENDPOINT })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert!(!raw.contains(EMBEDDED_PASSWORD), "{raw}");
+
+        // And nothing landed: no stored endpoint anywhere in the status read.
+        let (_, _, raw) = send_as(
+            &state,
+            "credurl-add",
+            "GET",
+            "/api/v1/company/inference",
+            None,
+        )
+        .await;
+        assert!(
+            !raw.contains(EMBEDDED_PASSWORD),
+            "a refused endpoint reached the store: {raw}"
+        );
+    }
+
+    /// Path 2 — the catalog-read failure note does not re-add it.
+    ///
+    /// `reqwest` redacts userinfo in its own error `Display`; the handler's own
+    /// `format!` used to put it back from the endpoint we hold.
+    #[tokio::test]
+    async fn a_catalog_read_failure_names_the_endpoint_without_its_credential() {
+        let home_dir = home();
+        let state =
+            state_with_manifest(home_dir.path(), "credurl-models", CREDENTIALED_MANIFEST).await;
+
+        let (status, body, raw) = send_as(
+            &state,
+            "credurl-models",
+            "GET",
+            "/api/v1/company/inference/models",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert!(
+            !raw.contains(EMBEDDED_PASSWORD),
+            "the catalog route leaked an embedded credential: {raw}"
+        );
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("Could not list models from"),
+            "the failure still names the endpoint it could not reach: {raw}"
+        );
+        assert!(
+            error.contains("http://***@127.0.0.1:9/unreachable/v1"),
+            "the endpoint is redacted, not dropped — the operator still needs to \
+             recognise which one it was: {raw}"
+        );
+    }
+
+    /// Path 3 — the read DTO, on the non-admin route every console reader calls.
+    #[tokio::test]
+    async fn the_company_status_read_redacts_an_endpoint_credential() {
+        let home_dir = home();
+        let state =
+            state_with_manifest(home_dir.path(), "credurl-status", CREDENTIALED_MANIFEST).await;
+
+        let (status, body, raw) = send_as(
+            &state,
+            "credurl-status",
+            "GET",
+            "/api/v1/company/inference",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert!(
+            !raw.contains(EMBEDDED_PASSWORD),
+            "`GET …/inference` is `ScopedCompany`, so this is the password on the \
+             wire for every console reader: {raw}"
+        );
+        assert_eq!(
+            body["baseUrl"].as_str(),
+            Some("http://***@127.0.0.1:9/unreachable/v1"),
+            "{raw}"
+        );
+    }
+
+    /// The same rule over a provider **row**, which is a different DTO built
+    /// from a different store.
+    #[tokio::test]
+    async fn a_provider_row_redacts_an_endpoint_credential() {
+        use crate::company::inference::store;
+
+        let home_dir = home();
+        let runtime = runtime_with(home_dir.path(), NO_INFERENCE).await;
+        // Written straight to the store, as a record predating the refusal
+        // would be — the handler now refuses this endpoint.
+        store::put_provider(
+            runtime.id(),
+            runtime.secrets().as_ref(),
+            store::ProviderDraft {
+                slug: "acme-gateway".into(),
+                label: "Acme gateway".into(),
+                kind: "custom".into(),
+                base_url: CREDENTIALED_ENDPOINT.into(),
+                models: BTreeMap::new(),
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let dto = effective_status_with(&runtime, None, false).await.unwrap();
+        let row = dto
+            .providers
+            .iter()
+            .find(|p| p.slug == "acme-gateway")
+            .expect("the planted provider is listed");
+        assert_eq!(row.base_url, "http://***@127.0.0.1:9/unreachable/v1");
+        assert!(
+            !serde_json::to_string(&dto)
+                .unwrap()
+                .contains(EMBEDDED_PASSWORD),
+            "the whole status DTO must be free of it, not just the field we looked at"
+        );
+    }
+
+    /// Defect B, end to end: a name past the bound is a 400 before any write,
+    /// not a 500 with a truncated credential behind it.
+    #[tokio::test]
+    async fn a_provider_name_past_the_bound_is_refused_rather_than_breaking_the_store() {
+        use crate::company::inference::store::MAX_PROVIDER_NAME_CHARS;
+
+        let home_dir = home();
+        let state = state_with_company_named(home_dir.path(), "longname").await;
+
+        // At the bound: accepted, and its credential round-trips through the
+        // store — including the clear the delete issues.
+        let at_limit = "a".repeat(MAX_PROVIDER_NAME_CHARS);
+        let (status, _, raw) = send_as(
+            &state,
+            "longname",
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({
+                "kind": "custom",
+                "label": at_limit,
+                "baseUrl": UNREACHABLE,
+                "key": "sk-not-a-real-key",
+                "addAnyway": true,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a name at the bound is legal: {raw}"
+        );
+        let (status, _, raw) = send_as(
+            &state,
+            "longname",
+            "DELETE",
+            &format!("/api/v1/company/inference/providers/{at_limit}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "removing it clears the credential, which is the write that used to \
+             fail after truncating it: {raw}"
+        );
+
+        // Past the bound: refused, and refused *before* the key is written.
+        let past_limit = "a".repeat(MAX_PROVIDER_NAME_CHARS + 1);
+        let (status, _, raw) = send_as(
+            &state,
+            "longname",
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({
+                "kind": "custom",
+                "label": past_limit,
+                "baseUrl": UNREACHABLE,
+                "key": "sk-not-a-real-key",
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a 500 here is the incident: {raw}"
+        );
+        assert!(
+            raw.contains(&MAX_PROVIDER_NAME_CHARS.to_string()),
+            "the refusal says what the limit is: {raw}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // Issue #597 — the card must report the endpoint requests actually reach,
     // not the built-in production constant.
     // ---------------------------------------------------------------------
@@ -2291,15 +2843,26 @@ base_url = "https://byo.example/v1"
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{raw}");
-        // The legacy name aliases through to what it now means.
+        // The legacy name still aliases onto the OpenRouter-shaped *kind* — that
+        // is what shape of API this is.
         assert_eq!(resp["status"]["provider"], "openrouter");
-        assert_eq!(resp["status"]["slug"], "openrouter");
         assert_eq!(resp["status"]["source"], "runtime");
         assert_eq!(resp["status"]["keyConfigured"], true);
-        // A key means the tenant's own OpenRouter account pays.
+        // But the **endpoint stays the platform's**, and this assertion is the
+        // fix. `managed` used to normalize onto `openrouter` before the managed
+        // branch was consulted, so a company that declared `managed` and stored
+        // a key had its requests sent to `openrouter.ai` — carrying, in the
+        // credential-link flow that writes exactly this blob, a TinyHumans
+        // token. Declaring `managed` means the company pays for its own agents
+        // on the TinyHumans brain, which is what this route's own header has
+        // said since #585 and what the code now does.
         assert_eq!(
             resp["status"]["baseUrl"],
-            crate::company::inference::OPENROUTER_BASE_URL
+            crate::company::inference::PLATFORM_BASE_URL
+        );
+        assert_eq!(
+            resp["status"]["slug"], "subscription",
+            "the telemetry slug separates the platform endpoint from a direct OpenRouter account"
         );
         assert!(!raw.contains(TOKEN), "PUT leaked the token: {raw}");
 
@@ -2371,7 +2934,7 @@ base_url = "https://byo.example/v1"
             Some(json!({ "provider": "openai_compatible", "baseUrl": "https://byo.example/v1", "key": TOKEN })),
         )
         .await;
-        let (_, _, get_raw) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let (_, get_dto, get_raw) = send(&state, "GET", "/api/v1/company/inference", None).await;
         // The live probe path returns an error (unreachable host) — assert the
         // scrubbed error body still never contains the token.
         let (_, _, test_raw) = send(&state, "POST", "/api/v1/company/inference/test", None).await;
@@ -2379,6 +2942,686 @@ base_url = "https://byo.example/v1"
         for raw in [put_raw, get_raw, test_raw] {
             assert!(!raw.contains(TOKEN), "a response leaked the token: {raw}");
         }
+
+        // The list route, extended here **before** there was anything to leak.
+        // The provider list is the newest way a credential could reach a wire,
+        // and the point of adding it to this test on the same change that adds
+        // the field is that the assertion exists before the mistake can.
+        let providers = get_dto["providers"]
+            .as_array()
+            .expect("the status carries a provider list");
+        assert_eq!(
+            providers.len(),
+            1,
+            "one provider: the flat slot, as entry zero"
+        );
+        let entry_zero = &providers[0];
+        assert_eq!(entry_zero["slug"], "openai_compatible");
+        assert_eq!(
+            entry_zero["keyConfigured"], true,
+            "the boolean is the only thing a read may say about a key"
+        );
+        // Not "no field called `key`" — no field with the VALUE, whatever it is
+        // called. A convenience rename would pass the narrower assertion.
+        for (name, value) in entry_zero.as_object().expect("a provider object") {
+            assert!(
+                !value.to_string().contains(TOKEN),
+                "provider field `{name}` leaked the token"
+            );
+        }
+
+        // Every WRITE route, extended on the change that adds them rather than
+        // afterwards. A credential reaches this subsystem through four bodies
+        // now, and each one is a separate chance to echo it back.
+        const SECOND: &str = "sk-not-a-real-key-for-the-second-provider";
+        let (_, _, add_raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({
+                "kind": "custom",
+                "label": "Acme gateway",
+                "baseUrl": UNREACHABLE,
+                "key": SECOND,
+            })),
+        )
+        .await;
+        let (_, _, edit_raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/providers/acme-gateway",
+            Some(json!({ "key": SECOND })),
+        )
+        .await;
+        let (_, _, probe_raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/probe",
+            Some(json!({ "baseUrl": UNREACHABLE, "key": SECOND })),
+        )
+        .await;
+        let (_, list_dto, list_raw) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let (_, _, delete_raw) = send(
+            &state,
+            "DELETE",
+            "/api/v1/company/inference/providers/acme-gateway",
+            None,
+        )
+        .await;
+
+        for raw in [add_raw, edit_raw, probe_raw, list_raw, delete_raw] {
+            for token in [TOKEN, SECOND] {
+                assert!(!raw.contains(token), "a write route leaked a token: {raw}");
+            }
+        }
+        // And the value assertion again, over a list that now holds two
+        // credentials rather than one.
+        for provider in list_dto["providers"].as_array().expect("a provider list") {
+            for (name, value) in provider.as_object().expect("a provider object") {
+                for token in [TOKEN, SECOND] {
+                    assert!(
+                        !value.to_string().contains(token),
+                        "provider field `{name}` leaked a token"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The discard port on loopback: a connection refused immediately, with no
+    /// DNS lookup and no wait. Loopback is a permitted probe target here because
+    /// the local-runtime category exists, which is exactly what makes it usable
+    /// as a test endpoint.
+    const UNREACHABLE: &str = "http://127.0.0.1:9/v1";
+
+    // --- the connect flow ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_cloud_provider_takes_its_endpoint_from_the_catalogue() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            // A base URL is sent and must be ignored: the paths in that table
+            // are too varied for an override to be anything but a mistake.
+            Some(json!({ "kind": "groq", "baseUrl": "https://wrong.example/v1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        let providers = resp["status"]["providers"].as_array().unwrap();
+        let groq = providers.iter().find(|p| p["slug"] == "groq").unwrap();
+        assert_eq!(groq["baseUrl"], "https://api.groq.com/openai/v1");
+        assert_eq!(groq["label"], "Groq");
+        assert_eq!(groq["enabled"], true, "a new provider arrives on");
+    }
+
+    #[tokio::test]
+    async fn a_second_provider_holds_its_own_credential() {
+        // The first moment two keys exist at once, which is the whole point of
+        // the list: today one slot per company means switching provider strands
+        // a credential for the wrong vendor in the only slot there is.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        for (label, key) in [
+            ("First", "sk-not-a-real-key-1"),
+            ("Second", "sk-not-a-real-key-2"),
+        ] {
+            let (status, _, raw) = send(
+                &state,
+                "POST",
+                "/api/v1/company/inference/providers",
+                Some(
+                    json!({ "kind": "custom", "label": label, "baseUrl": UNREACHABLE, "key": key }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{raw}");
+        }
+
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let providers = dto["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert!(
+            providers.iter().all(|p| p["keyConfigured"] == true),
+            "each provider holds its own credential: {providers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_keeps_the_key_and_creates_the_row() {
+        // The non-destructive path, which is the one the naive implementation
+        // gets wrong: a proxy, a WAF, a rate limit or a mistyped model id all
+        // fail a probe while the key is perfectly good.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({
+                "kind": "custom",
+                "label": "Acme gateway",
+                "baseUrl": UNREACHABLE,
+                "key": "sk-not-a-real-key",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the save succeeded: {raw}");
+        assert_eq!(resp["probe"]["ok"], false);
+        assert_eq!(resp["probe"]["class"], "endpoint");
+        let acme = resp["status"]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["slug"] == "acme-gateway")
+            .expect("the row was created");
+        assert_eq!(acme["keyConfigured"], true, "the key was kept");
+        assert_eq!(acme["health"]["state"], "endpoint");
+    }
+
+    #[tokio::test]
+    async fn a_slug_that_shadows_a_builtin_is_refused_before_anything_is_written() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, err, _) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Groq", "baseUrl": UNREACHABLE, "key": "sk-not-a-real-key" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+
+        // And nothing landed: not the record, and not the credential.
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert!(
+            dto["providers"].as_array().unwrap().is_empty(),
+            "a refused add writes nothing: {dto}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_provider_with_no_name_has_no_slug_to_write_under() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, _, _) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "   ", "baseUrl": UNREACHABLE })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_clears_its_credential_and_scrubs_its_routes() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Acme", "baseUrl": UNREACHABLE, "key": "sk-not-a-real-key" })),
+        )
+        .await;
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": { "reasoning-v1": "acme:gpt-5" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (status, resp, raw) = send(
+            &state,
+            "DELETE",
+            "/api/v1/company/inference/providers/acme",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(
+            resp["affectedTiers"],
+            json!(["reasoning-v1"]),
+            "the operator is told which rows moved"
+        );
+
+        let (_, routes, _) = send(&state, "GET", "/api/v1/company/inference/routes", None).await;
+        assert!(
+            routes["routes"].as_object().unwrap().is_empty(),
+            "the orphaned route was reset: {routes}"
+        );
+
+        // Re-adding the slug must not inherit the old credential. The store has
+        // no delete, so this only holds because the clear was actually issued.
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Acme", "baseUrl": UNREACHABLE })),
+        )
+        .await;
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let acme = dto["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["slug"] == "acme")
+            .unwrap();
+        assert_eq!(
+            acme["keyConfigured"], false,
+            "a re-added slug must not silently reuse the removed key"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_keeps_the_route_and_names_the_tiers_it_parks() {
+        // The departure from the plan, pinned so it is a decision rather than an
+        // omission: disabling does NOT scrub. A disabled provider keeps its
+        // endpoint, its label and its credential so that "stop billing this
+        // account this week" is expressible, and scrubbing would make
+        // re-enabling a re-configuration.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Acme", "baseUrl": UNREACHABLE, "key": "sk-not-a-real-key" })),
+        )
+        .await;
+        send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": { "reasoning-v1": "acme:gpt-5" } })),
+        )
+        .await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/acme/enabled",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(resp["affectedTiers"], json!(["reasoning-v1"]));
+
+        let (_, routes, _) = send(&state, "GET", "/api/v1/company/inference/routes", None).await;
+        assert_eq!(
+            routes["routes"]["reasoning-v1"], "acme:gpt-5",
+            "the route survives so switching back on restores it: {routes}"
+        );
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let acme = dto["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["slug"] == "acme")
+            .unwrap();
+        assert_eq!(acme["enabled"], false);
+        assert_eq!(
+            acme["keyConfigured"], true,
+            "a disabled provider keeps its credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_managed_key_does_not_take_another_row_s_key_with_it() {
+        // `inference/key` is ONE address that two rows can read through their
+        // own legacy fallback: entry zero's, and managed's. Which of them owns
+        // it depends on what entry zero's kind normalises to.
+        //
+        // Clearing it unconditionally while writing a *different* slug's slot
+        // destroyed whatever else was reading it — on a company configured for
+        // OpenRouter, removing the managed key silently took the OpenRouter key
+        // with it and the row went from "•••• configured" to a bare host. Found
+        // in a browser; pinned here.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        // Entry zero is OpenRouter, with its credential at the legacy address.
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({ "provider": "openrouter", "key": TOKEN })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/managed/key",
+            Some(json!({ "key": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        let zero = dto["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["slug"] == "openrouter")
+            .expect("entry zero is still listed");
+        assert_eq!(
+            zero["keyConfigured"], true,
+            "removing MANAGED's key must not clear a credential another row reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_managed_company_does_converge_off_the_legacy_address() {
+        // The other half: when entry zero IS managed, the legacy slot is its
+        // own, and writing the new address must retire the old one — otherwise
+        // a secret is orphaned at an address nothing will ever clear.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference",
+            Some(json!({ "provider": "managed", "key": TOKEN })),
+        )
+        .await;
+        let (status, _, raw) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/managed/key",
+            Some(json!({ "key": "sk-not-a-real-key" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(
+            dto["managed"]["source"], "provider_key",
+            "the new address is what answers now"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_is_explicit_and_survives_a_delete_that_is_not_it() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        for label in ["First", "Second"] {
+            send(
+                &state,
+                "POST",
+                "/api/v1/company/inference/providers",
+                Some(json!({ "kind": "custom", "label": label, "baseUrl": UNREACHABLE })),
+            )
+            .await;
+        }
+
+        // With no marker, the default is list order — today's behaviour, which
+        // is exactly what makes this change need no migration.
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(default_slug(&dto).as_deref(), Some("first"));
+
+        // Marked, it is a thing the operator said rather than a thing that
+        // happened.
+        let (status, _, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/second/default",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(default_slug(&dto).as_deref(), Some("second"));
+
+        // Deleting the one that is NOT the default leaves the marker alone —
+        // the failure the marker exists to prevent is the default moving with
+        // list order, silently.
+        send(
+            &state,
+            "DELETE",
+            "/api/v1/company/inference/providers/first",
+            None,
+        )
+        .await;
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(default_slug(&dto).as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn disabling_or_deleting_the_default_never_leaves_it_marked() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        for label in ["First", "Second"] {
+            send(
+                &state,
+                "POST",
+                "/api/v1/company/inference/providers",
+                Some(json!({ "kind": "custom", "label": label, "baseUrl": UNREACHABLE })),
+            )
+            .await;
+        }
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/second/default",
+            None,
+        )
+        .await;
+
+        // Switched off, the marker is CLEARED rather than moved: moving it
+        // would mark something the operator never chose, which is the
+        // positional default this replaces.
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/second/enabled",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(
+            default_slug(&dto).as_deref(),
+            Some("first"),
+            "a disabled provider is never the default"
+        );
+
+        // And a delete takes the marker with the record.
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/second/enabled",
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/second/default",
+            None,
+        )
+        .await;
+        send(
+            &state,
+            "DELETE",
+            "/api/v1/company/inference/providers/second",
+            None,
+        )
+        .await;
+        let (_, dto, _) = send(&state, "GET", "/api/v1/company/inference", None).await;
+        assert_eq!(default_slug(&dto).as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_is_switched_off_cannot_be_made_the_default() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Acme", "baseUrl": UNREACHABLE })),
+        )
+        .await;
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/acme/enabled",
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+
+        let (status, _, _) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers/acme/default",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The slug the status reports as the default, if any.
+    fn default_slug(dto: &Value) -> Option<String> {
+        dto["providers"]
+            .as_array()?
+            .iter()
+            .find(|p| p["isDefault"] == true)
+            .and_then(|p| p["slug"].as_str())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_route_naming_a_provider_nobody_holds_is_refused() {
+        // Fail closed. Accepting it and letting the turn discover it would
+        // attribute that workload's spend to whatever the fallback happened to
+        // be — the same defect as resolving an unknown provider kind.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, err, _) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": { "chat-v1": "ghost:gpt-5" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            err["error"].as_str().unwrap_or_default().contains("ghost"),
+            "the error names the slug that resolved to nothing: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tier_this_runtime_does_not_have_is_refused() {
+        // The five-row trap: `coding` maps onto the same `agentic-v1` tier as
+        // `agentic`, so a `coding-v1` route would write one tier's route under a
+        // second name and setting one would silently change the other.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, _, _) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": { "coding-v1": "managed" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_routing_mode_is_inferred_from_the_routes() {
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (_, routes, _) = send(&state, "GET", "/api/v1/company/inference/routes", None).await;
+        assert_eq!(routes["mode"], "managed", "nothing set is managed");
+
+        send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/providers",
+            Some(json!({ "kind": "custom", "label": "Acme", "baseUrl": UNREACHABLE })),
+        )
+        .await;
+        let (_, routes, _) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": {
+                "chat-v1": "acme:gpt-5",
+                "reasoning-v1": "acme:gpt-5",
+                "agentic-v1": "acme:gpt-5",
+                "vision-v1": "acme:gpt-5",
+            }})),
+        )
+        .await;
+        assert_eq!(routes["mode"], "own", "every row the same is own");
+
+        let (_, routes, _) = send(
+            &state,
+            "PUT",
+            "/api/v1/company/inference/routes",
+            Some(json!({ "routes": {
+                "chat-v1": "acme:gpt-5",
+                "reasoning-v1": "managed",
+            }})),
+        )
+        .await;
+        assert_eq!(routes["mode"], "advanced");
+    }
+
+    #[tokio::test]
+    async fn the_draft_probe_refuses_the_metadata_address() {
+        // The SSRF answer, made explicitly rather than inherited. That range is
+        // where a container's credentials live and a company's model endpoint is
+        // never there.
+        let home_dir = home();
+        let home = home_dir.path().to_path_buf();
+        let state = state_with_company(&home).await;
+
+        let (status, resp, raw) = send(
+            &state,
+            "POST",
+            "/api/v1/company/inference/probe",
+            Some(json!({ "baseUrl": "http://169.254.169.254/latest/meta-data", "key": "sk-not-a-real-key" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{raw}");
+        assert_eq!(resp["ok"], false);
+        assert_eq!(resp["class"], "endpoint");
     }
 
     // --- Issue #266: a save the running brain cannot honour --------------------

@@ -398,11 +398,20 @@ fn is_loopback_origin(origin: &str) -> bool {
 
 /// `POST …/credential/link/finish` — redeem the code and store what comes back.
 ///
-/// One key lands in **two** places: `tinyhumans/key`, the company's identity for
-/// everything the platform brokers, and `inference/key` on the `managed`
-/// provider, so the same grant that connects the company also gives its agents
-/// something to think with. That is the whole point of the flow — an admin who
-/// had to run it twice, once per page, would be back to two errands.
+/// The key lands in **one** place: `tinyhumans/key`, the company's identity for
+/// everything the platform brokers. The same grant still gives its agents
+/// something to think with, which is the whole point of the flow — but by
+/// *resolution* rather than by a copy, because
+/// [`resolve_effective`](crate::company::inference::resolve_effective) now reads
+/// the company's account key for a managed provider.
+///
+/// It used to write the key into `inference/key` as well, and that copy was two
+/// bugs. It went **stale**: rotating the account key through the ordinary route
+/// left the inference copy presenting the old value until someone replaced it
+/// separately. And it **misrouted**: it was stored with `provider: "managed"`,
+/// which `normalize_provider` folded onto `openrouter` before the managed branch
+/// was consulted, so a `th_…` key was presented as a bearer to `openrouter.ai`.
+/// With one slot and one resolution seam neither is reachable (issue #2266).
 async fn finish_link(
     State(state): State<AppState>,
     company: AdminScopedCompany,
@@ -437,14 +446,12 @@ async fn finish_link(
     store_key(runtime.id(), runtime.secrets().as_ref(), &key)
         .await
         .map_err(ApiError)?;
-    crate::company::inference::store_key(runtime.id(), runtime.secrets().as_ref(), &key)
-        .await
-        .map_err(ApiError)?;
     // The key alone does not arm inference: with no runtime declaration the
-    // status route reports the platform default and `keyConfigured: false`, so
-    // an operator would see a company that is connected but still cannot think.
-    // Declaring `managed` is what makes the stored key the one its turns are
-    // billed to — the same provider the Inference page's TinyHumans option sets.
+    // status route reports the platform default, so an operator would see a
+    // company that is connected but still cannot think. Declaring `managed` is
+    // what points its turns at the platform endpoint — and that is also what
+    // makes the company's own account key the credential they travel with,
+    // since an identity reaches a vendor only when the vendor is its own.
     crate::company::inference::save_runtime_config(
         runtime.id(),
         runtime.secrets().as_ref(),
