@@ -661,17 +661,19 @@ impl<'a> CycleRunner<'a> {
             drop(guard);
             return Err(err);
         }
-        for id in events.iter().filter_map(|(_, event)| match event {
-            CompanyEvent::ApprovalResolved { approval_id, .. }
-                if self.rt.grants.peek(approval_id).is_some() =>
-            {
-                Some(approval_id)
-            }
-            _ => None,
-        }) {
+        let claimed_grants: Vec<GrantedCall> = events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                CompanyEvent::ApprovalResolved { approval_id, .. } => {
+                    self.rt.grants.peek(approval_id)
+                }
+                _ => None,
+            })
+            .collect();
+        for grant in &claimed_grants {
             self.rt
                 .journal
-                .record_grant_dispatched(id, now_millis())
+                .record_grant_dispatched(&grant.approval_id, now_millis())
                 .await?;
         }
         let mut claimed: Vec<ApprovalContinuation> = Vec::new();
@@ -716,6 +718,17 @@ impl<'a> CycleRunner<'a> {
             self.run_locked(events, cycle_id.clone(), run_id, &mut effects),
         )
         .await;
+        for grant in &claimed_grants {
+            if self.rt.grants.peek(&grant.approval_id).is_some()
+                && let Err(err) = self.rt.journal.record_granted(grant).await
+            {
+                tracing::warn!(
+                    approval_id = %grant.approval_id,
+                    error = %err,
+                    "[approval] an unused single-use grant could not be re-armed after its turn"
+                );
+            }
+        }
         if outcome.is_ok() {
             // Harness cognition consumes while redispatching and run_locked
             // journals that buffered fact. Hosted and sidecar cognition instead
@@ -7149,81 +7162,115 @@ members = ["writer"]
         );
     }
 
-    /// Two grants consumed concurrently before their ordinary cycle drain stay
-    /// spent across a restart.
+    /// A restart inside the window between grant redemption and the cycle drain
+    /// must not re-arm the call.
     #[tokio::test]
-    async fn two_undrained_consumptions_stay_spent_after_a_restart() {
+    async fn an_undrained_consumption_stays_spent_during_a_restart() {
+        struct ConsumingBrain {
+            effect: Effect,
+            grants: Arc<std::sync::Mutex<Option<crate::runtime::grants::GrantSet>>>,
+            consumed: Arc<tokio::sync::Barrier>,
+            release: Arc<tokio::sync::Barrier>,
+        }
+
+        #[async_trait]
+        impl Brain for ConsumingBrain {
+            async fn run_cycle(
+                &self,
+                req: CycleRequest,
+                host: &dyn CycleHost,
+            ) -> Result<CycleResult> {
+                for event in &req.events {
+                    match event {
+                        CompanyEvent::OperatorMessage { .. } => {
+                            host.park_effect(self.effect.clone()).await?;
+                        }
+                        CompanyEvent::ApprovalResolved { .. } => {
+                            let grants = self
+                                .grants
+                                .lock()
+                                .expect("grant slot")
+                                .clone()
+                                .expect("runtime grant set installed");
+                            assert!(
+                                grants
+                                    .consume(
+                                        "finance",
+                                        "composio_execute",
+                                        &serde_json::json!({ "to": "a@b.test" }),
+                                    )
+                                    .is_some(),
+                                "the approved call is redeemed inside the follow-up turn"
+                            );
+                            self.consumed.wait().await;
+                            self.release.wait().await;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(CycleResult {
+                    channel_responses: Vec::new(),
+                    new_traces: Vec::new(),
+                    ledger_deltas: Vec::new(),
+                    token_usage: TokenUsage::default(),
+                })
+            }
+        }
+
         let home_dir = tmp_home();
         let home = home_dir.path().to_path_buf();
-        let (rt, ids) = park_two_blocked_tool_calls(
-            home.clone(),
-            harness_effect(
-                "finance",
-                "composio_execute",
-                serde_json::json!({ "to": "a@b.test" }),
-            ),
-        )
-        .await;
-        rt.resolve_approval(&ids[0], Verdict::Approve, operator())
-            .await
-            .unwrap();
-        rt.resolve_approval(&ids[1], Verdict::Approve, operator())
-            .await
-            .unwrap();
-        assert_eq!(rt.grants.live_count(), 2, "both tool calls were granted");
-
-        // Both tools run at roughly the same moment — a real race between the
-        // two `consume` calls, on real OS threads, neither drained before the
-        // crash this test models.
-        let args = serde_json::json!({ "to": "a@b.test" });
-        let barrier = Arc::new(std::sync::Barrier::new(2));
-        let handles: Vec<_> = (0..2)
-            .map(|_| {
-                let grants = rt.grants.clone();
-                let args = args.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    grants
-                        .consume("finance", "composio_execute", &args)
-                        .is_some()
-                })
-            })
-            .collect();
-        for h in handles {
-            assert!(
-                h.join().expect("thread"),
-                "both concurrent tool calls were admitted"
-            );
-        }
-        assert_eq!(rt.grants.live_count(), 0, "both grants were redeemed");
-        // Neither drain ran — nothing journals the consumption before the
-        // crash this test models.
-        drop(rt);
-
-        let restarted = Arc::new(
-            RuntimeBuilder::fs_defaults(home, manifest("supervised"))
+        let grants = Arc::new(std::sync::Mutex::new(None));
+        let consumed = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let rt = Arc::new(
+            RuntimeBuilder::new(home.clone(), manifest("supervised"))
+                .with_brain(Arc::new(ConsumingBrain {
+                    effect: harness_effect(
+                        "finance",
+                        "composio_execute",
+                        serde_json::json!({ "to": "a@b.test" }),
+                    ),
+                    grants: Arc::clone(&grants),
+                    consumed: Arc::clone(&consumed),
+                    release: Arc::clone(&release),
+                }))
+                .build()
                 .await
                 .unwrap(),
         );
+        *grants.lock().expect("grant slot") = Some(rt.grants.clone());
+        let report = rt
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                mentions: Vec::new(),
+                parent: None,
+                text: "do it".into(),
+                by: None,
+                chat: None,
+                deliverable: None,
+                attachments: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let id = report.parked[0].clone();
+        let resolving = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(
+                async move { rt.resolve_approval(&id, Verdict::Approve, operator()).await },
+            )
+        };
+        consumed.wait().await;
+        assert_eq!(rt.grants.live_count(), 0, "the grant was redeemed");
+
+        let restarted = RuntimeBuilder::fs_defaults(home, manifest("supervised"))
+            .await
+            .unwrap();
         assert_eq!(
             restarted.grants.live_count(),
             0,
-            "a dispatch claim must keep both undrained consumptions spent"
+            "a dispatch claim must keep an undrained consumption spent"
         );
-        for id in &ids {
-            assert!(
-                restarted.grants.peek(id).is_none(),
-                "a dispatched single-use grant must not replay: {id}"
-            );
-        }
-        assert!(
-            restarted
-                .grants
-                .consume("finance", "composio_execute", &args)
-                .is_none(),
-            "the identical call must not be admitted again after restart"
-        );
+        release.wait().await;
+        resolving.await.expect("follow-up task").unwrap();
     }
 
     /// Issue #243: a grant the agent never redeemed expires, is journaled, and
