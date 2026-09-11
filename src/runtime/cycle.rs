@@ -661,6 +661,19 @@ impl<'a> CycleRunner<'a> {
             drop(guard);
             return Err(err);
         }
+        for id in events.iter().filter_map(|(_, event)| match event {
+            CompanyEvent::ApprovalResolved { approval_id, .. }
+                if self.rt.grants.peek(approval_id).is_some() =>
+            {
+                Some(approval_id)
+            }
+            _ => None,
+        }) {
+            self.rt
+                .journal
+                .record_grant_dispatched(id, now_millis())
+                .await?;
+        }
         let mut claimed: Vec<ApprovalContinuation> = Vec::new();
         for continuation in continuation_claims {
             if let Err(error) = self
@@ -7136,21 +7149,10 @@ members = ["writer"]
         );
     }
 
-    /// The boot-time twin of `grants_replay_on_boot_but_a_spent_one_does_not`:
-    /// this is what happens when the restart lands **before** the cycle's own
-    /// drain journals the consumption, rather than after. Two different
-    /// agents' tool calls are running when the crash hits — a routine shape
-    /// under real traffic, not a corner case — and neither had reached the
-    /// drain yet. Both must re-arm on replay, both must keep their **original**
-    /// mint time rather than being handed a fresh TTL by the restart (so the
-    /// duplication window this leaves stays bounded by the grant's own
-    /// [`GRANT_TTL_MILLIS`], not extended indefinitely by however many times
-    /// the process happens to restart), and both must re-admit their exact
-    /// original call a second time — the concrete, exploitable shape of the
-    /// window TOOL-005 documents, now proven at the boot path GRANT-004 names
-    /// rather than only at the bare journal file.
+    /// Two grants consumed concurrently before their ordinary cycle drain stay
+    /// spent across a restart.
     #[tokio::test]
-    async fn two_undrained_consumptions_both_re_arm_and_re_admit_after_a_restart() {
+    async fn two_undrained_consumptions_stay_spent_after_a_restart() {
         let home_dir = tmp_home();
         let home = home_dir.path().to_path_buf();
         let (rt, ids) = park_two_blocked_tool_calls(
@@ -7169,10 +7171,6 @@ members = ["writer"]
             .await
             .unwrap();
         assert_eq!(rt.grants.live_count(), 2, "both tool calls were granted");
-        let original_at_millis: Vec<u64> = ids
-            .iter()
-            .map(|id| rt.grants.peek(id).unwrap().at_millis)
-            .collect();
 
         // Both tools run at roughly the same moment — a real race between the
         // two `consume` calls, on real OS threads, neither drained before the
@@ -7210,38 +7208,22 @@ members = ["writer"]
         );
         assert_eq!(
             restarted.grants.live_count(),
-            2,
-            "both undrained consumptions must re-arm on the next boot"
+            0,
+            "a dispatch claim must keep both undrained consumptions spent"
         );
-        for (id, expected_at_millis) in ids.iter().zip(original_at_millis) {
-            let replayed = restarted
-                .grants
-                .peek(id)
-                .expect("each grant replays as live");
-            assert_eq!(
-                replayed.at_millis, expected_at_millis,
-                "a restart must not reset a re-armed grant's clock — its TTL exposure stays \
-                 bounded by the ORIGINAL mint time, not extended by the crash"
+        for id in &ids {
+            assert!(
+                restarted.grants.peek(id).is_none(),
+                "a dispatched single-use grant must not replay: {id}"
             );
         }
-
-        // The exploitable shape: the identical call each agent already made
-        // once is admitted again, with no new approval anywhere in between.
         assert!(
             restarted
                 .grants
                 .consume("finance", "composio_execute", &args)
-                .is_some(),
-            "the first re-armed grant re-admits its already-executed call"
+                .is_none(),
+            "the identical call must not be admitted again after restart"
         );
-        assert!(
-            restarted
-                .grants
-                .consume("finance", "composio_execute", &args)
-                .is_some(),
-            "the second re-armed grant re-admits its already-executed call too"
-        );
-        assert_eq!(restarted.grants.live_count(), 0);
     }
 
     /// Issue #243: a grant the agent never redeemed expires, is journaled, and
