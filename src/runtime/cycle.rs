@@ -11208,6 +11208,58 @@ members = ["writer"]
         );
     }
 
+    /// A standing *denial* is the half of this that fails open when it is lost:
+    /// an operator who refused a tool for good gets that refusal silently
+    /// forgotten, and the next boot admits the call again. It must survive the
+    /// same plain `RuntimeBuilder::build` reboot an approval does.
+    #[tokio::test]
+    async fn a_standing_denial_survives_a_restart() {
+        let home_dir = tmp_home();
+        let home = home_dir.path().to_path_buf();
+        let (rt, id) = park_one_blocked_tool_call(
+            home.clone(),
+            grantable_effect(
+                "ops",
+                crate::policy::consequence::WEB_FETCH,
+                serde_json::json!({ "url": "https://docs.rs/x" }),
+            ),
+        )
+        .await;
+
+        let (_, follow_up) = rt
+            .resolve_approval_spawned(&id, Verdict::Deny, operator(), tool_scope())
+            .await
+            .unwrap();
+        let _ = crate::company::runtime::join_follow_up(follow_up).await;
+        let refused = rt.standing_grants()[0].clone();
+        assert_eq!(refused.verdict, Verdict::Deny);
+
+        let rebooted = Arc::new(
+            RuntimeBuilder::new(home, manifest("supervised"))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let replayed = rebooted.standing_grants();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "a restart must not forget a refusal the operator made stand"
+        );
+        assert_eq!(replayed[0].id, refused.id);
+        assert_eq!(
+            replayed[0].verdict,
+            Verdict::Deny,
+            "it must come back as a refusal, not as a permission"
+        );
+        assert_eq!(
+            replayed[0].scope.as_deref(),
+            refused.scope.as_deref(),
+            "and refusing exactly what it refused before"
+        );
+    }
+
     /// Issue #1458: when two identical cards park and the operator resolves the
     /// first as a standing **denial** and the second as a standing **approval**,
     /// the newer decision wins. `ApprovalPolicy` checks a deny above a standing
@@ -12129,6 +12181,10 @@ members = ["writer"]
     }
 
     /// Standing grants survive a restart, and revoking one is durable too.
+    ///
+    /// The reboots here take the path `serve` takes — `RuntimeBuilder::build`
+    /// and nothing else. `recover()` is not called, because no production
+    /// caller calls it.
     #[tokio::test]
     async fn a_standing_grant_replays_on_boot_and_a_revoked_one_does_not() {
         let home_dir = tmp_home();
@@ -12153,7 +12209,6 @@ members = ["writer"]
                 .await
                 .unwrap(),
         );
-        rt2.recover().await.unwrap();
         assert_eq!(rt2.grants.standing_count(), 1);
         assert_eq!(rt2.standing_grants()[0].id, grant_id);
 
@@ -12177,7 +12232,6 @@ members = ["writer"]
                 .await
                 .unwrap(),
         );
-        rt3.recover().await.unwrap();
         assert_eq!(
             rt3.grants.standing_count(),
             0,

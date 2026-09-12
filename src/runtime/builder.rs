@@ -2521,6 +2521,9 @@ impl RuntimeBuilder {
                 grants.rehydrate(journal.replayed_grants());
                 grants.rehydrate_continuations(journal.replayed_approval_continuations());
                 grants.rehydrate_blocker_resolutions(journal.replayed_blocker_resolutions());
+                grants.rehydrate_standing(
+                    journal.replayed_standing_grants(crate::ports::now_millis()),
+                );
                 grants
             }
         };
