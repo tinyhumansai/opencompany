@@ -910,14 +910,8 @@ export function blockerVerdictLabel(verdict: BlockerVerdict): string {
  * rest on its label alone. Every arm says its consequence, so the two that
  * matter are not the only two that look explained.
  *
- * **Worded by step kind, not by one shared assumption.** A paused board card
- * and a stopped workflow-run node do different things on `skip` and `cancel`:
- * a card redispatches on skip (there is no card-level skip yet) and returns
- * to To-do on cancel, while a node produces nothing on skip and stops the run
- * on cancel. Describing the node's behaviour on a card's controls tells an
- * operator their click will do one thing when it does another. `stepKind`
- * absent — no step behind the blocker, or a host that predates the field —
- * falls back to wording that makes no claim either path would contradict.
+ * Task and node blockers have different skip and cancel outcomes. When the
+ * step kind is absent, use wording that is valid for either path.
  */
 export function blockerVerdictConsequence(
   verdict: BlockerVerdict,
@@ -930,7 +924,7 @@ export function blockerVerdictConsequence(
       case "amend":
         return "Puts the card back in progress and runs it again with what you write.";
       case "skip":
-        return "Puts the card back in progress and runs it again — there is no separate skip for a card yet.";
+        return "Moves the card to In review without running it again. No output is produced.";
       case "cancel":
         return "Moves the card back to To-do without running it. It can be picked up again later.";
     }

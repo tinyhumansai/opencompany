@@ -354,12 +354,11 @@ impl BlockerVerdict {
         })
     }
 
-    /// Whether this verdict **re-enters** the stopped step.
+    /// Whether this verdict permits a follow-up after the stopped step.
     ///
-    /// Every verdict but [`Cancel`](Self::Cancel) resumes: a retry runs the step
-    /// again, an amend runs it with the answer, a skip proceeds past it. Cancel
-    /// abandons the work and starts nothing — the one place the resume fork
-    /// short-circuits before any cycle.
+    /// This does not decide whether a task card dispatches: a task skip settles
+    /// without another run, while a node skip re-enters its workflow past the
+    /// node. Cancel abandons either kind and starts nothing.
     pub fn resumes(self) -> bool {
         !matches!(self, Self::Cancel)
     }
@@ -452,8 +451,8 @@ impl BlockerResolution {
         self
     }
 
-    /// Whether resolving with this re-enters the stopped step — a shorthand for
-    /// [`BlockerVerdict::resumes`].
+    /// Whether resolving permits a follow-up — a shorthand for
+    /// [`BlockerVerdict::resumes`]. Task routing may settle without dispatch.
     pub fn resumes(&self) -> bool {
         self.verdict.resumes()
     }

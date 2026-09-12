@@ -1825,33 +1825,32 @@ impl CompanyRuntime {
         }
     }
 
-    /// Files the durable "a blocker was answered, picking it back up"
-    /// notification (issue #2008), the settle-side counterpart to
-    /// [`notify_blocker_parked`](Self::notify_blocker_parked).
-    ///
-    /// The park badged the operator that a person was blocked; nothing badged
-    /// them when the answer landed and the work resumed. Filed on the same DM
-    /// thread with the same thin `Approval` subject, so a console that folds
-    /// blocker badges by conversation clears the parked one and shows that the
-    /// stopped step is moving again. Best-effort — the resume already stands —
-    /// and a no-op for a blocker raised in no conversation, which has no thread
-    /// to badge.
+    /// Files the durable blocker-answer notification on the original DM thread.
+    /// Best-effort: the resolution already stands if this write fails.
     #[cfg(feature = "openhuman")]
     async fn notify_blocker_resumed(
         &self,
         id: &ApprovalId,
         thread: Option<&str>,
         resolution: &crate::ports::blockers::BlockerResolution,
+        step: Option<&crate::ports::blockers::BlockerStep>,
     ) {
-        use crate::ports::blockers::BlockerStep;
+        use crate::ports::blockers::{BlockerStep, BlockerVerdict};
         let Some(thread) = thread else {
             return;
         };
         let sender = thread.strip_prefix("dm:").unwrap_or(thread);
-        let step = match &resolution.step {
+        let step_id = match step {
             Some(BlockerStep::Task { task_id }) => task_id.clone(),
             Some(BlockerStep::Node { node_id, .. }) => node_id.clone(),
             None => "a question".to_string(),
+        };
+        let title = if resolution.verdict == BlockerVerdict::Skip
+            && matches!(step, Some(BlockerStep::Task { .. }))
+        {
+            format!("{sender}'s blocker on {step_id} was waived")
+        } else {
+            format!("{sender}'s blocker on {step_id} was answered — picking it back up")
         };
         let note = crate::ports::notifications::Notification {
             id: crate::ports::generate_id(),
@@ -1861,7 +1860,7 @@ impl CompanyRuntime {
                 id: id.as_ref().to_string(),
             },
             created_at: now_millis(),
-            title: format!("{sender}'s blocker on {step} was answered — picking it back up"),
+            title,
             audience: None,
             context: Some(thread.to_string()),
         };
@@ -2861,20 +2860,9 @@ impl CompanyRuntime {
         })
     }
 
-    /// Re-enters the step a resolved blocker stopped, carrying the operator's
-    /// answer (issue #1863) — the resume half `park_blocker` deliberately left
-    /// inert.
-    ///
-    /// The fork the whole tier turns on, reached from
-    /// [`spawn_follow_up`](Self::spawn_follow_up) once the verdict is durable.
-    /// A resuming verdict re-dispatches the stopped work carrying the answer; a
-    /// [`Cancel`](crate::ports::blockers::BlockerVerdict::Cancel) settles it and
-    /// starts nothing — the short-circuit that runs *before* any cycle. Which
-    /// step is re-entered is read off the blocker's own
-    /// [`BlockerStep`](crate::ports::blockers::BlockerStep): a board card is
-    /// moved back into In Progress so its dispatch edge fires; a workflow node
-    /// is handed the answer for its run; a bare agent question just carries the
-    /// answer back into the DM it was asked in.
+    /// Applies a durable blocker verdict to its task, workflow node, or DM.
+    /// Retry and amend re-dispatch task work; task skip and cancel settle it
+    /// without another run. Node verdicts retain their workflow semantics.
     ///
     /// The step rides on the resolution itself — the journal scrubs a parked
     /// effect's payload, so it is captured at resolve time — while the DM thread
@@ -2919,7 +2907,7 @@ impl CompanyRuntime {
         }
         outcome?;
         if resolution.resumes() {
-            self.notify_blocker_resumed(approval_id, thread.as_deref(), &resolution)
+            self.notify_blocker_resumed(approval_id, thread.as_deref(), &resolution, step.as_ref())
                 .await;
         }
         Ok(CycleRunner::new(self).already_resolved_report())
@@ -2987,24 +2975,29 @@ impl CompanyRuntime {
         thread: Option<&str>,
         origin_parent: Option<EventSeq>,
     ) -> Result<()> {
-        use crate::ports::blockers::BlockerStep;
+        use crate::ports::blockers::{BlockerStep, BlockerVerdict};
 
-        match step {
-            Some(BlockerStep::Task { task_id }) => {
-                if resolution.resumes() {
-                    self.resume_task_card(task_id, resolution, thread, origin_parent)
-                        .await
-                } else {
-                    self.cancel_task_card(task_id, thread, origin_parent).await
-                }
+        match (step, resolution.verdict) {
+            (Some(BlockerStep::Task { task_id }), BlockerVerdict::Skip) => {
+                self.skip_task_card(task_id, thread, origin_parent).await
             }
-            Some(BlockerStep::Node { run_id, node_id }) => {
+            (Some(BlockerStep::Task { task_id }), BlockerVerdict::Cancel) => {
+                self.cancel_task_card(task_id, thread, origin_parent).await
+            }
+            (
+                Some(BlockerStep::Task { task_id }),
+                BlockerVerdict::Retry | BlockerVerdict::Amend,
+            ) => {
+                self.resume_task_card(task_id, resolution, thread, origin_parent)
+                    .await
+            }
+            (Some(BlockerStep::Node { run_id, node_id }), _) => {
                 self.resume_node_blocker(run_id, node_id, resolution, thread, origin_parent)
                     .await
             }
             // A question with no card or node behind it — carrying the answer
             // back into its DM is the whole of the resume.
-            None => {
+            (None, _) => {
                 self.post_blocker_resume_note(
                     thread,
                     origin_parent,
@@ -3094,6 +3087,50 @@ impl CompanyRuntime {
         drop(_serialized);
         self.post_blocker_resume_note(thread, origin_parent, &blocker_resume_note(resolution))
             .await
+    }
+
+    #[cfg(feature = "openhuman")]
+    async fn skip_task_card(
+        self: &Arc<Self>,
+        task_id: &str,
+        thread: Option<&str>,
+        origin_parent: Option<EventSeq>,
+    ) -> Result<()> {
+        let _serialized = self.task_writes.lock().await;
+        let Some(mut card) = self
+            .ops
+            .tasks
+            .list(&self.id)
+            .await?
+            .into_iter()
+            .find(|task| task.id == task_id)
+        else {
+            return Ok(());
+        };
+        if card.column != crate::ports::tasks::COLUMN_PAUSED {
+            return Ok(());
+        }
+        card.note = Some(crate::runtime::advance::append_result(
+            card.note.as_deref(),
+            "operator",
+            BLOCKER_WAIVED,
+        ));
+        if let Some(thread) = thread {
+            card.origin =
+                crate::ports::tasks::TaskOrigin::new(Some(thread.to_string()), origin_parent);
+        }
+        card.column = crate::ports::tasks::COLUMN_IN_REVIEW.to_string();
+        card.output = None;
+        card.bounced = None;
+        card.updated_at_millis = now_millis();
+        self.ops.tasks.upsert(&self.id, &card).await?;
+        drop(_serialized);
+        self.post_blocker_resume_note(
+            thread,
+            origin_parent,
+            "Okay — I've waived that blocker. The card is in review; nothing ran again.",
+        )
+        .await
     }
 
     /// Settles a blocked card the operator cancelled, moving it back to To-do
@@ -7876,6 +7913,9 @@ pub(crate) enum BlockerReplyPlan {
 #[cfg(feature = "openhuman")]
 const BLOCKER_CANCELLED: &str =
     "cancelled from the blocker chat — the work was stopped, not failed";
+
+#[cfg(feature = "openhuman")]
+const BLOCKER_WAIVED: &str = "blocker question waived by the operator — no work was run";
 
 /// The one line posted back into a blocker's DM when its answer re-enters the
 /// stopped step (issue #1863), phrased per verdict so the operator sees what
@@ -13982,7 +14022,8 @@ mod tests {
         use crate::company::task_intent::BlockerReplyIntent;
         use crate::ports::blockers::{BlockerKind, BlockerPayload, BlockerSource, BlockerStep};
         use crate::ports::tasks::{
-            COLUMN_IN_PROGRESS, COLUMN_PAUSED, COLUMN_TODO, TaskDeliverable, TaskRecord, TaskTitle,
+            COLUMN_IN_PROGRESS, COLUMN_IN_REVIEW, COLUMN_PAUSED, COLUMN_TODO, TaskDeliverable,
+            TaskRecord, TaskTitle,
         };
         use crate::ports::types::CompanyId;
         use std::path::Path;
@@ -14011,6 +14052,14 @@ mod tests {
                 .tempdir()
                 .expect("tempdir");
             let runtime = build(home.path()).await;
+            (runtime, home)
+        }
+
+        async fn runtime_with_harness() -> (Arc<CompanyRuntime>, TempDir) {
+            let (mut runtime, home) = runtime().await;
+            Arc::get_mut(&mut runtime)
+                .expect("runtime is not shared yet")
+                .set_harness(Arc::new(crate::harness::HarnessPool::new()));
             (runtime, home)
         }
 
@@ -14147,12 +14196,15 @@ mod tests {
             );
         }
 
-        /// A skip proceeds past the blocker — the card re-dispatches without a
-        /// correction.
         #[tokio::test]
-        async fn skip_redispatches_the_paused_card() {
-            let (runtime, _home) = runtime().await;
-            seed(&runtime, &card("t-1", COLUMN_PAUSED)).await;
+        async fn skip_settles_the_paused_card_without_another_run() {
+            use crate::ports::runs::RunFilter;
+
+            let (runtime, _home) = runtime_with_harness().await;
+            let mut paused = card("t-1", COLUMN_PAUSED);
+            paused.origin = crate::ports::TaskOrigin::new(Some("general".to_string()), None);
+            paused.bounced = Some("an older attempt failed".to_string());
+            seed(&runtime, &paused).await;
             runtime
                 .park_blocker(&blocker("t-1"), "t-1", assignee("eng"))
                 .await
@@ -14168,7 +14220,46 @@ mod tests {
                 .await
                 .expect("resumes");
 
-            assert_eq!(stored(&runtime, "t-1").await.column, COLUMN_IN_PROGRESS);
+            let runs = runtime
+                .runs()
+                .list_runs(runtime.id(), &RunFilter::for_task("t-1"))
+                .await
+                .expect("list runs");
+            assert_eq!(runs.len(), 0, "a skip must not open another attempt");
+
+            let after = stored(&runtime, "t-1").await;
+            assert_eq!(after.column, COLUMN_IN_REVIEW);
+            assert!(after.output.is_none());
+            assert!(after.bounced.is_none());
+            assert_eq!(after.origin_chat_id(), Some("dm:eng"));
+            assert!(
+                after
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("blocker question waived by the operator"))
+            );
+
+            let replies = dm_notes(&runtime).await;
+            assert!(replies.iter().any(|reply| {
+                reply
+                    == "Okay — I've waived that blocker. The card is in review; nothing ran again."
+            }));
+
+            let notification = runtime
+                .notifications()
+                .list(runtime.id(), "eng")
+                .await
+                .expect("notifications")
+                .into_iter()
+                .find(|notification| notification.notification.kind == "blocker_resumed")
+                .expect("settle notification");
+            assert!(notification.notification.title.contains("was waived"));
+            assert!(
+                !notification
+                    .notification
+                    .title
+                    .contains("picking it back up")
+            );
         }
 
         /// A cancel settles the card and starts nothing: it lands back in To-do
@@ -14466,9 +14557,8 @@ mod tests {
         /// Every resume acknowledgement lands in the thread the question was
         /// asked in, not at the channel root.
         ///
-        /// The anchor is the one the approval recorded when it parked, and it
-        /// reaches all three resumes — a card re-entered, a card cancelled, and
-        /// a workflow node. Driven directly because `park_blocker` records no
+        /// The anchor is the one the approval recorded when it parked. Driven
+        /// directly because `park_blocker` records no
         /// parent of its own: only an `escalate_to_human` park carries one, and
         /// what is under test is that each resume passes on the anchor it is
         /// handed rather than dropping it.
@@ -14483,6 +14573,10 @@ mod tests {
                     "Okay — I've cancelled that. It's back in To-do if you want to pick it up \
                      later.",
                 ),
+                (
+                    BlockerVerdict::Skip,
+                    "Okay — I've waived that blocker. The card is in review; nothing ran again.",
+                ),
             ] {
                 let (runtime, _home) = runtime().await;
                 seed(&runtime, &card("t-1", COLUMN_PAUSED)).await;
@@ -14493,16 +14587,20 @@ mod tests {
                     step: None,
                 };
 
-                if verdict == BlockerVerdict::Cancel {
-                    runtime
+                match verdict {
+                    BlockerVerdict::Cancel => runtime
                         .cancel_task_card("t-1", Some("dm:eng"), Some(root))
                         .await
-                        .expect("cancels");
-                } else {
-                    runtime
+                        .expect("cancels"),
+                    BlockerVerdict::Skip => runtime
+                        .skip_task_card("t-1", Some("dm:eng"), Some(root))
+                        .await
+                        .expect("skips"),
+                    BlockerVerdict::Retry => runtime
                         .resume_task_card("t-1", &resolution, Some("dm:eng"), Some(root))
                         .await
-                        .expect("resumes");
+                        .expect("resumes"),
+                    BlockerVerdict::Amend => unreachable!(),
                 }
 
                 let threaded: Vec<Option<crate::ports::types::EventSeq>> = dm_replies(&runtime)
@@ -14588,7 +14686,7 @@ mod tests {
         /// A card an operator has since dragged out of `paused` is theirs — a
         /// resume must not yank it back, exactly as the expiry mover leaves it.
         #[tokio::test]
-        async fn a_card_moved_out_of_paused_is_not_yanked_back() {
+        async fn a_skip_leaves_a_card_moved_out_of_paused_alone() {
             let (runtime, _home) = runtime().await;
             seed(&runtime, &card("t-1", COLUMN_TODO)).await;
             runtime
@@ -14602,7 +14700,7 @@ mod tests {
                 .collect();
 
             runtime
-                .apply_blocker_reply(&ids, BlockerReplyIntent::Retry, "retry", None)
+                .apply_blocker_reply(&ids, BlockerReplyIntent::Skip, "skip", None)
                 .await
                 .expect("resumes");
 

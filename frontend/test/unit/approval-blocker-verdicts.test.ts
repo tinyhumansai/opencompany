@@ -218,15 +218,6 @@ describe("a blocker card offers four verdicts, not two", () => {
   });
 });
 
-/**
- * **The headline finding from the second review round on #2028.** The four
- * consequence lines were worded for a workflow node and rendered on every
- * `blocker.*` card, including a paused board card — whose `skip` in fact
- * redispatches the card (there is no card-level skip yet) and whose `cancel`
- * returns it to To-do rather than stopping a run. An operator reading the
- * node's wording on a card would click Skip expecting the work omitted and
- * get it re-run instead.
- */
 describe("a blocker's consequence is worded by which step it stopped", () => {
   it("gives retry, skip and cancel a different sentence for a card than for a node", () => {
     for (const verdict of ["retry", "skip", "cancel"] as BlockerVerdict[]) {
@@ -239,14 +230,12 @@ describe("a blocker's consequence is worded by which step it stopped", () => {
     }
   });
 
-  it("does not put the node's skip/cancel claims on a task-backed card", () => {
+  it("describes the task skip landing without another run", () => {
     const skip = blockerVerdictConsequence("skip", "task");
     const cancel = blockerVerdictConsequence("cancel", "task");
-    // The node's skip claims the work produces nothing; a card's skip in fact
-    // redispatches it (`resume_task_card` treats skip and retry alike).
-    expect(skip).not.toMatch(/produces nothing/i);
-    // The node's cancel claims it stops a run; a card has no run to stop — it
-    // returns to To-do.
+    expect(skip).toMatch(/in review/i);
+    expect(skip).toMatch(/without running it again/i);
+    expect(skip).toMatch(/no output is produced/i);
     expect(cancel).not.toMatch(/stops the run/i);
     expect(cancel).toMatch(/to-do/i);
   });

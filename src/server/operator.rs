@@ -11855,18 +11855,10 @@ mode = "full"
         assert!(banked_resolutions(&home, &company).await.is_empty());
     }
 
-    /// A blocker raised by `escalate_to_human` carries no
-    /// [`BlockerStep`](crate::ports::blockers::BlockerStep) — the tool holds
-    /// neither a card nor a node — so the resume falls back to the card the
-    /// approval is linked to, and answering re-dispatches it.
-    ///
-    /// The banked resolution is still stepless, and that assertion is
-    /// load-bearing rather than incidental: the fallback is read at resume
-    /// time, so the durable record keeps saying what the blocker actually
-    /// carried instead of being rewritten to claim a step it never had.
+    /// A stepless blocker uses its task link to settle the card it paused.
     #[cfg(feature = "openhuman")]
     #[tokio::test]
-    async fn an_agent_question_re_dispatches_the_card_its_approval_is_linked_to() {
+    async fn skipping_an_agent_question_settles_the_card_its_approval_is_linked_to() {
         use crate::ports::blockers::{BlockerKind, BlockerPayload, BlockerSource};
         use crate::runtime::journal::{ApprovalConversation, TaskLink};
 
@@ -11892,14 +11884,22 @@ mode = "full"
                     origin: None,
                     origin_message_seq: None,
                     parent_task_id: None,
-                    output: None,
+                    output: Some(crate::ports::tasks::TaskOutput {
+                        source: crate::ports::tasks::TaskOutputSource::Run {
+                            run_id: "old-run".to_string(),
+                            attempt: Some(1),
+                        },
+                        at_millis: 1,
+                        artifacts: Vec::new(),
+                        workflows: Vec::new(),
+                    }),
                     plan: None,
                     planning_attempts: Vec::new(),
                     deliverable: crate::ports::tasks::TaskDeliverable::Once,
                     workflow_proposal: None,
                     origin_run_id: None,
                     origin_workflow_id: None,
-                    bounced: None,
+                    bounced: Some("stale failure".to_string()),
                 },
             )
             .await
@@ -11978,8 +11978,28 @@ mode = "full"
             .expect("the card still exists");
         assert_eq!(
             card.column,
-            crate::ports::tasks::COLUMN_IN_PROGRESS,
-            "the answer re-dispatches the linked card"
+            crate::ports::tasks::COLUMN_IN_REVIEW,
+            "the skipped card is ready for human review"
+        );
+        assert!(card.output.is_none(), "a skip produces no output");
+        assert!(card.bounced.is_none(), "a skip clears the old bounce chip");
+        assert_eq!(card.origin_chat_id(), Some("dm:eng"));
+        assert!(
+            card.note
+                .as_deref()
+                .is_some_and(|note| { note.contains("blocker question waived by the operator") })
+        );
+        assert!(
+            runtime
+                .runs()
+                .list_runs(
+                    runtime.id(),
+                    &crate::ports::runs::RunFilter::for_task("t-9"),
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "a skip must not open another attempt"
         );
     }
 

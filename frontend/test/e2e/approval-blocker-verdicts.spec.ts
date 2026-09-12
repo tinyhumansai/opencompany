@@ -74,15 +74,7 @@ function parkedBlocker() {
   };
 }
 
-/**
- * A parked blocker whose stopped step is a paused board card (#2028).
- *
- * `skip` and `cancel` do not do the same thing here that they do to a
- * workflow node: skip puts the card back in progress (there is no
- * card-level skip yet — see `resume_task_card` in `src/company/runtime.rs`)
- * and cancel returns it to To-do, neither of which is "produces nothing" or
- * "stops the run". The consequence text must say so, not the node's wording.
- */
+/** A parked blocker whose stopped step is a paused board card. */
 function parkedTaskBlocker() {
   return {
     ...parkedBlocker(),
@@ -275,14 +267,6 @@ test("a blocker card offers four verdicts where an ordinary card offers two", as
   await expect(page.getByText("Stops it here.", { exact: false })).toBeVisible();
 });
 
-/**
- * **The headline of #2028's follow-up.** A card's `skip` and `cancel` do not
- * do what a workflow node's do — a card redispatches on skip (there is no
- * card-level skip yet) and returns to To-do on cancel — so the consequence
- * line must say a different thing for each, and neither may be the node's
- * wording. Real DOM text, on the same three fixtures the resolve-body tests
- * below click through.
- */
 test("a blocker's consequence text is worded by which step it stopped, not one shared line", async ({
   page,
 }) => {
@@ -296,13 +280,10 @@ test("a blocker's consequence text is worded by which step it stopped, not one s
   await expect(node.getByText("Moves past this step. It produces nothing", { exact: false })).toBeVisible();
   await expect(node.getByText("Stops the run here. Nothing after this step will run.", { exact: false })).toBeVisible();
 
-  // The task card must NOT claim the node's behaviour — "produces nothing" /
-  // "stops the run" would tell the operator work is skipped or a run is
-  // halted when the card in fact redispatches on skip and only returns to
-  // To-do on cancel.
-  await expect(task.getByText("Moves past this step. It produces nothing", { exact: false })).toHaveCount(0);
+  await expect(task.getByText("Moves past this step", { exact: false })).toHaveCount(0);
   await expect(task.getByText("Stops the run here.", { exact: false })).toHaveCount(0);
-  await expect(task.getByText("Puts the card back in progress", { exact: false }).first()).toBeVisible();
+  await expect(task.getByText("Moves the card to In review without running it again", { exact: false })).toBeVisible();
+  await expect(task.getByText("No output is produced", { exact: false })).toBeVisible();
   await expect(task.getByText("Moves the card back to To-do without running it.", { exact: false })).toBeVisible();
 
   // A blocker with no step behind it (or an old host) must not borrow either
