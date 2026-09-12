@@ -110,6 +110,30 @@ impl TaskStore for FsOps {
         write_atomic(&path, &serde_json::to_string(&tasks)?).await
     }
 
+    async fn update_if_column(
+        &self,
+        company: &CompanyId,
+        task: &TaskRecord,
+        observed: &TaskRecord,
+        expected_column: &str,
+    ) -> Result<bool> {
+        if observed.id != task.id || observed.column != expected_column {
+            return Ok(false);
+        }
+        let bundle = self.bundle(company);
+        bundle.ensure_dirs().await?;
+        let path = bundle.tasks_json();
+        let lock = path_lock(&path);
+        let _guard = lock.lock().await;
+        let mut tasks = load_json_vec::<TaskRecord>(&path).await?;
+        let Some(existing) = tasks.iter_mut().find(|existing| *existing == observed) else {
+            return Ok(false);
+        };
+        *existing = task.clone();
+        write_atomic(&path, &serde_json::to_string(&tasks)?).await?;
+        Ok(true)
+    }
+
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let path = self.bundle(company).tasks_json();
         let lock = path_lock(&path);

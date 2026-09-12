@@ -12426,6 +12426,15 @@ name = "Morning"
         async fn upsert(&self, _company: &CompanyId, _task: &TaskRecord) -> crate::Result<()> {
             unimplemented!("not exercised by these tests")
         }
+        async fn update_if_column(
+            &self,
+            _company: &CompanyId,
+            _task: &TaskRecord,
+            _observed: &TaskRecord,
+            _expected_column: &str,
+        ) -> crate::Result<bool> {
+            unimplemented!("not exercised by these tests")
+        }
         async fn delete(&self, _company: &CompanyId, _id: &str) -> crate::Result<bool> {
             unimplemented!("not exercised by these tests")
         }

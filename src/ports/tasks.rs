@@ -1592,6 +1592,16 @@ pub trait TaskStore: Send + Sync {
     async fn list(&self, company: &CompanyId) -> Result<Vec<TaskRecord>>;
     /// Inserts or replaces a task by id.
     async fn upsert(&self, company: &CompanyId, task: &TaskRecord) -> Result<()>;
+    /// Replaces an existing task only when it still matches the caller's
+    /// observed record and remains in `expected_column`.
+    /// Returns whether the conditional write was applied.
+    async fn update_if_column(
+        &self,
+        company: &CompanyId,
+        task: &TaskRecord,
+        observed: &TaskRecord,
+        expected_column: &str,
+    ) -> Result<bool>;
     /// Deletes a task by id; returns whether a task was removed.
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool>;
 }

@@ -1646,6 +1646,49 @@ impl crate::ports::tasks::TaskStore for SqliteStore {
         Ok(())
     }
 
+    async fn update_if_column(
+        &self,
+        company: &CompanyId,
+        task: &crate::ports::tasks::TaskRecord,
+        observed: &crate::ports::tasks::TaskRecord,
+        expected_column: &str,
+    ) -> Result<bool> {
+        if observed.id != task.id || observed.column != expected_column {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        let current = conn
+            .query_row(
+                "SELECT task_json FROM tasks WHERE company_id = ?1 AND id = ?2",
+                params![company.as_ref(), task.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(current_json) = current else {
+            return Ok(false);
+        };
+        let current: crate::ports::tasks::TaskRecord = serde_json::from_str(&current_json)?;
+        if current != *observed {
+            return Ok(false);
+        }
+        let task_json = serde_json::to_string(task)?;
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET task_json = ?1, updated_ms = ?2
+                 WHERE company_id = ?3 AND id = ?4 AND task_json = ?5",
+                params![
+                    task_json,
+                    task.updated_at_millis as i64,
+                    company.as_ref(),
+                    task.id,
+                    current_json
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(changed == 1)
+    }
+
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let conn = self.conn();
         let n = conn

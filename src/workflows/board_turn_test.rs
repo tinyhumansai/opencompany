@@ -300,6 +300,17 @@ impl TaskStore for FailingTasks {
             "the board is unavailable".to_string(),
         ))
     }
+    async fn update_if_column(
+        &self,
+        _company: &CompanyId,
+        _task: &TaskRecord,
+        _observed: &TaskRecord,
+        _expected_column: &str,
+    ) -> crate::Result<bool> {
+        Err(crate::error::OpenCompanyError::Harness(
+            "the board is unavailable".to_string(),
+        ))
+    }
     async fn delete(&self, _company: &CompanyId, _id: &str) -> crate::Result<bool> {
         Ok(false)
     }

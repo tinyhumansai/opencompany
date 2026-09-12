@@ -6820,6 +6820,17 @@ mode = "full"
                 "task store offline".to_string(),
             ))
         }
+        async fn update_if_column(
+            &self,
+            _company: &CompanyId,
+            _task: &crate::ports::tasks::TaskRecord,
+            _observed: &crate::ports::tasks::TaskRecord,
+            _expected_column: &str,
+        ) -> crate::Result<bool> {
+            Err(OpenCompanyError::InvalidRequest(
+                "task store offline".to_string(),
+            ))
+        }
         async fn delete(&self, _company: &CompanyId, _id: &str) -> crate::Result<bool> {
             Ok(false)
         }

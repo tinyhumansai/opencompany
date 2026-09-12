@@ -11964,6 +11964,15 @@ mod tests {
             async fn upsert(&self, _company: &CompanyId, _task: &TaskRecord) -> crate::Result<()> {
                 Ok(())
             }
+            async fn update_if_column(
+                &self,
+                _company: &CompanyId,
+                _task: &TaskRecord,
+                _observed: &TaskRecord,
+                _expected_column: &str,
+            ) -> crate::Result<bool> {
+                Ok(false)
+            }
             async fn delete(&self, _company: &CompanyId, _id: &str) -> crate::Result<bool> {
                 Ok(false)
             }

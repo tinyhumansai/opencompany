@@ -151,6 +151,24 @@ impl TaskStore for BoardAnnouncer {
         Ok(())
     }
 
+    async fn update_if_column(
+        &self,
+        company: &CompanyId,
+        task: &TaskRecord,
+        observed: &TaskRecord,
+        expected_column: &str,
+    ) -> Result<bool> {
+        let updated = self
+            .inner
+            .update_if_column(company, task, observed, expected_column)
+            .await?;
+        if updated {
+            self.announce(company, &task.id, CHANGE_UPDATED, Some(task.column.clone()))
+                .await;
+        }
+        Ok(updated)
+    }
+
     /// Deletes through, and announces only when a card was actually removed —
     /// a delete of an id the board never held changed nothing.
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
@@ -189,6 +207,23 @@ mod test {
                 None => rows.push(task.clone()),
             }
             Ok(())
+        }
+        async fn update_if_column(
+            &self,
+            _company: &CompanyId,
+            task: &TaskRecord,
+            observed: &TaskRecord,
+            expected_column: &str,
+        ) -> Result<bool> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(existing) = rows
+                .iter_mut()
+                .find(|existing| *existing == observed && existing.column == expected_column)
+            else {
+                return Ok(false);
+            };
+            *existing = task.clone();
+            Ok(true)
         }
         async fn delete(&self, _company: &CompanyId, id: &str) -> Result<bool> {
             let mut rows = self.rows.lock().unwrap();

@@ -1705,6 +1705,46 @@ impl crate::ports::tasks::TaskStore for MongoStore {
         Ok(())
     }
 
+    async fn update_if_column(
+        &self,
+        company: &CompanyId,
+        task: &crate::ports::tasks::TaskRecord,
+        observed: &crate::ports::tasks::TaskRecord,
+        expected_column: &str,
+    ) -> Result<bool> {
+        if observed.id != task.id || observed.column != expected_column {
+            return Ok(false);
+        }
+        let collection = self.collection("tasks");
+        let Some(current) = collection
+            .find_one(doc! {"company_id": company.as_ref(), "task_id": &task.id})
+            .await
+            .map_err(mongo_err)?
+        else {
+            return Ok(false);
+        };
+        let current_json = get_str(&current, "task_json")?;
+        let current_task: crate::ports::tasks::TaskRecord = serde_json::from_str(&current_json)?;
+        if current_task != *observed {
+            return Ok(false);
+        }
+        let result = collection
+            .update_one(
+                doc! {
+                    "company_id": company.as_ref(),
+                    "task_id": &task.id,
+                    "task_json": current_json,
+                },
+                doc! {"$set": {
+                    "task_json": serde_json::to_string(task)?,
+                    "updated_ms": task.updated_at_millis as i64,
+                }},
+            )
+            .await
+            .map_err(mongo_err)?;
+        Ok(result.matched_count == 1)
+    }
+
     async fn delete(&self, company: &CompanyId, id: &str) -> Result<bool> {
         let res = self
             .collection("tasks")
