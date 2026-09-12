@@ -19,6 +19,17 @@ interface Props {
   configured: boolean;
   /** Called after a successful connection, so the page re-reads its status. */
   onConnected?: () => void;
+  /**
+   * Whether to render the sentence under the button.
+   *
+   * True everywhere the button stands in a column of prose that does not
+   * already explain what connecting buys. False on the Account page, whose
+   * header card carries that sentence as its own sub-line — printing it again
+   * two inches lower is the duplication that page's pass exists to remove, and
+   * a paragraph inside a `justify-between` header row is not a shape this
+   * component can make look right anyway.
+   */
+  hint?: boolean;
 }
 
 /**
@@ -44,6 +55,7 @@ export function ConnectTinyHumansButton({
   canManage,
   configured,
   onConnected,
+  hint = true,
 }: Props) {
   const [busy, setBusy] = useState(false);
   // The redemption runs from an effect, and StrictMode double-invokes effects.
@@ -119,10 +131,12 @@ export function ConnectTinyHumansButton({
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
         {configured ? "Reconnect TinyHumans" : "Connect TinyHumans"}
       </Button>
-      <p className="text-xs text-muted-foreground">
-        Sign in to TinyHumans and this company gets its key automatically — nothing to copy. It
-        covers both the model your agents think with and the accounts they connect.
-      </p>
+      {hint && (
+        <p className="text-xs text-muted-foreground">
+          Sign in to TinyHumans and this company gets its key automatically — nothing to copy. It
+          covers both the model your agents think with and the accounts they connect.
+        </p>
+      )}
     </div>
   );
 }

@@ -25,8 +25,13 @@ import type { OpenCompanyClient } from "./client";
  * - `company` — this company's own key. What setting one buys you.
  * - `attested` / `static` — no company key set, so calls fall back to the
  *   instance's platform identity.
- * - `none` — neither, so providers cannot be connected or used at all. The
- *   honest degraded state, and the one the picker must not paper over.
+ * - `none` — neither, so nothing the platform brokers for this company works:
+ *   no provider can be connected, and there is no TinyHumans account to bill
+ *   thinking to. The honest degraded state, and the one the picker must not
+ *   paper over — but it is **not** "nothing works". A company whose LLM page
+ *   holds a key of its own thinks perfectly well with this unset: that key
+ *   outranks this one in the managed chain, and a provider of its own does not
+ *   consult this one at all.
  */
 export type CompanyCredentialSource = "company" | "attested" | "static" | "none";
 

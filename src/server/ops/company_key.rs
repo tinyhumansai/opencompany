@@ -55,25 +55,56 @@ const SWITCH_NOTE: &str = "Agents present the new credential on their next cycle
 /// company's wallet, and membership in the company is what grants access to it.
 ///
 /// The last sentence is load-bearing. The Connections screen renders this card
-/// next to the Inference one, both read "configured / not configured", and the
-/// two keys are different in kind — pasting one into the other's field is the
-/// exact mistake the `tinyhumans/key`-vs-`inference/key` split exists to
-/// prevent. An admin will not have read that reasoning in the module docs, so
-/// the card has to carry it. See [`company_key`](crate::company::company_key).
+/// next to the Inference one, both read "configured / not configured", and
+/// pasting a *provider's* key into this field is the exact mistake the
+/// `tinyhumans/key`-vs-`inference/key` split exists to prevent. An admin will
+/// not have read that reasoning in the module docs, so the card has to carry
+/// it. See [`company_key`](crate::company::company_key).
+///
+/// The distinction is **kept** — an OpenRouter key pasted here is the mistake
+/// the split exists to prevent — but narrowed to what is true. The wording this
+/// replaces compressed it into "nothing to do with models", and [`finish_link`]
+/// contradicts that directly: a managed turn resolves *through* this key, so
+/// for most companies this credential is exactly what their agents think on.
+/// Telling an admin otherwise sends them hunting for a second key they do not
+/// need.
+///
+/// It also states the **billing move**, which neither string used to — but
+/// states it conditionally, because it is conditional twice over. This notice
+/// is returned by [`set_key`] *and* [`finish_link`] *and* [`get_status`], and
+/// the two write paths do different amounts: a paste writes `tinyhumans/key`
+/// and stops, while the grant also declares the `managed` provider. And the
+/// managed chain has two rungs above this key — a key pasted for TinyHumans on
+/// the LLM page, and the legacy `inference/key` — either of which goes on
+/// answering after this one is set (#2266). A flat "setting this moves every
+/// agent turn onto this account" would be false on both counts, which is the
+/// same shape of overclaim the rest of this change removes, pointing the other
+/// way.
 const CONSEQUENCE: &str = "This is the company's TinyHumans account key — the identity the platform presents when it \
      connects providers like Gmail or Slack on your behalf. Every member's agents act and spend \
      through it, and a provider connected with it belongs to the company rather than to the \
      person who connected it. Spend arrives as one account, so it cannot be attributed per \
-     member. It is not the model-provider key on the Inference card: that one is whatever your \
-     chosen provider issues (an OpenRouter key, or your own endpoint's), and the two are stored \
-     separately on purpose.";
+     member. Where this company's models are set to TinyHumans, its agents' turns resolve through \
+     this same key and are billed here too — unless a TinyHumans key set on the LLM page outranks \
+     it. Connecting points the models here as well as the apps; pasting a key sets the identity \
+     and leaves the choice of provider alone. It is not a model provider's own key: an OpenRouter \
+     key, or your own endpoint's, belongs on the LLM page and will not serve as an identity here.";
 
 /// Said instead when nothing is configured and the instance carries no identity
 /// either — the honest degraded state, rather than a picker that will fail.
+///
+/// Scoped to what this credential actually governs. "Providers cannot be
+/// connected or used" read as "nothing works", and a company whose LLM page
+/// holds a key of its own goes on thinking perfectly well without this one —
+/// that key outranks this credential in the managed chain, and a provider of
+/// its own never consults it. Overstating the breakage sends that operator to
+/// fix something that is not broken.
 const DEGRADED: &str = "No credential is set for this company and this instance carries no \
-     platform identity, so providers cannot be connected or used. Set the company's TinyHumans \
-     account key to enable them — not the model-provider key from the Inference card, which is a \
-     different credential.";
+     platform identity, so nothing the platform brokers on its behalf works: no provider can be \
+     connected, and there is no TinyHumans account to bill thinking to. Set the company's \
+     TinyHumans account key. A model provider's own key from the LLM page is a different \
+     credential and will not do for this — though a company that has set one there can still \
+     think while this is unset.";
 
 /// Builds the company-credential route fragment.
 pub fn router() -> Router<AppState> {

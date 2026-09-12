@@ -134,12 +134,20 @@ async fn the_key_round_trips_write_only_and_reports_the_company_tier() {
     assert_eq!(status, StatusCode::OK, "{raw}");
     assert_eq!(dto["configured"], false);
     assert_eq!(dto["source"], "none");
+    let degraded = dto["notice"].as_str().unwrap_or_default();
     assert!(
-        dto["notice"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("cannot be connected"),
+        degraded.contains("no provider can be connected"),
         "the degraded state has to say what is unavailable: {dto}"
+    );
+    // …and must not overstate it. "Providers cannot be connected or used" read
+    // as "nothing works", and a company whose LLM page holds a key of its own
+    // goes on thinking perfectly well without this credential — that key
+    // outranks it in the managed chain, and a provider of its own never
+    // consults it. Overstating the breakage sends that operator to fix
+    // something that is not broken.
+    assert!(
+        degraded.contains("can still think while this is unset"),
+        "the degraded state must not claim the whole company has stopped: {dto}"
     );
     assert!(dto.get("key").is_none(), "status must never carry the key");
 
@@ -166,8 +174,39 @@ async fn the_key_round_trips_write_only_and_reports_the_company_tier() {
     // sit next to each other and both read "configured"; the copy is the only
     // thing standing between an admin and pasting an OpenRouter key here.
     assert!(
-        notice.contains("Inference card"),
+        notice.contains("LLM page"),
         "the notice must say which key this is NOT: {notice}"
+    );
+
+    // The billing consequence, stated before the save rather than discovered on
+    // the next invoice — and stated *conditionally*, because it is conditional
+    // twice. This same notice comes back from the paste route and the grant
+    // route, and they do different amounts: a paste writes `tinyhumans/key` and
+    // stops, while `finish_link` also declares the `managed` provider. And the
+    // managed chain has two rungs above this key (a key pasted for TinyHumans
+    // on the LLM page, then the legacy `inference/key`), either of which goes
+    // on answering after this one is set — #2266. A flat "this moves every
+    // agent turn onto the account" would be false on both counts.
+    assert!(
+        notice.contains("resolve through this same key"),
+        "the notice must say how the thinking reaches this account: {notice}"
+    );
+    assert!(
+        notice.contains("outranks it"),
+        "the notice must not promise a move a higher rung would prevent: {notice}"
+    );
+    assert!(
+        notice.contains("leaves the choice of provider alone"),
+        "the notice must not let a paste be read as choosing the provider: {notice}"
+    );
+
+    // And it must not overshoot the other way. "It is not the model-provider
+    // key" was false: this credential very often IS what the agents think on,
+    // and denying it sends an admin hunting for a second key they do not need.
+    // The distinction that survives is narrower — not a *provider's* key.
+    assert!(
+        !notice.contains("not the model-provider key"),
+        "the notice must not claim this key has nothing to do with models: {notice}"
     );
 
     // GET reflects it and still never carries the key.
