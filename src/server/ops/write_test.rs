@@ -4623,6 +4623,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
             text: "on it".into(),
             steps: Vec::new(),
             task_id: Some("t-1".into()),
+            outputs: Vec::new(),
         },
         // An ordinary chat reply — excluded.
         CompanyEvent::AgentReply {
@@ -4635,6 +4636,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
             text: "unrelated chatter".into(),
             steps: Vec::new(),
             task_id: None,
+            outputs: Vec::new(),
         },
         // Tagged to a different task — excluded.
         CompanyEvent::AgentReply {
@@ -4647,6 +4649,7 @@ async fn task_detail_assembles_timeline_and_lineage() {
             text: "someone else's work".into(),
             steps: Vec::new(),
             task_id: Some("t-other".into()),
+            outputs: Vec::new(),
         },
         CompanyEvent::DeskTaskCompleted {
             task_id: "t-1".into(),
@@ -5492,6 +5495,7 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
             text: "First draft is up.".into(),
             steps: Vec::new(),
             task_id: Some("t-1".into()),
+            outputs: Vec::new(),
         },
     ] {
         runtime.events().append(&company, event).await.unwrap();

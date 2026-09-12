@@ -36,6 +36,7 @@ export type CompanyStreamEvent =
        * chat reply.
        */
       taskId?: string;
+      outputs?: import("@/api/types").ChatOutput[];
       /**
        * The message this reply belongs under (issue #364) — its thread inside
        * the channel. Absent for a reply in the channel itself, and on a host
@@ -709,6 +710,8 @@ export interface AgentReplyEvent {
   seq: number;
   /** The board card this reply opened (issue #246), when it opened one. */
   taskId?: string;
+  /** Workspace nodes and artifacts produced by this reply's turn. */
+  outputs?: import("@/api/types").ChatOutput[];
   /**
    * The **host-side** id of the message this reply belongs under (issue #364).
    * Namespaced into a console id by the injector, which is what knows about the
@@ -1261,6 +1264,7 @@ export function handleEvent(
         // not POST for, e.g. an inbound channel turn — carries its "card
         // opened" chip too, rather than only the locally-awaited copy.
         taskId: event.taskId,
+        outputs: event.outputs,
         // Issue #364: and lands in the same thread a reload would put it in,
         // rather than arriving in the channel and jumping on the next refresh.
         parentId: event.parentId,

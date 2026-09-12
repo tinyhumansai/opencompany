@@ -69,6 +69,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: "email".into(),
                 agent: None,
                 text: "hello".into(),
@@ -101,6 +102,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: "email".into(),
                 agent: None,
                 text: "hi".into(),

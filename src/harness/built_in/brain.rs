@@ -346,6 +346,7 @@ fn system_notice(text: String) -> OutboundMessage {
     OutboundMessage {
         message_id: None,
         task_id: None,
+        outputs: Vec::new(),
         channel: "operator".to_string(),
         agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
         text,
@@ -412,6 +413,7 @@ fn confined_bubble(outcome: crate::harness::TurnOutcome) -> OutboundMessage {
     OutboundMessage {
         message_id: None,
         task_id: None,
+        outputs: Vec::new(),
         channel: "operator".to_string(),
         agent: Some(confine::CONFINED_AGENT_ID.to_string()),
         text: outcome.reply,
@@ -813,11 +815,12 @@ impl HarnessBrain {
                     .pending_publishes
                     .claim(publish::PublishDestination::Conversation)
             });
+        let output_claim = self.deps.pending_publishes.output_collector().claim();
         // Un-streamed, like a dispatched card: this turn is answered by the
         // bubble returned below, and its transient frames would otherwise
         // misattribute onto whichever chat thread the console is watching.
-        let outcome = run_turn
-            .run_steered_background(
+        let outcome = output_claim
+            .scoped(run_turn.run_steered_background(
                 &self.record().id,
                 &grant.agent,
                 &instruction,
@@ -831,14 +834,14 @@ impl HarnessBrain {
                 // the delegation drain below is bound to.
                 ChatTarget::in_thread(grant.origin_thread.as_deref(), grant.origin_parent),
                 None,
-            )
+            ))
             .await;
         drop(guard);
         let published = self.deps.pending_publishes.drain();
         if !published.is_empty()
             && publish_claim.is_some()
-            && let Err(err) = self
-                .record_conversation_publishes(
+            && let Err(err) = output_claim
+                .scoped(self.record_conversation_publishes(
                     &grant.agent,
                     // Both halves of the conversation the approval was raised
                     // in (#1890), the same pair the delegation drain below is
@@ -847,7 +850,7 @@ impl HarnessBrain {
                     // one of them.
                     ChatTarget::in_thread(grant.origin_thread.as_deref(), grant.origin_parent),
                     published,
-                )
+                ))
                 .await
         {
             tracing::error!(
@@ -870,17 +873,19 @@ impl HarnessBrain {
         // card, but has nowhere to relay their reply to — there is no relay turn
         // on this path. That is a strict improvement on dropping it unrun, and it
         // is recorded on the card the hand-off opens.
-        let drained = match self
-            .delegation_runner(run_turn.as_ref(), &record)
-            // The conversation the approval was raised in (#1890) — both halves
-            // of it. A grant records `origin_parent` beside `origin_thread` for
-            // exactly this reason, so a threaded approval resumes in its own
-            // thread rather than against the channel's unparented history.
-            .in_thread(grant.origin_parent)
-            .drain_and_execute(
-                grant.origin_thread.as_deref(),
-                delegation::MessageContext::default(),
-                delegation::HandOffs::Run,
+        let drained = match output_claim
+            .scoped(
+                self.delegation_runner(run_turn.as_ref(), &record)
+                    // The conversation the approval was raised in (#1890) — both halves
+                    // of it. A grant records `origin_parent` beside `origin_thread` for
+                    // exactly this reason, so a threaded approval resumes in its own
+                    // thread rather than against the channel's unparented history.
+                    .in_thread(grant.origin_parent)
+                    .drain_and_execute(
+                        grant.origin_thread.as_deref(),
+                        delegation::MessageContext::default(),
+                        delegation::HandOffs::Run,
+                    ),
             )
             .await
         {
@@ -896,6 +901,7 @@ impl HarnessBrain {
             }
         };
         drop(delegation_claim);
+        let outputs = output_claim.drain();
 
         let text = match outcome {
             // Issue #1846 review (Codex #3869725683): `run_steered_background`
@@ -976,6 +982,7 @@ impl HarnessBrain {
             // so a continuation that spawned or handed off work links to it
             // instead of pointing at nothing.
             task_id: drained.spawned_task,
+            outputs,
             channel: grant.agent.clone(),
             agent: None,
             text,
@@ -2160,6 +2167,7 @@ impl HarnessBrain {
                     text: result_text.clone(),
                     steps: Vec::new(),
                     task_id: Some(card.id.clone()),
+                    outputs: Vec::new(),
                 },
             )
             .await
@@ -2577,6 +2585,12 @@ impl HarnessBrain {
                 title: record.title.clone(),
                 kind: record.kind,
             });
+            self.deps.pending_publishes.output_collector().artifact(
+                record.id.clone(),
+                card.id.clone(),
+                version,
+                &record.title,
+            );
             // Keep the working set current so two publishes of the same path in
             // one run extend one record rather than opening two.
             on_card.push(record);
@@ -4004,6 +4018,7 @@ impl HarnessBrain {
                         channel_responses.push(OutboundMessage {
                             message_id: outcome.report_seq.map(|seq| seq.value().to_string()),
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: "operator".to_string(),
                             agent: Some(crate::hivemind::HIVE_REPORT_AUTHOR.to_string()),
                             text: outcome.summary(),
@@ -4158,36 +4173,39 @@ impl HarnessBrain {
                     let run_turn = self.run_turn();
                     // Bound for the runner's whole lifetime (issue #707): one turn, one record.
                     let record = self.record();
-                    let turn = self
-                        .delegation_runner(run_turn.as_ref(), &record)
-                        // Issues #1035 / #1152: the operator's own statement of
-                        // what this message is for. The REST handler already
-                        // acts on it; until #1035 the runtime never saw it, so
-                        // it could not tell a message the handler had carded
-                        // from one it had not — and since #1152 it also carries
-                        // "this is not work", which the runtime has to honour or
-                        // the console's promise holds on one surface only.
-                        .requested(*deliverable)
-                        // Who else this message named (issue: mentions). Context
-                        // for the turn, never a second dispatch.
-                        .also_mentioned(also_mentioned)
-                        // The thread this message belongs to (#1890). Its own
-                        // `parent` IS the root — a reply is parented to its
-                        // question's parent, never to the question — so an
-                        // unparented message carries `None` and lands on the
-                        // channel-level conversation.
-                        .in_thread(*parent)
-                        // This message's own line in the journal, so the chat
-                        // seed can tell it apart from a concurrently accepted
-                        // sibling by identity instead of by text.
-                        .answering(event_seq)
-                        .maybe_for_task(thread_card.as_deref())
-                        // Issue #1846 review (Codex #3864988176): the operator's
-                        // own words, so a delegate's budget-pause marker re-parks
-                        // with what the operator actually asked for rather than
-                        // the hand-off instruction the model wrote.
-                        .reissue_message(composed.clone())
-                        .handle_operator_message(&responder, &composed, chat_id)
+                    let output_claim = self.deps.pending_publishes.output_collector().claim();
+                    let turn = output_claim
+                        .scoped(
+                            self.delegation_runner(run_turn.as_ref(), &record)
+                                // Issues #1035 / #1152: the operator's own statement of
+                                // what this message is for. The REST handler already
+                                // acts on it; until #1035 the runtime never saw it, so
+                                // it could not tell a message the handler had carded
+                                // from one it had not — and since #1152 it also carries
+                                // "this is not work", which the runtime has to honour or
+                                // the console's promise holds on one surface only.
+                                .requested(*deliverable)
+                                // Who else this message named (issue: mentions). Context
+                                // for the turn, never a second dispatch.
+                                .also_mentioned(also_mentioned)
+                                // The thread this message belongs to (#1890). Its own
+                                // `parent` IS the root — a reply is parented to its
+                                // question's parent, never to the question — so an
+                                // unparented message carries `None` and lands on the
+                                // channel-level conversation.
+                                .in_thread(*parent)
+                                // This message's own line in the journal, so the chat
+                                // seed can tell it apart from a concurrently accepted
+                                // sibling by identity instead of by text.
+                                .answering(event_seq)
+                                .maybe_for_task(thread_card.as_deref())
+                                // Issue #1846 review (Codex #3864988176): the operator's
+                                // own words, so a delegate's budget-pause marker re-parks
+                                // with what the operator actually asked for rather than
+                                // the hand-off instruction the model wrote.
+                                .reissue_message(composed.clone())
+                                .handle_operator_message(&responder, &composed, chat_id),
+                        )
                         .await?;
                     let mut operator_steps = turn.steps;
                     let mut operator_reply = turn.reply;
@@ -4229,8 +4247,8 @@ impl HarnessBrain {
                     // time that scan runs the queue has already been drained here.
                     let published_sources: Vec<String> =
                         published.iter().map(|p| p.source.clone()).collect();
-                    let mut published_card = self
-                        .file_conversation_batch(
+                    let mut published_card = output_claim
+                        .scoped(self.file_conversation_batch(
                             &responder,
                             turn.spawned_task.as_deref(),
                             // Issue #1890 B: the same conversation this turn
@@ -4239,7 +4257,7 @@ impl HarnessBrain {
                             publish_claim.is_some(),
                             published,
                             &mut operator_reply,
-                        )
+                        ))
                         .await;
 
                     // Issue #989: on a turn that paused at its iteration cap, run
@@ -4274,8 +4292,8 @@ impl HarnessBrain {
                         let unpublished = publish::unpublished(&changed.files, &published_sources);
                         if !unpublished.is_empty() {
                             let nudge_control = SteerControl::new();
-                            let declined = self
-                                .nudge_for_unpublished(
+                            let declined = output_claim
+                                .scoped(self.nudge_for_unpublished(
                                     run_turn.as_ref(),
                                     &responder,
                                     text,
@@ -4285,18 +4303,18 @@ impl HarnessBrain {
                                     &nudge_control,
                                     None,
                                     None,
-                                )
+                                ))
                                 .await;
                             let nudge_published = self.deps.pending_publishes.drain();
-                            if let Some(card_id) = self
-                                .file_conversation_batch(
+                            if let Some(card_id) = output_claim
+                                .scoped(self.file_conversation_batch(
                                     &responder,
                                     turn.spawned_task.as_deref(),
                                     ChatTarget::in_thread(chat_id, *parent),
                                     publish_claim.is_some(),
                                     nudge_published,
                                     &mut operator_reply,
-                                )
+                                ))
                                 .await
                             {
                                 published_card = published_card.or(Some(card_id));
@@ -4333,6 +4351,7 @@ impl HarnessBrain {
                         }
                     }
                     drop(publish_claim);
+                    let operator_outputs = output_claim.drain();
                     // Re-skin any MCP tool-call failures (from the orchestrator
                     // turn, a delegated desk turn, or the relay turn) as error
                     // steps on the operator bubble — one surface, one renderer.
@@ -4370,6 +4389,7 @@ impl HarnessBrain {
                         reply_to: None,
                         mentions: Vec::new(),
                         steps: operator_steps,
+                        outputs: operator_outputs,
                     });
                     // ── @ IS NOT AN EXECUTION CHANNEL ──────────────────────
                     //
@@ -4431,6 +4451,7 @@ impl HarnessBrain {
                         channel_responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: "operator".to_string(),
                             agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
                             text: iteration_cap_pause_notice(&responder),
@@ -4457,6 +4478,7 @@ impl HarnessBrain {
                         channel_responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: "operator".to_string(),
                             agent: None,
                             text: spend_halt_notice(halt),
@@ -4479,6 +4501,7 @@ impl HarnessBrain {
                         channel_responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: "operator".to_string(),
                             agent: None,
                             text: budget_pause_notice(pause),
@@ -4555,6 +4578,7 @@ impl HarnessBrain {
                     let mut responses = vec![OutboundMessage {
                         message_id: None,
                         task_id: turn.spawned_task,
+                        outputs: Vec::new(),
                         // The reply lands on the General desk — the destination
                         // — and the responder is its author. Fusing the two into
                         // `channel` made reload history route the same reply to
@@ -4589,6 +4613,7 @@ impl HarnessBrain {
                         responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: crate::server::ops::language::DEFAULT_DESK.to_string(),
                             agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
                             text: iteration_cap_pause_notice(&responder),
@@ -4601,6 +4626,7 @@ impl HarnessBrain {
                         responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: crate::server::ops::language::DEFAULT_DESK.to_string(),
                             agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
                             text: spend_halt_notice(halt),
@@ -4613,6 +4639,7 @@ impl HarnessBrain {
                         responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: crate::server::ops::language::DEFAULT_DESK.to_string(),
                             agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
                             text: budget_pause_notice(pause),
@@ -4718,6 +4745,7 @@ impl HarnessBrain {
                         responses.push(OutboundMessage {
                             message_id: None,
                             task_id: None,
+                            outputs: Vec::new(),
                             channel: crate::server::ops::language::DEFAULT_DESK.to_string(),
                             agent: Some(crate::ports::SYSTEM_AUTHOR.to_string()),
                             text: notice,
@@ -4741,6 +4769,7 @@ impl HarnessBrain {
                                         audience: Vec::new(),
                                         parent: None,
                                         task_id: response.task_id.clone(),
+                                        outputs: response.outputs.clone(),
                                         chat_id: crate::server::ops::language::DEFAULT_DESK
                                             .to_string(),
                                         agent_id,

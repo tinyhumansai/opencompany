@@ -556,6 +556,7 @@ pub fn relay_reply(
     OutboundMessage {
         message_id: None,
         task_id: Some(card.id.clone()),
+        outputs: Vec::new(),
         channel: orchestrator.to_string(),
         agent: None,
         text: relay_text(card, responder, orchestrator, prior_responders),

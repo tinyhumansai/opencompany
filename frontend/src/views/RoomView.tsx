@@ -2270,6 +2270,7 @@ export function RoomView({
               parentId,
               steps: r.steps,
               taskId: r.taskId,
+              outputs: r.outputs,
               messageId: r.messageId,
               mentions: r.mentions,
             }),

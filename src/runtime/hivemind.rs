@@ -433,6 +433,7 @@ mod test {
             mention_depth: 0,
             parent: None,
             task_id: None,
+            outputs: Vec::new(),
             chat_id: chat.to_string(),
             agent_id: agent_id.to_string(),
             text: text.to_string(),

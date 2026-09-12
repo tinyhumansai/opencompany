@@ -149,6 +149,18 @@ export function isFailedStep(status: TurnStepStatus | undefined): boolean {
   return status === "error";
 }
 
+/** One addressable object produced by a chat-started agent turn. */
+export interface ChatOutput {
+  kind: "workspace-node" | "artifact";
+  targetId: string;
+  /** Bounded, redacted label supplied by the host. */
+  title: string;
+  /** Required for artifact links; absent for workspace nodes. */
+  taskId?: string;
+  /** Exact artifact revision produced by the turn. */
+  version?: number;
+}
+
 /** One channel reply from a cycle. */
 export interface OutboundMessage {
   channel: string;
@@ -172,6 +184,8 @@ export interface OutboundMessage {
    * wrong. The bubble's `steps` timeline still shows every spawn.
    */
   taskId?: string;
+  /** Workspace nodes and artifacts produced by this reply's turn. */
+  outputs?: ChatOutput[];
   /**
    * Who this reply names, as the host resolved them (issue #1645).
    *
@@ -461,6 +475,8 @@ export interface ChatHistoryMessageDto {
    * renders identically whichever surface hydrated the transcript.
    */
   taskId?: string;
+  /** Live output buttons to restore when this transcript is rehydrated. */
+  outputs?: ChatOutput[];
   /**
    * The message this one replies to (issue #364), by that message's own `id`.
    * Absent for a message posted straight into the channel — which is every

@@ -821,6 +821,7 @@ pub fn build_agent(
                 manifest_agent.id.clone(),
                 workspace_writes,
                 manifest_agent.write_scope(),
+                deps.pending_publishes.output_collector(),
             ))
         }
         _ => None,

@@ -10,7 +10,7 @@ import type { TeamMember } from "@/lib/team";
 import { cn } from "@/lib/utils";
 import { BudgetPauseNoticeCard } from "./BudgetPauseNoticeCard";
 import { EchoPlaceholder, echoMarkerFor } from "./EchoPlaceholder";
-import { FailedSendNotice } from "./MessageRow";
+import { FailedSendNotice, OutputLinkRow } from "./MessageRow";
 import { MessageAttachments } from "./MessageAttachments";
 import { ReferralChip, ReferralConversation, StepTimeline } from "./StepTimeline";
 import { MessageComposer } from "./MessageComposer";
@@ -516,6 +516,9 @@ function Line({
             of itself anywhere, even after the panel was closed (Codex on
             #2069). */}
         {message.steps && message.steps.length > 0 && <StepTimeline steps={message.steps} />}
+        {message.outputs && message.outputs.length > 0 && (
+          <OutputLinkRow outputs={message.outputs} />
+        )}
         {!!liveSteps?.length && <StepTimeline steps={[...liveSteps]} defaultOpen />}
         {/* And the crossings, for the same reason the steps are here: a room's
             turns are threaded, so this panel is the only surface a deliberating

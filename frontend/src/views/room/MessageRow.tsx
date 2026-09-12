@@ -1,4 +1,5 @@
-import { MessageSquareReply, TriangleAlert } from "lucide-react";
+import { useState } from "react";
+import { FileText, MessageSquareReply, Paperclip, TriangleAlert } from "lucide-react";
 
 import type { TaskStatus } from "@/api/tasks";
 import type { CognitionState, TurnStep } from "@/api/types";
@@ -9,6 +10,7 @@ import type { EpisodeTurn } from "@/lib/hive/episode";
 import { TeammateAvatar } from "@/components/teammate-avatar";
 import { Button } from "@/components/ui/button";
 import { consoleHref } from "@/lib/console-paths";
+import { artifactHref } from "@/lib/task-output";
 import { IN_FLIGHT_COLUMNS } from "@/lib/board-columns";
 import { isHostMessageId, type ChatMessage } from "@/lib/chat";
 import { isBudgetPauseNotice } from "@/hooks/use-events";
@@ -455,6 +457,9 @@ export function MessageRow({
         )}
 
         {message.steps && message.steps.length > 0 && <StepTimeline steps={message.steps} />}
+        {message.outputs && message.outputs.length > 0 && (
+          <OutputLinkRow outputs={message.outputs} />
+        )}
         {/* The running turn this message asked for. Opens by default: unlike a
             settled turn's steps — which sit behind a count because the answer
             above them is what the reader came for — there is no answer yet, and
@@ -677,6 +682,69 @@ function SystemPill({
           onClick={() => onReviewCard(taskId, "approve")}
         >
           {reviewInFlight ? "Approving…" : "Approve"}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/** The reply-level buttons for objects this turn produced. */
+export function OutputLinkRow({ outputs }: { outputs: NonNullable<ChatMessage["outputs"]> }) {
+  const [expanded, setExpanded] = useState(false);
+  const links: {
+    key: string;
+    href: string;
+    label: string;
+    kind: "workspace-node" | "artifact";
+  }[] = [];
+  for (const output of outputs) {
+    if (output.kind === "workspace-node") {
+      links.push({
+        key: `${output.kind}:${output.targetId}`,
+        href: consoleHref("workspace", output.targetId),
+        label: output.title,
+        kind: output.kind,
+      });
+      continue;
+    }
+    if (output.taskId !== undefined && output.version !== undefined) {
+      links.push({
+        key: `${output.kind}:${output.targetId}:${output.version}`,
+        href: artifactHref(output.taskId, output.targetId, output.version),
+        label: output.title,
+        kind: output.kind,
+      });
+    }
+  }
+  if (links.length === 0) return null;
+
+  const visible = expanded ? links : links.slice(0, 1);
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-2" data-chat-output-links>
+      {visible.map((link) => (
+        <a
+          key={link.key}
+          href={link.href}
+          title={`Open ${link.label}`}
+          className="flex h-7 max-w-full min-w-0 items-center gap-1.5 rounded-full bg-muted px-3 text-xs text-muted-foreground transition-opacity hover:opacity-80"
+        >
+          {link.kind === "artifact" ? (
+            <Paperclip className="size-3.5 shrink-0" />
+          ) : (
+            <FileText className="size-3.5 shrink-0" />
+          )}
+          <span className="truncate">{link.label}</span>
+        </a>
+      ))}
+      {links.length > 1 && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 rounded-full px-2 text-xs"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((open) => !open)}
+        >
+          {expanded ? "Show less" : `+${links.length - 1} more`}
         </Button>
       )}
     </div>

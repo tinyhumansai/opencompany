@@ -148,6 +148,7 @@ impl ChannelAdapter for DeskChannel {
                     text: msg.text,
                     steps: msg.steps,
                     task_id: msg.task_id,
+                    outputs: msg.outputs,
                     parent: msg
                         .reply_to
                         .and_then(|reply| reply.chat_id.parse::<u64>().ok())
@@ -298,6 +299,7 @@ impl ChannelAdapter for DurableOperatorChannel {
                         .unwrap_or_else(|| WORKFLOW_REPLY_AUTHOR.to_string()),
                     text: msg.text,
                     steps: msg.steps,
+                    outputs: msg.outputs,
                     task_id: msg.task_id,
                     parent: msg
                         .reply_to
@@ -431,6 +433,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: "operator".into(),
                 agent: None,
                 text: "hello".into(),
@@ -490,6 +493,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: "engineering".into(),
                 agent: None,
                 text: "the weekly digest".into(),
@@ -548,6 +552,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: OPERATOR_CHANNEL.into(),
                 agent: None,
                 text: "[Acme] Weekly digest — Owner summary\n\nQ3 is up 12%.".into(),
@@ -592,6 +597,7 @@ mod test {
             .send(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: OPERATOR_CHANNEL.into(),
                 agent: None,
                 text: "the owner report".into(),

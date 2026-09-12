@@ -516,6 +516,7 @@ mod test {
                 text: "hello".into(),
                 steps: vec![],
                 task_id: None,
+                outputs: Vec::new(),
                 parent: None,
             },
         ] {

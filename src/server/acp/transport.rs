@@ -1822,6 +1822,7 @@ mode = "none"
                 steps: Vec::new(),
                 reply_to: None,
                 task_id: None,
+                outputs: Vec::new(),
                 message_id: None,
                 mentions: Vec::new(),
             }],

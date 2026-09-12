@@ -2594,6 +2594,7 @@ export function AppShell({
             makeMessage(from, event.text, {
               channel: event.agentId,
               taskId: event.taskId,
+              outputs: event.outputs,
               mentions: event.mentions,
               // Issue #483: same identity as the thread store above. This is
               // the store `hydrateThread` folds into, so this is where the

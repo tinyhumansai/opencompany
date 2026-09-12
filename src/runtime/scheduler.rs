@@ -590,6 +590,7 @@ mod test {
                     responses.push(OutboundMessage {
                         message_id: None,
                         task_id: None,
+                        outputs: Vec::new(),
                         channel: "operator".into(),
                         agent: None,
                         text: format!("scheduled: {prompt}"),

@@ -564,6 +564,7 @@ impl<'a> EpisodeReferrals<'a> {
                     text,
                     steps: Vec::new(),
                     task_id: None,
+                    outputs: Vec::new(),
                     parent: conversation.thread_root.map(EventSeq::new),
                     mentions: Vec::new(),
                     mention_depth: 0,

@@ -370,6 +370,9 @@ pub struct CompanyWorkspace {
     /// construction site but the agent builder's) is unconfined, the behaviour
     /// this module had before per-path write scope existed.
     write_scope: Option<Vec<String>>,
+    /// The per-turn output sink. `None` preserves the small direct test
+    /// constructors; the agent builder always wires the shared collector.
+    outputs: Option<crate::harness::turn_outputs::TurnOutputCollector>,
 }
 
 impl CompanyWorkspace {
@@ -381,6 +384,7 @@ impl CompanyWorkspace {
             agent_id,
             artifacts: None,
             write_scope: None,
+            outputs: None,
         }
     }
 
@@ -403,6 +407,22 @@ impl CompanyWorkspace {
     pub fn with_write_scope(mut self, scope: Option<Vec<String>>) -> Self {
         self.write_scope = scope;
         self
+    }
+
+    /// Wire the shared sink that attributes successful writes to the current
+    /// agent turn.
+    pub fn with_output_collector(
+        mut self,
+        outputs: crate::harness::turn_outputs::TurnOutputCollector,
+    ) -> Self {
+        self.outputs = Some(outputs);
+        self
+    }
+
+    fn record_output(&self, node_id: &str, path: &str) {
+        if let Some(outputs) = &self.outputs {
+            outputs.workspace_node(node_id, path);
+        }
     }
 
     /// Whether `path` is inside this agent's write scope.
@@ -1830,6 +1850,7 @@ impl Tool for WorkspaceWriteTool {
             .await
         {
             Ok(node) => {
+                self.workspace.record_output(&node.id, &entry.path);
                 // Issue #552: the note this agent just overwrote may be another
                 // agent's *published deliverable*, whose authoritative history
                 // is the artifact chain. An overwrite the chain never saw is
@@ -2226,6 +2247,9 @@ impl Tool for WorkspaceCreateTool {
                         // an adopted folder must not be reported as freshly
                         // created, or the agent believes a duplicate landed.
                         let id = &claim.node().id;
+                        if claim.was_created() {
+                            self.workspace.record_output(id, &normalized);
+                        }
                         Ok(ToolResult::success(if claim.was_created() {
                             format!(
                                 "Created the workspace folder `{path}` (id={id}). Create notes \
@@ -2279,15 +2303,18 @@ impl Tool for WorkspaceCreateTool {
                     // The id and revision go back with the acknowledgement so an
                     // immediate follow-up `workspace_write` needs no extra round
                     // trip through list + read.
-                    Ok(()) => Ok(ToolResult::success(format!(
-                        "Created the workspace note `{path}` (id={id}, rev={rev}, {bytes} bytes). \
-                         To revise it, call `{WORKSPACE_WRITE_TOOL}` with expected_updated_at={rev} \
-                         and the complete new body.",
-                        path = echo_path(&normalized),
-                        id = node.id,
-                        rev = node.updated_at_millis,
-                        bytes = content.map_or(0, str::len),
-                    ))),
+                    Ok(()) => {
+                        self.workspace.record_output(&node.id, &normalized);
+                        Ok(ToolResult::success(format!(
+                            "Created the workspace note `{path}` (id={id}, rev={rev}, {bytes} bytes). \
+                             To revise it, call `{WORKSPACE_WRITE_TOOL}` with expected_updated_at={rev} \
+                             and the complete new body.",
+                            path = echo_path(&normalized),
+                            id = node.id,
+                            rev = node.updated_at_millis,
+                            bytes = content.map_or(0, str::len),
+                        )))
+                    }
                     // The note create failed after this call may have minted the
                     // agent's own home; undo an empty home before surfacing the
                     // store's error, so it is not left for Repair to sweep
@@ -2337,10 +2364,12 @@ pub fn workspace_tools(
     agent_id: String,
     can_write: bool,
     write_scope: Option<Vec<String>>,
+    outputs: crate::harness::turn_outputs::TurnOutputCollector,
 ) -> Vec<Box<dyn Tool>> {
     let workspace = CompanyWorkspace::new(store, company, agent_id)
         .with_artifacts(artifacts)
-        .with_write_scope(write_scope);
+        .with_write_scope(write_scope)
+        .with_output_collector(outputs);
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(WorkspaceListTool::new(workspace.clone())),
         Box::new(WorkspaceReadTool::new(workspace.clone())),
@@ -5739,6 +5768,7 @@ mod tests {
             TEST_AGENT.to_string(),
             false,
             None,
+            Default::default(),
         );
         let names: Vec<&str> = read_only.iter().map(|t| t.name()).collect();
         assert_eq!(
@@ -5760,6 +5790,7 @@ mod tests {
             TEST_AGENT.to_string(),
             true,
             None,
+            Default::default(),
         );
         let names: Vec<&str> = writable.iter().map(|t| t.name()).collect();
         assert_eq!(
@@ -5791,6 +5822,7 @@ mod tests {
             TEST_AGENT.to_string(),
             true,
             None,
+            Default::default(),
         );
         assert_eq!(tools[0].permission_level(), PermissionLevel::ReadOnly);
         assert_eq!(tools[1].permission_level(), PermissionLevel::ReadOnly);

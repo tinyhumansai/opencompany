@@ -880,6 +880,7 @@ pub(crate) fn channel_message_from_effect(effect: &Effect) -> Option<OutboundMes
     Some(OutboundMessage {
         message_id: None,
         task_id: None,
+        outputs: Vec::new(),
         channel,
         agent: None,
         text,

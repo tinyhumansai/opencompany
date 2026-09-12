@@ -525,6 +525,7 @@ impl<'a> EpisodeDriver<'a> {
                                 audience: Vec::new(),
                                 steps: Vec::new(),
                                 task_id: None,
+                                outputs: Vec::new(),
                                 parent: self.thread_root,
                                 mentions: Vec::new(),
                                 mention_depth: 0,
@@ -563,6 +564,7 @@ impl<'a> EpisodeDriver<'a> {
                         // does not raise.
                         steps: Vec::new(),
                         task_id: None,
+                        outputs: Vec::new(),
                         parent: self.thread_root,
                         // A deliberation line names topics and message numbers,
                         // not people. Left empty rather than half-resolved —
@@ -621,6 +623,7 @@ impl<'a> EpisodeDriver<'a> {
                                 audience,
                                 steps: Vec::new(),
                                 task_id: None,
+                                outputs: Vec::new(),
                                 parent: self.thread_root,
                                 mentions: Vec::new(),
                                 mention_depth: 0,
@@ -1165,6 +1168,7 @@ impl<'a> EpisodeDriver<'a> {
                     audience: Vec::new(),
                     steps: Vec::new(),
                     task_id: None,
+                    outputs: Vec::new(),
                     parent: self.thread_root,
                     mentions: Vec::new(),
                     mention_depth: 0,

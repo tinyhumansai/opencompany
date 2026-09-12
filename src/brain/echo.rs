@@ -49,6 +49,7 @@ impl Brain for EchoBrain {
                 channel_responses.push(OutboundMessage {
                     message_id: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     channel: "operator".to_string(),
                     agent: None,
                     text: format!("You said: {text}"),
@@ -62,6 +63,7 @@ impl Brain for EchoBrain {
                 channel_responses.push(OutboundMessage {
                     message_id: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     channel: channel.clone(),
                     agent: None,
                     text,
@@ -75,6 +77,7 @@ impl Brain for EchoBrain {
             channel_responses.push(OutboundMessage {
                 message_id: None,
                 task_id: None,
+                outputs: Vec::new(),
                 channel: "operator".to_string(),
                 agent: None,
                 text: "Acknowledged.".to_string(),

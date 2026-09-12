@@ -318,6 +318,10 @@ fn cannot_publish_here(path: &str) -> String {
 #[derive(Clone, Default)]
 pub struct PendingPublishQueue {
     inner: Arc<Mutex<Vec<PendingPublish>>>,
+    /// Addressable workspace/artifact outputs produced while this queue's
+    /// cached tools run. Kept on the same shared dependency as publishes so
+    /// both output kinds necessarily reach the same chat-turn drain.
+    outputs: crate::harness::turn_outputs::TurnOutputCollector,
     /// Publishes that were **refused** because nothing here could record one
     /// (issue #1192) — the source path, recorded at the moment the refusal is
     /// raised.
@@ -331,6 +335,11 @@ pub struct PendingPublishQueue {
 }
 
 impl PendingPublishQueue {
+    /// The turn-scoped collector shared by this queue's tool instances.
+    pub fn output_collector(&self) -> crate::harness::turn_outputs::TurnOutputCollector {
+        self.outputs.clone()
+    }
+
     /// Stages a publish.
     pub fn push(&self, publish: PendingPublish) {
         self.inner.lock().expect("publish queue").push(publish);

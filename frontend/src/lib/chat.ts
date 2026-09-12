@@ -2,6 +2,7 @@ import type {
   AttachmentDto,
   ChatHistoryMessageDto,
   ChatMentionDto,
+  ChatOutput,
   TurnStep,
 } from "@/api/types";
 
@@ -248,6 +249,8 @@ export interface ChatMessage {
    * chip linking to `#/tasks/<id>`.
    */
   taskId?: string;
+  /** Workspace nodes and artifacts produced by this reply's turn. */
+  outputs?: ChatOutput[];
   /**
    * Files attached to this line (issue #1682), each a reference into the
    * company workspace. Set on your own message from the composer's pending
@@ -439,6 +442,7 @@ export function makeMessage(
     parentId?: string;
     steps?: TurnStep[];
     taskId?: string;
+    outputs?: ChatOutput[];
     messageId?: string;
     attachments?: AttachmentDto[];
     /** Mention spans the host resolved against this message, for chip rendering. */
@@ -454,6 +458,7 @@ export function makeMessage(
     parentId: opts.parentId,
     steps: opts.steps,
     taskId: opts.taskId,
+    outputs: opts.outputs?.length ? opts.outputs : undefined,
     // Issue #1682: an empty list is dropped to `undefined` so a line with no
     // attachment stays exactly the shape it was before the field existed.
     attachments: opts.attachments?.length ? opts.attachments : undefined,
@@ -606,6 +611,10 @@ export function fromHistory(entries: ChatHistoryMessageDto[]): ChatMessage[] {
       // Only your own lines never have one — you did not open a card by
       // speaking.
       taskId: from === "you" ? undefined : entry.taskId,
+      // Keep the produced-file buttons on exactly the same durable path as the
+      // card chip above. A live-only field vanishes on the first thread switch
+      // or page reload and makes a valid output look broken.
+      outputs: from === "you" || !entry.outputs?.length ? undefined : entry.outputs,
       // Rehydrate the operator's attachments (issue #1682) so a bubble carries
       // the same chips on reload it showed live. Empty drops to `undefined`,
       // keeping the pre-#1682 line shape.

@@ -17,8 +17,8 @@ use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::CompanyStore;
 use crate::ports::types::{
-    Actor, ActorKind, Attachment, CompanyEvent, CompanyId, CompanyRecord, EventSeq, Mention,
-    MentionTarget, StoredEvent, TurnStep,
+    Actor, ActorKind, Attachment, ChatOutput, ChatOutputKind, CompanyEvent, CompanyId,
+    CompanyRecord, EventSeq, Mention, MentionTarget, StoredEvent, TurnStep,
 };
 use crate::server::ops::language::DEFAULT_DESK;
 
@@ -453,6 +453,12 @@ pub struct MessageView {
     /// renderer actually asks, which is whether there is still a card to link
     /// to (issue #984).
     pub task_id: Option<String>,
+    /// Addressable workspace objects produced by this reply's turn.
+    ///
+    /// Empty for messages predating output tracking and after every recorded
+    /// target has been removed. The journal remains append-only; history
+    /// projects only targets that are still clickable.
+    pub outputs: Vec<ChatOutput>,
     /// The message this one replies to (issue #364), by that message's own id —
     /// what makes a thread survive a reload rather than living in one browser.
     ///
@@ -654,6 +660,7 @@ impl MessageView {
                 text,
                 steps,
                 task_id,
+                outputs,
                 parent,
                 mentions,
                 ..
@@ -672,6 +679,7 @@ impl MessageView {
                 referral_conversation: None,
                 steps,
                 task_id,
+                outputs,
                 parent_id: parent.map(|seq| seq.value().to_string()),
                 reactions: Vec::new(),
                 mentions: project_mentions(&mentions, authors, viewer),
@@ -757,6 +765,7 @@ impl MessageView {
                     by_person,
                     steps: Vec::new(),
                     task_id: None,
+                    outputs: Vec::new(),
                     parent_id: parent.map(|seq| seq.value().to_string()),
                     reactions: Vec::new(),
                     mentions: project_mentions(&mentions, authors, viewer),
@@ -813,6 +822,7 @@ impl MessageView {
                 referral_conversation: None,
                 steps: Vec::new(),
                 task_id: Some(task_id),
+                outputs: Vec::new(),
                 // Rendered the same way an `OperatorMessage`'s parent is, a few
                 // arms up — the console keys a thread off this string and does
                 // not care which event minted it.
@@ -836,6 +846,7 @@ impl MessageView {
                 referral_conversation: None,
                 steps: Vec::new(),
                 task_id: None,
+                outputs: Vec::new(),
                 parent_id: None,
                 reactions: Vec::new(),
                 mentions: Vec::new(),
@@ -1220,6 +1231,7 @@ pub async fn history_for_desk(
     }
 
     drop_dead_cards(runtime, &mut messages).await?;
+    drop_dead_outputs(runtime, &mut messages).await?;
     attach_referral_origins(runtime, desk_id, &mut messages).await?;
     Ok(messages)
 }
@@ -1684,6 +1696,90 @@ async fn drop_dead_cards(
     Ok(())
 }
 
+/// Removes reply output links whose target no longer exists.
+///
+/// Like [`drop_dead_cards`], this is a projection rule rather than a journal
+/// rewrite: the turn really did produce the object, but history must not
+/// rehydrate a button that now leads nowhere.
+async fn drop_dead_outputs(
+    runtime: &CompanyRuntime,
+    messages: &mut [MessageView],
+) -> Result<(), OpenCompanyError> {
+    if !messages.iter().any(|message| !message.outputs.is_empty()) {
+        return Ok(());
+    }
+
+    let needs_workspace = messages.iter().any(|message| {
+        message
+            .outputs
+            .iter()
+            .any(|output| output.kind == ChatOutputKind::WorkspaceNode)
+    });
+    let live_workspace: HashSet<String> = if needs_workspace {
+        runtime
+            .workspace()
+            .tree(runtime.id())
+            .await?
+            .into_iter()
+            .map(|node| node.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let needs_artifacts = messages.iter().any(|message| {
+        message
+            .outputs
+            .iter()
+            .any(|output| output.kind == ChatOutputKind::Artifact)
+    });
+    let live_artifacts: HashSet<(String, String, u32)> = if needs_artifacts {
+        runtime
+            .artifacts()
+            .list(runtime.id(), None)
+            .await?
+            .into_iter()
+            .flat_map(|artifact| {
+                artifact.versions.into_iter().map(move |version| {
+                    (
+                        artifact.id.clone(),
+                        artifact.task_id.clone(),
+                        version.version,
+                    )
+                })
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    for message in messages {
+        let mut kept = Vec::with_capacity(message.outputs.len());
+        for output in message.outputs.drain(..) {
+            let live = match output.kind {
+                ChatOutputKind::WorkspaceNode => live_workspace.contains(&output.target_id),
+                ChatOutputKind::Artifact => {
+                    let Some(task_id) = output.task_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(version) = output.version else {
+                        continue;
+                    };
+                    live_artifacts.contains(&(
+                        output.target_id.clone(),
+                        task_id.to_string(),
+                        version,
+                    ))
+                }
+            };
+            if live {
+                kept.push(output);
+            }
+        }
+        message.outputs = kept;
+    }
+    Ok(())
+}
+
 /// Counts a desk's messages before a cursor without materialising them.
 ///
 /// GraphQL's [`Page`](crate::server::graphql::pagination::Page) exposes an
@@ -1773,6 +1869,7 @@ mod test {
             mention_depth: 0,
             parent: None,
             task_id: None,
+            outputs: Vec::new(),
             chat_id: chat_id.to_string(),
             agent_id: "ceo".to_string(),
             text: "hi".to_string(),
@@ -2141,6 +2238,7 @@ mod test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: "studio".to_string(),
                     agent_id: "operator".to_string(),
                     text: "You said: on it".to_string(),
@@ -2343,6 +2441,7 @@ mod test {
                     mention_depth: 0,
                     parent: Some(EventSeq::new(4)),
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: "studio".to_string(),
                     agent_id: "ceo".to_string(),
                     text: "on it".to_string(),
@@ -2594,6 +2693,7 @@ mod test {
                     text: "…".to_string(),
                     steps: Vec::new(),
                     task_id: None,
+                    outputs: Vec::new(),
                     parent: None,
                 },
             )
@@ -2972,6 +3072,7 @@ mod dead_card_test {
             mention_depth: 0,
             parent: None,
             task_id: Some(task_id.to_string()),
+            outputs: Vec::new(),
             chat_id: MAIN_THREAD_ID.to_string(),
             agent_id: "ceo".to_string(),
             text: "Opened a card for that.".to_string(),
@@ -3107,6 +3208,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: MAIN_THREAD_ID.to_string(),
                     agent_id: "ceo".to_string(),
                     text: "just talking".to_string(),
@@ -3155,6 +3257,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
                     text: "admin-only owner report".to_string(),
@@ -3173,6 +3276,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
                     text: "ordinary workflow report".to_string(),
@@ -3242,6 +3346,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
                     text: "visible report".to_string(),
@@ -3260,6 +3365,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
                     text: "admin-only report".to_string(),
@@ -3313,6 +3419,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
                     text: "admin-only owner report".to_string(),
@@ -3331,6 +3438,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
                     text: "ordinary workflow report".to_string(),
@@ -3396,6 +3504,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string(),
                     text: "admin-only owner report".to_string(),
@@ -3414,6 +3523,7 @@ mod dead_card_test {
                     mention_depth: 0,
                     parent: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     chat_id: crate::runtime::OPERATOR_CHANNEL.to_string(),
                     agent_id: crate::runtime::WORKFLOW_REPLY_AUTHOR.to_string(),
                     text: "ordinary workflow report".to_string(),
@@ -3569,6 +3679,7 @@ mod referral_origin_test {
                         text: text.to_string(),
                         steps: Vec::new(),
                         task_id: None,
+                        outputs: Vec::new(),
                         parent: None,
                         mentions: Vec::new(),
                         mention_depth: 0,
@@ -3633,6 +3744,7 @@ mod referral_origin_test {
                         text: text.to_string(),
                         steps: Vec::new(),
                         task_id: None,
+                        outputs: Vec::new(),
                         parent: None,
                         mentions: Vec::new(),
                         mention_depth: 0,
@@ -3697,6 +3809,7 @@ mod referral_origin_test {
                         text: text.to_string(),
                         steps: Vec::new(),
                         task_id: None,
+                        outputs: Vec::new(),
                         parent: None,
                         mentions: Vec::new(),
                         mention_depth: 0,
@@ -3823,6 +3936,7 @@ mod referral_origin_test {
             text: "design came back: error messages are a design-system problem".to_string(),
             steps: Vec::new(),
             task_id: None,
+            outputs: Vec::new(),
             parent: None,
             mentions: Vec::new(),
             mention_depth: 0,
@@ -3941,6 +4055,7 @@ mod referral_origin_test {
                         text: format!("unrelated line {i}"),
                         steps: Vec::new(),
                         task_id: None,
+                        outputs: Vec::new(),
                         parent: None,
                         mentions: Vec::new(),
                         mention_depth: 0,
@@ -3972,6 +4087,7 @@ mod referral_origin_test {
                     text: "design came back: it is a design-system problem".to_string(),
                     steps: Vec::new(),
                     task_id: None,
+                    outputs: Vec::new(),
                     parent: None,
                     mentions: Vec::new(),
                     mention_depth: 0,

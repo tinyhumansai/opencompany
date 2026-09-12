@@ -602,6 +602,7 @@ mod tests {
                 channel_responses: vec![crate::ports::types::OutboundMessage {
                     message_id: None,
                     task_id: None,
+                    outputs: Vec::new(),
                     channel: "general".to_string(),
                     agent: Some("ceo".to_string()),
                     text: "the API shipped".to_string(),

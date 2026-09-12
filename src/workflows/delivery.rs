@@ -1526,6 +1526,7 @@ async fn send_to_channel_adapter(
         .send(OutboundMessage {
             message_id: None,
             task_id: None,
+            outputs: Vec::new(),
             channel: journal_channel.to_string(),
             agent: admin_only.then(|| crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR.to_string()),
             text: body,
