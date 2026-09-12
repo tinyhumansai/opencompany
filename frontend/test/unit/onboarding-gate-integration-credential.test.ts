@@ -298,10 +298,19 @@ describe("IntegrationStep distinguishes a missing connection from a missing cred
     }
   });
 
-  it("does not name a credential route the Apps page it links to has hidden", async () => {
-    // `product-scope.ts` hides the OpenHuman-managed route (`OAuthView` drops
-    // `CompanyCredentialCard` behind the same flag), so this sentence must not
-    // send the founder after a TinyHumans account key that page won't take.
+  it("names every credential route the Apps page it links to will actually take", async () => {
+    // This sentence is the first-run instruction, and its whole job is to send
+    // the founder after a credential the page it links to accepts. While
+    // `COMPOSIO_MANAGED_HIDDEN` was set, that was a Composio API key and
+    // nothing else — naming a TinyHumans account key sent them after one the
+    // Apps page had no surface for.
+    //
+    // The flag is off. The managed route is a selectable row again and the
+    // company-credential card is on the page above it, so the account key is
+    // now the ONE-CLICK way to finish this step and must be named first. The
+    // branch is kept rather than collapsed to the current value, because it is
+    // what makes re-hiding the route the single edit `product-scope.ts`
+    // promises — and reading the flag here is what pins the copy to it.
     await render("none");
     const copy = container.textContent ?? "";
     expect(copy).toContain("needs a credential to connect it with");
@@ -311,7 +320,16 @@ describe("IntegrationStep distinguishes a missing connection from a missing cred
       );
       expect(copy).toContain("Composio API key of your own");
     } else {
-      expect(copy).toContain("TinyHumans account key");
+      // Both, and in this order: the one-click credential, then the escape
+      // hatch for a company that wants its own Composio account. A first run
+      // that only heard about the second is the errand the grant removed.
+      expect(copy, "the managed route is offered — name its credential").toContain(
+        "TinyHumans account key",
+      );
+      expect(copy).toContain("Composio token of your own");
+      expect(copy.indexOf("TinyHumans account key")).toBeLessThan(
+        copy.indexOf("Composio token of your own"),
+      );
     }
   });
 

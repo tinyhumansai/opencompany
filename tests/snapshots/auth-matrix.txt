@@ -1776,6 +1776,13 @@ POST /api/v1/companies/{id}/chat/upload must-change-password-admin refused:403:p
 POST /api/v1/companies/{id}/chat/upload platform permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/companies/{id}/chat/upload tenant-non-owner refused:403:forbidden source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/companies/{id}/chat/upload tenant-owner permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/composio/api-key/test tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/companies/{id}/composio/authorize admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/companies/{id}/composio/authorize anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/companies/{id}/composio/authorize member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
@@ -2301,6 +2308,13 @@ POST /api/v1/company/chat/upload must-change-password-admin refused:403:password
 POST /api/v1/company/chat/upload platform permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/company/chat/upload tenant-non-owner refused:403:forbidden source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/company/chat/upload tenant-owner permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
+POST /api/v1/company/composio/api-key/test admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/composio/api-key/test tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/company/composio/authorize admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/company/composio/authorize anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/company/composio/authorize member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-

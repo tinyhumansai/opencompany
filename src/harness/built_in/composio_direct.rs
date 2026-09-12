@@ -667,6 +667,94 @@ impl V3Category {
     }
 }
 
+// ── Checking a DRAFT key, before anything is stored ──────────────────
+//
+// The console's "paste an API key" flow validates the key it was handed rather
+// than the key the company is already on, and it does so BEFORE the write. That
+// ordering is a deliberate departure from the inference connect flow
+// (`docs/modules/inference/connect-flow.md`), which writes the credential
+// first: its probe resolves a key by provider slug out of the store, so the
+// only way to exercise a draft there is to store it and roll back on a
+// destructive failure — which buys a rollback path and an orphaned-secret
+// failure mode along with it. Composio's probe takes the key **directly**, as
+// an argument, so there is nothing to roll back: a key that Composio rejects is
+// simply never written, and no failure of this function can leave the company
+// holding a credential it did not choose. That doc's own "Testing a draft"
+// section is where the shape comes from.
+//
+// No SSRF guard, on purpose. The connect-flow doc spends a section on SSRF
+// because its probe dials an endpoint the OPERATOR typed. This one dials
+// `DIRECT_BASE_URL` — a compile-time constant, the same one `v3_base` pins for
+// every other call in this module — and takes no endpoint from any caller.
+// There is no attacker-controlled destination here to guard, and adding a guard
+// would suggest, wrongly, that there is a way to point this somewhere else.
+
+/// How long a draft-key check may take before it is reported as a timeout.
+///
+/// Shorter than the 60s the listing calls allow: this one sits in front of an
+/// operator watching a modal, the answer is advisory, and a check that has not
+/// come back in ten seconds has already failed at being a check.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask Composio whether it recognises `api_key`, without storing it anywhere.
+///
+/// `Ok(())` means Composio answered the call. `Err` carries a raw reason for
+/// [`classify`](crate::company::composio_probe::classify) — **for
+/// classification and a debug log only**: the caller puts
+/// [`describe`](crate::company::composio_probe::describe)'s fixed copy on the
+/// wire, never this string.
+///
+/// The cheapest authenticated read Composio v3 has: one page of one toolkit.
+/// The response body is discarded — only whether the call was accepted matters,
+/// and a body that echoed the request is not something to carry back.
+pub(crate) async fn probe_api_key(api_key: &str) -> Result<(), String> {
+    probe_at(&v3_base(), api_key).await
+}
+
+/// [`probe_api_key`] against an explicit base.
+///
+/// Private, and reachable from a shipped build only through [`probe_api_key`],
+/// which always pins Composio's own host — the same rule `v3_base` follows for
+/// [`DirectComposio`], and for the same reason: a base a caller could choose
+/// would be a way to send the `x-api-key` header somewhere else.
+async fn probe_at(base: &str, api_key: &str) -> Result<(), String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        // Not reachable from the route (it never probes a clear), but a blank
+        // key would otherwise be sent to Composio and come back 401 —
+        // classified `auth`, which is the destructive class. Refuse it here in
+        // the non-destructive class instead.
+        return Err("no Composio API key was given, so nothing could be checked".to_string());
+    }
+    let url = format!("{base}/toolkits");
+    let request = oh::config::build_runtime_proxy_client_with_timeouts("composio.probe", 10, 5)
+        .get(&url)
+        .header("x-api-key", api_key)
+        .query(&[("limit", "1")])
+        .send();
+    let resp = match tokio::time::timeout(PROBE_TIMEOUT, request).await {
+        Err(_) => {
+            return Err(format!(
+                "Composio timed out after {}s",
+                PROBE_TIMEOUT.as_secs()
+            ));
+        }
+        // `reqwest`'s own rendering names the URL (a constant here) and the
+        // transport fault; it never carries a header, so it cannot carry the
+        // key. It is still only ever classified and debug-logged.
+        Ok(Err(err)) => return Err(err.to_string()),
+        Ok(Ok(resp)) => resp,
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    // The status line and nothing else. A Composio error body can echo the
+    // request, and a proxy's error body is an HTML page — neither is something
+    // to carry back from a function whose output is classified by substring.
+    Err(format!("Composio answered {status}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,6 +1329,110 @@ mod tests {
         assert!(
             !err.contains("ak_live"),
             "a body that echoes the key must never reach the caller: {err}"
+        );
+    }
+
+    // ── The draft-key probe ──────────────────────────────────────────
+
+    /// A mock Composio v3 `/toolkits` that answers `status`, recording the
+    /// `x-api-key` it was handed. Returns the base and the recorder.
+    async fn spawn_probe_backend(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/toolkits",
+                axum::routing::get(
+                    move |State(seen): State<Arc<Mutex<Vec<String>>>>, headers: HeaderMap| async move {
+                        if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                            seen.lock().unwrap().push(key.to_string());
+                        }
+                        (status, body)
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A key Composio accepts probes clean, and the key really is what was
+    /// presented — a probe that authenticated as something else would report on
+    /// a credential the operator is not about to store.
+    #[tokio::test]
+    async fn a_key_composio_accepts_probes_clean_and_is_the_key_presented() {
+        let (base, seen) = spawn_probe_backend(axum::http::StatusCode::OK, r#"{"items":[]}"#).await;
+        probe_at(&base, "ak_not_a_real_key_0123456789")
+            .await
+            .expect("a 200 is a clean probe");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["ak_not_a_real_key_0123456789"]
+        );
+    }
+
+    /// A rejected key comes back as a status line that classifies `auth` — and
+    /// the raw reason never carries the key, even when the upstream body does.
+    #[tokio::test]
+    async fn a_rejected_key_classifies_auth_without_echoing_itself() {
+        use crate::company::composio_probe::{ComposioProbeClass, classify};
+
+        let (base, _) = spawn_probe_backend(
+            axum::http::StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid key ak_not_a_real_key_0123456789"}"#,
+        )
+        .await;
+        let err = probe_at(&base, "ak_not_a_real_key_0123456789")
+            .await
+            .expect_err("a 401 is not a clean probe");
+        assert_eq!(classify(&err), ComposioProbeClass::Auth, "{err}");
+        assert!(
+            !err.contains("ak_not_a_real_key"),
+            "the probe must not carry the key back, even when the body echoes it: {err}"
+        );
+    }
+
+    /// A gateway in front of Composio is NOT a statement about the key: the
+    /// classifier has to see a non-destructive class, or a corporate proxy
+    /// deletes a working credential.
+    #[tokio::test]
+    async fn a_gateway_failure_is_never_read_as_a_bad_key() {
+        use crate::company::composio_probe::{ComposioProbeClass, classify};
+
+        let (base, _) =
+            spawn_probe_backend(axum::http::StatusCode::BAD_GATEWAY, "<html>proxy</html>").await;
+        let err = probe_at(&base, "ak_not_a_real_key_0123456789")
+            .await
+            .expect_err("a 502 is not a clean probe");
+        assert_eq!(classify(&err), ComposioProbeClass::Unknown, "{err}");
+        assert!(!classify(&err).is_destructive());
+    }
+
+    /// Nothing listening classifies as a connection problem, not a credential
+    /// one. Port 0 in a URL is never bound, so this needs no server at all.
+    #[tokio::test]
+    async fn an_unreachable_host_is_a_connection_problem_not_a_credential_one() {
+        use crate::company::composio_probe::classify;
+
+        let err = probe_at("http://127.0.0.1:1/api/v3", "ak_not_a_real_key_0123456789")
+            .await
+            .expect_err("nothing is listening there");
+        assert!(
+            !classify(&err).is_destructive(),
+            "an unreachable host must never take a key away: {err} -> {}",
+            classify(&err)
         );
     }
 }

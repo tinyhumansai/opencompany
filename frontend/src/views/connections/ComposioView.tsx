@@ -3,7 +3,6 @@ import { Info } from "lucide-react";
 import type { OpenCompanyClient } from "@/api/client";
 import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { CompanyCredentialCard } from "@/views/connections/CompanyCredentialCard";
 import { ComposioSection } from "@/views/connections/ComposioSection";
 import { useComposioCredential } from "@/views/connections/use-composio-credential";
 
@@ -76,26 +75,25 @@ export function ComposioView({ client, company }: Props) {
           </Alert>
         )}
 
-        {/* The general answer above the Composio-specific one: one key
-            authorizing every brokered surface, with the Composio credential as
-            the escape hatch (issue #586).
+        {/* `CompanyCredentialCard` used to sit here, above the rows: the
+            general answer (one TinyHumans key authorising every brokered
+            surface) over the Composio-specific one. It is gone from THIS page
+            and unchanged on the API Key page, which is the only place it
+            renders now.
 
-            This was hidden behind `COMPOSIO_MANAGED_HIDDEN` because asking for
-            a TinyHumans key meant sending an operator to another site to mint
-            one — a worse errand than the Composio key below, for a credential
-            most people did not have. The key grant removes the errand: the card
-            now leads with one button and falls back to the field only where a
-            grant cannot complete.
+            Two surfaces for one credential is the reason. The card carried its
+            own paste field and Save for the company key, and the rows below
+            carry a managed route whose "Billed to this company's TinyHumans
+            account" sub-line reports that same key — so the page asked for one
+            credential twice, in two visual languages, and an operator reading
+            it had to work out whether they were two different keys. Retiring
+            that shape is what issue #2259's rework is for; leaving the card
+            above it would have kept the old surface alongside the new one.
 
-            It is no longer gated by a flag at all. The card asks the host and
-            renders nothing when there is no credential plane to talk to, which
-            is a truer answer than a constant. */}
-        <CompanyCredentialCard
-          client={client}
-          company={company}
-          canManage={credential.canManage}
-          onChanged={credential.changed}
-        />
+            What leaves with it: `HubAccountLinks` — "Manage API keys" and "Top
+            up balance" — which the card rendered and the rows have no
+            equivalent for. Both are still one click away on the API Key page,
+            where the key they act on is set. */}
 
         {/* Remounted on a credential change so its status is re-read: the tier
             it reports (`company` vs `attested` vs `none`) is downstream of the

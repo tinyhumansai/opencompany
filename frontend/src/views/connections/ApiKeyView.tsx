@@ -275,8 +275,15 @@ export function ApiKeyView({ client, company }: Props) {
       ) : null}
 
       {/* The full credential control — paste, rotate, clear — under the pitch
-          rather than instead of it. The card is the same one Apps renders, so
-          the two pages cannot drift into different vocabularies for one key. */}
+          rather than instead of it.
+
+          This is now the ONLY page that renders the card. It used to render on
+          the Composio page as well, which was the argument for sharing one
+          component — two pages, one vocabulary for one key. That page dropped
+          it (see `ComposioView`): its rows already report this key as the
+          managed route's payer, so the card asked for the same credential a
+          second time, in a second language, a few inches above. One caller is
+          the simpler answer to the same problem. */}
       <CompanyCredentialCard
         client={client}
         company={company}

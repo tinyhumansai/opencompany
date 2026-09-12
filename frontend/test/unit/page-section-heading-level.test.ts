@@ -45,12 +45,20 @@ const PAGES = [
   },
   {
     // The credential half of the Apps page, which is a page of its own since
-    // issue #2259. Its two sections came off `OAuthView` above, and the point
-    // of pinning them here is the same one the MCP note makes below: a page's
-    // outline is exactly what a split changes, and these `h2`s now head under
+    // issue #2259. Its section came off `OAuthView` above, and the point of
+    // pinning it here is the same one the MCP note makes below: a page's
+    // outline is exactly what a split changes, and this `h2` now heads under
     // this page's `h1` rather than the accounts page's.
+    //
+    // ONE section, not two. `CompanyCredentialCard` was the other and no longer
+    // renders here: it asked for the company's TinyHumans key in its own
+    // language directly above rows that report that same key, so the page put
+    // one credential on screen twice. It still heads at `h2` on the API Key
+    // page, which is the only place it renders now. That page is not in this
+    // map, so nothing here pins it any more — which is correct: this list is
+    // per-page outlines, and it is no longer part of this page's.
     view: "connections/ComposioView",
-    sections: ["connections/CompanyCredentialCard", "connections/ComposioSection"],
+    sections: ["connections/ComposioSection"],
   },
   {
     // The Connections split gave MCP and inference pages of their own, and a

@@ -220,19 +220,23 @@ test("a host that never answers at all still gets the honest warning", async ({ 
   await expect(page.getByTestId(PROBE_FAILED)).toBeVisible({ timeout: 60_000 });
 });
 
-// Skipped, not deleted: the console behaviour is still worth pinning, but the
-// control this drives is gone. It fills the legacy managed-route token card,
-// which `showManagedTokenCard` gates on `mode === "managed"` — and with
-// `COMPOSIO_MANAGED_HIDDEN` set, `MODE_ORDER` holds only `byok`, so
-// `formModeFor` can never answer `managed` and the card never renders. That is
-// the `locator.fill` timeout on the field below, not a regression in the
-// re-read.
+// Still skipped, but no longer for the reason it was.
+//
+// It was skipped because the control it drives had gone: it fills the
+// managed-route token field, and with `COMPOSIO_MANAGED_HIDDEN` set the managed
+// route was filtered out of the picker entirely, so the field never rendered
+// and this failed as a `locator.fill` timeout rather than as a regression in
+// the re-read.
+//
+// That flag is now off and the managed route is a row again, so the field is
+// reachable — behind the row's own "Replace token" control rather than a card
+// that rendered on its own. **The body below has been retargeted to that
+// path**, but it has NOT been run: un-skipping needs a pass of the Console E2E
+// lane against a live host, which the change that retargeted it did not have.
+// Whoever runs that lane next should drop the `.skip` and find out.
 //
 // Every other case in this file sets the token through the API; only this one
-// needed the UI, because a *rotation through the form* is what it is about.
-// Retargeting it at the BYOK `composio-api-key` field would be a different
-// credential with different eviction semantics, so it is left for whoever owns
-// the managed route to redirect or retire.
+// needs the UI, because a *rotation through the form* is what it is about.
 test.skip("rotating the credential re-reads the catalog instead of warning about it", async ({
   page,
 }) => {
@@ -260,12 +264,26 @@ test.skip("rotating the credential re-reads the catalog instead of warning about
   const reread = page.waitForResponse(
     (response) => isComposioStatus(new URL(response.url())) && response.status() === 200,
   );
+  // The form is opened by the row that owns the credential, rather than
+  // rendering unasked — "do not show a control that cannot act" applies to a
+  // password field as much as to a button.
+  await page.getByTestId("composio-row-managed-replace").click();
   const field = page.getByLabel(/Composio token/);
   await field.fill(`${TOKEN}-rotated`);
-  await page.getByRole("button", { name: "Save token" }).click();
-  // The field is cleared only on a write the host accepted, so this separates
+  // "Rotate", not "Save": the row knows a token is already stored, and the
+  // button says which of the two things it is doing.
+  await page.getByTestId("composio-form-save").click();
+  // The dialog closes only on a write the host accepted — a refusal keeps it
+  // open with the message inside it, next to the field — so this separates
   // "the rotation happened" from "the click did nothing".
-  await expect(field).toHaveValue("", { timeout: 30_000 });
+  //
+  // Asserting the FIELD is empty cannot do that job now. It used to, while the
+  // form was a card on the page that stayed mounted; the credential opens in a
+  // modal instead, so on a successful write the input unmounts with it and an
+  // assertion on an element that is no longer there fails rather than passes.
+  await expect(page.getByTestId("composio-form-dialog")).toHaveCount(0, {
+    timeout: 30_000,
+  });
   await reread;
 
   // The provider this company has not connected, so it can only have reached

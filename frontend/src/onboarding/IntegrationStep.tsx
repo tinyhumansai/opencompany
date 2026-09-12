@@ -296,12 +296,14 @@ export function IntegrationStep({
           <p>
             Agents reach Gmail, Slack and GitHub through a connected account. Before any
             provider can be connected, this company needs a credential to connect it with —{" "}
-            {/* `COMPOSIO_MANAGED_HIDDEN` took the OpenHuman-managed route out of Apps
-                (`OAuthView` hides `CompanyCredentialCard` behind the same flag), so
-                naming a TinyHumans account key here sent the founder after a credential
-                the page this card links to no longer accepts. Reading the flag rather
-                than restating its current value keeps re-enabling that surface the
-                single edit `product-scope.ts` promises it is. */}
+            {/* Reads `COMPOSIO_MANAGED_HIDDEN` rather than restating its current
+                value, which is what kept re-enabling the managed route the single
+                edit `product-scope.ts` promises it is — and that edit has now
+                happened. While the flag was set, the OpenHuman-managed route was
+                out of Apps, so naming a TinyHumans account key here sent the
+                founder after a credential the page this card links to would not
+                accept. With the route back, both credentials finish this step and
+                both are named: the account key is the one-click half. */}
             {COMPOSIO_MANAGED_HIDDEN
               ? "a Composio API key of your own."
               : "a TinyHumans account key, or a Composio token of your own."}

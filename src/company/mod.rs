@@ -30,6 +30,11 @@ pub mod artifact_mirror;
 pub mod avatar;
 pub mod company_key;
 pub mod composio;
+/// Classifying a Composio credential check, so a probe that failed for a proxy,
+/// a WAF or a rate limit never deletes a working key (issue #2275). Pure and
+/// always compiled — the decision is a function over a string, and the route
+/// that consumes it answers in every build. See [`composio_probe`].
+pub mod composio_probe;
 #[cfg(test)]
 mod content_test;
 // Which workspace documents each role is told to reason from

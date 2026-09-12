@@ -46,15 +46,25 @@ export const HOST_SETTINGS_HIDDEN = true;
 /**
  * Hides the OpenHuman-managed Composio route, leaving BYOK the only choice.
  *
- * Still on. It used to gate the company-credential card as well, which made it
- * one flag doing two jobs: hiding a *Composio route* and hiding the *TinyHumans
- * key* surface. Those came apart when the key grant landed — the credential
- * card is now worth showing (one click, no paste) while the managed Composio
- * route is hidden for its own reasons, which this flag still names. The card
- * decides its own visibility from the host's answer instead; see
- * `CompanyCredentialCard`.
+ * **Off**, for the same reason {@link INFERENCE_MANAGED_HIDDEN} is. The managed
+ * route was hidden while choosing it meant going and minting a credential by
+ * hand, which made a Composio API key of your own the honestly easier option.
+ * The company-key grant removes that errand: the managed route is one click,
+ * and it is the option that also arms the company's connections in the same
+ * step.
+ *
+ * It used to gate the company-credential card as well, which made it one flag
+ * doing two jobs — hiding a *Composio route* and hiding the *TinyHumans key*
+ * surface. Those came apart when the grant landed and the card started deciding
+ * its own visibility from the host's answer; see `CompanyCredentialCard`. What
+ * is left here is the route, and the route is now offered.
+ *
+ * What this turns back on: `composioRows` returns a managed row that can be
+ * selected rather than only reported, and `IntegrationStep` names the
+ * TinyHumans account key alongside a Composio token as ways to finish
+ * onboarding.
  */
-export const COMPOSIO_MANAGED_HIDDEN = true;
+export const COMPOSIO_MANAGED_HIDDEN = false;
 
 /**
  * Hides the managed inference provider, leaving the operator to name one.

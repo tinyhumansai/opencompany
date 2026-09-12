@@ -190,12 +190,13 @@ describe("the switcher carries hosts, and only hosts", () => {
 });
 
 /**
- * BYOK only, on both credential surfaces.
+ * Both routes, on both credential surfaces.
  *
- * The pair that matters: the managed route must not be *selectable*, and a
- * company already on it must still be *legible*. Hiding a route by deleting its
- * descriptor would satisfy the first and break the second — the label tables
- * keep every route for exactly that reason.
+ * `COMPOSIO_MANAGED_HIDDEN` and `INFERENCE_MANAGED_HIDDEN` are now both off, so
+ * these pin the *presence* of the managed route rather than its absence — and
+ * the pair that always mattered is unchanged: a route must be selectable, and a
+ * company already on one must be legible. The hide satisfied the second and
+ * broke the first; what replaced it has to do both.
  */
 
 function composioStatus(over: Partial<ComposioStatus> = {}): ComposioStatus {
@@ -239,51 +240,77 @@ async function mountComposio(status: ComposioStatus) {
   });
 }
 
-describe("Composio offers this company's own account and nothing else", () => {
-  it("offers this company's own Composio key, and no route to pick between", async () => {
-    // With one route left there is nothing to choose, so the picker goes and the
-    // credential field for that route is what the operator lands on. A picker of
-    // one is not a choice; it is a click between the operator and the task.
+describe("Composio offers both routes, and says which one is live", () => {
+  it("offers a real choice between the two accounts", async () => {
+    // The point of the flag flip. While it was set, `MODE_ORDER` filtered
+    // `managed` out and the picker collapsed to a single credential field —
+    // there was nothing to choose because only one route was on offer.
     await mountComposio(composioStatus({ mode: "managed", credentialSource: "none" }));
 
-    expect(document.querySelector("#composio-api-key")).not.toBeNull();
-    expect(document.querySelectorAll('[role="radiogroup"]')).toHaveLength(0);
-    expect(find("composio-mode-managed")).toBeNull();
+    expect(find("composio-row-managed")).not.toBeNull();
+    expect(find("composio-row-byok")).not.toBeNull();
+    expect(document.querySelectorAll('[role="radiogroup"]')).toHaveLength(1);
   });
 
-  it("cannot leave a radiogroup with nothing checked, because there is none", async () => {
-    // The a11y break this replaces: managed filtered out of the order array with
-    // a company still on it left `active` false for every tile, so the whole
-    // group reported aria-checked="false". Removing the group removes the state.
+  it("checks exactly one route, never none", async () => {
+    // The a11y break the hide caused: managed filtered out of the order array
+    // with a company still on it left `active` false for every tile, so the
+    // whole group reported aria-checked="false" — a control claiming the
+    // company had chosen nothing, which is a different and wrong statement from
+    // "it is on a route not offered here".
     await mountComposio(composioStatus({ mode: "managed", credentialSource: "none" }));
 
-    const radios = document.querySelectorAll('[role="radio"]');
-    const checked = document.querySelectorAll('[role="radio"][aria-checked="true"]');
-    expect(radios.length === 0 || checked.length === 1).toBe(true);
+    expect(document.querySelectorAll('[role="radio"][aria-checked="true"]')).toHaveLength(1);
+    expect(
+      find("composio-row-managed-select")!.getAttribute("aria-checked"),
+      "the company is on managed",
+    ).toBe("true");
   });
 
-  it("names nothing about the hidden route anywhere on the panel", async () => {
-    await mountComposio(composioStatus({ mode: "managed", credentialSource: "none" }));
+  it("names the managed route, because it is a route again", async () => {
+    await mountComposio(composioStatus({ mode: "managed", credentialSource: "company" }));
 
-    expect(container.textContent).not.toContain("OpenHuman");
-    expect(container.textContent).not.toContain("TinyHumans");
-    expect(container.textContent).not.toContain("api.tinyhumans.ai");
+    expect(container.textContent).toContain("TinyHumans-managed");
+    // ...and says which account pays, which is the decision the row exists for.
+    expect(find("composio-row-managed-subline")!.textContent).toContain(
+      "Billed to this company's TinyHumans account",
+    );
   });
-  it("offers a BYOK company no control that would move it off its own account", async () => {
-    // Clearing a key is not "the key goes away". The host derives the route from
-    // whether one exists, so an empty write puts the company back on the route
-    // this console no longer offers — and a company with any credential there
-    // resumes acting through it, a different account billed differently.
+
+  it("gives a BYOK company the route back, and still no second name for it", async () => {
+    // Clearing a BYOK key and switching to managed are ONE host call, because
+    // the host derives the route from whether a key exists. While managed was
+    // hidden, the only control that made that call could not name where it
+    // landed, so there was no honest button and the section offered none.
     //
-    // A button here could only say that, naming the route, or not say it, which
-    // is the switch happening silently. Rotating stays; removing does not.
-    await mountComposio(composioStatus({ mode: "byok", credentialSource: "company" }));
+    // With the route on screen the call has a name — the managed row's
+    // "Use this" — and the own-account row must NOT also offer it as a
+    // "Remove key", which would be one action wearing two labels.
+    await mountComposio(composioStatus({ mode: "byok", credentialSource: "static" }));
 
-    expect(find("composio-clear-key")).toBeNull();
-    expect(container.textContent).not.toContain("Clear key");
-    expect(container.textContent).not.toContain("use OpenHuman-managed");
+    expect(find("composio-row-managed-select")).not.toBeNull();
+    expect(find("composio-row-managed-select")!.textContent).toContain("Use this");
+    expect(find("composio-row-byok-remove")).toBeNull();
     // Rotation is still reachable, so a compromised key is still replaceable.
-    expect(container.textContent).toContain("Rotate key");
+    expect(find("composio-row-byok-replace")).not.toBeNull();
+  });
+
+  it("hides the way back when the managed chain resolves to nothing", async () => {
+    // Offering a switch into an outage is worse than offering no switch. The
+    // row still reports why, in its sub-line — which is the whole of what the
+    // operator gets here now that the company-credential card is off this page
+    // (it is on the API Key page), and is why the sub-line has to say which
+    // payer failed to resolve rather than only that one did not.
+    await mountComposio(
+      composioStatus({
+        mode: "byok",
+        credentialSource: "static",
+        managedCredentialSource: "none",
+      }),
+    );
+
+    expect(find("composio-row-managed-select")).toBeNull();
+    expect(find("composio-row-managed-subline")!.textContent).toContain("No credential resolves");
   });
 });
 
