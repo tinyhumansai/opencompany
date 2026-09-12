@@ -336,6 +336,32 @@ fn global_workflows_list_last_and_a_company_graph_of_the_same_id_wins() {
 }
 
 #[test]
+fn a_company_file_claiming_a_global_id_never_resolves_to_the_global() {
+    let taken = &workflows()[0].id;
+    let dir = tempfile::Builder::new()
+        .prefix("opencompany-globals-")
+        .tempdir()
+        .expect("tempdir");
+    let workflows_dir = dir.path().join("workflows");
+    std::fs::create_dir_all(&workflows_dir).expect("workflows dir");
+    // The file claims the id by its name; its body disagrees, so the seed scan
+    // skips it and the company union yields nothing.
+    std::fs::write(
+        workflows_dir.join(format!("{taken}.toml")),
+        "id = \"renamed\"\nname = \"Ours\"\n\n[[node]]\nid = \"t\"\nkind = \"trigger\"\nname = \"T\"\n",
+    )
+    .expect("seed graph");
+
+    let loaded = crate::company::load_workflow_with_globals(Some(dir.path()), &[], &[], taken)
+        .expect("loads");
+    assert!(
+        loaded.is_none(),
+        "a company file claiming this id must not resolve to the global behind it: got {:?}",
+        loaded.map(|file| (file.id, file.name, file.global))
+    );
+}
+
+#[test]
 fn a_disabled_global_workflow_neither_lists_nor_loads() {
     let dropped = &workflows()[0].id;
     let disable = vec![format!("workflow:{dropped}")];

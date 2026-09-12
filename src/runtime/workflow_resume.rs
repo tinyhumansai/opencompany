@@ -114,7 +114,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::Result;
-use crate::company::load_workflow_union;
+use crate::company::load_workflow_with_globals;
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::ports::types::Effect;
@@ -1244,21 +1244,31 @@ async fn spawn_continuation(
         )));
     };
 
-    // The same seed ∪ overlay union the run route loads through, so a graph
-    // authored on a hosted tenant (no source directory) resumes exactly like a
-    // committed one.
-    let overlays = runtime
+    let (overlays, disable) = runtime
         .store()
         .load(runtime.id())
         .await?
-        .map(|record| record.overlay_workflows)
+        .map(|record| (record.overlay_workflows, record.manifest.globals.disable))
         .unwrap_or_default();
     let workflow =
-        load_workflow_union(runtime.source_dir(), &overlays, workflow_id)?.ok_or_else(|| {
-            OpenCompanyError::CompanyNotFound(format!(
-                "workflow {workflow_id} (it was approved, but the graph no longer exists)"
-            ))
-        })?;
+        load_workflow_with_globals(runtime.source_dir(), &overlays, &disable, workflow_id)?
+            .ok_or_else(|| {
+                OpenCompanyError::CompanyNotFound(format!(
+                    "workflow {workflow_id} (it was approved, but the graph no longer exists)"
+                ))
+            })?;
+    if a_contested_id_no_longer_holds_the_parked_graph(
+        effect
+            .payload
+            .get(PAYLOAD_WORKFLOW_FINGERPRINT)
+            .and_then(Value::as_str),
+        &workflow,
+        &disable,
+    ) {
+        return Err(OpenCompanyError::CompanyNotFound(format!(
+            "workflow {workflow_id} (it was approved, but the graph it parked against is gone)"
+        )));
+    }
 
     let input = continuation_input(effect, approved, denied)?;
     // Issue #1862 prerequisite: carry the paused run's attribution into the
@@ -1405,19 +1415,30 @@ pub async fn spawn_blocked_node_continuation(
              workflow execution wired, so there is nothing to continue"
         )));
     };
-    let overlays = runtime
+    let (overlays, disable) = runtime
         .store()
         .load(runtime.id())
         .await?
-        .map(|record| record.overlay_workflows)
+        .map(|record| (record.overlay_workflows, record.manifest.globals.disable))
         .unwrap_or_default();
     let workflow =
-        load_workflow_union(runtime.source_dir(), &overlays, workflow_id)?.ok_or_else(|| {
-            OpenCompanyError::CompanyNotFound(format!(
-                "workflow {workflow_id} (a blocked step was approved, but the graph no longer \
-                 exists)"
-            ))
-        })?;
+        load_workflow_with_globals(runtime.source_dir(), &overlays, &disable, workflow_id)?
+            .ok_or_else(|| {
+                OpenCompanyError::CompanyNotFound(format!(
+                    "workflow {workflow_id} (a blocked step was approved, but the graph no longer \
+             exists)"
+                ))
+            })?;
+    if a_contested_id_no_longer_holds_the_parked_graph(
+        workflow_fingerprint.as_deref(),
+        &workflow,
+        &disable,
+    ) {
+        return Err(OpenCompanyError::CompanyNotFound(format!(
+            "workflow {workflow_id} (a blocked step was approved, but the graph it parked \
+             against is gone)"
+        )));
+    }
     // Issue #401: `begin` refuses at the concurrency ceiling; propagate it so
     // the caller surfaces the same refusal rather than losing the run
     // silently. Deliberately split from `spawn_admitted` below (mirroring the
@@ -1518,6 +1539,32 @@ fn graph_unchanged_since_park(effect: &Effect, workflow: &crate::company::Workfl
             .and_then(Value::as_str),
         workflow,
     )
+}
+
+/// Whether an id a global could answer to resolved to a graph this run did not
+/// park against.
+///
+/// A company graph and a global can hold one id, and either can replace the
+/// other while a run sits parked: deleting the company's copy surfaces the
+/// global, and authoring one buries it. Both directions end with a graph that
+/// is not what the operator answered for, and a trigger re-run there executes
+/// nodes nobody approved.
+///
+/// Keyed on the id being contested rather than on which side won, so the two
+/// directions cannot drift apart. An id no global answers to is untouched: an
+/// edited company graph is the operator's own edit of their own graph, and
+/// still falls back to a trigger re-run. A run parked before fingerprints were
+/// stashed still replays as it did.
+fn a_contested_id_no_longer_holds_the_parked_graph(
+    parked: Option<&str>,
+    workflow: &crate::company::WorkflowFile,
+    disable: &[String],
+) -> bool {
+    let contested = !crate::globals::disabled(disable, "workflow", &workflow.id)
+        && crate::globals::workflows()
+            .iter()
+            .any(|global| global.id == workflow.id);
+    contested && parked.is_some_and(|parked| parked != workflow.content_fingerprint())
 }
 
 /// The shared check behind [`graph_unchanged_since_park`] (the gate path,
@@ -2792,6 +2839,74 @@ from = "start"
 to = "gate"
 "#;
 
+    /// A contested id that no longer holds the graph a run parked against is
+    /// refused, whichever side won it.
+    ///
+    /// A company graph and a global can hold one id. Deleting the company's
+    /// copy surfaces the global; authoring one buries it. Both directions end
+    /// with a graph the operator never answered for.
+    #[test]
+    fn a_contested_id_is_refused_in_both_directions() {
+        let contested = &crate::globals::workflows()[0].id;
+        let parked = crate::company::parse_workflow(FINGERPRINT_V1).expect("parses");
+        let other = crate::company::parse_workflow(FINGERPRINT_V2).expect("parses");
+
+        let mut surfaced_global = other.clone();
+        surfaced_global.id = contested.clone();
+        surfaced_global.global = true;
+        assert!(
+            a_contested_id_no_longer_holds_the_parked_graph(
+                Some(&parked.content_fingerprint()),
+                &surfaced_global,
+                &[],
+            ),
+            "a global surfacing under a deleted company graph's id must not run in its place"
+        );
+
+        let mut authored_company = other.clone();
+        authored_company.id = contested.clone();
+        authored_company.global = false;
+        assert!(
+            a_contested_id_no_longer_holds_the_parked_graph(
+                Some(&parked.content_fingerprint()),
+                &authored_company,
+                &[],
+            ),
+            "a company graph authored over a parked global must not run in its place either"
+        );
+
+        let mut unchanged = surfaced_global.clone();
+        unchanged.global = true;
+        assert!(
+            !a_contested_id_no_longer_holds_the_parked_graph(
+                Some(&unchanged.content_fingerprint()),
+                &unchanged,
+                &[],
+            ),
+            "the graph a run genuinely parked against still resumes"
+        );
+        assert!(
+            !a_contested_id_no_longer_holds_the_parked_graph(None, &surfaced_global, &[]),
+            "a run parked before fingerprints were stashed keeps replaying as it did"
+        );
+        assert!(
+            !a_contested_id_no_longer_holds_the_parked_graph(
+                Some(&parked.content_fingerprint()),
+                &other,
+                &[],
+            ),
+            "an id no global answers to is the operator's own edit — unchanged behaviour"
+        );
+        assert!(
+            !a_contested_id_no_longer_holds_the_parked_graph(
+                Some(&parked.content_fingerprint()),
+                &surfaced_global,
+                &[format!("workflow:{contested}")],
+            ),
+            "a global the company disabled cannot contest the id at all"
+        );
+    }
+
     /// A card parked before this check existed carries no
     /// `PAYLOAD_WORKFLOW_FINGERPRINT` at all — must not be treated as a
     /// mismatch, or every pre-existing parked card would spuriously fall back
@@ -3177,6 +3292,70 @@ mode = "full"
             crate::ports::types::StartedBy::Operator,
             "a card with no started_by payload must degrade to the old default, not error: {:?}",
             started[0].started_by
+        );
+    }
+
+    /// The gate path resolves a global too.
+    ///
+    /// The blocked-node twin is the reachable half today — no global declares
+    /// an approval gate — so this pins the other arm against the day one does,
+    /// and against a reader restoring the company-only loader on either.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn an_approved_gate_on_a_global_graph_continues() {
+        let global = crate::globals::workflows()
+            .first()
+            .expect("the baseline ships at least one workflow");
+        let home = seed_home();
+        assert!(
+            !home
+                .path()
+                .join("workflows")
+                .join(format!("{}.toml", global.id))
+                .exists(),
+            "the fixture must not carry a company copy of {}",
+            global.id
+        );
+        let (rt, runner) = runtime(home.path(), true).await;
+
+        let effect = gate_effect(
+            &global.id,
+            "gather",
+            &json!({ "request": "the week" }),
+            "run-that-paused",
+            &[],
+            &[],
+            None,
+        );
+        let id = rt
+            .approvals
+            .park(rt.id(), effect.clone())
+            .await
+            .expect("parks");
+        rt.journal()
+            .record_parked(
+                &id,
+                &effect,
+                crate::ports::now_millis(),
+                TaskLink::Unlinked,
+                ApprovalConversation::default(),
+                None,
+            )
+            .await
+            .expect("journals");
+
+        rt.resolve_approval(&id, Verdict::Approve, operator())
+            .await
+            .expect("resolves");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(
+            started
+                .iter()
+                .map(|run| run.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![global.id.as_str()],
+            "approving a gate on a global must start its continuation"
         );
     }
 
@@ -3721,6 +3900,63 @@ mode = "full"
             remaining.is_empty(),
             "the refused lineage is unreachable from here on, so it must be pruned rather than \
              leaked: {remaining:?}"
+        );
+    }
+
+    /// A blocked node on a global graph resumes.
+    ///
+    /// A global lives only in the static baseline, so a resume that reloads
+    /// the graph through the company's own two sources cannot find it: the
+    /// answer is banked, the continuation never starts, and the run ends
+    /// stranded carrying a message that says the graph no longer exists.
+    #[cfg(feature = "openhuman")]
+    #[tokio::test]
+    async fn a_blocked_node_on_a_global_graph_resumes() {
+        let global = crate::globals::workflows()
+            .first()
+            .expect("the baseline ships at least one workflow");
+
+        let home = seed_home();
+        assert!(
+            !home
+                .path()
+                .join("workflows")
+                .join(format!("{}.toml", global.id))
+                .exists(),
+            "the fixture must not carry a company copy of {}, or the union loader would find \
+             it and the global layer would go untested",
+            global.id
+        );
+
+        let mut rt = RuntimeBuilder::new(home.path().to_path_buf(), manifest())
+            .with_seed_dir(home.path().to_path_buf())
+            .build()
+            .await
+            .expect("runtime builds");
+        let runner = Arc::new(RecordingRunner::default());
+        rt.set_workflow_runner(runner.clone());
+        let rt = Arc::new(rt);
+
+        spawn_blocked_node_continuation(
+            &rt,
+            "blocked-turn",
+            &global.id,
+            json!({ "request": "x" }),
+            crate::ports::types::StartedBy::Operator,
+            None,
+            None,
+        )
+        .await
+        .expect("a blocked node on a global graph continues");
+
+        let started = wait_for_runs(&runner, 1).await;
+        assert_eq!(
+            started
+                .iter()
+                .map(|run| run.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![global.id.as_str()],
+            "answering the question must start the continuation, not strand the run"
         );
     }
 
