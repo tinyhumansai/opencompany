@@ -35,7 +35,7 @@ admins = ["harness-e2e@tinyhumans.ai"]
 [tools]
 # No `web`, no `search`: the answer has to be computed, not looked up. See the
 # parent bundle for the full argument.
-allow = ["files", "docs", "shell", "code", "workspace", "workspace.*"]
+allow = ["files", "docs", "shell", "code", "workspace", "workspace.*", "mcp:*"]
 
 # A live run routes inference through the local llm-ladder-router, so it costs
 # marketplace rates rather than a hosted subscription: point the managed

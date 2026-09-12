@@ -21,7 +21,10 @@ tier = "reasoning"
 # status page, a policy, a filing deadline), and a teammate that cannot look it
 # up reports "blocked" without saying on what. Admitted only by an explicit
 # company grant, so it costs nothing where nobody opted in.
-tools = ["workspace.*", "workspace.write", "docs.*", "files.*", "search"]
+# `mcp:*` on the same terms: it confers nothing in a company that installed no
+# server, and lets this teammate reach the ones a company did install rather
+# than being the baseline hole a correct roster still falls through.
+tools = ["workspace.*", "workspace.write", "docs.*", "files.*", "search", "mcp:*"]
 
 prompt = """
 You are the company's operations teammate. You keep the record straight: what

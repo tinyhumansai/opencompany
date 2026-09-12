@@ -33,7 +33,7 @@ human_role = "Set the question and accept the findings"
 #
 # Search spend is bounded by `search_daily_calls`; set it to `0` to pause
 # search without editing this list.
-allow = ["*", "search"]
+allow = ["*", "search", "mcp:*"]
 search_daily_calls = 200
 
 # ---------------------------------------------------------------------------

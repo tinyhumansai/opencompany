@@ -16,7 +16,7 @@ tier = "orchestrator"
 # one. It must appear here AND in `[tools].allow` in `company.toml` — the
 # per-agent list narrows the company-wide one, so either edit alone is a silent
 # no-op (#312).
-tools = ["web.*", "search"]
+tools = ["web.*", "search", "mcp:*"]
 budget_usd_daily = 5.0
 
 # The role's working rules, checked in beside this file and read at manifest

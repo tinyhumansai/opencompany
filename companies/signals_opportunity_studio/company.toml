@@ -32,7 +32,7 @@ max_passes = 12
 #
 # This list gates the company; each agent's own `tools` narrows it further, so
 # `search` also has to appear on the scout / analyst / research agents above.
-allow = ["web.*", "docs.*", "search"]
+allow = ["web.*", "docs.*", "search", "mcp:*"]
 
 [channels.operator]
 enabled = true

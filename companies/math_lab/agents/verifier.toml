@@ -7,7 +7,7 @@ tier = "reasoning"
 # it stays on disk where the verifier can choose not to look at it.
 context = ["GOAL.md", "brief.md", "METHOD.md"]
 
-tools = ["files", "shell", "code", "workspace.read"]
+tools = ["files", "shell", "code", "workspace.read", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

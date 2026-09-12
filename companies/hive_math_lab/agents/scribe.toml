@@ -5,7 +5,7 @@ context = ["GOAL.md", "brief.md", "METHOD.md", "attempts.md", "answers.md"]
 # The one role that may write the shared note tree, and the one with no shell:
 # a recorder that can re-run the program is a recorder that will eventually
 # record a number nobody else saw.
-tools = ["files", "docs", "workspace", "workspace.write"]
+tools = ["files", "docs", "workspace", "workspace.write", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

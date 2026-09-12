@@ -41,7 +41,7 @@ human_role = "Prioritization calls and roadmap sign-off"
 # teammate here should be able to act on a third-party account under the
 # company's OAuth grant. Both are real-money / real-consequence namespaces that
 # `*` does not confer, so omitting them is the whole decision.
-allow = ["*", "workspace", "search"]
+allow = ["*", "workspace", "search", "mcp:*"]
 
 # Group chats — the desks the human talks to. Each pulls in a few agents from
 # the roster; the first member is the desk's lead (the routing target).

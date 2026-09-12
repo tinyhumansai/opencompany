@@ -93,7 +93,14 @@ members = ["creative_director", "copywriter", "landing_page_builder"]
 # unrestricted desk would hand the company grant, billing included, straight
 # back. The ceiling still narrows the belt further, keeping `search`, `media`
 # and `composio` off the desk.
-tools = ["*", "workspace.write"]
+#
+# `mcp:*` is listed for the same reason `workspace.write` is: it is an opt-in
+# namespace `*` does not confer, so a ceiling that omits it removes the
+# company's installed servers from this desk. Spend is what the three names
+# above are excluded for, and a server the operator installed and connected is
+# not a spend decision — leaving it out made the desk's teammates report no MCP
+# tools at all while the console showed the server connected and healthy.
+tools = ["*", "workspace.write", "mcp:*"]
 
 [[group_chat]]
 id = "growth"

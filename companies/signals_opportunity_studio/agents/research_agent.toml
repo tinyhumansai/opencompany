@@ -1,7 +1,7 @@
 role = "Research Agent"
 description = "Deep-dive the top opportunities and compile the operator's weekly brief."
 tier = "reasoning"
-tools = ["web.*", "docs.*", "search"]
+tools = ["web.*", "docs.*", "search", "mcp:*"]
 budget_usd_daily = 8.0
 
 # The role's working rules, checked in beside this file and read at manifest

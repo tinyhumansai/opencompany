@@ -3,7 +3,7 @@ description = "Write the program the approach calls for, run it, and report what
 tier = "reasoning"
 context = ["GOAL.md", "brief.md", "METHOD.md", "attempts.md"]
 
-tools = ["files", "docs", "shell", "code", "workspace.read"]
+tools = ["files", "docs", "shell", "code", "workspace.read", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

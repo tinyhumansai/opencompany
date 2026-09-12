@@ -18,7 +18,10 @@ tier = "frontend"
 # one). Both cost nothing in a company that never opted into web search: the
 # request is intersected with `[tools].allow`, and `search` is admitted only by
 # an explicit company grant.
-tools = ["workspace.*", "docs.*", "files.*", "web.*", "search"]
+# `mcp:*` on the same terms: it confers nothing in a company that installed no
+# server, and lets this teammate reach the ones a company did install rather
+# than being the baseline hole a correct roster still falls through.
+tools = ["workspace.*", "docs.*", "files.*", "web.*", "search", "mcp:*"]
 
 prompt = """
 You are the company's writer. Work arrives as notes, findings, transcripts, or

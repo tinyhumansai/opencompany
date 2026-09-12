@@ -19,7 +19,10 @@ tier = "reasoning"
 # `search` bills per call and is admitted only by an explicit company grant, so
 # naming it here costs nothing in a company that never opted into web search and
 # lets the researcher actually search in one that did.
-tools = ["workspace.read", "docs.*", "files.*", "web.*", "search"]
+# `mcp:*` on the same terms: it confers nothing in a company that installed no
+# server, and lets this teammate reach the ones a company did install rather
+# than being the baseline hole a correct roster still falls through.
+tools = ["workspace.read", "docs.*", "files.*", "web.*", "search", "mcp:*"]
 
 prompt = """
 You are the company's researcher. You answer questions the company cannot

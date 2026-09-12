@@ -7,7 +7,7 @@ context = ["GOAL.md", "brief.md", "METHOD.md", "attempts.md"]
 # terms of it rather than by staring. What the theorist may NOT do is answer the
 # stated problem — see `prompts/theorist.md`. The boundary is in the brief and
 # in the ledger: this role opens attempts, it never closes an answer.
-tools = ["files", "shell", "workspace.read"]
+tools = ["files", "shell", "workspace.read", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

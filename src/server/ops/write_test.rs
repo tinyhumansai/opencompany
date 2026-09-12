@@ -3775,12 +3775,20 @@ async fn mcp_reachability_lists_reaching_agents_including_overlay() {
     // Issue #931: every row carries the display label the rest of the console
     // uses — a manifest agent's role, an overlay teammate's name — so the minted
     // overlay id is never what a reader sees.
+    // The four baseline teammates every company inherits ask for `mcp:*`, so a
+    // company granting it reaches them too. Listed rather than filtered out:
+    // this asserts the whole reachable set, and hiding the half that is not
+    // this manifest's own would leave the baseline free to drift unseen.
     assert_eq!(
         reach("notion"),
         vec![
             pair("019fa75dbc9b-000000000001", "Helper"),
             pair("ceo", "Chief"),
             pair("eng", "Engineer"),
+            pair("operations", "Operations"),
+            pair("page_builder", "Page Builder"),
+            pair("researcher", "Researcher"),
+            pair("writer", "Writer"),
         ]
     );
     // linear: only the wildcard holders — ceo scoped itself out of it.
@@ -3789,6 +3797,10 @@ async fn mcp_reachability_lists_reaching_agents_including_overlay() {
         vec![
             pair("019fa75dbc9b-000000000001", "Helper"),
             pair("eng", "Engineer"),
+            pair("operations", "Operations"),
+            pair("page_builder", "Page Builder"),
+            pair("researcher", "Researcher"),
+            pair("writer", "Writer"),
         ],
         "ceo narrowed to mcp:notion, so it cannot reach linear"
     );
@@ -3864,10 +3876,21 @@ async fn mcp_reachability_is_empty_for_a_disabled_server() {
             .collect()
     };
 
-    // Enabled: the one agent's grant covers it.
+    // Enabled: the one agent's grant covers it, and so does the baseline's —
+    // this company grants `mcp:*`, which the inherited teammates ask for. The
+    // disabled assertion below is the one this test is about.
     let (status, list) = send(&state, "GET", "/api/v1/company/mcp/servers", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(reach(&list[0]), vec!["ceo".to_string()]);
+    assert_eq!(
+        reach(&list[0]),
+        vec![
+            "ceo".to_string(),
+            "operations".to_string(),
+            "page_builder".to_string(),
+            "researcher".to_string(),
+            "writer".to_string(),
+        ]
+    );
 
     // Disabling it empties reachability in the mutating response itself.
     let (status, updated) = send(

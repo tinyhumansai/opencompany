@@ -4,7 +4,7 @@ description = "The naive method at a bound it can actually finish, with the comm
 # needs a fast model, not a clever one.
 context = ["GOAL.md", "brief.md", "METHOD.md", "attempts.md"]
 
-tools = ["files", "shell", "code", "workspace.read"]
+tools = ["files", "shell", "code", "workspace.read", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

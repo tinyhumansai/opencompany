@@ -6,7 +6,7 @@ context = ["GOAL.md", "brief.md", "METHOD.md", "attempts.md", "answers.md"]
 # The one solvers-desk seat with a write grant, mirroring the scribe's on the
 # records desk — and for the same reason: a member that can also compute is a
 # member that will eventually remember a number nobody else on the desk saw.
-tools = ["files", "workspace", "workspace.read", "workspace.write"]
+tools = ["files", "workspace", "workspace.read", "workspace.write", "mcp:*"]
 
 ledgers = [
     { name = "tasks", access = "record" },

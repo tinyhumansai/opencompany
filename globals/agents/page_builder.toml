@@ -11,7 +11,10 @@ tier = "frontend"
 # teammate that company never wrote. A request is intersected with
 # `[tools].allow`, so this can only ever be narrower than what the company
 # permits, never wider.
-tools = ["pages.*", "workspace.*"]
+# `mcp:*` on the same terms: it confers nothing in a company that installed no
+# server, and lets this teammate reach the ones a company did install rather
+# than being the baseline hole a correct roster still falls through.
+tools = ["pages.*", "workspace.*", "mcp:*"]
 
 prompt = """
 You are the company's page builder. You design and maintain the small,

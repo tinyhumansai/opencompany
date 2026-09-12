@@ -1579,3 +1579,173 @@ fn every_shipped_setup_card_is_pickable() {
         }
     }
 }
+
+/// One teammate's effective grants under the full three-level narrowing a
+/// running company applies: `[tools].allow ∩ group_chat.tools ∩ [[agent]].tools`.
+///
+/// Runs the real `agent_scoped_grants` over the desks this teammate actually
+/// sits on, so a bundle cannot pass here and fail in the harness. The
+/// two-level `grants_for_one_agent` above skips the desk ceiling, which is the
+/// level a reachability question turns on.
+fn desk_scoped_grants(manifest: &CompanyManifest, agent: &super::Agent) -> Vec<String> {
+    let desk_tools: Vec<Vec<String>> = manifest
+        .group_chats
+        .iter()
+        .filter(|chat| chat.members.iter().any(|member| member == &agent.id))
+        .map(|chat| chat.tools.clone())
+        .collect();
+    let desk_refs: Vec<&[String]> = desk_tools.iter().map(Vec::as_slice).collect();
+    agent_scoped_grants(&manifest.tools.allow, &desk_refs, agent.tools.as_deref())
+}
+
+/// Every bundle, with its global baseline left on — the roster a running
+/// company actually has.
+fn load_company_with_globals(dir: &Path) -> CompanyManifest {
+    CompanyManifest::from_path(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+}
+
+/// A declared MCP server must be callable by somebody.
+///
+/// Declaring a server and granting the namespace are separate edits in
+/// separate files, and nothing until this test compared them. A bundle could
+/// ship a server, document it in its README, pass every parse and safety check
+/// above, and still hand it to a roster where no teammate holds `mcp:*` — an
+/// install that connects, reports healthy, and answers no call anyone can make.
+///
+/// Asserted for declared servers whether or not they ship enabled: enabling is
+/// an operator's one click, and the grant has to already be right when they
+/// make it.
+#[test]
+fn every_declared_mcp_server_is_reachable_by_some_teammate() {
+    let mut checked = 0usize;
+    let mut unreachable = Vec::new();
+    for company in subdirs(&repo_root().join("companies")) {
+        let name = company.file_name().unwrap().to_str().unwrap().to_string();
+        let manifest = load_company_with_globals(&company);
+        for server in &manifest.mcp_servers {
+            checked += 1;
+            let reached = manifest.agents.iter().any(|agent| {
+                crate::runtime::tools::grants_cover_server(
+                    &desk_scoped_grants(&manifest, agent),
+                    &server.name,
+                )
+            });
+            if !reached {
+                unreachable.push(format!(
+                    "  {name}: `{}` — company grants {:?}",
+                    server.name, manifest.tools.allow
+                ));
+            }
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "{} declared MCP server(s) no teammate can reach. Connecting one reports healthy \
+         and answers no call anybody can make:\n{}",
+        unreachable.len(),
+        unreachable.join("\n")
+    );
+    assert!(
+        checked > 0,
+        "no shipped bundle declared an MCP server, so this check looked at nothing — \
+         the walk found no manifests rather than finding them clean"
+    );
+}
+
+/// A desk that can reach none of the company's MCP servers is a dead end.
+///
+/// A desk is a conversation an operator opens, so "somebody in the company can
+/// call it" is not the promise the screen makes — the promise is that the
+/// teammates in front of them can.
+///
+/// Deliberately "at least one server", not "every server". Scoping a single
+/// server to the desk that owns it is the point of the middle level:
+/// `retail_co` gives each teammate exactly one `mcp:<server>` and its desks
+/// reach only their own, which is correct and must keep passing. What a desk
+/// may not be is cut off entirely from a company that installed servers.
+///
+/// This is the level that `every_declared_mcp_server_is_reachable_by_some_teammate`
+/// cannot see: a bundle whose other desks hold the grant passes it while the
+/// desk an operator is typing into holds nothing.
+#[test]
+fn every_desk_can_reach_at_least_one_declared_mcp_server() {
+    let mut dead_ends = Vec::new();
+    for company in subdirs(&repo_root().join("companies")) {
+        let name = company.file_name().unwrap().to_str().unwrap().to_string();
+        let manifest = load_company_with_globals(&company);
+        if manifest.mcp_servers.is_empty() {
+            continue;
+        }
+        for chat in &manifest.group_chats {
+            if chat.members.is_empty() {
+                continue;
+            }
+            let reached = chat.members.iter().any(|member| {
+                manifest
+                    .agents
+                    .iter()
+                    .find(|agent| &agent.id == member)
+                    .is_some_and(|agent| {
+                        let grants = desk_scoped_grants(&manifest, agent);
+                        manifest.mcp_servers.iter().any(|server| {
+                            crate::runtime::tools::grants_cover_server(&grants, &server.name)
+                        })
+                    })
+            });
+            if !reached {
+                dead_ends.push(format!(
+                    "  {name}: desk `{}` reaches none of {} installed server(s) — desk ceiling {:?}",
+                    chat.id,
+                    manifest.mcp_servers.len(),
+                    chat.tools
+                ));
+            }
+        }
+    }
+    assert!(
+        dead_ends.is_empty(),
+        "{} desk(s) narrow the company grant past a server the company installed. An \
+         operator talking to one gets a teammate that cannot call a server the console \
+         reports as connected:\n{}",
+        dead_ends.len(),
+        dead_ends.join("\n")
+    );
+}
+
+/// The global baseline reaches MCP.
+///
+/// Every company inherits these teammates whichever vertical it started from,
+/// including one minted by the setup wizard, and they answer in the main
+/// channel. A baseline teammate without the namespace makes MCP unreachable in
+/// a company whose own roster and grants are entirely correct — the one gap
+/// neither check above can see, because it is not any bundle's fault.
+///
+/// `BASE_BELT` already grants it to every teammate the wizard mints; this holds
+/// the hand-authored baseline to the same rule.
+#[test]
+fn every_global_teammate_can_reach_an_installed_mcp_server() {
+    let globals = crate::globals::agents();
+    assert!(
+        !globals.is_empty(),
+        "the global baseline is empty, so this check looked at nothing"
+    );
+    let allow = vec!["mcp:*".to_string()];
+    let unreachable: Vec<String> = globals
+        .iter()
+        .filter(|agent| {
+            !crate::runtime::tools::grants_cover_server(
+                &agent_scoped_grants(&allow, &[], agent.tools.as_deref()),
+                "any-installed-server",
+            )
+        })
+        .map(|agent| format!("  `{}` — belt {:?}", agent.id, agent.tools))
+        .collect();
+    assert!(
+        unreachable.is_empty(),
+        "{} global teammate(s) cannot reach an installed MCP server. Every company \
+         inherits these, so the gap follows the baseline into companies whose own grants \
+         are correct:\n{}",
+        unreachable.len(),
+        unreachable.join("\n")
+    );
+}
