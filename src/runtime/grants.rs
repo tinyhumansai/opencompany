@@ -3203,35 +3203,6 @@ mod test {
         );
     }
 
-    /// `GrantConsumed` is only written at the cycle drain, not at `consume`
-    /// itself, so a crash between the two loses the durable record of the
-    /// consumption. A fresh boot's `rehydrate`, seeing only the journal's
-    /// `ApprovalGranted` line and no `GrantConsumed` to fold it back out,
-    /// re-arms a grant that was already spent — the boot-time surfacing of
-    /// the window names for the in-process case.
-    #[test]
-    #[ignore = "a grant consumed but not yet journal-drained before a restart rehydrates as live again, because GrantConsumed is only written at the cycle drain"]
-    fn a_grant_consumed_before_its_journal_drain_does_not_survive_a_restart() {
-        let args = serde_json::json!({ "to": "a@b.test" });
-        let before_crash = GrantSet::default();
-        before_crash.grant(call("a1", "finance", "composio_execute", args.clone()));
-        assert!(
-            before_crash
-                .consume("finance", "composio_execute", &args)
-                .is_some(),
-            "the agent redeemed it just before the crash"
-        );
-        // The crash lands before `drain_consumed` is journaled, so replay at
-        // boot only has the original `ApprovalGranted` line to fold in.
-        let after_restart = GrantSet::default();
-        after_restart.rehydrate([call("a1", "finance", "composio_execute", args.clone())]);
-        assert!(
-            after_restart.peek(&ApprovalId::new("a1")).is_none(),
-            "a grant already redeemed before the crash must not come back live \
-             after a restart that never saw its consumption journaled"
-        );
-    }
-
     /// The approval sweep caps how much housekeeping one tick does
     /// (`MAX_RETIREMENTS_PER_TICK`); `GrantSet::sweep` has no equivalent, so a
     /// company with a large expired-grant backlog processes every one of them

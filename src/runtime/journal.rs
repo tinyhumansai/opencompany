@@ -256,6 +256,15 @@ enum JournalRecord {
         /// The grant, whole.
         grant: GrantedCall,
     },
+    /// A single-use grant committed to one follow-up turn.
+    /// Written before that turn starts so recovery cannot re-arm authority
+    /// whose tool call may already have run.
+    GrantDispatched {
+        /// The grant committed to the turn.
+        id: ApprovalId,
+        /// Epoch-millis the dispatch was committed.
+        at_millis: u64,
+    },
     /// A follow-up turn owed after an agent explicitly asked the operator a
     /// question. Unlike `ApprovalGranted`, this carries either verdict and
     /// conveys no authority to execute a tool call.
@@ -665,6 +674,7 @@ impl JournalRecord {
             // direction — the cost of the loss is an extra question, never an
             // extra call.
             Self::ApprovalGranted { .. } => Durability::Process,
+            Self::GrantDispatched { .. } => Durability::Host,
             // Conversation continuations carry no execution authority. Losing
             // a queued one means the agent misses a verdict; losing a terminal
             // line can repeat a model follow-up, but cannot repeat an effect.
@@ -1449,6 +1459,9 @@ impl RuntimeJournal {
             }
             JournalRecord::ApprovalGranted { grant } => {
                 state.grants.insert(grant.approval_id.clone(), grant);
+            }
+            JournalRecord::GrantDispatched { id, .. } => {
+                state.grants.remove(&id);
             }
             JournalRecord::ApprovalContinuationQueued { continuation } => {
                 state
@@ -2435,6 +2448,21 @@ impl RuntimeJournal {
             .insert(grant.approval_id.clone(), grant.clone());
         self.append(&JournalRecord::ApprovalGranted {
             grant: grant.clone(),
+        })
+        .await
+    }
+
+    /// Durably commits a single-use grant to one follow-up turn before the
+    /// turn can re-issue its approved tool call.
+    pub async fn record_grant_dispatched(&self, id: &ApprovalId, at_millis: u64) -> Result<()> {
+        self.state
+            .lock()
+            .expect("journal state poisoned")
+            .grants
+            .remove(id);
+        self.append(&JournalRecord::GrantDispatched {
+            id: id.clone(),
+            at_millis,
         })
         .await
     }
@@ -3949,15 +3977,10 @@ mod test {
         );
     }
 
-    /// `GrantConsumed` is buffered in memory and journaled only at
-    /// the cycle drain (see `GrantState::consumed`'s doc), so a restart that
-    /// lands between "the tool ran" and "the drain wrote the record" replays
-    /// the grant as still live. This pins that this is what actually happens
-    /// on replay today — the documented duplication window, not a guess about
-    /// it — so a fix that closes the window is a deliberate, visible change to
-    /// this test rather than a silent behavior shift.
+    /// A single-use grant claimed for a follow-up turn must not re-arm when the
+    /// tool consumes it but the cycle has not drained that consumption yet.
     #[tokio::test]
-    async fn a_grant_consumed_but_not_yet_drained_replays_as_live_after_a_restart() {
+    async fn a_grant_consumed_but_not_yet_drained_does_not_replay_after_a_restart() {
         let dir = tmp_dir();
         let path = dir.path().join("journal.jsonl");
         let journal = RuntimeJournal::new(&path);
@@ -3966,20 +3989,36 @@ mod test {
             .record_granted(&grant("appr-crash", 1_000))
             .await
             .unwrap();
-        // The tool ran and `GrantSet::consume` removed it from the in-memory
-        // live set here, in the real path — but that consumption is buffered,
-        // not journaled, until the cycle runner's drain. No `record_grant_consumed`
-        // call happens before the crash this test models.
+        let live = crate::runtime::grants::GrantSet::default();
+        live.rehydrate(journal.replayed_grants());
+        journal
+            .record_grant_dispatched(&ApprovalId::new("appr-crash"), 1_500)
+            .await
+            .unwrap();
+        assert!(
+            live.consume(
+                "finance",
+                "composio_execute",
+                &crate::policy::test_support::composio_send_args(),
+            )
+            .is_some()
+        );
+        assert_eq!(live.live_count(), 0);
 
         let reloaded = RuntimeJournal::new(&path);
         reloaded.load().await.unwrap();
         let replayed = reloaded.replayed_grants();
         assert_eq!(
             replayed.len(),
-            1,
-            "an undrained consumption re-arms the grant on replay: {replayed:?}"
+            0,
+            "a grant already consumed by its claimed turn must not re-arm before the drain: \
+             {replayed:?}"
         );
-        assert_eq!(replayed[0].approval_id, ApprovalId::new("appr-crash"));
+        assert_eq!(
+            live.drain_consumed(),
+            vec![ApprovalId::new("appr-crash")],
+            "the terminal consumption is still waiting for the ordinary cycle drain"
+        );
     }
 
     #[tokio::test]
@@ -4730,6 +4769,10 @@ mod test {
             JournalRecord::ApprovalGranted {
                 grant: grant("a", 4),
             },
+            JournalRecord::GrantDispatched {
+                id: ApprovalId::new("a"),
+                at_millis: 4,
+            },
             JournalRecord::ApprovalContinuationQueued {
                 continuation: ApprovalContinuation {
                     call: grant("continuation", 4),
@@ -4825,12 +4868,12 @@ mod test {
     /// pinned separately below (issue #1145) — deliberately not by loosening
     /// this list, which is the assertion that would have stopped noticing.
     #[test]
-    fn host_durable_kinds_are_exactly_the_nine_that_protect_approval_work() {
+    fn host_durable_kinds_are_exactly_the_ten_that_protect_approval_work() {
         let all = every_record_kind();
         let tags: HashSet<String> = all.iter().map(record_tag).collect();
         assert_eq!(
             tags.len(),
-            21,
+            22,
             "every JournalRecord variant must appear once in every_record_kind"
         );
 
@@ -4851,9 +4894,10 @@ mod test {
                 "BlockedNodeStashed".to_string(),
                 "EffectExecuted".to_string(),
                 "GrantConsumed".to_string(),
+                "GrantDispatched".to_string(),
                 "StandingGrantRevoked".to_string()
             ],
-            "the host-durable set is these nine kinds and nothing else; \
+            "the host-durable set is these ten kinds and nothing else; \
              widening it taxes the hot path, narrowing it lets an effect duplicate, \
              a spent grant re-arm, an explicit follow-up repeat, or a blocked node's \
              stash/approval/dispatch survive a process restart but not the host crash it also \
