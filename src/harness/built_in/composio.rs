@@ -175,6 +175,8 @@ pub struct TenantComposio {
     /// `composio_execute` sends no connection id, leaving the account to
     /// Composio's own resolution exactly as before.
     defaults: crate::company::composio::ComposioDefaults,
+    #[cfg(feature = "composio")]
+    authorizations: Arc<tokio::sync::Mutex<live::AuthorizeCache>>,
 }
 
 impl TenantComposio {
@@ -196,6 +198,8 @@ impl TenantComposio {
             catalog: Credential::None,
             toolkits,
             defaults: Default::default(),
+            #[cfg(feature = "composio")]
+            authorizations: Default::default(),
         }
     }
 
@@ -238,6 +242,8 @@ impl TenantComposio {
             catalog: Credential::None,
             toolkits,
             defaults: Default::default(),
+            #[cfg(feature = "composio")]
+            authorizations: Default::default(),
         }
     }
 
@@ -648,6 +654,7 @@ mod live {
             Box::new(ComposioAuthorizeTool {
                 config: Arc::clone(&config),
                 toolkits: Arc::clone(&toolkits),
+                company: metering.company.clone(),
             }),
             Box::new(ComposioExecuteTool {
                 config,
@@ -917,7 +924,7 @@ mod live {
         let http = managed_execute_client()?;
 
         let post =
-            async |body: &Value| post_managed_execute(client.inner(), &http, body, &key).await;
+            async |body: &Value| post_managed_execute(client.inner(), http, body, &key).await;
 
         let mut resp = post(&body).await?;
         if is_post_oauth_auth_error(&resp) {
@@ -1741,9 +1748,140 @@ mod live {
 
     // ── composio_authorize ──────────────────────────────────────────────
 
+    const AUTHORIZE_HANDOFF_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+    const MAX_PENDING_AUTHORIZATIONS: usize = 64;
+
+    #[derive(Default)]
+    pub(super) struct AuthorizeCache {
+        pending: std::collections::HashMap<String, PendingAuthorization>,
+        in_flight: std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    }
+
+    impl std::fmt::Debug for AuthorizeCache {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("AuthorizeCache")
+                .finish_non_exhaustive()
+        }
+    }
+
+    struct PendingAuthorization {
+        started: tokio::time::Instant,
+        response: ComposioAuthorizeResponse,
+    }
+
+    fn authorize_request_key(
+        config: &TenantComposio,
+        company: &CompanyId,
+        credential: &str,
+        toolkit: &str,
+        extra: &Option<Value>,
+    ) -> Result<String> {
+        use sha2::{Digest, Sha256};
+
+        let mut identity = json!([
+            company,
+            config.backend_url,
+            config.mode() == ComposioMode::Byok,
+            credential,
+            toolkit.trim().to_ascii_lowercase(),
+            extra.is_some(),
+            extra
+        ]);
+        identity.sort_all_objects();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&identity)?)
+        ))
+    }
+
+    async fn authorize_pending(
+        config: &TenantComposio,
+        company: &CompanyId,
+        client: &LiveClient,
+        credential: &str,
+        toolkit: &str,
+        extra: Option<Value>,
+    ) -> Result<ComposioAuthorizeResponse> {
+        let key = authorize_request_key(config, company, credential, toolkit, &extra)?;
+        let key_lock = {
+            let mut cache = config.authorizations.lock().await;
+            cache
+                .pending
+                .retain(|_, pending| pending.started.elapsed() < AUTHORIZE_HANDOFF_LIFETIME);
+            cache.in_flight.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = cache.in_flight.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let occupied = cache.pending.len()
+                    + cache
+                        .in_flight
+                        .keys()
+                        .filter(|in_flight_key| !cache.pending.contains_key(*in_flight_key))
+                        .count();
+                if !cache.pending.contains_key(&key) && occupied >= MAX_PENDING_AUTHORIZATIONS {
+                    anyhow::bail!(
+                        "too many cached OAuth handoffs; wait for earlier handoffs to expire"
+                    );
+                }
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                cache.in_flight.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _key_guard = key_lock.lock().await;
+        let pending = {
+            let mut cache = config.authorizations.lock().await;
+            cache
+                .pending
+                .retain(|_, pending| pending.started.elapsed() < AUTHORIZE_HANDOFF_LIFETIME);
+            cache
+                .pending
+                .get(&key)
+                .map(|pending| (pending.started, pending.response.clone()))
+        };
+        if let Some((started, response)) = pending {
+            let connections = client.list_connections().await?;
+            if let Some(connection) = connections.connections.iter().find(|connection| {
+                connection.id == response.connection_id
+                    && connection
+                        .normalized_toolkit()
+                        .eq_ignore_ascii_case(toolkit)
+            }) {
+                let status = connection.status.trim().to_ascii_uppercase();
+                match status.as_str() {
+                    "PENDING" | "INITIATED" | "INITIALIZING" => {
+                        if started.elapsed() < AUTHORIZE_HANDOFF_LIFETIME {
+                            return Ok(response);
+                        }
+                    }
+                    "ACTIVE" | "CONNECTED" | "EXPIRED" | "FAILED" | "ERROR" | "INACTIVE"
+                    | "DISCONNECTED" => {}
+                    _ => anyhow::bail!(
+                        "cannot verify the existing OAuth handoff status; no new handoff was started"
+                    ),
+                }
+            }
+            let mut cache = config.authorizations.lock().await;
+            cache.pending.remove(&key);
+        }
+        let started = tokio::time::Instant::now();
+        let response = client.authorize(toolkit, extra).await?;
+        let mut cache = config.authorizations.lock().await;
+        cache.pending.insert(
+            key,
+            PendingAuthorization {
+                started,
+                response: response.clone(),
+            },
+        );
+        Ok(response)
+    }
+
     struct ComposioAuthorizeTool {
         config: Arc<TenantComposio>,
         toolkits: Arc<Vec<String>>,
+        company: CompanyId,
     }
 
     #[async_trait]
@@ -1753,7 +1891,7 @@ mod live {
         }
 
         fn description(&self) -> &str {
-            "Begin an OAuth handoff for a Composio toolkit (e.g. `gmail`) and return the hosted connect URL the operator opens in a browser to connect the account."
+            "Reuse a pending OAuth handoff or begin one for a Composio toolkit (e.g. `gmail`). Return the hosted connect URL the operator opens in a browser. Completed, failed, or expired handoffs are replaced when connecting again."
         }
 
         fn parameters_schema(&self) -> Value {
@@ -1800,7 +1938,16 @@ mod live {
                     )));
                 }
             };
-            match client.authorize(&toolkit, extra).await {
+            match authorize_pending(
+                &self.config,
+                &self.company,
+                &client,
+                &secrets[0],
+                &toolkit,
+                extra,
+            )
+            .await
+            {
                 Ok(resp) => Ok(scrubbed_ok(
                     serde_json::to_value(&resp).unwrap_or(Value::Null),
                     &secrets,
@@ -1917,6 +2064,365 @@ mod live {
 
         use crate::ports::types::CompanyId;
         use crate::ports::usage::UsageSample;
+
+        #[derive(Default)]
+        struct AuthorizeBackend {
+            posts: Vec<(String, Value)>,
+            connections: Vec<Value>,
+            fail_authorize: bool,
+            fail_status: bool,
+        }
+
+        struct AuthorizeFixture {
+            config: TenantComposio,
+            state: Arc<Mutex<AuthorizeBackend>>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for AuthorizeFixture {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn authorize_fixture() -> AuthorizeFixture {
+            use axum::{
+                Router,
+                extract::State,
+                http::HeaderMap,
+                routing::{get, post},
+            };
+
+            let state = Arc::new(Mutex::new(AuthorizeBackend::default()));
+            let app = Router::new()
+                .route(
+                    "/agent-integrations/composio/authorize",
+                    post(async |State(state): State<Arc<Mutex<AuthorizeBackend>>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                        let mut state = state.lock().unwrap();
+                        state.posts.push((headers["authorization"].to_str().unwrap().to_string(), body.clone()));
+                        if state.fail_authorize {
+                            return axum::Json(json!({ "success": false, "error": "authorize unavailable" }));
+                        }
+                        let id = format!("connection-{}", state.posts.len());
+                        state.connections.push(json!({ "id": id, "toolkit": body["toolkit"], "status": "INITIATED" }));
+                        axum::Json(json!({ "success": true, "data": {
+                            "connectionId": id, "connectUrl": format!("https://connect.composio.dev/{id}")
+                        } }))
+                    }),
+                )
+                .route(
+                    "/agent-integrations/composio/connections",
+                    get(async |State(state): State<Arc<Mutex<AuthorizeBackend>>>| {
+                        let state = state.lock().unwrap();
+                        if state.fail_status {
+                            axum::Json(json!({ "success": false, "error": "connection status unavailable" }))
+                        } else {
+                            axum::Json(json!({ "success": true, "data": { "connections": state.connections } }))
+                        }
+                    }),
+                )
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            AuthorizeFixture {
+                config: TenantComposio::new(url, Credential::from_value("token-a"), Vec::new()),
+                state,
+                server,
+            }
+        }
+
+        fn authorize_tool(config: &TenantComposio, company: &str) -> Arc<dyn Tool> {
+            Arc::from(
+                composio_tools(
+                    config,
+                    ComposioMetering {
+                        company: CompanyId::new(company),
+                        agent: "ceo".to_string(),
+                        meter: None,
+                    },
+                )
+                .into_iter()
+                .find(|tool| tool.name() == "composio_authorize")
+                .unwrap(),
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn authorize_clones_share_one_pending_handoff_under_a_race() {
+            for attempt in 0..5 {
+                let fixture = authorize_fixture().await;
+                let barrier = Arc::new(tokio::sync::Barrier::new(8));
+                let mut racers = tokio::task::JoinSet::new();
+                for _ in 0..8 {
+                    let tool = authorize_tool(&fixture.config.clone(), "acme");
+                    let barrier = barrier.clone();
+                    let args = json!({ "toolkit": "gmail" });
+                    racers.spawn(async move {
+                        barrier.wait().await;
+                        tool.execute(args).await
+                    });
+                }
+                while let Some(result) = racers.join_next().await {
+                    let result = result.unwrap().unwrap();
+                    assert!(!result.is_error, "{}", result.output());
+                    assert!(result.output().contains("connection-1"));
+                }
+                assert_eq!(
+                    fixture.state.lock().unwrap().posts.len(),
+                    1,
+                    "attempt {attempt}: racing cloned tools must open one handoff"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_slow_authorize_does_not_block_an_unrelated_toolkit() {
+            use axum::{Router, extract::State, routing::post};
+
+            #[derive(Default)]
+            struct ParallelBackend {
+                slow_started: tokio::sync::Notify,
+                release_slow: tokio::sync::Notify,
+            }
+
+            async fn authorize(
+                State(state): State<Arc<ParallelBackend>>,
+                axum::Json(body): axum::Json<Value>,
+            ) -> axum::Json<Value> {
+                let toolkit = body["toolkit"].as_str().unwrap().to_string();
+                if toolkit == "gmail" {
+                    state.slow_started.notify_one();
+                    state.release_slow.notified().await;
+                }
+                axum::Json(json!({ "success": true, "data": {
+                    "connectionId": format!("connection-{toolkit}"),
+                    "connectUrl": format!("https://connect.composio.dev/{toolkit}")
+                } }))
+            }
+
+            let state = Arc::new(ParallelBackend::default());
+            let app = Router::new()
+                .route("/agent-integrations/composio/authorize", post(authorize))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let config = TenantComposio::new(url, Credential::from_value("token-a"), Vec::new());
+            let gmail = authorize_tool(&config, "acme");
+            let gmail_call =
+                tokio::spawn(async move { gmail.execute(json!({ "toolkit": "gmail" })).await });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.slow_started.notified(),
+            )
+            .await
+            .expect("the slow request must reach the backend");
+
+            let slack = authorize_tool(&config, "acme");
+            let slack_result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                slack.execute(json!({ "toolkit": "slack" })),
+            )
+            .await;
+            let slack_completed = match slack_result {
+                Ok(result) => {
+                    let result = result.unwrap();
+                    assert!(!result.is_error, "{}", result.output());
+                    true
+                }
+                Err(_) => false,
+            };
+            state.release_slow.notify_one();
+            let gmail_result = gmail_call.await.unwrap().unwrap();
+            assert!(!gmail_result.is_error, "{}", gmail_result.output());
+            assert_eq!(
+                usize::from(slack_completed),
+                1,
+                "an authorization for one toolkit must not wait for another toolkit's network call"
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn authorize_reconnects_after_a_terminal_or_missing_connection() {
+            for status in [
+                "ACTIVE",
+                "CONNECTED",
+                "EXPIRED",
+                "FAILED",
+                "ERROR",
+                "INACTIVE",
+                "DISCONNECTED",
+                "missing",
+            ] {
+                let fixture = authorize_fixture().await;
+                let tool = authorize_tool(&fixture.config, "acme");
+                let first = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+                assert!(!first.is_error, "{}", first.output());
+                {
+                    let mut state = fixture.state.lock().unwrap();
+                    if status == "missing" {
+                        state.connections.clear();
+                    } else {
+                        state.connections[0]["status"] = json!(status);
+                    }
+                }
+                let second = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+                assert!(!second.is_error, "{status}: {}", second.output());
+                assert!(
+                    second.output().contains("connection-2"),
+                    "{status}: {}",
+                    second.output()
+                );
+                assert_eq!(
+                    fixture.state.lock().unwrap().posts.len(),
+                    2,
+                    "{status} must permit a fresh handoff"
+                );
+                let repeated = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+                assert!(!repeated.is_error, "{}", repeated.output());
+                assert_eq!(second.output(), repeated.output());
+                assert_eq!(fixture.state.lock().unwrap().posts.len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn authorize_unknown_or_unreadable_status_does_not_start_another_handoff() {
+            let fixture = authorize_fixture().await;
+            let tool = authorize_tool(&fixture.config, "acme");
+            let first = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!first.is_error);
+            fixture.state.lock().unwrap().connections[0]["status"] = json!("UNRECOGNIZED");
+            let unknown = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(unknown.is_error);
+            assert!(unknown.output().contains("no new handoff"));
+            fixture.state.lock().unwrap().fail_status = true;
+            let unreadable = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(unreadable.is_error);
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 1);
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.fail_status = false;
+                state.connections[0]["status"] = json!("PENDING");
+            }
+            let recovered = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!recovered.is_error);
+            assert_eq!(first.output(), recovered.output());
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn authorize_failed_post_is_not_cached() {
+            let fixture = authorize_fixture().await;
+            let tool = authorize_tool(&fixture.config, "acme");
+            fixture.state.lock().unwrap().fail_authorize = true;
+            let first = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(first.is_error);
+            fixture.state.lock().unwrap().fail_authorize = false;
+            let second = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!second.is_error, "{}", second.output());
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 2);
+            let third = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!third.is_error);
+            assert_eq!(second.output(), third.output());
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn authorize_expires_pending_handoffs_at_the_documented_lifetime() {
+            let fixture = authorize_fixture().await;
+            let tool = authorize_tool(&fixture.config, "acme");
+            let first = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!first.is_error);
+            for pending in fixture
+                .config
+                .authorizations
+                .lock()
+                .await
+                .pending
+                .values_mut()
+            {
+                pending.started = tokio::time::Instant::now() - AUTHORIZE_HANDOFF_LIFETIME;
+            }
+            let second = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!second.is_error);
+            assert!(second.output().contains("connection-2"));
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn authorize_keys_isolate_companies_credentials_and_extra_parameters() {
+            let fixture = authorize_fixture().await;
+            let first = authorize_tool(&fixture.config, "acme");
+            let another_company = authorize_tool(&fixture.config.clone(), "another-company");
+            let initial = json!({ "toolkit": "gmail", "extra_params": { "scope_hint": "one", "nested": { "a": 1, "b": 2 } } });
+            assert!(!first.execute(initial.clone()).await.unwrap().is_error);
+            assert!(!first.execute(json!({ "extra_params": { "nested": { "b": 2, "a": 1 }, "scope_hint": "one" }, "toolkit": "gmail" })).await.unwrap().is_error);
+            assert_eq!(fixture.state.lock().unwrap().posts.len(), 1);
+            assert!(
+                !another_company
+                    .execute(initial.clone())
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+            let mut rotated = fixture.config.clone();
+            rotated.credential = Credential::from_value("token-b");
+            assert!(
+                !authorize_tool(&rotated, "acme")
+                    .execute(initial.clone())
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+            assert!(
+                !first
+                    .execute(json!({ "toolkit": "gmail", "extra_params": { "scope_hint": "two" } }))
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+            let state = fixture.state.lock().unwrap();
+            assert_eq!(state.posts.len(), 4);
+            assert_eq!(state.posts[2].0, "Bearer token-b");
+            let debug = format!("{:?}", fixture.config);
+            assert!(!debug.contains("connection-1"));
+            assert!(!debug.contains("token-a"));
+        }
+
+        #[tokio::test]
+        async fn authorize_cache_refuses_capacity_without_starting_an_untracked_handoff() {
+            let fixture = authorize_fixture().await;
+            let tool = authorize_tool(&fixture.config, "acme");
+            for i in 0..MAX_PENDING_AUTHORIZATIONS {
+                let result = tool
+                    .execute(json!({ "toolkit": "gmail", "extra_params": { "account_hint": i } }))
+                    .await
+                    .unwrap();
+                assert!(!result.is_error, "{}", result.output());
+            }
+            let refused = tool.execute(json!({ "toolkit": "gmail", "extra_params": { "account_hint": MAX_PENDING_AUTHORIZATIONS } })).await.unwrap();
+            assert!(refused.is_error);
+            assert!(refused.output().contains("too many cached OAuth handoffs"));
+            assert_eq!(
+                fixture.state.lock().unwrap().posts.len(),
+                MAX_PENDING_AUTHORIZATIONS
+            );
+            for pending in fixture
+                .config
+                .authorizations
+                .lock()
+                .await
+                .pending
+                .values_mut()
+            {
+                pending.started = tokio::time::Instant::now() - AUTHORIZE_HANDOFF_LIFETIME;
+            }
+            let retried = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+            assert!(!retried.is_error);
+            assert_eq!(fixture.config.authorizations.lock().await.pending.len(), 1);
+        }
 
         #[test]
         fn execute_keys_are_canonical_and_scoped_to_the_action_and_actor() {
@@ -3837,13 +4343,7 @@ mod isolation_tests {
         );
     }
 
-    /// Two `composio_authorize` calls for the same toolkit, back to back, must
-    /// not each open a fresh OAuth handoff. There is no lock, no idempotency key
-    /// and no already-connected short-circuit around `client.authorize`, so the
-    /// second call reaches the backend exactly like the first and the operator
-    /// is handed two competing connect URLs for one account.
     #[tokio::test]
-    #[ignore = "confirms fail-open: repeat authorize is not deduped or short-circuited"]
     async fn a_repeated_authorize_for_one_toolkit_is_deduped() {
         let log: AuthLog = Arc::new(Mutex::new(Vec::new()));
         async fn authorize(State(log): State<AuthLog>) -> axum::Json<Value> {
@@ -3855,6 +4355,17 @@ mod isolation_tests {
         }
         let app = Router::new()
             .route("/agent-integrations/composio/authorize", post(authorize))
+            .route(
+                "/agent-integrations/composio/connections",
+                get(async || {
+                    axum::Json(json!({
+                        "success": true,
+                        "data": { "connections": [
+                            { "id": "conn-1", "toolkit": "gmail", "status": "INITIATED" }
+                        ] }
+                    }))
+                }),
+            )
             .with_state(log.clone());
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
@@ -3871,7 +4382,7 @@ mod isolation_tests {
 
         let first = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
         assert!(!first.is_error, "{}", first.output());
-        let second = tool.execute(json!({ "toolkit": "gmail" })).await.unwrap();
+        let second = tool.execute(json!({ "toolkit": "GMAIL" })).await.unwrap();
         assert!(!second.is_error, "{}", second.output());
 
         assert_eq!(
