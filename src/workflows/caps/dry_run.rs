@@ -322,6 +322,50 @@ mod tests {
         }
     }
 
+    /// A malformed allowlist is not the only case [`preflight_refusal`] decides
+    /// differently from the real guard. When **every** entry filters out during
+    /// normalization, the real guard (`normalize_allowed_domains`, upstream)
+    /// treats the list as misconfigured and fails closed — refusing every URL,
+    /// on-list host or not. `preflight_refusal`'s own doc comment takes the
+    /// opposite, deliberate stance for this case: "an allowlist this cannot
+    /// read cleanly is left unchecked" rather than reproducing that subtlety.
+    ///
+    /// The result is a real, if narrow, dry-run/real-run parity gap: a
+    /// workflow whose `web_allowed_domains` is entirely unparseable (every
+    /// entry blank, or scheme-only) previews clean and then refuses every
+    /// live request once armed. This pins the gap as it stands today rather
+    /// than asserting it away, so a future change to either side has to
+    /// touch this test on purpose.
+    #[tokio::test]
+    async fn dry_http_passes_an_entirely_malformed_allowlist_the_real_guard_fails_closed_on() {
+        use crate::workflows::caps::http::GuardedHttpClient;
+        use openhuman_core::openhuman::security::SecurityPolicy;
+        use std::sync::Arc;
+
+        // Whitespace-only: `normalize`/`normalize_domain` both trim it to empty
+        // and drop it, so this is the "every entry malformed" case on both
+        // sides, not a mixed list (which is a different, already-documented
+        // divergence).
+        let malformed = vec!["   ".to_string()];
+        let request = json!({ "method": "GET", "url": "https://example.com/hook" });
+
+        let real = GuardedHttpClient::new(Arc::new(SecurityPolicy::default()), malformed.clone());
+        let live = real.request(request.clone(), None).await;
+        assert!(
+            matches!(&live, Err(EngineError::Capability(m)) if m.contains("allowed websites")),
+            "a wholly malformed allowlist must fail the real guard closed, or this \
+             test no longer pins the divergence it names: {live:?}"
+        );
+
+        let dry = DryRunHttp::new(malformed).request(request, None).await;
+        assert!(
+            dry.is_ok(),
+            "the dry run reported the malformed-allowlist request as refused — \
+             either preflight_refusal grew a fail-closed check for this case \
+             (update this test to match) or something else changed: {dry:?}"
+        );
+    }
+
     /// **Behavioural parity with the real client.**
     ///
     /// The authoritative rules live upstream in a private `url_guard` module, so

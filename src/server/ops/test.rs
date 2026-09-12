@@ -278,6 +278,42 @@ async fn smtp_test_without_sender_is_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// The sender is wired (unlike the 404 case above) but nothing was ever
+/// `PUT` to `/smtp`, so there are no credentials to send with. This is a
+/// different refusal from "not wired" — a 400 naming the missing
+/// configuration, not a 404 saying the feature does not exist on this host.
+#[tokio::test]
+async fn smtp_test_with_a_sender_but_no_stored_credentials_is_400() {
+    let home_dir = home();
+    let home = home_dir.path().to_path_buf();
+    let sender = Arc::new(RecordingMailSender::new());
+    let state = state_with(&home, ConnectionsRuntime::new().with_mail(sender.clone())).await;
+    let app = router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/company/smtp/test")
+                .header("cookie", crate::server::test_support::fixed_cookie("acme"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("no SMTP credentials configured"),
+        "the refusal must name what is missing, not just fail: {text}"
+    );
+    assert!(
+        sender.sent().is_empty(),
+        "a refused test-send must never reach the sender"
+    );
+}
+
 #[tokio::test]
 async fn smtp_test_sends_and_records_outbound() {
     let home_dir = home();

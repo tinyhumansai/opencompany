@@ -318,6 +318,12 @@ fn migrate_bundles(companies: &Path, migration: &mut NestMigration) -> Result<()
         }
         let destination = companies.join(&name);
         if exists(&destination) {
+            // Another process migrating this same bundle takes the legacy entry
+            // with it, so a destination that appeared while the source vanished
+            // is that move — not two different bundles contending for one name.
+            if !exists(&legacy) {
+                continue;
+            }
             migration.collisions.push(Collision {
                 what: Relocated::Company,
                 legacy,
@@ -461,13 +467,16 @@ fn read_dir_names(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
         }
     };
     entries
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|source| OpenCompanyError::StoreIo {
-                    path: dir.to_path_buf(),
-                    source,
-                })
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(Ok(entry.file_name())),
+            // The directory went away mid-scan: another process finished the
+            // same migration and removed it. Nothing left to enumerate, which
+            // is the same answer an absent directory gives above.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => Some(Err(OpenCompanyError::StoreIo {
+                path: dir.to_path_buf(),
+                source,
+            })),
         })
         .collect()
 }
@@ -1143,6 +1152,125 @@ mod test {
         // still propagates, so this tolerance cannot mask a broken migration.
         let nowhere = home.path().join("companies/companies/globex/company.toml");
         assert!(rename_or_already_moved(&vanished, &nowhere).is_err());
+    }
+
+    /// The test above proves the *tolerance* — one call against a filesystem
+    /// already left half-moved by some other run. It does not prove the
+    /// *race itself* is safe, only its aftermath staged by hand. This drives
+    /// two real threads into [`migrate_legacy_nest`] over the same home at
+    /// once, synchronized with a barrier so both reach the rename at
+    /// (approximately) the same instant — `serve` booting while a hand-run
+    /// `export` migrates the same install, the scenario the module doc
+    /// names directly.
+    #[test]
+    fn two_concurrent_migrations_of_the_same_home_never_lose_or_duplicate_a_bundle() {
+        // The barrier releases both threads before `migrate_legacy_nest`, which
+        // scans before it renames — so a schedule where the winner finishes
+        // before the loser scans never reaches the tolerated `NotFound` at all.
+        // Repeating the race makes that interleaving near-certain rather than
+        // lucky; every attempt asserts the same invariants, so a regression
+        // fails on whichever attempt exposes it.
+        for attempt in 0..24 {
+            let home = TempHome::new(&format!("concurrent-race-{attempt}"));
+            home.write(
+                "companies/companies/acme/company.toml",
+                "[company]\nname = \"Acme\"\n",
+            );
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let path_a = home.path().to_path_buf();
+            let barrier_a = barrier.clone();
+            let handle_a = std::thread::spawn(move || {
+                barrier_a.wait();
+                migrate_legacy_nest(&path_a)
+            });
+            let path_b = home.path().to_path_buf();
+            let barrier_b = barrier.clone();
+            let handle_b = std::thread::spawn(move || {
+                barrier_b.wait();
+                migrate_legacy_nest(&path_b)
+            });
+
+            let result_a = handle_a.join().expect("thread a did not panic");
+            let result_b = handle_b.join().expect("thread b did not panic");
+
+            let migration_a =
+                result_a.expect("the losing thread must not abort with the winner's NotFound");
+            let migration_b =
+                result_b.expect("the losing thread must not abort with the winner's NotFound");
+
+            assert!(migration_a.collisions.is_empty(), "{migration_a:?}");
+            assert!(migration_b.collisions.is_empty(), "{migration_b:?}");
+            assert_eq!(
+                migration_a.moved.len() + migration_b.moved.len(),
+                1,
+                "exactly one of the two racing calls may claim the move — the other \
+                 must see it already done: a={migration_a:?} b={migration_b:?}"
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("companies/acme/company.toml")).unwrap(),
+                "[company]\nname = \"Acme\"\n",
+                "the bundle must land intact exactly once, never merged or truncated \
+                 by the two renames overlapping"
+            );
+            assert!(
+                !home.path().join("companies/companies/acme").exists(),
+                "the loser must not have left a stale copy behind at the legacy path"
+            );
+        }
+    }
+
+    /// The sibling above races two whole migrations, so the interleaving it
+    /// needs is probable rather than certain: a schedule where the winner
+    /// finishes before the loser scans passes without ever reaching the
+    /// tolerated `NotFound`. This one barriers at the rename itself, leaving
+    /// nothing between release and syscall, so the contended path is the only
+    /// path it can take.
+    #[test]
+    fn two_threads_renaming_one_bundle_split_into_exactly_one_mover_and_one_no_op() {
+        for attempt in 0..8 {
+            let home = TempHome::new(&format!("rename-contention-{attempt}"));
+            home.write(
+                "companies/companies/acme/company.toml",
+                "[company]\nname = \"Acme\"\n",
+            );
+            let legacy = home.path().join("companies/companies/acme");
+            let destination = home.path().join("companies/acme");
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let race = |barrier: std::sync::Arc<std::sync::Barrier>| {
+                let from = legacy.clone();
+                let to = destination.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    rename_or_already_moved(&from, &to)
+                })
+            };
+            let handle_a = race(barrier.clone());
+            let handle_b = race(barrier.clone());
+
+            let moved_a = handle_a
+                .join()
+                .expect("thread a did not panic")
+                .expect("the losing thread must not surface the winner's NotFound as an error");
+            let moved_b = handle_b
+                .join()
+                .expect("thread b did not panic")
+                .expect("the losing thread must not surface the winner's NotFound as an error");
+
+            assert_eq!(
+                usize::from(moved_a) + usize::from(moved_b),
+                1,
+                "exactly one thread may claim the rename: a={moved_a} b={moved_b}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(destination.join("company.toml")).unwrap(),
+                "[company]\nname = \"Acme\"\n",
+                "the bundle must arrive intact, not merged by two overlapping renames"
+            );
+            assert!(!legacy.exists(), "nothing may remain at the legacy path");
+        }
     }
 
     #[test]

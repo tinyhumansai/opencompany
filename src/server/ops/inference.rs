@@ -1603,6 +1603,42 @@ base_url = "https://byo.example/v1"
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// `restart_runtime` takes `AdminScopedCompany` in its signature, but
+    /// nothing here had actually driven a plain member against it over HTTP —
+    /// every other test in this module authenticates as the seeded admin.
+    /// Rebuilding a company's runtime on demand is at least as sharp a
+    /// boundary as any other admin-only write in this module.
+    #[tokio::test]
+    async fn a_member_may_not_restart_the_runtime() {
+        let home_dir = home();
+        let home = home_dir.path();
+        let id = CompanyId::new("acme");
+        let state = state_with_company(home)
+            .await
+            .with_rebuilder(std::sync::Arc::new(Working {
+                home: home.to_path_buf(),
+            }));
+        state.set_boot_inputs(id.clone(), crate::runtime::BootInputs::default());
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+        let before = state.registry().get(&id).expect("registered");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/company/inference/restart")
+            .header("cookie", crate::server::test_support::member_cookie("acme"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A refused request must not have rebuilt the runtime either.
+        let after = state.registry().get(&id).expect("still registered");
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "a forbidden restart must not swap the runtime"
+        );
+    }
+
     /// Issue #1736: the console cannot offer a restart it has no way to know is
     /// available, so the status carries the capability rather than leaving the
     /// card to guess from the deployment shape.

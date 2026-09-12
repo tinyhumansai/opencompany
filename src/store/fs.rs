@@ -3676,6 +3676,72 @@ mod test {
         );
     }
 
+    /// **Cross-process safety, simulated in-process.** [`path_lock`] is
+    /// keyed on a process-wide `static`, so it serializes every writer inside
+    /// *this* process regardless of what they call through. To prove the claim
+    /// that matters for a second `opencompany` process over the same bundle —
+    /// that losing that in-process lock bounds the damage to a lost update and
+    /// never a torn file — this drives many concurrent [`write_atomic_bytes`]
+    /// calls directly, bypassing [`path_lock`] entirely, exactly as two
+    /// unsynchronised processes would.
+    ///
+    /// Each writer's payload is large and distinct, so a write that is not
+    /// truly atomic (a naive truncate-then-stream, or two renames' bytes
+    /// interleaving) would leave the file holding neither candidate in full —
+    /// short, mixed, or holding a length that names no writer. The assertion
+    /// is deliberately narrow: not "the last writer wins" (unordered
+    /// concurrent tasks have no defined last), only that whichever bytes land
+    /// are exactly one full, uncorrupted candidate.
+    #[tokio::test]
+    async fn concurrent_writers_without_the_lock_never_leave_a_torn_file() {
+        let root_dir = tmp_root();
+        let dir = root_dir.path().join("state");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("tasks.json");
+
+        const WRITERS: u8 = 12;
+        // Each candidate is a distinct byte repeated many times, so a torn or
+        // interleaved result is detectable from content alone: any byte in
+        // the final file that is not the *one* value every position holds
+        // proves a mix, and any length that is not exactly `BYTES` proves a
+        // truncation.
+        const BYTES: usize = 200 * 1024;
+        let candidates: Vec<Vec<u8>> = (0..WRITERS)
+            .map(|writer| vec![b'A' + writer; BYTES])
+            .collect();
+
+        // `spawn` alone permits the runtime to finish one writer before the
+        // next begins, and a serial schedule passes this test without ever
+        // reaching the contended path. The barrier holds every task at the
+        // instant before the write so they are released together.
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS as usize));
+        let mut set = tokio::task::JoinSet::new();
+        for candidate in candidates.clone() {
+            let path = path.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            set.spawn(async move {
+                gate.wait().await;
+                write_atomic_bytes(&path, &candidate).await
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            res.unwrap().expect("no writer observes an I/O error");
+        }
+
+        let landed = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(
+            landed.len(),
+            BYTES,
+            "a torn write left a length matching no candidate: {} bytes",
+            landed.len()
+        );
+        assert!(
+            candidates.iter().any(|c| c == &landed),
+            "the file's bytes were not a single writer's payload in full — a torn \
+             or interleaved write slipped through the lock-free path"
+        );
+    }
+
     /// A failed write still surfaces as an error rather than half-succeeding —
     /// the same direction `durable_append_reports_an_unwritable_path` pins for
     /// the append path. Here the temp create fails because the parent is a

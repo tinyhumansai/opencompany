@@ -370,4 +370,34 @@ mod tests {
             .count();
         assert_eq!(step_events, 1, "two renames must journal the step once");
     }
+
+    /// `require_admin` is called in the handler body rather than expressed
+    /// through an `AdminScopedCompany` extractor (see the module doc comment),
+    /// so nothing at the type level proves a plain member is refused — that
+    /// authority check has to be exercised over HTTP like any other route's.
+    #[tokio::test]
+    async fn a_member_is_refused() {
+        let dir = home();
+        let state = state(dir.path()).await;
+        crate::server::test_support::seed_fixed_member(&state, "acme").await;
+
+        let request = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/company")
+            .header("cookie", crate::server::test_support::member_cookie("acme"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "name": "Member's Choice" }).to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let id = CompanyId::new("acme");
+        let store = state.registry().get(&id).unwrap().store().clone();
+        let reloaded = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.manifest.company.name, "Provisional Co",
+            "a refused rename must not touch the stored name"
+        );
+        assert!(!reloaded.name_confirmed);
+    }
 }
