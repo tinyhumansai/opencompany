@@ -162,6 +162,36 @@ programming. `opencompany check` reports any problems in plain language, and
 adding a new business is a new folder, not a new program.
 [Your first company](gitbooks/get-started/your-first-company.md) walks through it.
 
+## What it reports about itself
+
+Nothing, unless it is a tenant on the TinyHumans hosted platform.
+
+- **A self-hosted or desktop install sends nothing** — and not "nothing by
+  default" in the sense of a switch someone could flip. The network client is
+  behind a cargo feature the shipped default build does not compile in, so
+  there is no code in that binary that could make the request. Getting one out
+  of that state takes a recompile, not a config change.
+- **Hosted tenants report product usage**, because the platform builds their
+  image with that feature on and injects a project token. What it reports is
+  shape and outcome under an opaque id: how many companies are configured,
+  which storage backend is in use, whether a turn finished or failed, and token
+  and cost counts.
+- **No company content ever leaves, on any install.** Not message text,
+  prompts, agent output, file paths, ledger values, tool names or arguments,
+  email addresses, company or agent names, task titles, error messages, or
+  credentials of any kind. That is enforced by construction rather than by
+  review: a reported property is a word compiled into the binary, a count, a
+  number or a boolean, and the type has no `String` variant for runtime text to
+  arrive in.
+- **To turn it off**, set `OPENCOMPANY_ANALYTICS=off`. It outranks everything
+  else, and boot prints one line saying which way it resolved.
+
+[`docs/spec/runtime/analytics.md`](docs/spec/runtime/analytics.md) has every
+event and property, the conditions that must all hold before anything is sent,
+and how the opaque id is derived. Crash reporting is separate, off until you
+configure it, and goes to your own Sentry project rather than ours —
+[`docs/spec/runtime/crash-reporting.md`](docs/spec/runtime/crash-reporting.md).
+
 ## Documentation
 
 | Where | What's there |
