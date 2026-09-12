@@ -25,8 +25,24 @@
 //! platform and capped per day. That mirrors OpenHuman's own rule, where a BYO
 //! engine with no key falls back to the managed surface.
 
+pub mod catalogue;
+pub mod probe;
+pub mod resolve;
+pub mod store;
+
 /// Holds the company's chosen search provider slug — one of
 /// [`SUPPORTED_PROVIDERS`].
+///
+/// # Entry zero
+///
+/// This is now the **legacy** address, and it is deliberately still read. A
+/// company that configured search before the provider list existed has its
+/// selection here and its key at [`API_KEY_SECRET`], and
+/// [`store::list_providers`] synthesises that pair into the first row rather
+/// than migrating it — the [`SecretStore`](crate::ports::SecretStore) port has
+/// no rename and no delete, so a flag-day migration on a store with no
+/// transaction can leave a company with neither configuration. The first save
+/// through the new path moves it. See `docs/modules/search/data-model.md`.
 ///
 /// Stored rather than inferred from which key happens to be present: the slug is
 /// what decides which API the key is presented to, and a key sent to the wrong
@@ -110,7 +126,41 @@ pub fn effective_provider(provider: &str, has_key: bool, has_endpoint: bool) -> 
     }
 }
 
-/// [`effective_provider`] over a company's secret store.
+/// Every connected provider, paired with whether its credential is present.
+///
+/// The credential itself never leaves the store here — only the boolean, asked
+/// of the store per provider rather than read from a flag that could go stale
+/// against a cleared secret.
+///
+/// # Errors
+///
+/// Returns an error when the secret store cannot be read.
+pub async fn candidates(
+    company: &crate::ports::types::CompanyId,
+    secrets: &dyn crate::ports::SecretStore,
+) -> crate::Result<Vec<resolve::Candidate>> {
+    let mut candidates = Vec::new();
+    for provider in store::list_providers(company, secrets).await? {
+        let has_key = store::provider_key_configured(company, secrets, &provider.slug).await?;
+        candidates.push(resolve::Candidate { provider, has_key });
+    }
+    Ok(candidates)
+}
+
+/// The provider a company's agents actually search through, over its store.
+///
+/// **The one derivation**, unchanged in name and contract from the single-slot
+/// version it replaces — the console's Search page, the capabilities panel and
+/// [`crate::harness::built_in::search_byo`] all call this rather than restating
+/// the rule. What changed is only what it reads: a list of connected providers
+/// and a default marker, instead of three flat keys.
+///
+/// That "only" hides the one hazard in the rework. Every reader must move
+/// together with the store's convergence write: a console that writes a
+/// credential to `search/provider/<slug>/key` while some reader is still on
+/// `search/api_key` sees an unconfigured company and silently drops it to
+/// managed search. The agents keep searching; they just quietly stop using the
+/// account the operator pays for.
 ///
 /// # Errors
 ///
@@ -119,19 +169,9 @@ pub async fn resolve_effective_provider(
     company: &crate::ports::types::CompanyId,
     secrets: &dyn crate::ports::SecretStore,
 ) -> crate::Result<String> {
-    let read = async |key: &str| -> crate::Result<Option<String>> {
-        Ok(secrets
-            .get(company, key)
-            .await?
-            .map(|value| value.0.trim().to_string())
-            .filter(|value| !value.is_empty()))
-    };
-    let provider = read(PROVIDER_SECRET)
-        .await?
-        .unwrap_or_else(|| MANAGED_PROVIDER.to_string());
-    let has_key = read(API_KEY_SECRET).await?.is_some();
-    let has_endpoint = read(ENDPOINT_SECRET).await?.is_some();
-    Ok(effective_provider(&provider, has_key, has_endpoint).to_string())
+    let candidates = candidates(company, secrets).await?;
+    let marked = store::load_default_slug(company, secrets).await?;
+    Ok(resolve::effective_slug(resolve::active(&candidates, marked.as_deref())).to_string())
 }
 
 #[cfg(test)]

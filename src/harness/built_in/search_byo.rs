@@ -56,10 +56,7 @@
 
 use std::sync::Arc;
 
-use crate::company::search::{
-    API_KEY_SECRET, ENDPOINT_SECRET, MANAGED_PROVIDER, PROVIDER_SECRET, configuration_complete,
-    provider_is_byo,
-};
+use crate::company::search::{configuration_complete, provider_is_byo};
 use crate::ports::SecretStore;
 use crate::ports::types::CompanyId;
 
@@ -129,23 +126,40 @@ impl TenantSearch {
         secrets: &Arc<dyn SecretStore>,
         company: &CompanyId,
     ) -> crate::error::Result<Option<TenantSearch>> {
-        let read = async |key: &str| -> crate::error::Result<Option<String>> {
-            Ok(secrets
-                .get(company, key)
-                .await?
-                .map(|value| value.0.trim().to_string())
-                .filter(|value| !value.is_empty()))
+        // Asks the same resolver the console's status route and the
+        // capabilities panel ask. That is not tidiness: the store's convergence
+        // rule moves a credential from `search/api_key` to
+        // `search/provider/<slug>/key` on the first save, and a reader still
+        // looking at the flat address would see an unconfigured company and
+        // silently drop it to managed search — the agents would keep searching,
+        // they would just quietly stop using the account the operator pays for.
+        // Every reader moves together or none does.
+        let candidates = crate::company::search::candidates(company, secrets.as_ref()).await?;
+        let marked =
+            crate::company::search::store::load_default_slug(company, secrets.as_ref()).await?;
+        let Some(active) = crate::company::search::resolve::active(&candidates, marked.as_deref())
+        else {
+            if !candidates.is_empty() {
+                tracing::warn!(
+                    company = %company,
+                    "[search] a BYO provider is connected but none resolves; falling back to the \
+                     managed surface"
+                );
+            }
+            return Ok(None);
         };
 
-        let provider = read(PROVIDER_SECRET)
-            .await?
-            .unwrap_or_else(|| MANAGED_PROVIDER.to_string());
+        let provider = active.provider.slug.clone();
+        // Belt to the resolver's braces: `active` only ever returns a complete,
+        // enabled provider, and `managed` is never a record.
         if !provider_is_byo(&provider) {
             return Ok(None);
         }
 
-        let api_key = read(API_KEY_SECRET).await?;
-        let endpoint = read(ENDPOINT_SECRET).await?;
+        let api_key =
+            crate::company::search::store::load_provider_key(company, secrets.as_ref(), &provider)
+                .await?;
+        let endpoint = active.provider.endpoint.clone();
         if !configuration_complete(&provider, api_key.is_some(), endpoint.is_some()) {
             tracing::warn!(
                 company = %company,
@@ -426,6 +440,10 @@ mod live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The legacy flat keys are a test concern only now: the resolver reaches
+    // them through `company::search::store`'s entry-zero fallback rather than
+    // naming them.
+    use crate::company::search::{API_KEY_SECRET, ENDPOINT_SECRET, PROVIDER_SECRET};
     use crate::error::Result;
     use crate::ports::types::SecretValue;
 
@@ -478,6 +496,98 @@ mod tests {
         async fn set(&self, _c: &CompanyId, _k: &str, _v: SecretValue) -> Result<()> {
             Err(crate::error::OpenCompanyError::Store("boom".into()))
         }
+    }
+
+    /// The list, the marker and the harness agree on which account is billed.
+    ///
+    /// This is the seam the whole rework turns on: the console writes a
+    /// credential at `search/provider/<slug>/key`, and the harness must read it
+    /// from there. A harness still reading the flat `search/api_key` would see
+    /// an unconfigured company and fall back to managed search — the agents keep
+    /// searching, they just quietly stop using the account the operator pays
+    /// for, which is the silent half of the failure this change exists to end.
+    ///
+    /// Every credential below is obviously fake.
+    #[tokio::test]
+    async fn the_marked_provider_is_the_one_the_harness_wires() {
+        let secrets = MemSecrets::with(&[
+            (
+                crate::company::search::store::PROVIDER_INDEX_KEY,
+                r#"[{"slug":"exa","enabled":true},{"slug":"brave","enabled":true}]"#,
+            ),
+            ("search/provider/exa/key", "exa-not-a-real-key"),
+            ("search/provider/brave/key", "brave-not-a-real-key"),
+            (crate::company::search::store::DEFAULT_PROVIDER_KEY, "brave"),
+        ]);
+
+        let resolved = TenantSearch::resolve(&secrets, &company())
+            .await
+            .expect("resolve")
+            .expect("a marked provider resolves");
+        assert_eq!(resolved.provider(), "brave");
+
+        let tools = byo_search_tools(&resolved);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name() == crate::harness::search::WEB_SEARCH_TOOL),
+            "the canonical web_search name must be on the belt whichever provider answers"
+        );
+    }
+
+    /// Moving the marker moves the account, with no key re-entered.
+    #[tokio::test]
+    async fn moving_the_marker_moves_which_credential_is_used() {
+        let pairs: Vec<(&str, &str)> = vec![
+            (
+                crate::company::search::store::PROVIDER_INDEX_KEY,
+                r#"[{"slug":"exa","enabled":true},{"slug":"brave","enabled":true}]"#,
+            ),
+            ("search/provider/exa/key", "exa-not-a-real-key"),
+            ("search/provider/brave/key", "brave-not-a-real-key"),
+            (crate::company::search::store::DEFAULT_PROVIDER_KEY, "exa"),
+        ];
+        let secrets = MemSecrets::with(&pairs);
+        let first = TenantSearch::resolve(&secrets, &company())
+            .await
+            .expect("resolve")
+            .expect("resolves");
+        assert_eq!(first.provider(), "exa");
+
+        secrets
+            .set(
+                &company(),
+                crate::company::search::store::DEFAULT_PROVIDER_KEY,
+                SecretValue("brave".to_string()),
+            )
+            .await
+            .expect("set marker");
+
+        let second = TenantSearch::resolve(&secrets, &company())
+            .await
+            .expect("resolve")
+            .expect("resolves");
+        assert_eq!(second.provider(), "brave");
+        assert_ne!(
+            TenantSearch::fingerprint(&Some(first)),
+            TenantSearch::fingerprint(&Some(second)),
+            "the roster must rebuild when the account changes, or the old credential keeps \
+             authenticating until a restart"
+        );
+    }
+
+    /// A company that configured search before the list existed keeps working.
+    #[tokio::test]
+    async fn the_legacy_flat_keys_still_wire_a_provider() {
+        let secrets = MemSecrets::with(&[
+            (crate::company::search::PROVIDER_SECRET, "exa"),
+            (crate::company::search::API_KEY_SECRET, "exa-not-a-real-key"),
+        ]);
+        let resolved = TenantSearch::resolve(&secrets, &company())
+            .await
+            .expect("resolve")
+            .expect("entry zero resolves with nothing migrated");
+        assert_eq!(resolved.provider(), "exa");
     }
 
     fn company() -> CompanyId {

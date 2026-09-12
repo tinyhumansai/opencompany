@@ -88,7 +88,10 @@ async function openSettingsPage(page: Page, sub: string) {
  * Idempotent on the invite: a re-run hits `409 already a member`, which is a
  * success for our purposes — the address can sign in either way.
  */
-async function signInAsMember(admin: APIRequestContext, context: APIRequestContext) {
+async function signInAsMember(
+  admin: APIRequestContext,
+  context: APIRequestContext,
+) {
   const invited = await admin.post("/api/v1/company/users/invites", {
     data: { email: MEMBER_EMAIL, role: "member" },
   });
@@ -110,7 +113,10 @@ async function signInAsMember(admin: APIRequestContext, context: APIRequestConte
   const verified = await context.post("/api/v1/company/auth/verify", {
     data: { code: devCode },
   });
-  expect(verified.ok(), `member sign-in failed: ${await verified.text()}`).toBeTruthy();
+  expect(
+    verified.ok(),
+    `member sign-in failed: ${await verified.text()}`,
+  ).toBeTruthy();
   expect((await verified.json()).role).toBe("member");
 }
 
@@ -125,7 +131,9 @@ test("a member sees what Settings holds but is offered nothing that changes it",
 
     // ---- Hosting: where this company's sites go live ------------------------
     await openSettingsPage(memberPage, "hosting");
-    await expect(memberPage.getByTestId("hosting-read-only")).toBeVisible({ timeout: 30_000 });
+    await expect(memberPage.getByTestId("hosting-read-only")).toBeVisible({
+      timeout: 30_000,
+    });
 
     // The assertion that matters most: no credential field anywhere. A member
     // must never be handed somewhere to paste a deployment token.
@@ -135,24 +143,45 @@ test("a member sees what Settings holds but is offered nothing that changes it",
 
     // The read survives — what the company deploys through explains why a
     // teammate can deploy at all.
-    await expect(memberPage.getByRole("heading", { name: "Hosting" })).toBeVisible();
+    await expect(
+      memberPage.getByRole("heading", { name: "Hosting" }),
+    ).toBeVisible();
 
     // ---- Search: whose index answers a teammate, under whose retention ------
     await openSettingsPage(memberPage, "search");
-    await expect(memberPage.getByTestId("search-read-only")).toBeVisible({ timeout: 30_000 });
-    await expect(memberPage.getByTestId("search-api-key")).toHaveCount(0);
-    await expect(memberPage.getByTestId("search-save")).toHaveCount(0);
-    await expect(memberPage.getByTestId("search-clear")).toHaveCount(0);
+    await expect(memberPage.getByTestId("search-read-only")).toBeVisible({
+      timeout: 30_000,
+    });
+    // The page is a provider list now rather than a single form, so the same
+    // property is asserted against the controls that exist: nothing that
+    // changes where the company searches is offered, and disconnecting
+    // everything is not rendered for a member at all.
+    await expect(memberPage.getByTestId("search-add")).toBeDisabled();
+    await expect(memberPage.getByTestId("search-disconnect-all")).toHaveCount(
+      0,
+    );
 
-    // The provider stays visible and inert. This page's own footnote says the
-    // choice is an administrator's; it used to print that under a live picker.
-    const provider = memberPage.getByTestId("search-provider");
-    await expect(provider).toBeVisible();
-    await expect(provider).toBeDisabled();
+    // The page itself stays readable. Which index answers a teammate's search is
+    // worth reading even when it is not yours to change — this page's own notice
+    // says the choice is an administrator's, and it used to print that under a
+    // live picker.
+    //
+    // `search-provider-list` renders whatever the runner has: there is no empty
+    // branch to miss any more, because the Managed row is unconditional and the
+    // notice for a company with no records of its own is the list's last row
+    // rather than a replacement for it. Neither assertion below depends on the
+    // runner having a managed credential — pinning `data-state` here would make
+    // this test about the fixture rather than about authority.
+    await expect(memberPage.getByTestId("search-provider-list")).toBeVisible();
+    await expect(
+      memberPage.getByTestId("search-provider-managed"),
+    ).toBeVisible();
 
     // ---- Approvals: the policy-generated tier and always-ask list -----------
     await openSettingsPage(memberPage, "approvals");
-    await expect(memberPage.getByTestId("policy-read-only")).toBeVisible({ timeout: 30_000 });
+    await expect(memberPage.getByTestId("policy-read-only")).toBeVisible({
+      timeout: 30_000,
+    });
     // The tiers stay readable — which one is in force decides what this
     // member's teammates may do without asking — but none of them is a choice.
     await expect(memberPage.getByTestId("policy-tier-full")).toBeDisabled();
@@ -168,10 +197,14 @@ test("a member sees what Settings holds but is offered nothing that changes it",
     // the risk when adding role gates is over-correcting into a member losing
     // a page that was always theirs.
     await openSettingsPage(memberPage, "usage");
-    await expect(memberPage.getByRole("heading", { name: "Usage" })).toBeVisible({
+    await expect(
+      memberPage.getByRole("heading", { name: "Usage" }),
+    ).toBeVisible({
       timeout: 30_000,
     });
-    await expect(memberPage.getByRole("combobox", { name: "Usage date range" })).toBeEnabled();
+    await expect(
+      memberPage.getByRole("combobox", { name: "Usage date range" }),
+    ).toBeEnabled();
   } finally {
     await memberContext.close();
   }
@@ -182,17 +215,22 @@ test("an admin is still offered every Settings control", async ({ page }) => {
   // if the admin path still renders what the member's does not.
   await openSettingsPage(page, "hosting");
   await expect(page.getByTestId("hosting-read-only")).toHaveCount(0);
-  await expect(page.getByTestId("hosting-api-key")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("hosting-api-key")).toBeVisible({
+    timeout: 30_000,
+  });
   await expect(page.getByTestId("hosting-save")).toBeVisible();
 
   await openSettingsPage(page, "search");
   await expect(page.getByTestId("search-read-only")).toHaveCount(0);
-  await expect(page.getByTestId("search-provider")).toBeEnabled({ timeout: 30_000 });
-  await expect(page.getByTestId("search-save")).toBeVisible();
+  await expect(page.getByTestId("search-add")).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByTestId("search-provider-list")).toBeVisible();
+  await expect(page.getByTestId("search-provider-managed")).toBeVisible();
 
   await openSettingsPage(page, "approvals");
   await expect(page.getByTestId("policy-read-only")).toHaveCount(0);
-  await expect(page.getByTestId("policy-tier-full")).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByTestId("policy-tier-full")).toBeEnabled({
+    timeout: 30_000,
+  });
   // Domain and SMTP assertions retired with the surface — see the matching
   // note in the member test above.
 });

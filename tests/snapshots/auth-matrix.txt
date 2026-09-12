@@ -159,6 +159,13 @@ DELETE /api/v1/companies/{id}/search/key must-change-password-admin refused:403:
 DELETE /api/v1/companies/{id}/search/key platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/companies/{id}/search/key tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/companies/{id}/search/key tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/companies/{id}/search/providers/{slug} tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/companies/{id}/tasks/{task_id} admin permitted source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
 DELETE /api/v1/companies/{id}/tasks/{task_id} anonymous refused:401:unauthorized source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
 DELETE /api/v1/companies/{id}/tasks/{task_id} member permitted source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
@@ -369,6 +376,13 @@ DELETE /api/v1/company/search/key must-change-password-admin refused:403:passwor
 DELETE /api/v1/company/search/key platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/company/search/key tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/company/search/key tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+DELETE /api/v1/company/search/providers/{slug} tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 DELETE /api/v1/company/tasks/{task_id} admin permitted source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
 DELETE /api/v1/company/tasks/{task_id} anonymous refused:401:unauthorized source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
 DELETE /api/v1/company/tasks/{task_id} member permitted source=ops access=scoped features=openhuman blast=destructive note="Members may delete task cards." wait=-
@@ -2042,6 +2056,20 @@ POST /api/v1/companies/{id}/resume must-change-password-admin refused:403:passwo
 POST /api/v1/companies/{id}/resume platform permitted source=external access=admin features=openhuman blast=authority note="" wait=-
 POST /api/v1/companies/{id}/resume tenant-non-owner refused:403:forbidden source=external access=admin features=openhuman blast=authority note="" wait=-
 POST /api/v1/companies/{id}/resume tenant-owner permitted source=external access=admin features=openhuman blast=authority note="" wait=-
+POST /api/v1/companies/{id}/search/providers admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/providers tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/companies/{id}/search/test tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/companies/{id}/setup/roster admin permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/companies/{id}/setup/roster anonymous refused:401:unauthorized source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/companies/{id}/setup/roster member permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
@@ -2539,6 +2567,20 @@ POST /api/v1/company/memory/ingest/links must-change-password-admin refused:403:
 POST /api/v1/company/memory/ingest/links platform permitted source=ops access=scoped features=openhuman blast=authority note="Members may submit URLs for server-side ingestion." wait=-
 POST /api/v1/company/memory/ingest/links tenant-non-owner refused:403:forbidden source=ops access=scoped features=openhuman blast=authority note="Members may submit URLs for server-side ingestion." wait=-
 POST /api/v1/company/memory/ingest/links tenant-owner permitted source=ops access=scoped features=openhuman blast=authority note="Members may submit URLs for server-side ingestion." wait=-
+POST /api/v1/company/search/providers admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/providers tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+POST /api/v1/company/search/test tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 POST /api/v1/company/setup/roster admin permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/company/setup/roster anonymous refused:401:unauthorized source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
 POST /api/v1/company/setup/roster member permitted source=ops access=scoped features=openhuman blast=ordinary note="" wait=-
@@ -2889,6 +2931,27 @@ PUT /api/v1/companies/{id}/search must-change-password-admin refused:403:passwor
 PUT /api/v1/companies/{id}/search platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/companies/{id}/search tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/companies/{id}/search tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/default tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug} tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/companies/{id}/search/providers/{slug}/key tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/companies/{id}/skills/{slug} admin permitted source=ops access=admin features=openhuman blast=authority note="" wait=-
 PUT /api/v1/companies/{id}/skills/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=authority note="" wait=-
 PUT /api/v1/companies/{id}/skills/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=authority note="" wait=-
@@ -3113,6 +3176,27 @@ PUT /api/v1/company/search must-change-password-admin refused:403:password_chang
 PUT /api/v1/company/search platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/company/search tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/company/search tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/default tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug} tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key admin permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key member refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key must-change-password-admin refused:403:password_change_required source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key platform permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key tenant-non-owner refused:403:forbidden source=ops access=admin features=openhuman blast=credential note="" wait=-
+PUT /api/v1/company/search/providers/{slug}/key tenant-owner permitted source=ops access=admin features=openhuman blast=credential note="" wait=-
 PUT /api/v1/company/skills/{slug} admin permitted source=ops access=admin features=openhuman blast=authority note="" wait=-
 PUT /api/v1/company/skills/{slug} anonymous refused:401:unauthorized source=ops access=admin features=openhuman blast=authority note="" wait=-
 PUT /api/v1/company/skills/{slug} member refused:403:forbidden source=ops access=admin features=openhuman blast=authority note="" wait=-

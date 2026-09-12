@@ -36,22 +36,47 @@ const HOSTING = {
 const SEARCH = {
   provider: "brave",
   effectiveProvider: "brave",
+  providers: [
+    {
+      slug: "brave",
+      label: "Brave Search",
+      category: "account",
+      enabled: true,
+      keyConfigured: true,
+      takesKey: true,
+      takesEndpoint: false,
+      endpoint: null,
+      complete: true,
+      isDefault: true,
+    },
+  ],
   endpoint: null,
   apiKeyConfigured: true,
   needsApiKey: false,
   needsEndpoint: false,
   granted: true,
   inBuild: true,
-  supportedProviders: ["managed", "brave", "searxng"],
+  managedConfigured: true,
+  managedDailyCallCap: 100,
+  supportedProviders: ["managed", "brave", "exa", "querit", "searxng"],
 };
 
 /** A client answering the page's own read, and `/auth/me` as `role`. */
-function clientAs(role: "admin" | "member", answer: unknown): OpenCompanyClient {
+function clientAs(
+  role: "admin" | "member",
+  answer: unknown,
+): OpenCompanyClient {
   return {
     scopeFor: () => "/api/v1/companies/acme",
     get: (path: string) =>
       path.endsWith("/auth/me")
-        ? Promise.resolve({ id: "u1", email: "a@b.c", role, company: "acme", hasPassword: true })
+        ? Promise.resolve({
+            id: "u1",
+            email: "a@b.c",
+            role,
+            company: "acme",
+            hasPassword: true,
+          })
         : Promise.resolve(answer),
   } as unknown as OpenCompanyClient;
 }
@@ -70,7 +95,9 @@ function at(testid: string): HTMLElement | null {
 }
 
 beforeEach(() => {
-  (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  (
+    globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
+  ).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -128,50 +155,84 @@ describe("Settings → Hosting, by role", () => {
 });
 
 describe("Settings → Search, by role", () => {
-  it("offers a member no key field and no way to change the provider", async () => {
+  // The page is a provider list now rather than a single form, so these assert
+  // the same property against the controls that exist: a member may read which
+  // index answers, and may change none of it.
+  it("offers a member no way to connect, change or disconnect a provider", async () => {
     const client = clientAs("member", SEARCH);
     await show(createElement(SearchView, { client, company: "acme" }));
 
-    expect(at("search-api-key")).toBeNull();
-    expect(at("search-save")).toBeNull();
-    expect(at("search-clear")).toBeNull();
+    expect(at("search-add")?.hasAttribute("disabled")).toBe(true);
+    // Every per-row control is an admin's. The host agrees: every write route
+    // AND the probe are `AdminScopedCompany`, the probe because it spends the
+    // company's money.
+    for (const control of [
+      "search-provider-brave-toggle",
+      "search-provider-brave-menu",
+      "search-provider-brave-test",
+    ]) {
+      const element = at(control);
+      expect(element).not.toBeNull();
+      expect(
+        element?.hasAttribute("disabled") ||
+          element?.getAttribute("aria-disabled") === "true",
+      ).toBe(true);
+    }
+    // Disconnecting everything is not offered to a member at all.
+    expect(at("search-disconnect-all")).toBeNull();
   });
 
-  it("leaves the provider picker visible to a member but not operable", async () => {
+  it("still shows a member which index answers", async () => {
     // Which index answers a teammate's search is worth reading even when it is
-    // not yours to change — the page's own footnote is about exactly that.
+    // not yours to change.
     const client = clientAs("member", SEARCH);
     await show(createElement(SearchView, { client, company: "acme" }));
 
-    const picker = at("search-provider");
-    expect(picker).not.toBeNull();
-    expect(picker?.hasAttribute("disabled") || picker?.getAttribute("aria-disabled") === "true").toBe(
-      true,
+    expect(at("search-provider-list")?.getAttribute("data-state")).toBe(
+      "populated",
     );
+    expect(at("search-provider-brave")).not.toBeNull();
+    expect(at("search-provider-brave-default")).not.toBeNull();
   });
 
-  it("states the rule the page's own footnote has always asserted", async () => {
-    // The page has always ended with "the choice is an administrator's and not
-    // a teammate's". Until this gate existed it printed that under an enabled
-    // picker and an enabled Save.
+  it("states the rule, rather than printing it under enabled controls", async () => {
+    // The page has always ended by saying the choice is an administrator's.
+    // Until this gate existed it printed that under an enabled picker and an
+    // enabled Save.
     const client = clientAs("member", SEARCH);
     await show(createElement(SearchView, { client, company: "acme" }));
 
     const notice = at("search-read-only");
     expect(notice).not.toBeNull();
     expect(notice?.textContent).toContain("Only an admin");
-    // The footnote's own characters, typographic apostrophe included — this is
-    // the sentence the page was printing under an enabled picker.
-    expect(container.textContent).toContain("an administrator’s and not an agent’s");
+    expect(notice?.textContent).toContain("an admin decides them");
   });
 
-  it("offers an admin the whole form and no notice", async () => {
+  it("offers an admin every control and no notice", async () => {
+    // The control. Every assertion above is only worth having if the admin path
+    // still renders what the member's does not.
     const client = clientAs("admin", SEARCH);
     await show(createElement(SearchView, { client, company: "acme" }));
 
     expect(at("search-read-only")).toBeNull();
-    expect(at("search-api-key")).not.toBeNull();
-    expect(at("search-save")).not.toBeNull();
-    expect(at("search-clear")).not.toBeNull();
+    expect(at("search-add")?.hasAttribute("disabled")).toBe(false);
+    expect(at("search-disconnect-all")).not.toBeNull();
+    for (const control of [
+      "search-provider-brave-toggle",
+      "search-provider-brave-menu",
+      "search-provider-brave-test",
+    ]) {
+      const element = at(control);
+      expect(element).not.toBeNull();
+      // The SAME predicate the member loop uses, negated. Checking only the
+      // `disabled` attribute here would pass for a control that carries
+      // `aria-disabled="true"` and no `disabled` — which is one of the two
+      // shapes the member loop accepts as disabled, so this test would agree
+      // that a control is both disabled for a member and enabled for an admin.
+      expect(
+        element?.hasAttribute("disabled") ||
+          element?.getAttribute("aria-disabled") === "true",
+      ).toBe(false);
+    }
   });
 });

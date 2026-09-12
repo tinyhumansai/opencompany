@@ -110,10 +110,13 @@ const PEOPLE_OK = (url: string): unknown =>
 const SEARCH_OK = {
   provider: "managed",
   effectiveProvider: "managed",
+  providers: [],
   endpoint: null,
   apiKeyConfigured: false,
   granted: true,
   inBuild: true,
+  managedConfigured: true,
+  managedDailyCallCap: 100,
   supportedProviders: ["managed", "brave", "exa"],
 };
 
