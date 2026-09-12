@@ -697,6 +697,18 @@ const GRACEFUL_EMPTY_REPLY: &str = "Sorry — I hit a temporary model hiccup and
 const TOTAL_BUDGET_EXHAUSTED_NOTICE: &str =
     "Token budget for this period is exhausted — dispatch paused until the period resets.";
 
+fn monthly_budget_exhausted_notice(cap_usd: f64) -> String {
+    format!(
+        "This company has reached its monthly spend cap of ${cap_usd:.2} — dispatch is paused until the month resets."
+    )
+}
+
+fn unmeasurable_monthly_budget_notice(cap_usd: f64) -> String {
+    format!(
+        "This company's monthly spend cap of ${cap_usd:.2} cannot be checked because its financial ledger is unavailable — dispatch is paused until the ledger can be read."
+    )
+}
+
 /// The operator-facing notice returned when one teammate has spent its manifest
 /// `budget_usd_daily` (issue #304) — a hard dispatch refusal for that teammate
 /// only, made before any model call.
@@ -2360,6 +2372,7 @@ where
 /// A pool of live agents, one roster per company.
 pub struct HarnessPool {
     agents: RwLock<HashMap<CompanyId, Vec<Arc<CompanyAgent>>>>,
+    monthly_budgets: RwLock<HashMap<CompanyId, Option<f64>>>,
     /// Fingerprint of the effective MCP server set the cached roster was built
     /// from, keyed by company. Drives MCP-freshness: [`ensure`](Self::ensure)
     /// rebuilds the roster whenever the fingerprint changes.
@@ -2615,6 +2628,21 @@ fn policy_ensure_lock(company: &CompanyId) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+static MONTHLY_SPEND_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<CompanyId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn monthly_spend_lock(company: &CompanyId) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = MONTHLY_SPEND_LOCKS.lock().expect("monthly spend locks");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(company).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(company.clone(), Arc::downgrade(&lock));
+    lock
+}
+
 /// What the total-ceiling gate decided.
 ///
 /// Not a `Result`: a refusal is an ordinary outcome of asking rather than an
@@ -2628,11 +2656,17 @@ enum CeilingGate {
     Refused(TurnOutcome),
 }
 
+enum MonthlyBudgetGate {
+    Admitted(Option<tokio::sync::OwnedMutexGuard<()>>),
+    Refused(TurnOutcome),
+}
+
 impl HarnessPool {
     /// Builds an empty pool.
     pub fn new() -> Self {
         Self {
             agents: RwLock::new(HashMap::new()),
+            monthly_budgets: RwLock::new(HashMap::new()),
             mcp_fingerprints: RwLock::new(HashMap::new()),
             overlay_fingerprints: RwLock::new(HashMap::new()),
             capability_fingerprints: RwLock::new(HashMap::new()),
@@ -2781,6 +2815,11 @@ impl HarnessPool {
         deps: &HarnessDeps,
         policy_snapshot: Option<&Policy>,
     ) -> crate::Result<()> {
+        self.monthly_budgets
+            .write()
+            .await
+            .insert(company.id.clone(), company.manifest.budget.monthly_usd);
+
         // Re-resolve + fingerprint the effective MCP set (cheap; no rebuild yet).
         let effective_mcp = self.resolve_effective_mcp(company, deps).await;
         let mcp_fp = mcp_fingerprint(&effective_mcp);
@@ -3231,6 +3270,7 @@ impl HarnessPool {
     /// selection after invalidating.
     async fn invalidate_roster(&self, company: &CompanyId) {
         self.agents.write().await.remove(company);
+        self.monthly_budgets.write().await.remove(company);
         self.mcp_fingerprints.write().await.remove(company);
         self.overlay_fingerprints.write().await.remove(company);
         self.capability_fingerprints.write().await.remove(company);
@@ -4046,6 +4086,80 @@ impl HarnessPool {
         }
     }
 
+    async fn monthly_budget_refusal(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        deps: &HarnessDeps,
+    ) -> MonthlyBudgetGate {
+        let Some(configured_cap) = self
+            .monthly_budgets
+            .read()
+            .await
+            .get(company)
+            .copied()
+            .flatten()
+        else {
+            return MonthlyBudgetGate::Admitted(None);
+        };
+
+        let guard = monthly_spend_lock(company).lock_owned().await;
+        let record = match deps.store.load(company).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                tracing::error!(
+                    company = %company,
+                    agent = agent_id,
+                    cap = configured_cap,
+                    "[company-budget] company record is unavailable; refusing inference dispatch"
+                );
+                return MonthlyBudgetGate::Refused(spend_gate_refusal(
+                    unmeasurable_monthly_budget_notice(configured_cap),
+                    SpendGateCause::Unmeasurable,
+                ));
+            }
+            Err(error) => {
+                tracing::error!(
+                    company = %company,
+                    agent = agent_id,
+                    cap = configured_cap,
+                    %error,
+                    "[company-budget] ledger read failed; refusing inference dispatch"
+                );
+                return MonthlyBudgetGate::Refused(spend_gate_refusal(
+                    unmeasurable_monthly_budget_notice(configured_cap),
+                    SpendGateCause::Unmeasurable,
+                ));
+            }
+        };
+
+        let Some(cap) = record.manifest.budget.monthly_usd else {
+            return MonthlyBudgetGate::Admitted(None);
+        };
+        let spent = crate::metering::finances_from(
+            &record.ledger,
+            &record.manifest.budget,
+            None,
+            crate::ports::now_millis(),
+        )
+        .spent_usd;
+        if spent >= cap {
+            tracing::info!(
+                company = %company,
+                agent = agent_id,
+                spent,
+                cap,
+                "[company-budget] monthly spend cap reached; refusing inference dispatch"
+            );
+            return MonthlyBudgetGate::Refused(spend_gate_refusal(
+                monthly_budget_exhausted_notice(cap),
+                SpendGateCause::Exhausted,
+            ));
+        }
+
+        MonthlyBudgetGate::Admitted(Some(guard))
+    }
+
     /// Runs one **confined** turn (issue #416): an ephemeral agent with no
     /// tools, no company memory and no roster identity, for a question about one
     /// object rather than about the company.
@@ -4079,6 +4193,14 @@ impl HarnessPool {
                 CeilingGate::Admitted(reservation) => reservation,
                 CeilingGate::Refused(refusal) => return Ok(refusal),
             };
+
+        let _monthly_budget = match self
+            .monthly_budget_refusal(company, confine::CONFINED_AGENT_ID, deps)
+            .await
+        {
+            MonthlyBudgetGate::Admitted(guard) => guard,
+            MonthlyBudgetGate::Refused(refusal) => return Ok(refusal),
+        };
 
         let confined = confine::build_confined_agent(company, company_name, confinement, deps)?;
         let agent = CompanyAgent {
@@ -4235,6 +4357,11 @@ impl HarnessPool {
         let _ceiling = match Self::total_ceiling_refusal(company, agent_id, deps).await {
             CeilingGate::Admitted(reservation) => reservation,
             CeilingGate::Refused(refusal) => return Ok(refusal),
+        };
+
+        let _monthly_budget = match self.monthly_budget_refusal(company, agent_id, deps).await {
+            MonthlyBudgetGate::Admitted(guard) => guard,
+            MonthlyBudgetGate::Refused(refusal) => return Ok(refusal),
         };
 
         // Per-agent daily spend cap (issue #304): the same HARD, pre-model-call
@@ -10913,6 +11040,145 @@ description = "Sets direction."
             search: None,
             tenant_search: None,
             workspace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn monthly_inference_cap_refuses_a_non_discoverable_company_after_spend() {
+        let dir = tempfile::tempdir().expect("temporary workspace");
+        let store = Arc::new(crate::store::FsCompanyStore::new(dir.path()));
+        let provider = Arc::new(ScriptedProvider::new(vec![Ok("model-ran".to_string())]));
+        let mut deps = deps_with_plan(dir.path(), Arc::new(MockContext::default()), None, None);
+        deps.store = store.clone();
+        deps.provider = provider.clone();
+
+        let mut rec = record();
+        rec.manifest.place.discoverable = false;
+        rec.manifest.budget.monthly_usd = Some(1.0);
+        let prior_spend = LedgerEntry {
+            at_millis: crate::ports::now_millis(),
+            kind: "inference.spend".to_string(),
+            amount_usd: -1.0,
+            memo: "prior inference".to_string(),
+        };
+        store.save(&rec).await.expect("company is persisted");
+        store
+            .append_ledger(&rec.id, prior_spend)
+            .await
+            .expect("prior inference spend is persisted");
+
+        let pool = HarnessPool::new();
+        pool.ensure(&rec, &deps).await.expect("roster builds");
+        let outcome = pool
+            .run(
+                &rec.id,
+                "ceo",
+                "must-not-run",
+                &deps,
+                crate::runtime::delegation::ChatTarget::default(),
+            )
+            .await
+            .expect("a budget refusal is an ordinary outcome");
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a company at its monthly cap must not make another inference call"
+        );
+        assert_eq!(
+            outcome.reply,
+            "This company has reached its monthly spend cap of $1.00 — dispatch is paused until the month resets.",
+            "the refusal must explain the company-wide monthly cap"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_inference_turns_cannot_both_spend_the_last_monthly_budget() {
+        struct DelayedProvider(ScriptedProvider);
+
+        #[async_trait]
+        impl ChatModel<()> for DelayedProvider {
+            async fn invoke(
+                &self,
+                state: &(),
+                request: ModelRequest,
+            ) -> tinyinference::Result<ModelResponse> {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.0.invoke(state, request).await
+            }
+        }
+
+        impl HarnessModel for DelayedProvider {
+            fn telemetry_provider_id(&self) -> String {
+                "monthly-budget-race".to_string()
+            }
+        }
+
+        for attempt in 0..5 {
+            let dir = tempfile::tempdir().expect("temporary workspace");
+            let store = Arc::new(crate::store::FsCompanyStore::new(dir.path()));
+            let provider = Arc::new(DelayedProvider(
+                ScriptedProvider::new(vec![Ok("completed".to_string()); 2]).reporting_usage(
+                    tinyinference::Usage {
+                        input_tokens: 1_200,
+                        output_tokens: 340,
+                        total_tokens: 1_540,
+                        ..Default::default()
+                    },
+                ),
+            ));
+            let mut deps = deps_with_plan(dir.path(), Arc::new(MockContext::default()), None, None);
+            deps.store = store.clone();
+            deps.provider = provider.clone();
+            let deps = Arc::new(deps);
+
+            let mut rec = record();
+            rec.id = CompanyId::new(format!("monthly-budget-race-{attempt}"));
+            rec.manifest.place.discoverable = false;
+            rec.manifest.budget.monthly_usd = Some(1.0);
+            store.save(&rec).await.expect("company is persisted");
+            store
+                .append_ledger(
+                    &rec.id,
+                    LedgerEntry {
+                        at_millis: crate::ports::now_millis(),
+                        kind: "inference.spend".to_string(),
+                        amount_usd: -0.999_999,
+                        memo: "prior inference".to_string(),
+                    },
+                )
+                .await
+                .expect("prior inference spend is persisted");
+
+            let pool = Arc::new(HarnessPool::new());
+            pool.ensure(&rec, &deps).await.expect("roster builds");
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut racers = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let barrier = barrier.clone();
+                let pool = pool.clone();
+                let deps = deps.clone();
+                let company = rec.id.clone();
+                racers.spawn(async move {
+                    barrier.wait().await;
+                    pool.run(
+                        &company,
+                        "ceo",
+                        "answer once",
+                        &deps,
+                        crate::runtime::delegation::ChatTarget::default(),
+                    )
+                    .await
+                });
+            }
+            while let Some(result) = racers.join_next().await {
+                result.expect("racer joins").expect("dispatch resolves");
+            }
+            assert_eq!(
+                provider.0.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "attempt {attempt}: one remaining monthly budget must admit exactly one model call"
+            );
         }
     }
 
