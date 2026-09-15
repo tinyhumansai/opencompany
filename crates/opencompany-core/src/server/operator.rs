@@ -4681,6 +4681,10 @@ pub(crate) struct ReferralConversationDto {
     other_desk_name: String,
     /// Whether a person was asked rather than a desk — `@name` vs `#desk`.
     direct: bool,
+    /// Whether this desk was ASKED rather than doing the asking. Every other
+    /// field is named from the asker's side, so without this the label renders
+    /// an answering desk's crossing backwards.
+    inbound: bool,
     /// The exchange, oldest first. Its length is the count in the label.
     lines: Vec<ReferralLineDto>,
 }
@@ -4963,6 +4967,7 @@ impl From<MessageView> for ChatHistoryMessageDto {
                     other_desk_id: crossing.other_desk_id,
                     other_desk_name: crossing.other_desk_name,
                     direct: crossing.direct,
+                    inbound: crossing.inbound,
                     lines: crossing
                         .lines
                         .into_iter()

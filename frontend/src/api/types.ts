@@ -430,6 +430,15 @@ export interface ReferralConversationDto {
   otherDeskName: string;
   /** Whether a person was asked rather than a desk — `@name` vs `#desk`. */
   direct: boolean;
+  /**
+   * Whether this desk was **asked** rather than doing the asking.
+   *
+   * Every other field is named from the asking desk's side, because that was
+   * the only desk a crossing used to be folded onto. Optional because a host
+   * predating it omits it, and `undefined` means the asking side — which is
+   * what every older row is.
+   */
+  inbound?: boolean;
   lines: ReferralLineDto[];
 }
 

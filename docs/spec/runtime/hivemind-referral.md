@@ -40,17 +40,62 @@ So this host wires the wider seam once and reaches the narrower one through
 idempotency keys that have to agree. `@teammate` dispatch and `@#desk` referral
 are one code path here and one manifest block.
 
-## One question is still one turn
+## A question put to a desk is answered by the desk
 
-A desk mention reads like fan-out and is not. `@#platform` resolves to exactly
-one agent — that desk's first eligible member other than the author — **before
-the decision leaves the fold**, and there is no variant of `ReferralDecision`
-that carries two. `direct_responder` is untouched, so a desk mention still
-cannot start a turn through the ordinary responder ladder.
+`@#platform` resolves to exactly one agent in the library — that desk's first
+eligible member other than the author — **before the decision leaves the
+fold**, and there is no variant of `ReferralDecision` that carries two. That
+resolution is positional, not a judgement about fit: on
+`members = ["exchanges", "refunds"]`, `@#returns` selects `exchanges` every
+time and `refunds` cannot be reached by a desk crossing at all.
+
+Answering a question put to a *desk* with whichever seat is listed first on it
+is the thing deliberation exists to stop, so this host convenes the far desk
+instead: `HiveReferralRunner::deliberate` stands up that desk's own episode —
+its `[hive]` policy, quorum, turn budget, move grammar and desk memory.
+`direct_responder` is untouched, so a desk mention still cannot start a turn
+through the ordinary responder ladder.
+
+**What comes home depends on how the room ended.** A room that CONVERGED
+answers with its closing report: that row names the proposal that carried and
+who grounded it, which is the one sentence no single seat on that desk is
+entitled to say. A room that did not converge has no such sentence, and its
+report is bookkeeping — "Nobody on the desk had anything to add, so the room did
+not open" — so relaying it would tell the asking room the desk had no view while
+the view sat in the transcript. An unconverged room carries its members' own
+turns instead, attributed and in order, each rewritten so the far desk's topic
+and sequence markers do not travel into a desk where they name nothing.
+
+Three things follow, and each is load-bearing:
+
+- **The question is journaled on the desk being asked**, as the asking agent's
+  own operator message, and the episode's thread is rooted on it. A single-seat
+  crossing deliberately leaves nothing there; a room cannot work that way,
+  because it folds its own transcript to decide the next turn. It is also what
+  gives every turn a parent — without one, two crossings into the same desk in
+  one cycle share the channel-level projection and fold each other's turns as
+  votes.
+- **The answer is credited to the desk**, not to the seat the library resolved:
+  `room_note` writes "the Platform desk answered the question: …". A room's
+  conclusion is not any one member's line, and seats may have argued the other
+  way.
+- **A crossing is one room deep.** The referred episode is given no federation.
+  `max_hops` bounds a chain within one episode's ledger, and a referred episode
+  has a fresh ledger at hop 0 — so a far desk allowed to refer onward could
+  convene a third desk and nothing in the hop budget would see it.
+
+A far desk that cannot hold a room — no `[hive]` block, one member, quorum out
+of reach — falls back to the single-seat crossing, because each of those is an
+ordinary shape a company is allowed to have. A room that was stood up and then
+*broke* is a failed crossing, never retried as one seat: that would bill the
+room's turns and then bill a turn again for the same question.
+
+`deliberates = false` restores the single-seat crossing. It is the cheaper arm
+and the one every measurement taken before this existed was taken against.
 
 `max_hops` bounds how *deep* a chain goes. The library deliberately bounds
-nothing about how *wide* one is, because only a host knows what a question
-costs it. Here it costs a full model turn on another desk, so this host adds
+nothing about how *wide* one is, or what one costs, because only a host knows.
+A crossing costs this host a full episode on another desk, so it adds
 `peer_cap`: how many crossing questions **one episode** may ask, in total,
 default 2. A question over the cap is refused, counted, and named in the closing
 report.
@@ -111,12 +156,15 @@ max_hops = 2      # chain depth; 2 is one round trip
 reach = "desks"   # "local" | "channels" | "desks"
 returns = true    # carry the answer back to the desk that asked
 peer_cap = 2      # crossing questions per episode (this host's own bound)
+deliberates = true # a `@#desk` question convenes that desk, not one of its seats
 ```
 
 Every field is optional; the block as a whole defaults to referring nothing.
 Opting in and saying nothing else buys `max_hops = 2`, `reach = "desks"`,
-`returns = true`, `peer_cap = 2` — a desk that opted in and got `local` would
-have opted in to nothing it could not already do.
+`returns = true`, `peer_cap = 2`, `deliberates = true` — a desk that opted in
+and got `local` would have opted in to nothing it could not already do, and one
+that asked a peer *desk* for its judgement asked for more than one seat's
+opinion.
 
 `reach` widens strictly, which is why the library makes it one knob and not
 two: a `@#desk` mention only means anything once a turn is allowed to run
@@ -126,7 +174,7 @@ somewhere other than here.
 | --- | --- | --- |
 | `local` | pulled into this conversation | ignored |
 | `channels` | runs on their own desk | ignored |
-| `desks` | runs on their own desk | selects that desk's one responder |
+| `desks` | runs on their own desk | convenes that desk (`deliberates`) |
 
 ### What validation refuses
 

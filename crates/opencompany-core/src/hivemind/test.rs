@@ -17,13 +17,16 @@ use crate::ports::types::{CompanyEvent, CompanyId, CompanyRecord, EventSeq, Stor
 /// forward-scan default, because the session adapter's paging is one of the
 /// things under test and a default that reads the whole log would hide a cursor
 /// bug rather than expose it.
+/// `pub(crate)` rather than `pub(super)`: `harness::built_in::brain` needs an
+/// `EventLog` to exercise what a referred room carries home, and this is the
+/// crate's in-memory one. Still `#[cfg(test)]`, so nothing ships.
 #[derive(Default)]
-pub(super) struct MemoryLog {
+pub(crate) struct MemoryLog {
     events: Mutex<Vec<StoredEvent>>,
 }
 
 impl MemoryLog {
-    pub(super) fn company() -> CompanyId {
+    pub(crate) fn company() -> CompanyId {
         CompanyId::new("acme")
     }
 

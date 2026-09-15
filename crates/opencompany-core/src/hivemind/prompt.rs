@@ -282,6 +282,16 @@ pub struct EpisodePrompt<'a> {
     /// the fold `step` runs, so nothing here can move an option towards a
     /// decision on this desk.
     elsewhere: &'a [(String, Vec<SessionMessage>)],
+    /// Whether this is the SECOND pass of one member's turn, taken because the
+    /// question it asked another desk has come back answered.
+    ///
+    /// Without saying so, the continuation renders the same prompt the first
+    /// pass got, and a seat that has already committed `!defer @#returns …`
+    /// reads its own line at the bottom of the transcript and commits it again
+    /// — observed on `companies/retail_co` as the identical row twice, the
+    /// second one carrying the crossing. The seat is not being asked to decide
+    /// again; it is being asked what the answer changes.
+    continuing: bool,
     /// The episode's watermark — `EpisodeDriver::run`'s `trigger` — or `None`
     /// for a caller that never set one.
     ///
@@ -313,6 +323,7 @@ impl<'a> EpisodePrompt<'a> {
             unspoken: &[],
             peers: Vec::new(),
             elsewhere: &[],
+            continuing: false,
             trigger: None,
         }
     }
@@ -339,6 +350,16 @@ impl<'a> EpisodePrompt<'a> {
     #[must_use]
     pub fn with_unspoken(mut self, unspoken: &'a [String]) -> Self {
         self.unspoken = unspoken;
+        self
+    }
+
+    /// Mark this as the continuation of a turn whose crossing was answered.
+    ///
+    /// See [`EpisodePrompt::continuing`]. Off by default, so every prompt that
+    /// is not a continuation renders byte for byte as it did before.
+    #[must_use]
+    pub fn continuing(mut self) -> Self {
+        self.continuing = true;
         self
     }
 
@@ -405,7 +426,7 @@ impl<'a> EpisodePrompt<'a> {
             Phase::Deliberate => self.deliberate_protocol(),
         };
         format!(
-            "You are @{}, the {} on the {} desk. {sight}\n\n{}{}{}\n\n{protocol}\n\n{}{}{}{}{}{}\
+            "You are @{}, the {} on the {} desk. {sight}\n\n{}{}{}\n\n{protocol}\n\n{}{}{}{}{}{}{}\
              Shared attributed transcript:\n{}\n\nYour one line:",
             self.member.id,
             self.member.role,
@@ -418,9 +439,26 @@ impl<'a> EpisodePrompt<'a> {
             self.missing(),
             self.peers(),
             self.elsewhere(),
+            self.crossed(),
             self.last_line(visible),
             render_transcript(visible, self.trigger, Some(&self.member.id)),
         )
+    }
+
+    /// What a continuation is for, said plainly.
+    ///
+    /// Empty for every ordinary turn, so this adds nothing to the prompt a
+    /// first pass renders. See [`EpisodePrompt::continuing`] for the failure it
+    /// exists to stop.
+    fn crossed(&self) -> String {
+        if !self.continuing {
+            return String::new();
+        }
+        "The question you put to another desk has been answered, and that answer is in the \
+         transcript below. This is the same turn continuing on it — do not ask again, and do not \
+         repeat the line you already committed. Say what the answer settles: if it confirms your \
+         reading, record that; if it changes it, say what changes.\n\n"
+            .to_string()
     }
 
     /// The topic id this task's answer is named by, and the rule for coining

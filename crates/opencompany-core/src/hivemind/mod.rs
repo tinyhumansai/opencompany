@@ -87,7 +87,7 @@ mod referral_test;
 #[cfg(test)]
 mod round_test;
 #[cfg(test)]
-mod test;
+pub(crate) mod test;
 
 pub use aside::{ASIDE_MARKER, AsideConfig, SURFACE_MARKER};
 pub use episode::{EpisodeDriver, HiveTurnRunner};
@@ -144,3 +144,19 @@ pub const HIVE_FAILURE_AUTHOR: &str = "hive-failure";
 /// summary. Both fold as system rows, so neither can ever be counted as a
 /// supporter; only this one may appear more than once in an episode.
 pub const HIVE_REFERRAL_AUTHOR: &str = "hive-referral";
+
+/// Whether an `agent_id` is one of this module's reserved system authors rather
+/// than a teammate.
+///
+/// Three ids now say "the room, not a member" — the closing report, a failed
+/// turn's notice, and an answer carried back from another desk — and a caller
+/// that wants "the lines members actually said" has to exclude all three. Every
+/// one is hyphenated so no roster id can equal it, which is what makes this a
+/// safe test rather than a guess.
+#[must_use]
+pub fn is_hive_author(agent_id: &str) -> bool {
+    matches!(
+        agent_id,
+        HIVE_REPORT_AUTHOR | HIVE_FAILURE_AUTHOR | HIVE_REFERRAL_AUTHOR
+    )
+}

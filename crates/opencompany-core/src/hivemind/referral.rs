@@ -109,6 +109,27 @@ pub struct ReferralConfig {
     /// second opinion, not enough for a six-seat room to poll the company.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_cap: Option<u32>,
+    /// Whether a question put to a **desk** is answered by that desk
+    /// deliberating, rather than by one of its seats taking a single turn.
+    ///
+    /// Here for exactly the reason [`ReferralConfig::peer_cap`] is: the
+    /// library bounds the shape of a crossing and deliberately says nothing
+    /// about what one costs, because only a host knows. It resolves `@#desk`
+    /// to that desk's *one responder* — the first active member in declared
+    /// order — and returns a decision with no plural in it, so `@#returns` on
+    /// a `members = ["exchanges", "refunds"]` desk reaches `exchanges` every
+    /// time and cannot reach `refunds` at all. Asking a desk and being
+    /// answered by whichever seat happens to be listed first is the thing
+    /// deliberation exists to stop.
+    ///
+    /// Defaults to `true` for a desk that opted in to referral: it asked a
+    /// peer *desk* for its judgement, and one seat's opinion is a weaker
+    /// answer than the one it asked for. Set it `false` to get the
+    /// single-responder crossing back — the cheap arm, and the one every
+    /// measurement before this flag existed was taken against. It costs a
+    /// room instead of a turn, which is the trade the knob is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliberates: Option<bool>,
 }
 
 /// The reach words a manifest may write, in widening order.
@@ -153,6 +174,12 @@ impl ReferralConfig {
     #[must_use]
     pub fn peer_cap(&self) -> u32 {
         self.peer_cap.unwrap_or(2)
+    }
+
+    /// Whether a desk crossing runs the far desk as a room.
+    #[must_use]
+    pub fn deliberates(&self) -> bool {
+        self.deliberates.unwrap_or(true)
     }
 }
 
@@ -266,6 +293,41 @@ pub trait HiveReferralRunner: Send + Sync {
     /// unanswered and goes on, exactly as it does when one of its own seats
     /// misses a turn.
     async fn refer(&self, desk_id: &str, agent_id: &str, prompt: &str) -> Result<String>;
+
+    /// Put the question to `desk_id` as a **room**, and return the conclusion
+    /// it reached — or `None` when that desk cannot deliberate, in which case
+    /// the caller falls back to [`refer`](Self::refer) and one seat answers.
+    ///
+    /// `None` rather than an error, because "this desk has no `[hive]` block",
+    /// "it has one member" and "its quorum is unreachable right now" are all
+    /// ordinary shapes a company is allowed to have — and every one of them
+    /// has a correct answer that is not a failure: ask the seat. An `Err` is
+    /// reserved for a room that was stood up and then broke, which is a failed
+    /// crossing exactly as a failed single turn is.
+    ///
+    /// # The question is journaled on the far desk, which a single-seat
+    /// crossing deliberately does not do
+    ///
+    /// A room decides what to say next by folding its own transcript, so a
+    /// question that is not in that transcript is a question the room cannot
+    /// read. The implementation therefore writes it there — as the asking
+    /// agent's own operator message, the same shape a chat-path crossing
+    /// already lands — and roots the episode's thread on it. `asker` is who
+    /// that row is attributed to.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever standing up or running the far desk's episode failed
+    /// with. Treated exactly as a failed [`refer`](Self::refer): the asking
+    /// room is told the question went unanswered and carries on.
+    async fn deliberate(
+        &self,
+        _desk_id: &str,
+        _asker: &str,
+        _prompt: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// What one episode's referrals actually did, for the closing report.
@@ -327,6 +389,90 @@ marker: this is not a deliberation turn, it is an answer to a colleague."
     )
 }
 
+/// How a crossing reads to a desk that will DELIBERATE on it.
+///
+/// [`referral_prompt`] closes by telling its reader "Do not open your reply with
+/// a `!` marker: this is not a deliberation turn, it is an answer to a
+/// colleague." That is right for the seat it was written for and exactly wrong
+/// for a room: `EpisodePrompt`'s own protocol opens with "Reply with ONE line
+/// only, beginning with exactly one of these markers", so handing the
+/// single-seat prompt to a room as its task contradicts the protocol in the
+/// same prompt — and a member that follows the task deposits prose, which the
+/// fold counts for nothing. Three of the first four live crossings ended `idle`
+/// with markerless turns for exactly this reason (CodeRabbit, #2332).
+///
+/// So this says who asked and what they asked, and says nothing about how to
+/// reply: the room already has a protocol, and it is the only thing entitled to
+/// set the shape of a turn on that desk.
+///
+/// The question comes LAST, with no footer after it, so [`asked_message`]
+/// recovers it from this shape exactly as it does from the single-seat one.
+#[must_use]
+pub fn referral_room_prompt(asker_label: &str, asker_desk: &str, question: &str) -> String {
+    format!(
+        "{asker_label} on the {asker_desk} desk has put a question to this desk. Answer it from \
+what this desk knows, and say plainly if it does not know — a wrong answer crossing desks is \
+worse than no answer, because the room that asked cannot check it against anything they have.
+
+Their message:
+
+{question}"
+    )
+}
+
+/// The question out of a [`referral_prompt`], or the text unchanged when it is
+/// not one.
+///
+/// The prompt wraps the asker's words in instructions written for the far
+/// teammate — "Answer it from what you and this desk know… Do not open your
+/// reply with a `!` marker" — and a *deliberated* crossing journals that whole
+/// prompt on the desk being asked, because that is what the room was handed.
+/// The collapsed crossing on the asking desk then matched that row as the
+/// question and rendered the instructions where the question should be, so a
+/// reader opening it saw "cancellations on the Order Operations desk has asked
+/// you a question. Answer it from what you and this desk know." instead of what
+/// was asked.
+///
+/// Split on the prompt's own section header, so this cannot drift from the
+/// template: if the header stops appearing, the text passes through whole,
+/// which is the behaviour before a prompt was ever journaled.
+#[must_use]
+pub fn asked_message(text: &str) -> String {
+    const HEAD: &str = "Their message:";
+    let Some((_, rest)) = text.split_once(HEAD) else {
+        return text.trim().to_string();
+    };
+    // **The exact footer, or nothing.**
+    //
+    // Two earlier attempts both cut the question short, in opposite ways.
+    // Splitting FORWARDS on the footer's opening sentence truncated a question
+    // that quoted it (CodeRabbit). Splitting BACKWARDS fixed that for the
+    // single-seat prompt and broke `referral_room_prompt`, which deliberately
+    // has no footer at all — so a room question quoting that sentence was
+    // truncated at its own words instead (Codex). Both are the same mistake:
+    // recognising the footer by a fragment that the question may also contain.
+    //
+    // So the footer is taken from `referral_prompt` itself, whole, and removed
+    // only as a suffix. A shape that does not end with it — the room prompt, or
+    // any future one — keeps its question intact, and the two cannot drift
+    // because the literal is never written twice.
+    let footer = {
+        let empty = referral_prompt("", "", "");
+        empty
+            .split_once(HEAD)
+            .map(|(_, tail)| tail.trim_start().to_string())
+            .unwrap_or_default()
+    };
+    let question = match footer.is_empty() {
+        true => rest,
+        false => rest
+            .trim_end()
+            .strip_suffix(footer.as_str())
+            .unwrap_or(rest),
+    };
+    question.trim().to_string()
+}
+
 /// The conversation two teammates hold with each other, by their ids.
 ///
 /// **A crossing is a conversation between two people, not a message posted in
@@ -365,6 +511,47 @@ pub fn returned_note(target: &str, desk: &str, answer: &str) -> String {
     )
 }
 
+/// How a far desk's *room* answer reads on the asking desk.
+///
+/// The desk, not a seat. [`returned_note`] names the member whose turn produced
+/// the answer, which is right when one member's turn is what produced it; a
+/// deliberated answer is the room's conclusion, and the seat the library
+/// resolved `@#desk` to may well have argued against it. Attributed to the room
+/// and authored by [`HIVE_REFERRAL_AUTHOR`](super::HIVE_REFERRAL_AUTHOR) for
+/// the same reason every crossing answer is: information crosses, votes do not.
+#[must_use]
+pub fn room_note(desk: &str, answer: &str) -> String {
+    let answer = answer.trim().trim_start_matches('!').trim();
+    format!("{} answered the question: {answer}", named_desk(desk))
+}
+
+/// A [`returned_note`] with its attribution removed, for a surface that
+/// attributes the line itself.
+///
+/// The prefix is load-bearing in the journal — it is what makes a crossing's
+/// answer read as the far desk's words in a room that never heard them, and the
+/// module docs turn on it. Inside the collapsed crossing the console folds onto
+/// the asking row it is the third copy of the same fact: the header already
+/// names the desk that was asked, and the line already carries the answerer's
+/// avatar and name. It rendered as "exchanges — @exchanges on the Returns and
+/// Exchanges desk answered the question: …".
+///
+/// Derived from [`returned_note`] rather than matched by pattern, so the two
+/// cannot drift: an empty answer renders exactly the prefix to remove.
+#[must_use]
+pub fn unattributed(target: &str, desk: &str, text: &str) -> String {
+    // Both shapes an answer can come home under — a seat's and a room's. A
+    // crossing that convened a desk carries `room_note`, and stripping only the
+    // seat form left "the Returns and Exchanges desk answered the question: …"
+    // rendered inside a fold whose header already says `#returns`.
+    for prefix in [returned_note(target, desk, ""), room_note(desk, "")] {
+        if let Some(rest) = text.strip_prefix(prefix.trim_end()) {
+            return rest.trim_start().to_string();
+        }
+    }
+    text.to_string()
+}
+
 /// A desk named for a sentence: "the Operations desk", "the eng desk".
 ///
 /// The template used to append " desk" unconditionally, and every desk in this
@@ -382,6 +569,20 @@ fn named_desk(desk: &str) -> String {
     } else {
         format!("the {trimmed} desk")
     }
+}
+
+/// The line an unanswered question leaves when a ROOM could not answer it.
+///
+/// [`unanswered_note`] names the seat that was asked, which is right when a
+/// seat was asked. A crossing that convened the far desk asked nobody in
+/// particular — and when that room fails, `forward` returns from the
+/// `deliberate` arm before `refer` ever runs — so naming the seat the library
+/// happened to resolve credits a teammate with a refusal it never made, on a
+/// desk where nobody reading the row can check. The same defect
+/// [`room_note`] exists to remove on the success path (CodeRabbit, #2332).
+#[must_use]
+pub fn room_unanswered_note(desk: &str) -> String {
+    format!("{} did not answer the question.", named_desk(desk))
 }
 
 /// The line an unanswered question leaves on the asking desk.
@@ -425,6 +626,9 @@ pub struct EpisodeReferrals<'a> {
     /// Desk names by id, likewise.
     desk_names: BTreeMap<String, String>,
     peer_cap: u32,
+    /// Whether a `@#desk` crossing convenes that desk rather than asking one
+    /// of its seats ([`ReferralConfig::deliberates`]).
+    deliberates: bool,
     state: Mutex<ReferralState>,
     /// The asking episode's own fold boundary.
     ///
@@ -465,6 +669,15 @@ struct ReferralState {
     /// this is where that sequence comes from — the episode knows it, because
     /// it wrote the marker itself a moment earlier.
     forwards: HashMap<String, u64>,
+    /// Desks whose answer to this episode's last question came from the whole
+    /// room rather than from one seat, so the return can attribute it to the
+    /// desk instead of to a member who did not personally answer.
+    ///
+    /// Keyed by desk id and consumed on read. Safe because a forward and the
+    /// return that answers it strictly alternate inside one `consider` call —
+    /// the same property `ledger.asked.last_mut()` in `ret` already relies on
+    /// — so at most one unread entry per desk can exist at a time.
+    room_answers: HashSet<String>,
 }
 
 impl<'a> EpisodeReferrals<'a> {
@@ -476,7 +689,11 @@ impl<'a> EpisodeReferrals<'a> {
         company: CompanyId,
         home: DispatchConversation,
         federation: &HiveFederation,
-        peer_cap: u32,
+        // The desk's own `[hive.referral]` block rather than the two bounds
+        // read off it. Both are this host's, not the library's — how WIDE a
+        // crossing may go and what one costs — so they travel together, and a
+        // third such bound adds no parameter here.
+        config: &ReferralConfig,
         scope: Arc<EpisodeScope>,
     ) -> Self {
         Self {
@@ -494,7 +711,8 @@ impl<'a> EpisodeReferrals<'a> {
                 .iter()
                 .map(|desk| (desk.id.clone(), desk.name.clone()))
                 .collect(),
-            peer_cap,
+            peer_cap: config.peer_cap(),
+            deliberates: config.deliberates(),
             state: Mutex::new(ReferralState::default()),
             scope,
         }
@@ -646,6 +864,52 @@ impl<'a> EpisodeReferrals<'a> {
         }
     }
 
+    /// What an unanswered crossing leaves behind, however it failed.
+    ///
+    /// Extracted because a crossing now has two ways to come back empty — a
+    /// single seat's turn, or a whole room stood up on the far desk — and they
+    /// owe the asking episode the identical bookkeeping: the failure counted on
+    /// the ledger, one note on the desk that spent the question, and a refusal
+    /// the fold reads as "nobody answered" rather than as an error.
+    ///
+    /// Journaled on the *asking* desk, not the far one: it is the room that
+    /// spent the question that needs to know it got nothing back.
+    async fn unanswered(
+        &self,
+        referral: &Referral,
+        error: &crate::OpenCompanyError,
+        // Whether it was a ROOM that failed rather than a seat, so the note
+        // names whoever was actually asked. See `room_unanswered_note`.
+        by_room: bool,
+    ) -> EnqueueOutcome {
+        tracing::warn!(
+            company = %self.company,
+            from = %referral.from.desk_id,
+            to = %referral.to.desk_id,
+            target = %referral.target_id,
+            error = %error,
+            "[hive] a referred turn did not finish; the room continues"
+        );
+        let mut state = self.state.lock().await;
+        state.ledger.failed = state.ledger.failed.saturating_add(1);
+        drop(state);
+        let _ = self
+            .journal(
+                &self.home,
+                super::HIVE_REFERRAL_AUTHOR,
+                match by_room {
+                    true => room_unanswered_note(&self.desk_name(&referral.to.desk_id)),
+                    false => {
+                        unanswered_note(&referral.target_id, &self.desk_name(&referral.to.desk_id))
+                    }
+                },
+            )
+            .await;
+        EnqueueOutcome::Refused {
+            reason: EnqueueRefusal::TargetUnavailable,
+        }
+    }
+
     async fn forward(&self, referral: &Referral) -> EnqueueOutcome {
         let asker = self.label(&referral.source_id);
         let asker_desk = self.desk_name(&referral.from.desk_id);
@@ -699,38 +963,62 @@ impl<'a> EpisodeReferrals<'a> {
         } else {
             true
         };
-        let answer = match self
-            .runner
-            .refer(&pair.desk_id, &referral.target_id, &prompt)
-            .await
-        {
-            Ok(answer) => answer,
-            Err(error) => {
-                tracing::warn!(
-                    company = %self.company,
-                    from = %referral.from.desk_id,
-                    to = %referral.to.desk_id,
-                    target = %referral.target_id,
-                    error = %error,
-                    "[hive] a referred turn did not finish; the room continues"
-                );
-                let mut state = self.state.lock().await;
-                state.ledger.failed = state.ledger.failed.saturating_add(1);
-                drop(state);
-                // Journaled on the *asking* desk, not the far one: the far desk
-                // has no idea it was asked, and the room that spent the question
-                // is the one that needs to know it got nothing back.
-                let _ = self
-                    .journal(
-                        &self.home,
-                        super::HIVE_REFERRAL_AUTHOR,
-                        unanswered_note(&referral.target_id, &self.desk_name(&referral.to.desk_id)),
-                    )
-                    .await;
-                return EnqueueOutcome::Refused {
-                    reason: EnqueueRefusal::TargetUnavailable,
-                };
-            }
+        // **A desk was asked, so the desk answers — not whichever seat is
+        // listed first on it.**
+        //
+        // `forward_to_desk` in the library resolves `@#returns` to that desk's
+        // one responder and hands it here as `target_id`; on
+        // `members = ["exchanges", "refunds"]` that is `exchanges` every single
+        // time, and `refunds` is not reachable by a desk crossing at all. The
+        // comment above already names the objection — a desk crossing must not
+        // "skip the deliberation the desk exists for" — and running the far
+        // desk's own episode is what actually honours it. Until this, the
+        // objection was answered only by *where the row landed*: the turn ran
+        // on the desk's channel instead of a private thread, which changed who
+        // could read it and not who thought about it.
+        //
+        // Never for a crossing asked `by_name`: `@sre` is a question put to a
+        // person, and convening their whole desk to answer it is the mirror of
+        // the bug above. Never when the desk says `deliberates = false`, which
+        // is the cheap single-seat arm every earlier measurement was taken
+        // against. And `None` from the seam means that desk cannot hold a room
+        // — no `[hive]` block, one member, quorum out of reach — so the seat
+        // answers, exactly as it did before.
+        let room = match !by_name && self.deliberates {
+            true => match self
+                .runner
+                .deliberate(
+                    &referral.to.desk_id,
+                    &referral.source_id,
+                    // Never `prompt`: that one is addressed to a single seat and
+                    // forbids the very markers a room's protocol requires. See
+                    // `referral_room_prompt`.
+                    &referral_room_prompt(&asker, &asker_desk, &referral.content),
+                )
+                .await
+            {
+                Ok(found) => found,
+                // A room that was stood up and then broke is a failed
+                // crossing, handled by the arm below with the single-seat
+                // failures — not silently retried as one seat, which would
+                // bill the room's turns and then bill a turn again.
+                Err(error) => {
+                    return self.unanswered(referral, &error, true).await;
+                }
+            },
+            false => None,
+        };
+        let deliberated = room.is_some();
+        let answer = match room {
+            Some(conclusion) => conclusion,
+            None => match self
+                .runner
+                .refer(&pair.desk_id, &referral.target_id, &prompt)
+                .await
+            {
+                Ok(answer) => answer,
+                Err(error) => return self.unanswered(referral, &error, false).await,
+            },
         };
         // Journaled in the conversation the turn ran in — the pair's own thread,
         // under the teammate that answered, directly beneath the question they
@@ -738,7 +1026,20 @@ impl<'a> EpisodeReferrals<'a> {
         // put to that desk and its colleagues were never asked, so a transcript
         // that is supposed to record what THAT desk did should not be holding
         // somebody else's exchange.
+        // **Never after a room.** A deliberated crossing has already written
+        // its whole exchange on the far desk — the question, every turn, the
+        // closing report — so writing the answer again here appended a verbatim
+        // copy of that report under the seat the library had resolved, with no
+        // parent. Three faults in one row: it duplicated text already on the
+        // desk, it attributed the room's conclusion to one member who had not
+        // written it, and `parent: None` put it at channel level instead of in
+        // the crossing's thread, where no projection drops it and it read as
+        // `exchanges` posting the room's summary as its own message.
+        //
+        // The single-seat path still needs it: there the far desk's only row IS
+        // the answer, and nothing else journals it.
         if asked
+            && !deliberated
             && let Err(error) = self
                 .journal(&pair, &referral.target_id, answer.clone())
                 .await
@@ -758,6 +1059,11 @@ impl<'a> EpisodeReferrals<'a> {
             returned: false,
             crossed: referral.to.desk_id != self.home.desk_id,
         });
+        if deliberated {
+            // Read by `ret`, which is the only place that can still name the
+            // answerer and by then has nothing but the `Referral` to go on.
+            state.room_answers.insert(referral.to.desk_id.clone());
+        }
         state.last_answer = Some((referral.clone(), answer));
         EnqueueOutcome::Enqueued
     }
@@ -770,7 +1076,22 @@ impl<'a> EpisodeReferrals<'a> {
     /// under a member's own id.
     async fn ret(&self, referral: &Referral) -> EnqueueOutcome {
         let desk = self.desk_name(&referral.from.desk_id);
-        let text = returned_note(&referral.source_id, &desk, &referral.content);
+        // **Who to credit.** A single-seat crossing is answered by the seat and
+        // says so. A room's conclusion is not any one member's line — it is
+        // what the desk converged on, and several of its seats may have argued
+        // the other way — so naming the responder the library happened to pick
+        // would put words in a teammate's mouth that the teammate did not say,
+        // over on a desk where nobody can check.
+        let by_room = self
+            .state
+            .lock()
+            .await
+            .room_answers
+            .remove(&referral.from.desk_id);
+        let text = match by_room {
+            true => room_note(&desk, &referral.content),
+            false => returned_note(&referral.source_id, &desk, &referral.content),
+        };
         if let Err(error) = self
             .journal(&referral.to, super::HIVE_REFERRAL_AUTHOR, text)
             .await

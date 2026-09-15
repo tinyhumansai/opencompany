@@ -197,9 +197,18 @@ export function ReferralConversation({ crossing }: { crossing: ReferralConversat
           {/* Who was asked, in the form they were asked in: `@name` went to a
               person, `#desk` was put to a room. Naming the answerer's desk
               alongside their name read as though the desk had been asked, which
-              for a `@name` crossing is the one thing that did not happen. */}
-          asked {crossing.direct ? `@${crossing.otherId}` : `#${crossing.otherDeskId}`} ·{" "}
-          {count} message{count === 1 ? "" : "s"}
+              for a `@name` crossing is the one thing that did not happen.
+
+              On the desk that WAS asked the same exchange runs the other way,
+              and every field is named from the asker's side — so the unswapped
+              label read "asked #order_ops" over a row where `order_ops` was
+              the desk doing the asking. `inbound` names the teammate who
+              raised it, which is the one thing this side does not already
+              know: the chip above says the desk, the fold says who. */}
+          {crossing.inbound
+            ? `asked by @${crossing.otherId}`
+            : `asked ${crossing.direct ? `@${crossing.otherId}` : `#${crossing.otherDeskId}`}`}{" "}
+          · {count} message{count === 1 ? "" : "s"}
         </span>
       </button>
       {open && (
