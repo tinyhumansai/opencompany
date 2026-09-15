@@ -523,6 +523,17 @@ pub async fn fan_out(
 ) -> Result<FanOutReport> {
     let _guard = slot_guard(company).await;
 
+    // The proxy base every TinyHumans write below carries. From the caller's
+    // configured platform when it says so; the catalogue's production endpoint
+    // otherwise.
+    let proxy_base_url = request
+        .proxy_base_url
+        .map(catalogue::tinyhumans_proxy_url)
+        .or_else(|| {
+            catalogue::cloud_provider(inference::MANAGED_SLUG).map(|c| c.endpoint.to_string())
+        })
+        .unwrap_or_default();
+
     // 1. Validate. Nothing is written yet.
     let new = request.key.trim().to_string();
     let clearing = new.is_empty();
@@ -784,10 +795,7 @@ pub async fn fan_out(
         let base = row
             .as_ref()
             .map(|r| r.base_url.clone())
-            .or_else(|| {
-                catalogue::cloud_provider(inference::MANAGED_SLUG).map(|c| c.endpoint.to_string())
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| proxy_base_url.clone());
         match prober.probe(&base, &new).await {
             Ok(ids) => {
                 if let Err(err) = inference_store::record_health(
@@ -950,7 +958,7 @@ pub async fn fan_out(
                 slug: inference::MANAGED_SLUG.to_string(),
                 label: cat.label.to_string(),
                 kind: inference::MANAGED_SLUG.to_string(),
-                base_url: cat.endpoint.to_string(),
+                base_url: proxy_base_url.clone(),
                 models: tier_overrides(chosen),
                 enabled: true,
             },

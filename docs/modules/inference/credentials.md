@@ -232,6 +232,28 @@ between two providers. The paragraph can be deleted rather than reworded.
 - **One resolution seam per identity**, so a rotation reaches every surface in
   the same cycle rather than one at a time.
 
+## Where the TinyHumans row points, and what the save puts to work
+
+Two facts about `PUT {scope}/credential` that the key-reworks slices left implicit,
+both found by the umbrella repo's cross-repo e2e (`workflow-opencompany`,
+`scripts/e2e-tinyhumans-key.sh`, 2026-09-16):
+
+- **The `tinyhumans` row follows `api_url`.** The catalogue row's `endpoint` is the
+  production proxy and stays a static table, but the row the fan-out *stores* — and
+  the base the health probe reads — is `catalogue::tinyhumans_proxy_url(api_url)`
+  = `{TINYHUMANS_API_URL}/agent-integrations/openrouter`, the same platform every
+  other TinyHumans surface on the instance already follows (key-grant, Composio,
+  billing). The LLM page's add path (`plan_add`) does the same. With the default
+  `api_url` nothing changes; with a staging or local platform the key that platform
+  minted is probed where it is known instead of against production.
+- **A save that first configures inference rebuilds the company.** A company that
+  booted with no inference source runs the offline echo brain, and the brain is
+  chosen at build time (issue #290). When the fan-out fills the provider row or
+  the default and `restart_required` holds, `set_key` / `finish_link` run
+  `rebuild_company` and answer off the successor — as `PUT {scope}/inference`
+  already did. The Account page's "Restart now" toast remains for the case where
+  the rebuild itself fails.
+
 ## Known gaps this design does not address
 
 Named so they are not mistaken for solved:

@@ -57,6 +57,27 @@ pub enum CatalogShape {
 /// The path the TinyHumans OpenRouter proxy is served under.
 pub const TINYHUMANS_PROXY_PATH: &str = "/agent-integrations/openrouter";
 
+/// The TinyHumans OpenRouter proxy base for the platform this instance talks
+/// to: `api_url` (the resolved `TINYHUMANS_API_URL` / `config.toml` `api_url`)
+/// with [`TINYHUMANS_PROXY_PATH`] appended.
+///
+/// The catalogue row's `endpoint` is the production host, and it stays that
+/// way — it is a static table. But the row a company *stores* must follow the
+/// same platform every other TinyHumans surface on this instance already
+/// follows (Composio, the key-grant link, billing all derive from `api_url`),
+/// or a staging or local platform mints an account key that OpenCompany then
+/// probes against production, where it is unknown. With the default `api_url`
+/// this is byte-for-byte the catalogue endpoint.
+pub fn tinyhumans_proxy_url(api_url: &str) -> String {
+    let base = api_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return cloud_provider(super::MANAGED_SLUG)
+            .map(|c| c.endpoint.to_string())
+            .unwrap_or_default();
+    }
+    format!("{base}{TINYHUMANS_PROXY_PATH}")
+}
+
 /// How a provider expects its credential presented.
 ///
 /// `Anthropic` exists for exactly one entry in the whole catalogue, and that is
@@ -1304,6 +1325,30 @@ mod tests {
         // Codex stores under `openai`, which is already reserved as a cloud row.
         assert!(is_reserved_slug("openai"));
         assert!(!is_reserved_slug("acme-gateway"));
+    }
+
+    #[test]
+    fn the_proxy_url_follows_api_url_and_defaults_to_the_catalogue_endpoint() {
+        let row = cloud_provider("tinyhumans").expect("tinyhumans is in the catalogue");
+        assert_eq!(
+            tinyhumans_proxy_url(crate::app::config::DEFAULT_API_URL),
+            row.endpoint
+        );
+        assert_eq!(
+            tinyhumans_proxy_url("http://localhost:5005/"),
+            "http://localhost:5005/agent-integrations/openrouter"
+        );
+        assert_eq!(
+            tinyhumans_proxy_url("https://staging-api.tinyhumans.ai"),
+            "https://staging-api.tinyhumans.ai/agent-integrations/openrouter"
+        );
+        // Blank falls back to the row rather than minting a bare path.
+        assert_eq!(tinyhumans_proxy_url("  "), row.endpoint);
+        // Whatever it is, the shape reads as paged.
+        assert_eq!(
+            catalog_shape_for("openrouter", &tinyhumans_proxy_url("http://localhost:5005")),
+            CatalogShape::PagedEnvelope
+        );
     }
 
     #[test]

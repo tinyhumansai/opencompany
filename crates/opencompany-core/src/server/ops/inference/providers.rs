@@ -503,6 +503,7 @@ async fn add_provider(
             .as_deref()
             .map(str::trim)
             .is_some_and(|k| !k.is_empty()),
+        &state.config().api_url,
     )?;
     // Keys rework (#2306), slice 4a: the account-key fan-out
     // (`company_key::fan_out`) reads and writes this exact slug's row and key
@@ -1005,11 +1006,19 @@ struct AddPlan {
 /// the catalogue; a local runtime's endpoint is the thing being chosen and is
 /// normalised and scheme-checked here; a CLI login supplies neither and skips
 /// the probe because there is nothing to present.
+///
+/// `api_url` is this instance's configured TinyHumans platform
+/// (`AppConfig::api_url`, from `TINYHUMANS_API_URL`): the `tinyhumans` row's
+/// endpoint is derived from it rather than read off the catalogue, so a
+/// staging or local platform gets a row that points at itself — see
+/// [`catalogue::tinyhumans_proxy_url`]. Every other cloud row keeps its
+/// catalogue endpoint.
 fn plan_add(
     kind: &str,
     label: Option<&str>,
     base_url: Option<&str>,
     has_key: bool,
+    api_url: &str,
 ) -> Result<AddPlan, ApiError> {
     let invalid = |msg: String| ApiError(OpenCompanyError::InvalidRequest(msg));
 
@@ -1024,11 +1033,16 @@ fn plan_add(
         if cloud.slug == crate::company::inference::MANAGED_SLUG && !has_key {
             return Err(invalid("TinyHumans needs an API key.".to_string()));
         }
+        let base_url = if cloud.slug == crate::company::inference::MANAGED_SLUG {
+            catalogue::tinyhumans_proxy_url(api_url)
+        } else {
+            cloud.endpoint.to_string()
+        };
         return Ok(AddPlan {
             slug: cloud.slug.to_string(),
             label: cloud.label.to_string(),
             kind: cloud.slug.to_string(),
-            base_url: cloud.endpoint.to_string(),
+            base_url,
             custom: false,
             probes: true,
         });
@@ -2698,6 +2712,7 @@ fn mode_name(mode: resolve::RoutingMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::config::DEFAULT_API_URL;
     use std::collections::BTreeMap;
 
     fn provider(slug: &str, kind: &str) -> store::Provider {
@@ -2790,12 +2805,28 @@ mod tests {
     #[test]
     fn omlx_can_be_added_without_a_key() {
         assert!(
-            plan_add("omlx", None, Some("http://127.0.0.1:10240/v1"), false).is_ok(),
+            plan_add(
+                "omlx",
+                None,
+                Some("http://127.0.0.1:10240/v1"),
+                false,
+                DEFAULT_API_URL
+            )
+            .is_ok(),
             "omlx requires no key, so it must not be refused for want of one"
         );
         // Supplying one is still allowed: `jundot/omlx` has an opt-in
         // `--api-key`, so accepting a key and demanding one stay separate.
-        assert!(plan_add("omlx", None, Some("http://127.0.0.1:10240/v1"), true).is_ok());
+        assert!(
+            plan_add(
+                "omlx",
+                None,
+                Some("http://127.0.0.1:10240/v1"),
+                true,
+                DEFAULT_API_URL
+            )
+            .is_ok()
+        );
     }
 
     /// No shipped local runtime sets `needs_key` any more, so the refusal itself
@@ -2833,7 +2864,26 @@ mod tests {
     fn a_keyless_local_runtime_is_still_added_without_one() {
         // Ollama wants an endpoint, not a credential. The rule is the
         // catalogue's per-row `needs_key`, never "local runtimes are keyless".
-        assert!(plan_add("ollama", None, None, false).is_ok());
+        assert!(plan_add("ollama", None, None, false, DEFAULT_API_URL).is_ok());
+    }
+
+    #[test]
+    fn a_tinyhumans_add_points_at_the_configured_platform() {
+        let prod = plan_add("tinyhumans", None, None, true, DEFAULT_API_URL).expect("planned");
+        assert_eq!(
+            prod.base_url,
+            "https://api.tinyhumans.ai/agent-integrations/openrouter"
+        );
+        let local =
+            plan_add("tinyhumans", None, None, true, "http://localhost:5005").expect("planned");
+        assert_eq!(
+            local.base_url,
+            "http://localhost:5005/agent-integrations/openrouter"
+        );
+        // Only TinyHumans follows `api_url`; every other cloud row keeps its own host.
+        let other =
+            plan_add("openrouter", None, None, true, "http://localhost:5005").expect("planned");
+        assert_eq!(other.base_url, "https://openrouter.ai/api/v1");
     }
 
     /// A named model is written to every tier, so no workload is left to fall

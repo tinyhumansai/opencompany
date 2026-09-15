@@ -22,6 +22,8 @@
 //! embeddings still resolve from the environment (#585), so "wired to it" is a
 //! smaller set than "brokered" until that lands.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, post};
@@ -438,6 +440,51 @@ async fn restart_required_for(runtime: &CompanyRuntime) -> bool {
     super::inference::restart_pending(runtime, configured)
 }
 
+/// Puts a fan-out that just configured inference to work, the way the LLM
+/// page's own `PUT …/inference` does (issue #290): when the company booted
+/// with no inference source it is on the offline echo brain, and a
+/// `tinyhumans` row plus default this write created cannot reach agents until
+/// the runtime is rebuilt. Telling the operator "restart required" in a toast
+/// was the whole of the previous behaviour, and the observed result was a
+/// company whose account key, row and default all read as set while every
+/// turn still answered `You said: …`.
+///
+/// Only rebuilds when the fan-out actually moved the provider row or the
+/// default — a save that changed nothing about inference (a Composio-only
+/// copy, a rotation of an already-live key) never quiesces a running
+/// company. Returns the runtime the response status must be read off: the
+/// successor after a rebuild, else the one the request came in on. A failed
+/// rebuild is logged and falls back to the incoming runtime, whose status
+/// still reports `restart_required` — the honest answer, exactly as
+/// `set_config` handles the same failure.
+async fn rebuild_if_pending(
+    state: &AppState,
+    company: &AdminScopedCompany,
+    report: &company_key::FanOutReport,
+) -> Arc<CompanyRuntime> {
+    let runtime = company.runtime.clone();
+    let inference_moved = report.slots.iter().any(|s| {
+        matches!(
+            s.slot,
+            company_key::Slot::Provider | company_key::Slot::Default
+        ) && slot_changed(s.outcome)
+    });
+    if !inference_moved || !restart_required_for(runtime.as_ref()).await {
+        return runtime;
+    }
+    match crate::runtime::rebuild_company(state, runtime.id()).await {
+        Ok(successor) => successor,
+        Err(err) => {
+            tracing::warn!(
+                company = %runtime.id(),
+                error = %err,
+                "account key saved but the runtime could not be rebuilt; a restart is still required",
+            );
+            runtime
+        }
+    }
+}
+
 /// `GET …/credential` — whether this company has its own key, and which identity
 /// its brokered calls present.
 async fn get_status(
@@ -479,6 +526,7 @@ async fn set_key(
             key: &body.key,
             model: body.model.as_deref(),
             confirm_in_use: body.confirm_in_use,
+            proxy_base_url: Some(&state.config().api_url),
         },
         prober.as_ref(),
     )
@@ -514,15 +562,18 @@ async fn set_key(
     // not having one.
     journal_fan_out(&company, clearing, &report).await?;
 
+    // Read off whichever runtime is live after this write — the successor if
+    // the fan-out configured inference for a company that booted without any.
+    let live = rebuild_if_pending(&state, &company, &report).await;
     Ok(Json(MutationResponse {
-        status: effective_status(&state, runtime).await?,
+        status: effective_status(&state, live.as_ref()).await?,
         note: company_key::fan_out_note(clearing, &report, body.model.as_deref()),
         slots: report.slots.iter().map(SlotReportDto::from).collect(),
         needs_model: report.needs_model,
         sets_default: report.sets_default,
         models: report.models.clone(),
         used_by,
-        restart_required: restart_required_for(runtime).await,
+        restart_required: restart_required_for(live.as_ref()).await,
     }))
 }
 
@@ -742,6 +793,7 @@ async fn finish_link(
             // this path, so it is set unconditionally rather than threaded
             // from a request that has no such field.
             confirm_in_use: true,
+            proxy_base_url: Some(&state.config().api_url),
         },
         prober.as_ref(),
     )
@@ -758,15 +810,16 @@ async fn finish_link(
     }
     journal_fan_out(&company, false, &report).await?;
 
+    let live = rebuild_if_pending(&state, &company, &report).await;
     Ok(Json(MutationResponse {
-        status: effective_status(&state, runtime).await?,
+        status: effective_status(&state, live.as_ref()).await?,
         note: company_key::fan_out_note(false, &report, None),
         slots: report.slots.iter().map(SlotReportDto::from).collect(),
         needs_model: report.needs_model,
         sets_default: report.sets_default,
         models: report.models.clone(),
         used_by: None,
-        restart_required: restart_required_for(runtime).await,
+        restart_required: restart_required_for(live.as_ref()).await,
     }))
 }
 

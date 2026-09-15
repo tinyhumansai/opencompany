@@ -245,6 +245,7 @@ async fn matrix_m1() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -297,6 +298,7 @@ async fn matrix_m2() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -365,6 +367,7 @@ async fn matrix_m3() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -408,6 +411,7 @@ async fn matrix_m4() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -472,6 +476,7 @@ async fn matrix_m5() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -542,6 +547,7 @@ async fn matrix_m5_plus_auth() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -608,6 +614,7 @@ async fn matrix_m5_plus_auth() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober2,
     )
@@ -641,6 +648,7 @@ async fn matrix_m6() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -714,6 +722,7 @@ async fn matrix_m7() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -758,6 +767,7 @@ async fn matrix_m8() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -839,6 +849,7 @@ async fn matrix_m9() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -882,6 +893,7 @@ async fn matrix_m10() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -943,6 +955,7 @@ async fn matrix_m11() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -956,6 +969,7 @@ async fn matrix_m11() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1008,6 +1022,7 @@ async fn matrix_m12() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1043,6 +1058,7 @@ async fn matrix_m13() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1091,6 +1107,7 @@ async fn matrix_m14() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1136,6 +1153,7 @@ async fn matrix_c1() {
             key: "",
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1196,6 +1214,7 @@ async fn matrix_c2() {
             key: "",
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1230,6 +1249,7 @@ async fn matrix_c3() {
             key: "",
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1276,6 +1296,7 @@ async fn an_auth_probe_restores_the_llm_slots_exactly() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1313,6 +1334,7 @@ async fn a_non_auth_probe_failure_keeps_everything() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1351,6 +1373,7 @@ async fn an_invalid_model_writes_nothing() {
             key: NEW,
             model: Some("chat-v1"),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1377,6 +1400,7 @@ async fn a_model_with_a_clear_is_refused() {
             key: "",
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1416,6 +1440,7 @@ async fn a_read_failure_after_the_account_key_is_stored_still_keeps_the_key() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1480,6 +1505,7 @@ async fn failing_account_key_write_writes_nothing_else() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1507,6 +1533,7 @@ async fn failing_composio_write_still_sets_up_llm() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1544,6 +1571,7 @@ async fn failing_inference_write_skips_row_default_and_probe() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1582,6 +1610,7 @@ async fn failing_row_write_keeps_the_key_copy() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1612,6 +1641,7 @@ async fn failing_default_write_keeps_the_row() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1645,6 +1675,7 @@ async fn failing_health_record_does_not_change_outcomes() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1681,6 +1712,7 @@ async fn concurrent_saves_leave_every_copy_equal_to_the_account_key() {
                 key: NEW,
                 model: None,
                 confirm_in_use: true,
+                proxy_base_url: None,
             },
             &prober_a,
         );
@@ -1691,6 +1723,7 @@ async fn concurrent_saves_leave_every_copy_equal_to_the_account_key() {
                 key: OTHER,
                 model: None,
                 confirm_in_use: true,
+                proxy_base_url: None,
             },
             &prober_b,
         );
@@ -1739,6 +1772,7 @@ async fn no_report_or_note_contains_a_key() {
             key: NEW,
             model: None,
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     )
@@ -1921,6 +1955,7 @@ async fn a_fan_out_racing_a_provider_add_loses_neither_row() {
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     );
@@ -2003,6 +2038,7 @@ async fn a_fan_out_racing_a_default_change_backs_off_or_wins_but_never_corrupts(
             key: NEW,
             model: Some(MODEL),
             confirm_in_use: true,
+            proxy_base_url: None,
         },
         &prober,
     );

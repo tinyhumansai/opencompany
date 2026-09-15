@@ -120,6 +120,13 @@ pub struct FanOutRequest<'a> {
     /// flow passes `true` unconditionally — a grant never clears (Q10), so
     /// the flag never gates anything there.
     pub confirm_in_use: bool,
+    /// The TinyHumans OpenRouter proxy base a minted `tinyhumans` row carries
+    /// and the health probe reads — `catalogue::tinyhumans_proxy_url(api_url)`
+    /// from the caller's `AppConfig`, so the row follows the platform this
+    /// instance is configured for (`TINYHUMANS_API_URL`) rather than always
+    /// production. `None` means the catalogue's production endpoint, which is
+    /// what every existing test asks for.
+    pub proxy_base_url: Option<&'a str>,
 }
 
 /// Everything a `PUT …/credential` needs to answer with, once the fan-out
