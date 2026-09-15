@@ -1531,7 +1531,7 @@ impl ChatModel<()> for HostedProvider {
     /// is resolved fresh for this request, and the response's token/cost usage is
     /// parsed back out (the WS5 metering signal).
     ///
-    /// [`Agent::turn`]: openhuman_core::openhuman::agent::Agent
+    /// [`Agent::turn`]: openhuman_core::agent::Agent
     async fn invoke(&self, _state: &(), request: ModelRequest) -> TaResult<ModelResponse> {
         let messages = wire_messages(&request.messages);
         let model = request
@@ -2315,7 +2315,7 @@ impl ChatModel<()> for TenantProvider {
     /// the effective config, then mirrors [`HostedProvider`]: full history
     /// reaches the backend and token/cost usage is parsed back out.
     ///
-    /// [`Agent::turn`]: openhuman_core::openhuman::agent::Agent
+    /// [`Agent::turn`]: openhuman_core::agent::Agent
     async fn invoke(&self, _state: &(), request: ModelRequest) -> TaResult<ModelResponse> {
         // The tier first, because resolution now depends on it: the routing
         // table decides per workload, so the decl cannot be resolved before the

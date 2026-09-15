@@ -73,7 +73,7 @@ use async_trait::async_trait;
 use futures::future::FutureExt;
 use serde_json::{Value, json};
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
 
@@ -9706,7 +9706,7 @@ name = "Morning"
         assert!(!paused_line.contains("worker"), "{out}");
 
         let payload = match &result.content[0] {
-            openhuman_core::openhuman::skills::types::ToolContent::Json { data } => data.clone(),
+            openhuman_core::skills::types::ToolContent::Json { data } => data.clone(),
             other => panic!("expected JSON payload, got {other:?}"),
         };
         assert_eq!(
@@ -11235,7 +11235,7 @@ name = "Morning"
         assert_eq!(cache.len(), 1, "a successful run must be cached");
         // The payload the brain sees carries a run id string.
         let payload = match &result.content[0] {
-            openhuman_core::openhuman::skills::types::ToolContent::Json { data } => data.clone(),
+            openhuman_core::skills::types::ToolContent::Json { data } => data.clone(),
             other => panic!("expected JSON payload, got {other:?}"),
         };
         assert!(
@@ -11318,7 +11318,7 @@ name = "Morning"
 
         // Read with the real run id (recover it from the payload).
         let payload = match &summary.content[0] {
-            openhuman_core::openhuman::skills::types::ToolContent::Json { data } => data.clone(),
+            openhuman_core::skills::types::ToolContent::Json { data } => data.clone(),
             other => panic!("{other:?}"),
         };
         let run_id = payload.get("run_id").and_then(Value::as_str).unwrap();
@@ -11369,7 +11369,7 @@ name = "Morning"
         assert!(md.contains("**Report**"), "{md}");
         assert!(md.contains("`done`"), "{md}");
         let run_id = match &summary.content[0] {
-            openhuman_core::openhuman::skills::types::ToolContent::Json { data } => data
+            openhuman_core::skills::types::ToolContent::Json { data } => data
                 .get("run_id")
                 .and_then(Value::as_str)
                 .unwrap()
@@ -12495,7 +12495,7 @@ name = "Morning"
         assert!(text.contains("Board unavailable"), "{text}");
 
         let payload = match &result.content[0] {
-            openhuman_core::openhuman::skills::types::ToolContent::Json { data } => data.clone(),
+            openhuman_core::skills::types::ToolContent::Json { data } => data.clone(),
             other => panic!("expected a JSON content block, got {other:?}"),
         };
         assert_eq!(

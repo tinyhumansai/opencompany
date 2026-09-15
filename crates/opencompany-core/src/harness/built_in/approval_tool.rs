@@ -7,7 +7,7 @@
 //! advertise that their own call stages a concrete approval.
 
 use async_trait::async_trait;
-use openhuman_core::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
+use openhuman_core::tools::traits::{PermissionLevel, Tool, ToolResult};
 use serde_json::{Value, json};
 
 use crate::harness::policy::{ApprovalRequest, ApprovalRequestQueue};

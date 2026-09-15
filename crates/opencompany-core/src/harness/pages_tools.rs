@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 // The workspace layout — `pages/<slug>/{page.toml,page.tsx,page.compiled.mjs}`
 // — is shared with `crate::server::ops::pages`, which is always compiled and

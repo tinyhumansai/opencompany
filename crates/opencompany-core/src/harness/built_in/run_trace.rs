@@ -36,7 +36,7 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::progress::AgentProgress;
 

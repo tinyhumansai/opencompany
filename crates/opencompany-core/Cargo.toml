@@ -222,7 +222,7 @@ tinyinference = { path = "../../vendor/openhuman/vendor/tinyagents/vendor/tinyin
 # behind them (`openhuman::hosting`), which is what lets a company put its
 # workspace on a real hosting provider. Taken without OpenHuman's TinyBus
 # module: `tinyhosts` is linked as a library, so nothing here loads a cdylib.
-openhuman_core = { package = "openhuman", path = "../../vendor/openhuman", optional = true, default-features = false, features = ["skills", "mcp", "hosting"] }
+openhuman_core = { package = "openhuman", path = "../../vendor/openhuman/crates/openhuman-core", optional = true, default-features = false, features = ["skills", "mcp", "hosting"] }
 
 # Desks, rosters, mentions and shared session transcripts — the pure algebra
 # behind a group chat several teammates share (`vendor/tinyhivemind`). It is the

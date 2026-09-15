@@ -15,7 +15,7 @@
 //! OpenCompany already holds the authoritative transcript: the company
 //! [`EventLog`]. This module projects the last `window` messages **that belong to
 //! the incoming desk** out of that log into the lossy `(role, content)` shape
-//! [`Agent::seed_resume_from_messages`](openhuman_core::openhuman::agent::Agent::seed_resume_from_messages)
+//! [`Agent::seed_resume_from_messages`](openhuman_core::agent::Agent::seed_resume_from_messages)
 //! accepts, so the switch branch can seed the correct thread's own recent turns
 //! directly instead of chasing a file that isn't there.
 //!
@@ -414,7 +414,7 @@ struct SeedEntry {
 /// `role` answers "user or assistant"; this answers "*whose* words", and a desk
 /// with more than one teammate needs both. Before this existed every
 /// `AgentReply` on the desk mapped to the bare role `"agent"`, which
-/// [`seed_resume_from_messages`](openhuman_core::openhuman::agent::Agent::seed_resume_from_messages)
+/// [`seed_resume_from_messages`](openhuman_core::agent::Agent::seed_resume_from_messages)
 /// turns into an **assistant** message — so a teammate's reply, a
 /// [`SYSTEM_AUTHOR`](crate::ports::SYSTEM_AUTHOR) notice and a
 /// [`WORKFLOW_REPLY_AUTHOR`](crate::runtime::WORKFLOW_REPLY_AUTHOR) report all
@@ -478,7 +478,7 @@ enum Speaker {
 /// The wire role a turn by somebody other than the seeded agent carries.
 ///
 /// **Deliberately not `"user"`, even though the model must read it as one.**
-/// [`seed_resume_from_messages`](openhuman_core::openhuman::agent::Agent::seed_resume_from_messages)
+/// [`seed_resume_from_messages`](openhuman_core::agent::Agent::seed_resume_from_messages)
 /// maps `"agent"`/`"assistant"` to the assistant role and *everything else* to
 /// the user role, so a peer turn lands in front of the model exactly as a
 /// labelled user message either way. What the spelling changes is what happens
@@ -505,7 +505,7 @@ pub const PEER_ROLE: &str = "peer";
 
 impl SeedEntry {
     /// Flattens one accumulated turn into the `(role, content)` pair
-    /// [`seed_resume_from_messages`](openhuman_core::openhuman::agent::Agent::seed_resume_from_messages)
+    /// [`seed_resume_from_messages`](openhuman_core::agent::Agent::seed_resume_from_messages)
     /// accepts.
     ///
     /// A peer's turn becomes a **labelled user turn**, not an unlabelled
@@ -756,7 +756,7 @@ impl SelfBoundary<'_> {
 
 /// Projects the last `window` messages owned by `(desk_id, desk_name)` out of the
 /// company [`EventLog`] into chronological `(role, content)` pairs for
-/// [`Agent::seed_resume_from_messages`](openhuman_core::openhuman::agent::Agent::seed_resume_from_messages).
+/// [`Agent::seed_resume_from_messages`](openhuman_core::agent::Agent::seed_resume_from_messages).
 ///
 /// Walks the log newest-first (`read_before`), keeps only the events
 /// [`chat_history::owns`] admits for this desk **and [`in_thread`] admits for

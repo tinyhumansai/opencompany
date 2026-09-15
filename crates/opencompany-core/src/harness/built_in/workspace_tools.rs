@@ -202,7 +202,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::company::artifact_mirror::{MirrorOutcome, mirror_node_edit};
 // One rule for what a node's path is and what a caller may pass as one, shared
@@ -3378,7 +3378,7 @@ mod tests {
     // replaced every one of them with the classifier's catch-all.
 
     /// The catch-all `ClassifiedFailure::Unknown` renders, from
-    /// `vendor/openhuman/src/openhuman/tools/status/ops.rs`. Every one of
+    /// `vendor/openhuman/crates/openhuman-core/src/tools/status/ops.rs`. Every one of
     /// `workspace_read`'s five failure exits used to collapse into this.
     const GENERIC_CAUSE: &str = "Something went wrong with this action.";
 

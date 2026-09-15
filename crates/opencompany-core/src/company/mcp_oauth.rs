@@ -9,7 +9,7 @@
 //! it write-only under the company's per-server credential key.
 //!
 //! **Why a bespoke module and not `oh::mcp::registry::oauth`.** OpenHuman's full
-//! flow (`vendor/openhuman/src/openhuman/mcp/registry/oauth.rs`) is coupled to
+//! flow (`vendor/openhuman/crates/openhuman-core/src/mcp/registry/oauth.rs`) is coupled to
 //! its SQLite `mcp_registry` store and its desktop loopback callback
 //! (`http://127.0.0.1:<core_port>/…`). Our console path is multi-tenant and
 //! stores credentials in a per-tenant [`SecretStore`](crate::ports::SecretStore),
@@ -32,7 +32,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::mcp::http_client::{AuthorizationServerMetadata, McpAuthorizationContext, McpHttpClient};
 

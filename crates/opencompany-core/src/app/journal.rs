@@ -299,7 +299,7 @@ fn under_temp_dir(dir: &Path, temp_dir: &Path) -> bool {
 #[cfg(feature = "openhuman")]
 pub fn pin_keyring(root: &JournalRoot) -> KeyringPin {
     let dir = root.root().to_path_buf();
-    openhuman_core::openhuman::security::keyring::init_workspace(&dir);
+    openhuman_core::security::keyring::init_workspace(&dir);
 
     let temporary = under_temp_dir(&dir, &std::env::temp_dir());
     if temporary {
@@ -649,7 +649,7 @@ mod test {
         let data_dir = PathBuf::from(std::env::var(SEAM_DATA_DIR_ENV).expect("parent sets this"));
         let expected = resolve(None, &data_dir);
 
-        let config = openhuman_core::openhuman::config::Config::load_or_init()
+        let config = openhuman_core::config::Config::load_or_init()
             .await
             .expect("the vendored config must load");
 
@@ -767,8 +767,7 @@ mod test {
         let pin = pin_keyring(&expected);
         assert_eq!(pin.dir(), expected.root());
 
-        let resolved =
-            openhuman_core::openhuman::security::keyring::store::workspace_dir_for_file_backend();
+        let resolved = openhuman_core::security::keyring::store::workspace_dir_for_file_backend();
         assert_eq!(
             resolved,
             expected.root(),

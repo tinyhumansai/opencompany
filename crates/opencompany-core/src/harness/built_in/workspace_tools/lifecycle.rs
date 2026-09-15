@@ -66,7 +66,7 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use openhuman_core::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
+use openhuman_core::tools::traits::{PermissionLevel, Tool, ToolResult};
 
 use crate::company::artifact_mirror::published_record_for_node;
 use crate::company::workspace_names::kebab_name;

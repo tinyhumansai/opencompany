@@ -232,7 +232,7 @@ mod live {
     use oh::tools::traits::{
         PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolScope, ToolTimeout,
     };
-    use openhuman_core::openhuman as oh;
+    use openhuman_core as oh;
 
     use crate::harness::search::WEB_SEARCH_TOOL;
 
@@ -738,10 +738,10 @@ mod tests {
     /// way a real turn folds it: the loop supplies the humanized tool name,
     /// [`StepLabels`](crate::harness::steps::StepLabels) restores what the tool
     /// calls itself, and `fold_steps` renders the row.
-    fn step_label(tools: &[Box<dyn openhuman_core::openhuman::tools::traits::Tool>]) -> String {
+    fn step_label(tools: &[Box<dyn openhuman_core::tools::traits::Tool>]) -> String {
         use crate::harness::search::WEB_SEARCH_TOOL;
         use crate::harness::steps::{StepLabels, fold_steps};
-        use openhuman_core::openhuman as oh;
+        use openhuman_core as oh;
 
         let labels = StepLabels::from_tools(tools);
         let started = oh::agent::progress::AgentProgress::ToolCallStarted {

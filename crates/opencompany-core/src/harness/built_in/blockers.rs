@@ -508,7 +508,7 @@ impl EscalateToHumanTool {
 }
 
 #[async_trait::async_trait]
-impl openhuman_core::openhuman::tools::traits::Tool for EscalateToHumanTool {
+impl openhuman_core::tools::traits::Tool for EscalateToHumanTool {
     fn name(&self) -> &str {
         ESCALATE_TO_HUMAN_TOOL
     }
@@ -541,15 +541,15 @@ impl openhuman_core::openhuman::tools::traits::Tool for EscalateToHumanTool {
         })
     }
 
-    fn permission_level(&self) -> openhuman_core::openhuman::tools::traits::PermissionLevel {
-        openhuman_core::openhuman::tools::traits::PermissionLevel::Write
+    fn permission_level(&self) -> openhuman_core::tools::traits::PermissionLevel {
+        openhuman_core::tools::traits::PermissionLevel::Write
     }
 
     async fn execute(
         &self,
         args: serde_json::Value,
-    ) -> anyhow::Result<openhuman_core::openhuman::tools::traits::ToolResult> {
-        use openhuman_core::openhuman::tools::traits::ToolResult;
+    ) -> anyhow::Result<openhuman_core::tools::traits::ToolResult> {
+        use openhuman_core::tools::traits::ToolResult;
 
         let question = args
             .get("question")
@@ -631,7 +631,7 @@ mod tool_test {
     use super::*;
     use crate::harness::built_in::policy::ApprovalRequestQueue;
     use crate::ports::blockers::{BlockerKind, BlockerPayload, BlockerSource};
-    use openhuman_core::openhuman::tools::traits::Tool;
+    use openhuman_core::tools::traits::Tool;
 
     fn tool(queue: &ApprovalRequestQueue) -> EscalateToHumanTool {
         EscalateToHumanTool::new(queue.clone(), "engineer".to_string())

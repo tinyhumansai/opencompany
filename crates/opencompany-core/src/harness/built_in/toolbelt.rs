@@ -1,7 +1,7 @@
 //! Coding + web tool wiring for embedded company agents (Cell A).
 //!
 //! This module bridges a curated slice of OpenHuman's tool surface into the
-//! harness's per-agent [`AgentBuilder`](openhuman_core::openhuman::agent::AgentBuilder)
+//! harness's per-agent [`AgentBuilder`](openhuman_core::agent::AgentBuilder)
 //! wiring in [`build`](crate::harness::build). Where [`file_tools`] grants an
 //! agent read/write inside its own workspace, this module adds the **exec-grade**
 //! families behind their own grant namespaces:
@@ -84,7 +84,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::host_runtime::{NativeRuntime, RuntimeAdapter};
 use oh::config::{AuditConfig, HttpRequestConfig};
@@ -957,7 +957,7 @@ pub enum CapabilityFilter {
 }
 
 /// Apply a [`CapabilityFilter`] to a built tool vector, just before it is handed
-/// to the [`AgentBuilder`](openhuman_core::openhuman::agent::AgentBuilder).
+/// to the [`AgentBuilder`](openhuman_core::agent::AgentBuilder).
 ///
 /// Intrinsic tools (memory / MCP / orchestrator / file / skill — any tool whose
 /// [`namespace_of`] is `None`) are always kept; only namespaced exec tools can

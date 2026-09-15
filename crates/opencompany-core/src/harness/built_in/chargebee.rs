@@ -118,7 +118,7 @@ mod live {
     };
 
     use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-    use openhuman_core::openhuman as oh;
+    use openhuman_core as oh;
 
     /// Builds the five per-tenant Chargebee tools over a resolved connection.
     pub fn chargebee_tools(config: &TenantChargebee) -> Vec<Box<dyn Tool>> {
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn the_five_tools_split_reads_from_writes() {
         use oh::tools::traits::PermissionLevel;
-        use openhuman_core::openhuman as oh;
+        use openhuman_core as oh;
 
         let config = TenantChargebee {
             config: ChargebeeConfig {

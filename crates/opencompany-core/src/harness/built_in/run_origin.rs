@@ -3,8 +3,8 @@
 //!
 //! Vendored OpenHuman answers the same question for its own turns with
 //! `AgentTurnOrigin`
-//! (`vendor/openhuman/src/openhuman/agent/turn_origin.rs`), read by its
-//! approval gate at `vendor/openhuman/src/openhuman/security/approval/gate.rs`.
+//! (`vendor/openhuman/crates/openhuman-core/src/agent/turn_origin.rs`), read by its
+//! approval gate at `vendor/openhuman/crates/openhuman-core/src/security/approval/gate.rs`.
 //! This is the same shape at OpenCompany's own dispatch layer — a company can
 //! run a task card, a workflow node or a scheduled job with nobody watching,
 //! and [`ApprovalPolicy::check`](crate::harness::built_in::policy::ApprovalPolicy::check)

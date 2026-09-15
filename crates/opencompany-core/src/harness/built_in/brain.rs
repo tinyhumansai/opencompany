@@ -3,7 +3,7 @@
 //!
 //! Where [`EchoBrain`](crate::brain::EchoBrain) turns every operator message
 //! into `"You said: …"`, `HarnessBrain` routes it to a live openhuman
-//! [`Agent`](openhuman_core::openhuman::agent::Agent) through a
+//! [`Agent`](openhuman_core::agent::Agent) through a
 //! [`HarnessPool`], so the reply comes from the hosted brain and the turn's
 //! token/cost usage is metered into the company ledger.
 //!
@@ -10424,7 +10424,7 @@ members = ["engineer", "designer"]
     #[tokio::test]
     async fn approval_requests_are_parked_for_the_operator() {
         use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};
-        use openhuman_core::openhuman::agent::tool_policy::{
+        use openhuman_core::agent::tool_policy::{
             ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest,
         };
 

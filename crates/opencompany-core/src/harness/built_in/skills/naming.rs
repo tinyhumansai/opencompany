@@ -80,7 +80,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 /// Tool name: enumerate the skills installed for this agent.
 pub const LIST_SKILLS_TOOL: &str = "list_skills";

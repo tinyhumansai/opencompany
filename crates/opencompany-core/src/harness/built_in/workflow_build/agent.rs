@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
 use oh::agent::prompts::SystemPromptBuilder;
@@ -117,6 +117,7 @@ pub(super) fn build_copilot_agent(
     // leaves the harness to no-op its writes.
     let _ = std::fs::create_dir_all(&workspace);
 
+    super::super::tool_posture::declare();
     let mut agent = AgentBuilder::default()
         .chat_model(deps.provider.clone() as Arc<dyn tinyinference::model::ChatModel<()>>)
         .memory(memory)

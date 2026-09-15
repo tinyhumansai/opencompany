@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::security::{AuditEvent, AuditEventType};
 use oh::tools::{

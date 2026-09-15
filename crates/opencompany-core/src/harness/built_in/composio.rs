@@ -591,7 +591,7 @@ mod live {
         ComposioExecuteResponse, ComposioToolkitsResponse, ComposioToolsResponse,
     };
     use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-    use openhuman_core::openhuman as oh;
+    use openhuman_core as oh;
 
     use crate::harness::built_in::composio_direct::DirectComposio;
 
@@ -4075,7 +4075,7 @@ mod isolation_tests {
     use axum::http::HeaderMap;
     use axum::routing::get;
     use oh::tools::traits::Tool;
-    use openhuman_core::openhuman as oh;
+    use openhuman_core as oh;
     use serde_json::{Value, json};
 
     /// Shared recorder for every `Authorization` header the mock backend saw.

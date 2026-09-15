@@ -2,7 +2,7 @@
 //! company SSE feed *while a turn is still running*.
 //!
 //! This mirrors OpenHuman's web-chat event bus
-//! (`vendor/openhuman/src/openhuman/web_chat/event_bus.rs`): a process-wide
+//! (`vendor/openhuman/crates/openhuman-core/src/web_chat/event_bus.rs`): a process-wide
 //! `tokio::sync::broadcast` fabric, one sender per company, that the harness
 //! publishes each mapped [`AgentProgress`](openhuman) event onto the instant it
 //! happens, and that the operator SSE route ([`company_events`]) fans back out

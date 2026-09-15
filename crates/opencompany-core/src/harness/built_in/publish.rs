@@ -90,7 +90,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
 

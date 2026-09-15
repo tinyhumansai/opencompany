@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use oh::mcp::registry::types::{ConnStatus, InstalledServer};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::company::mcp::{McpHealth, stdio_install_refusal};
 use crate::company::runtime::CompanyRuntime;

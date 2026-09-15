@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::stop_hooks::{BudgetStopHook, StopDecision, StopHook, TurnState};
 

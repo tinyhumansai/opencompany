@@ -145,7 +145,7 @@ use serde_json::{Value, json};
 use tinyflows::model::{NodeKind, WorkflowGraph};
 
 use oh::agent::tool_policy::{ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::company::Policy;
 use crate::harness::policy::{ApprovalPolicy, ApprovalRequestQueue};

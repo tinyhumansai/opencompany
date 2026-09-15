@@ -339,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn dry_http_passes_an_entirely_malformed_allowlist_the_real_guard_fails_closed_on() {
         use crate::workflows::caps::http::GuardedHttpClient;
-        use openhuman_core::openhuman::security::SecurityPolicy;
+        use openhuman_core::security::SecurityPolicy;
         use std::sync::Arc;
 
         // Whitespace-only: `normalize`/`normalize_domain` both trim it to empty
@@ -384,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_refusal_matches_the_real_client() {
         use crate::workflows::caps::http::GuardedHttpClient;
-        use openhuman_core::openhuman::security::SecurityPolicy;
+        use openhuman_core::security::SecurityPolicy;
         use std::sync::Arc;
 
         let allowed = vec!["example.com".to_string()];
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_refuse_what_the_real_client_allows() {
         use crate::workflows::caps::http::GuardedHttpClient;
-        use openhuman_core::openhuman::security::SecurityPolicy;
+        use openhuman_core::security::SecurityPolicy;
         use std::sync::Arc;
 
         let allowed = vec!["parity.invalid".to_string()];

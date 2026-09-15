@@ -32,7 +32,7 @@ use crate::ports::runs::{NewRun, RunStatus};
 use crate::ports::tasks::TaskTitle;
 use crate::ports::types::CompanyId;
 use crate::ports::{UsageMeter, UsageSample};
-use openhuman_core::openhuman::tools::traits::Tool;
+use openhuman_core::tools::traits::Tool;
 
 // ---------------------------------------------------------------------------
 // A scripted model

@@ -86,7 +86,7 @@
 
 use serde_json::{Value, json};
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 /// Default number of actions a [`Detail::Names`] listing renders.
 ///

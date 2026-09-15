@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::config::{Config, McpAuthConfig, McpServerConfig};
 use oh::mcp::config_servers::{McpRegistrySource, McpServerRegistry};

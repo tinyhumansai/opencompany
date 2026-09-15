@@ -51,7 +51,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
 use oh::agent::prompts::SystemPromptBuilder;
@@ -314,6 +314,7 @@ pub fn build_confined_agent(
 
     let tools: Vec<Box<dyn Tool>> = Vec::new();
 
+    super::tool_posture::declare();
     AgentBuilder::default()
         .chat_model(deps.provider.clone() as Arc<dyn tinyinference::model::ChatModel<()>>)
         .memory(memory)

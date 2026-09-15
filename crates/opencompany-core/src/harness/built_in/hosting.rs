@@ -147,7 +147,7 @@ mod live {
 
     use std::path::PathBuf;
 
-    use openhuman_core::openhuman::tools::Tool;
+    use openhuman_core::tools::Tool;
 
     /// The hosting tools for one company, deploying out of `workspace`.
     ///
@@ -158,7 +158,7 @@ mod live {
     /// build: an agent that cannot deploy is a degraded agent, not a broken
     /// company.
     pub fn hosting_tools(config: &TenantHosting, workspace: PathBuf) -> Vec<Box<dyn Tool>> {
-        match openhuman_core::openhuman::hosting::Account::connect(
+        match openhuman_core::hosting::Account::connect(
             &config.provider,
             &config.api_key,
             config.team(),

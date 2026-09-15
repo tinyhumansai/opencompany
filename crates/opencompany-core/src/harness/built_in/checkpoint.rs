@@ -22,7 +22,7 @@ use oh::tools::traits::{
     PermissionLevel, Tool, ToolCallOptions, ToolCategory, ToolResult, ToolScope, ToolSpec,
     ToolTimeout,
 };
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::store::fs::path_lock;
 

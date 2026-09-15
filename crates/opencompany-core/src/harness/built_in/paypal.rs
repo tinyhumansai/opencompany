@@ -111,7 +111,7 @@ mod live {
     use crate::paypal::client::PaypalClient;
 
     use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-    use openhuman_core::openhuman as oh;
+    use openhuman_core as oh;
 
     /// Builds the per-company PayPal tools over a resolved connection.
     pub fn paypal_tools(config: &TenantPaypal) -> Vec<Box<dyn Tool>> {
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn both_tools_are_read_only() {
         use oh::tools::traits::PermissionLevel;
-        use openhuman_core::openhuman as oh;
+        use openhuman_core as oh;
 
         let config = TenantPaypal {
             config: crate::paypal::PaypalConfig {

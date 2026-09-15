@@ -5,7 +5,7 @@
 //! The staging model emits tool calls as
 //! `<tool_call id="call_2">{"name":…,"arguments":{…}}</tool_call>` — with an
 //! `id` **attribute** on the open tag. OpenHuman's XML tool-call parser
-//! (`vendor/openhuman/src/openhuman/agent/harness/parse.rs`) matches open tags
+//! (`vendor/openhuman/crates/openhuman-core/src/agent/harness/parse.rs`) matches open tags
 //! only against the exact bare literals `<tool_call>`, `<toolcall>`,
 //! `<tool-call>`, `<invoke>` via `haystack.find(tag)`. Because each literal
 //! includes the closing `>`, an open tag that carries any attribute before the
@@ -41,7 +41,7 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 use regex::Regex;
 
 use oh::agent::dispatcher::{

@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::config::Config;
 use oh::skills::tools::{WorkflowDescribeTool, WorkflowListTool, WorkflowReadResourceTool};

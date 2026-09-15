@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::ports::ContextStore;
 use crate::ports::types::{ChunkAddr, CompanyId, ContextChunk};

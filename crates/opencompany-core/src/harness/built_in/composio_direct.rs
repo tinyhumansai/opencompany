@@ -11,7 +11,7 @@
 //! and every Composio call is then made against `backend.composio.dev` with
 //! that key in `x-api-key` — no proxy, no platform identity, no platform bill.
 //! It mirrors OpenHuman's own `backend` / `direct` split (see
-//! `vendor/openhuman/src/openhuman/integrations/composio/client.rs::create_composio_client`),
+//! `vendor/openhuman/crates/openhuman-core/src/integrations/composio/client.rs::create_composio_client`),
 //! and reuses OpenHuman's direct client
 //! ([`oh::tools::ComposioTool`]) and its response reshapers wherever they are
 //! reachable, so a BYOK result is the same envelope a managed one is and the
@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::integrations::composio::client::{direct_execute, direct_list_connections};
 use oh::integrations::composio::types::{

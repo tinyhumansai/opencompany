@@ -253,7 +253,7 @@ pub async fn token_configured(company: &CompanyId, secrets: &dyn SecretStore) ->
 // company's `x-api-key` — nothing is proxied, nothing is billed here, and the
 // providers it can connect are whatever its own Composio dashboard permits.
 // This mirrors OpenHuman's own `backend` / `direct` split
-// (`vendor/openhuman/src/openhuman/integrations/composio/client.rs::create_composio_client`);
+// (`vendor/openhuman/crates/openhuman-core/src/integrations/composio/client.rs::create_composio_client`);
 // the vocabulary here is `managed` / `byok` to match the search surface next
 // door (`crate::company::search`), which made the same choice first.
 

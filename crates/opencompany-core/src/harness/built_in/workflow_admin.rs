@@ -98,7 +98,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use oh::tools::traits::{PermissionLevel, Tool, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::company::{
     RawWorkflow, WorkflowSpecProjection, delete_company_workflow, load_workflow_with_globals,

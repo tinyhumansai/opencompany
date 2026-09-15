@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use oh::agent::tinyagents::payload_summarizer::{
     PayloadSummarizer, SummarizeOutcome, SummarizedPayload, UnavailableReason,

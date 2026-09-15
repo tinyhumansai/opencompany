@@ -175,6 +175,7 @@ pub mod steer;
 pub mod steps;
 pub mod title;
 pub mod tool_dispatcher;
+pub mod tool_posture;
 pub mod toolbelt;
 pub mod triage;
 pub mod turn_outputs;
@@ -217,7 +218,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 use tokio::sync::{Mutex, RwLock};
 
 use oh::agent::Agent;
@@ -7539,7 +7540,7 @@ description = "Builds the product."
     /// — saved to the record, never materialised, no error anywhere.
     #[tokio::test]
     async fn a_tool_added_teammate_colliding_with_a_manifest_id_still_joins_the_roster() {
-        use openhuman_core::openhuman::tools::Tool;
+        use openhuman_core::tools::Tool;
 
         use crate::harness::orchestrator::unscoped_add_agent;
 

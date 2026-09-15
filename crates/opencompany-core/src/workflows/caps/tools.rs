@@ -6,7 +6,7 @@
 //! `git_operations`, `csv_export`), and `web` (`web_fetch`, `http_request`,
 //! `curl`, `image_info`) — under ONE exec-security policy scoped to a dedicated
 //! per-company workflow workspace, then indexes the tools by their runtime
-//! [`name()`](openhuman_core::openhuman::tools::Tool::name). A `tool_call` node's
+//! [`name()`](openhuman_core::tools::Tool::name). A `tool_call` node's
 //! `slug` selects one by name.
 //!
 //! It also wires the metered `search` family (`web_search`) — the discovery tool
@@ -38,7 +38,7 @@ use tinyflows::error::{EngineError, Result as TfResult};
 
 use oh::security::SecurityPolicy;
 use oh::tools::{Tool, ToolResult};
-use openhuman_core::openhuman as oh;
+use openhuman_core as oh;
 
 use crate::harness::search::{SearchBackend, SearchMetering};
 use crate::harness::search_byo::TenantSearch;

@@ -26,6 +26,7 @@ glob group=Other reach=Nothing standing=PerCall
 grep group=Other reach=Nothing standing=PerCall
 hosting_add_domain group=Publish reach=Consequence standing=PerCall
 hosting_analytics group=Other reach=Nothing standing=PerCall
+hosting_deployment_logs group=Other reach=Nothing standing=PerCall
 hosting_deployment_status group=Other reach=Nothing standing=PerCall
 hosting_domain_status group=Other reach=Nothing standing=PerCall
 hosting_launch_site group=Publish reach=Consequence standing=PerCall
