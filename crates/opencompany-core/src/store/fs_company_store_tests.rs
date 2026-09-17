@@ -552,11 +552,11 @@ async fn cancelling_a_save_does_not_delete_a_temp_a_commit_still_owns() {
 
     // Park the metadata staging write, then abort the save while it is
     // held there — the update path stages meta.json first.
-    let release = stall_probe::arm(&bundle.meta_json());
+    let gate = stall_probe::arm(&bundle.meta_json());
     let after = record_named("After");
     let reader = FsCompanyStore::new(&root);
     let handle = tokio::spawn(async move { store.save(&after).await });
-    stall_probe::wait_blocked().await;
+    gate.wait().await;
     handle.abort();
     let joined = handle.await;
     assert!(
@@ -564,7 +564,7 @@ async fn cancelling_a_save_does_not_delete_a_temp_a_commit_still_owns() {
         "the save task must actually have been cancelled for this test \
              to mean anything, got {joined:?}"
     );
-    release.send(()).expect("stall gate still open");
+    gate.release().expect("stall gate still open");
 
     // Whatever the cancellation left behind, the bundle must never be a
     // new manifest paired with stale metadata, and must not accumulate

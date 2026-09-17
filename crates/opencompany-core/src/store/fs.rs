@@ -508,11 +508,12 @@ pub(crate) mod fault_probe;
 /// Issue #1828 review, sixth round: proving the cancellation hazard (and the
 /// fix for it) requires reliably cancelling the caller of `stage_atomic_bytes`
 /// *while* its blocking write is still in flight — a plain `sleep`-based race
-/// would be flaky. `arm` registers a gate for a target path; the blocking
-/// write closure parks on that gate (from a blocking-pool thread, so it never
-/// blocks the async runtime) until `maybe_block` is called and a test signals
-/// `wait_blocked()`, giving the test a deterministic window to `abort()` the
-/// caller before releasing the write to actually run.
+/// would be flaky. `arm` registers a gate for a target path and hands the test
+/// back a handle to it; the blocking write closure parks on that gate (from a
+/// blocking-pool thread, so it never blocks the async runtime) when
+/// `maybe_block` reaches it, waking the handle's `wait()`. That gives the test
+/// a deterministic window to `abort()` the caller before releasing the write to
+/// actually run.
 #[cfg(test)]
 #[path = "fs_stall_probe.rs"]
 pub(crate) mod stall_probe;
