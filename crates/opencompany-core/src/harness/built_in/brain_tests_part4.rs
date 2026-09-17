@@ -19,6 +19,8 @@ async fn task_dispatch_off_roster_assignee_is_refused_not_silently_reassigned() 
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -84,6 +86,8 @@ async fn a_refused_dispatch_with_no_origin_chat_files_a_dispatch_failed_notifica
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -130,6 +134,8 @@ async fn task_dispatch_links_the_working_agent_to_an_unassigned_card() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -163,6 +169,8 @@ async fn task_dispatch_routes_a_desk_assignee_to_its_lead_but_keeps_the_desk() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -209,6 +217,8 @@ async fn task_dispatch_routes_to_an_overlay_teammate() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -305,6 +315,8 @@ async fn task_dispatch_missing_card_is_noop() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "nope".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )

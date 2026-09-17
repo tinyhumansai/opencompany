@@ -1459,20 +1459,59 @@ impl CompanyRuntime {
             // Who owns the card going INTO this attempt. Read here and not after
             // the cycle, because by then a hand-off has already overwritten it —
             // which is exactly the value a rollback needs.
-            let owner_before = self
-                .ops
-                .tasks
-                .list(&self.id)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .find(|c| c.id == task_id)
-                .map(|c| c.assignee)
+            // **A failed read is not an absent card.**
+            //
+            // `unwrap_or_default` was tolerable while this only fed
+            // `owner_before`, where an empty owner is a survivable fallback.
+            // The origin is different: a swallowed error silently omits the
+            // conversation, and the dispatch then renders as the very silence
+            // this change removes — indistinguishable from a board-created
+            // card that genuinely has no thread (tinysweeper, #2369).
+            //
+            // Still not fatal, for the reason the rest of this path gives:
+            // record-keeping does not fail the work it records. It is logged,
+            // so an omitted origin has a cause a reader can find instead of
+            // looking like a card that was never raised in a conversation.
+            let cards = match self.ops.tasks.list(&self.id).await {
+                Ok(cards) => cards,
+                Err(error) => {
+                    tracing::warn!(
+                        company = %self.id,
+                        task = %task_id,
+                        error = %error,
+                        "[dispatch] the board could not be read; this attempt runs without its \
+                         owner or its originating conversation"
+                    );
+                    Vec::new()
+                }
+            };
+            let card_before = cards.into_iter().find(|c| c.id == task_id);
+            let owner_before = card_before
+                .as_ref()
+                .map(|c| c.assignee.clone())
                 .unwrap_or_default();
+            // **The conversation this attempt answers, carried onto the
+            // dispatch itself.**
+            //
+            // `DeskTaskCompleted` already stamps this pair, so a finished run is
+            // delivered into the thread that asked. The dispatch carried
+            // neither, so the *start* of the work reached the console naming
+            // only a card — and a thread that dispatched went silent from that
+            // moment until the answer arrived, because the chat turn had
+            // genuinely succeeded (it handed the work over) and its working row
+            // settled with it. Minutes of a real agent turn rendered as nothing,
+            // then a reply from nowhere.
+            //
+            // Read from the card rather than threaded through the call: the card
+            // is where `TaskOrigin` is recorded, and a second place deciding
+            // "which conversation is this?" is the drift #435 removed.
+            let origin = card_before.as_ref().and_then(|c| c.origin.clone());
             let report = match self
                 .run_cycle(vec![CompanyEvent::TaskDispatched {
                     task_id: task_id.clone(),
                     run_id: run_id.clone(),
+                    origin_chat_id: origin.as_ref().map(|o| o.origin_chat_id.clone()),
+                    origin_parent: origin.as_ref().and_then(|o| o.origin_parent),
                 }])
                 .await
             {

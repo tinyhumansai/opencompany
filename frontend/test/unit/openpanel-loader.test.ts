@@ -122,7 +122,18 @@ describe("OpenPanel console analytics", () => {
     const openPanelOrigin = new URL("https://openpanel.dev");
 
     expect(scriptSources).toContain("'self'");
-    expect(connectSources).toEqual(["'self'", "ipc:", "http://ipc.localhost"]);
+    // Sentry's ingest origin rides here too (#2380). It is listed rather than
+    // matched loosely so that widening the webview's reach stays a deliberate
+    // edit to this line — which is the whole point of asserting the set
+    // exactly. The two PRs that landed these facts could not see each other:
+    // #2377 wrote this expectation, #2380 added the origin, and the Console
+    // lane is path-filtered, so `main` never ran the two together.
+    expect(connectSources).toEqual([
+      "'self'",
+      "ipc:",
+      "http://ipc.localhost",
+      "https://sentry.tinyhumans.ai",
+    ]);
     expect(scriptSources.some((source) => sourceAllowsOrigin(source, openPanelOrigin))).toBe(false);
     expect(connectSources.some((source) => sourceAllowsOrigin(source, openPanelOrigin))).toBe(false);
   });

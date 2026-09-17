@@ -176,6 +176,15 @@ interface Props {
    * that there was no way to ask "is *this* thread working".
    */
   openTurn?: { queued: boolean };
+  /**
+   * Whether the work this thread dispatched is still running.
+   *
+   * Separate from {@link openTurn}: the turn that dispatched has already
+   * settled — handing the work over was the whole of what it did — so the panel
+   * had nothing to show while a real agent turn ran for minutes
+   * (CodeRabbit, #2369).
+   */
+  dispatchInFlight?: boolean;
   /** This console is typing here. Distinct from the main composer's callback
    * so the ping this thread sends carries the thread's own `parentId`. */
   onTyping?: () => void;
@@ -243,6 +252,7 @@ export function ThreadPanel({
   onClose,
   typingNames = [],
   openTurn,
+  dispatchInFlight,
   onTyping,
   cognition,
   onRedeemBudgetPause,
@@ -332,11 +342,11 @@ export function ThreadPanel({
         </p>
       ) : (
         <>
-          {openTurn && (
+          {(openTurn || dispatchInFlight) && (
             <div className="px-4 py-2">
               <WorkingIndicator
-                srLabel={openTurn.queued ? "Queued…" : "Replying…"}
-                queued={openTurn.queued}
+                srLabel={openTurn?.queued ? "Queued…" : "Replying…"}
+                queued={openTurn?.queued}
               />
             </div>
           )}

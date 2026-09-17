@@ -191,6 +191,8 @@ async fn the_backstop_never_overwrites_a_settle_the_brain_already_made() {
         rt.run_cycle(vec![CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
             run_id: Some(run_id.clone()),
+            origin_chat_id: None,
+            origin_parent: None,
         }])
         .await
         .expect("cycle");
@@ -226,6 +228,8 @@ async fn a_dispatch_cycle_starts_its_run_and_never_leaves_it_claiming_to_be_live
         .run_cycle(vec![CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
             run_id: Some(run_id.clone()),
+            origin_chat_id: None,
+            origin_parent: None,
         }])
         .await
         .expect("the cycle itself succeeds");
@@ -303,6 +307,8 @@ async fn the_backstop_returns_a_card_its_run_abandoned() {
     rt.run_cycle(vec![CompanyEvent::TaskDispatched {
         task_id: "t-1".into(),
         run_id: Some(run_id),
+        origin_chat_id: None,
+        origin_parent: None,
     }])
     .await
     .expect("the cycle itself succeeds");
@@ -391,6 +397,8 @@ async fn the_backstop_leaves_a_parked_card_exactly_where_the_operator_put_it() {
     rt.run_cycle(vec![CompanyEvent::TaskDispatched {
         task_id: "t-1".into(),
         run_id: Some(run_id.clone()),
+        origin_chat_id: None,
+        origin_parent: None,
     }])
     .await
     .expect("the cycle itself succeeds");
@@ -439,6 +447,8 @@ async fn a_failed_cycle_settles_its_run_and_still_reports_the_failure() {
         .run_cycle(vec![CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
             run_id: Some(run_id.clone()),
+            origin_chat_id: None,
+            origin_parent: None,
         }])
         .await
         .expect_err("a failing brain still fails the cycle");
@@ -499,6 +509,8 @@ async fn an_untracked_dispatch_still_runs_its_cycle() {
     rt.run_cycle(vec![CompanyEvent::TaskDispatched {
         task_id: "t-1".into(),
         run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
     }])
     .await
     .expect("an untracked dispatch is still a dispatch");
@@ -526,6 +538,8 @@ async fn a_dispatch_naming_an_unknown_run_does_not_fail_the_cycle() {
     rt.run_cycle(vec![CompanyEvent::TaskDispatched {
         task_id: "t-1".into(),
         run_id: Some("run-that-never-was".into()),
+        origin_chat_id: None,
+        origin_parent: None,
     }])
     .await
     .expect("an unknown run id is a bookkeeping miss, not a cycle failure");

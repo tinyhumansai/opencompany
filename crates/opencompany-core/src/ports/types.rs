@@ -1300,6 +1300,39 @@ pub enum CompanyEvent {
         /// stored record needs migrating.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<String>,
+        /// The conversation this dispatch was raised from, when one was —
+        /// [`TaskRecord::origin`](crate::ports::tasks::TaskRecord::origin),
+        /// stamped here at the moment the work is handed out.
+        ///
+        /// **Why a dispatch needs it and a completion already had it.**
+        /// `DeskTaskCompleted` carries the same pair, so a finished run is
+        /// delivered into the thread that asked for it. A dispatch carried
+        /// neither, so the *start* of that work reached the console as a
+        /// board-shaped frame naming only a card — and the thread went silent
+        /// from the moment it dispatched until the answer arrived, with a live
+        /// working row that had already settled because the chat turn genuinely
+        /// finished: it had handed the work over. Several minutes of a real
+        /// agent turn rendered as nothing at all, then a reply from nowhere.
+        ///
+        /// **Captured, never derived**, for the reason the completion's half
+        /// gives: nothing else on this event knows which conversation asked,
+        /// and a second place deciding "which conversation is this?" is exactly
+        /// the drift #435 exists to have removed.
+        ///
+        /// Additive: `#[serde(default)]` so every line written before this
+        /// existed still replays, and skipped when absent so a board-created
+        /// dispatch serializes byte-for-byte as it did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_chat_id: Option<String>,
+        /// The thread within [`origin_chat_id`](Self::TaskDispatched::origin_chat_id)
+        /// the dispatch was raised in.
+        ///
+        /// **Read as a pair with the channel, never alone** — the same rule
+        /// `DeskTaskCompleted` states: `None` here means the channel-level
+        /// conversation *when a channel is named*, and means nothing at all
+        /// when it is not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_parent: Option<EventSeq>,
     },
     /// An agent's MCP tool call failed during a turn, journaled by the harness
     /// so the operator has an audit trail of which server/tool broke and why.

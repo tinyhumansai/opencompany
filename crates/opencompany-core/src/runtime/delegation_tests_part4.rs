@@ -422,12 +422,27 @@ async fn a_handler_card_the_operator_moved_on_is_not_adopted() {
     );
 }
 
-/// The stand-down is keyed on the **detector**, not on finding the card:
-/// the handler's write is best-effort, so a missing card must not be read as
-/// "the handler did not fire" and re-open one. `spawned_task` is then
-/// honestly empty — there is no card to point at.
+/// One message, one card — the #463 guarantee, in the shape #2364 left it.
+///
+/// This test used to be `the_stand_down_holds_even_when_the_handlers_card_
+/// cannot_be_found`, and asserted **no** card: the stand-down was keyed on the
+/// task-intent *detector*, so a handler card that could not be found on the
+/// board still suppressed this path rather than re-opening the same work.
+///
+/// #2364 replaced that rule. The chat handler no longer cards on the triage at
+/// all — the board is a tool call now — so `carded_by_handler` reads a
+/// persisted card instead of the detector, and the hand-off's own card is the
+/// one card this message gets. The sibling that pins the same model from the
+/// other side is `a_tracked_instruction_still_delegates_under_a_claim`, which
+/// #2364 updated in the same way and which this file's version was missed
+/// alongside — it is why the gated lane has been red on `main` since that
+/// merge.
+///
+/// What is still worth pinning is the part that did NOT change: exactly one
+/// card, never two. The mechanism moved from the detector to the tool call;
+/// the guarantee did not.
 #[tokio::test]
-async fn the_stand_down_holds_even_when_the_handlers_card_cannot_be_found() {
+async fn a_handed_off_message_gets_exactly_one_card() {
     let fx = Fixture::new();
     let turns = ScriptedTurns::new(
         &fx,
@@ -442,8 +457,24 @@ async fn the_stand_down_holds_even_when_the_handlers_card_cannot_be_found() {
         .handle_operator_message("chief", "draft the launch plan for next quarter", None)
         .await
         .expect("operator message handled");
-    assert!(fx.cards().await.is_empty(), "no second card is opened");
-    assert!(turn.spawned_task.is_none(), "and none is claimed");
+    let cards = fx.cards().await;
+    assert_eq!(
+        cards.len(),
+        1,
+        "the hand-off's card is the only card this message gets: {cards:?}"
+    );
+    assert_eq!(
+        cards[0].assignee, "engineer",
+        "and it belongs to the delegate"
+    );
+    // …and the turn points at that same card rather than at nothing. The old
+    // assertion here was `is_none()`, which was only true because the old rule
+    // opened no card at all; with one card there is something honest to claim.
+    assert_eq!(
+        turn.spawned_task.as_deref(),
+        Some(cards[0].id.as_str()),
+        "the turn claims the card it actually opened"
+    );
 }
 
 /// …and the same thread stays quiet for a question, so a desk chat does not

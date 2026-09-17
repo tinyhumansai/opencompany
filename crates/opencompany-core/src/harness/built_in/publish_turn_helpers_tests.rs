@@ -454,6 +454,8 @@ pub(crate) fn dispatch_run(task_id: &str, run_id: Option<&str>) -> CycleRequest 
         events: vec![CompanyEvent::TaskDispatched {
             task_id: task_id.to_string(),
             run_id: run_id.map(str::to_string),
+            origin_chat_id: None,
+            origin_parent: None,
         }],
         event_seqs: Vec::new(),
         policy: None,

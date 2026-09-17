@@ -567,3 +567,65 @@ async fn a_paypal_grant_with_no_credential_wires_nothing_rather_than_failing() {
             .is_none()
     );
 }
+
+/// Issue #2369: the three destinations a dispatched card's turn can stream to.
+///
+/// Pinned on [`dispatch_live_stream`] directly, because the interesting part
+/// is the decision and not the turn around it. A dispatch runs for minutes, so
+/// getting this wrong is not a cosmetic bug in either direction: streaming a
+/// board-created card publishes an agent's frames into whatever thread is open
+/// (#125), and refusing to stream one raised in a thread is the silence this
+/// issue is about.
+///
+/// The thread root is deliberately *absent* from every `On` here. Issue #1890
+/// I split "which conversation is this turn in" from "where do its frames go",
+/// so identity rides the `ChatTarget` and only the desk reaches the stream —
+/// which is why the channel-level and threaded cases produce the same variant.
+#[test]
+fn a_dispatch_streams_to_its_origin_and_a_board_card_streams_nowhere() {
+    use crate::ports::types::EventSeq;
+    use crate::runtime::delegation::ChatTarget;
+
+    let in_thread = ChatTarget::dispatched_from(Some("strategy"), Some(EventSeq::new(41)));
+    assert!(
+        matches!(
+            dispatch_live_stream(&in_thread),
+            LiveStream::On {
+                chat_id: Some("strategy")
+            }
+        ),
+        "a card raised in a thread streams to that desk"
+    );
+    assert_eq!(
+        in_thread.thread_root,
+        Some(EventSeq::new(41)),
+        "the thread stays on the target, which is what #1890 I separated"
+    );
+
+    let in_channel = ChatTarget::dispatched_from(Some("strategy"), None);
+    assert!(
+        matches!(
+            dispatch_live_stream(&in_channel),
+            LiveStream::On {
+                chat_id: Some("strategy")
+            }
+        ),
+        "a card raised at channel level streams to the desk with no thread"
+    );
+    assert!(in_channel.thread_root.is_none());
+
+    let on_board = ChatTarget::dispatched_from(None, None);
+    assert!(
+        matches!(dispatch_live_stream(&on_board), LiveStream::Off),
+        "a board-created card names no conversation, so it publishes nothing"
+    );
+
+    // None of the three may seed history: a dispatched turn is given its
+    // instruction, not the thread's backlog (#1840).
+    for target in [&in_thread, &in_channel, &on_board] {
+        assert!(
+            !target.history_seed,
+            "a dispatched turn is never history-seeded"
+        );
+    }
+}

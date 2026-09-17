@@ -98,6 +98,10 @@ import { foldLiveFrame } from "@/lib/live-frame";
 import {
   type ChatMessage,
   dispatchMarkerPlacement,
+  clearDispatchRunning,
+  type DispatchRunning,
+  dispatchThreadKey,
+  markDispatchRunning,
   fromHistory,
   reconcileTranscript,
   hostMessageId,
@@ -2430,6 +2434,46 @@ export function AppShell({
    */
   const [referralWorking, setReferralWorking] = useState<Record<string, ReferralWorking>>({});
 
+  /**
+   * Threads whose dispatched work is still running, by {@link dispatchThreadKey}.
+   *
+   * A chat turn that dispatches **succeeds immediately** — handing the work over
+   * is the whole of what it did — so its working row settles while the real
+   * agent turn is only just starting. Every frame after that named a card and
+   * not a conversation, so the thread rendered minutes of live work as silence
+   * and then produced a reply from nowhere. This keeps the row up for the window
+   * between `task_dispatched` and `desk_task_completed`, both of which now carry
+   * the conversation that raised it.
+   *
+   * Keyed by **task id**, valued by thread key — not a per-thread count. A
+   * count is decremented by whichever terminal arrives, so an unrelated card
+   * completing in the same thread would take a live attempt's row down, and
+   * that attempt's own completion would then find nothing to clear
+   * (tinysweeper, #2369). One thread can have several attempts in flight (a
+   * retry, two asks), and each is now removed by its own id.
+   */
+  const [dispatchRunning, setDispatchRunning] = useState<DispatchRunning>({});
+  // Keyed on `client` as well as `company`: a reseat replaces the client while
+  // preserving the company (it edits a host address and keeps the connection
+  // id), so a company-only reset leaves the old host's counts standing. No
+  // terminal from the new host ever clears them, and the thread shows a working
+  // row for an attempt that is not running anywhere (CodeRabbit, #2369).
+  useEffect(() => {
+    setDispatchRunning((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+  }, [company, client]);
+  /**
+   * Drops every in-flight mark, for a caller that has lost event continuity.
+   *
+   * A missed `desk_task_completed` — a stream gap, a reconnect — would
+   * otherwise leave a thread marked working for the life of the page, since
+   * nothing else clears an entry (tinysweeper, #2369). Clearing on resync is
+   * the conservative direction: a row that should still be up returns with the
+   * next frame from the attempt, while a stuck one never leaves on its own.
+   */
+  const forgetRunningDispatches = useCallback(() => {
+    setDispatchRunning((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+  }, []);
+
   const injectAgentReply = useCallback(
     (event: AgentReplyEvent) => {
       // The desk speaking again is the end of any crossing it was waiting on.
@@ -3134,7 +3178,30 @@ export function AppShell({
     // Issue #377. Beside the board tick above, not instead of it: a settle both
     // moves a card between columns and needs saying in the conversation the
     // card came from.
-    onDispatchTerminal: injectDispatchMarker,
+    onDispatchTerminal: useCallback(
+      (event: CompanyStreamEvent) => {
+        // Closes the bracket the dispatch opened: the attempt is over, so the
+        // thread's working row comes down with it.
+        if (event.type === "desk_task_completed") {
+          // By task id, so a completion can only clear the attempt it belongs
+          // to. Keyed by conversation this removed whichever mark happened to
+          // be there.
+          setDispatchRunning((running) => clearDispatchRunning(running, event.taskId));
+        }
+        injectDispatchMarker(event);
+      },
+      [injectDispatchMarker],
+    ),
+    onDispatchStarted: useCallback((event: CompanyStreamEvent) => {
+      // Only a dispatch that names a conversation: a board-created one belongs
+      // to no thread and must not raise a working row in whatever is open.
+      if (event.type !== "task_dispatched") return;
+      const chatId = event.chatId;
+      if (chatId === undefined) return;
+      setDispatchRunning((running) =>
+        markDispatchRunning(running, event.taskId, chatId, event.parentId),
+      );
+    }, []),
     // The inline terminal marker is enough only while its origin channel is
     // actually on screen. Elsewhere — including another chat channel — the
     // event hook raises the linked completion toast (#1758).
@@ -3264,7 +3331,11 @@ export function AppShell({
       ownApprovalDecisionsRef.current.delete(approvalId);
       return mine;
     },
-    onResync: resyncDurableState,
+    onResync: useCallback(() => {
+      // Continuity is gone, so any mark held here may never see its terminal.
+      forgetRunningDispatches();
+      resyncDurableState();
+    }, [forgetRunningDispatches, resyncDurableState]),
     onRecoveryError: useCallback(() => {
       toast.error("Live updates couldn't be recovered", {
         description: "We couldn't refresh the latest company state. Check your connection and try again.",
@@ -3621,6 +3692,7 @@ export function AppShell({
           <RoomView
               client={client}
               company={company}
+              dispatchRunning={dispatchRunning}
               // What the agents in this company are allowed to do without
               // asking, rendered on the composer's toolbar row. Nothing renders
               // until the host has said what the tier is, rather than guessing

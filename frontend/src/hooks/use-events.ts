@@ -59,7 +59,25 @@ export type CompanyStreamEvent =
        */
       mentions?: ChatMentionDto[];
     }
-  | { type: "task_dispatched"; seq: number; atMillis: number; taskId: string }
+  | {
+      type: "task_dispatched";
+      seq: number;
+      atMillis: number;
+      taskId: string;
+      /**
+       * The conversation the work was raised from, when one was.
+       *
+       * `desk_task_completed` has carried this pair since #1890 B, which is why
+       * a finished dispatch lands in the thread that asked. The start carried
+       * neither, so a thread that dispatched went silent the moment it did: the
+       * chat turn had genuinely succeeded — it handed the work over — so its
+       * working row settled, and every frame after it named only a card.
+       * Minutes of a real agent turn rendered as nothing, then a reply from
+       * nowhere.
+       */
+      chatId?: string;
+      parentId?: string;
+    }
   | {
       type: "task_steered";
       seq: number;
@@ -871,6 +889,15 @@ interface Options {
    */
   onDispatchTerminal?: (event: CompanyStreamEvent) => void;
   /**
+   * Called when a dispatch **starts**, with the payload — the opening bracket
+   * of {@link Options.onDispatchTerminal}.
+   *
+   * Takes the payload for the same reason the terminal does: the reaction
+   * depends on *which* conversation raised the work, and a counter says nothing
+   * about that.
+   */
+  onDispatchStarted?: (event: CompanyStreamEvent) => void;
+  /**
    * Whether this console is currently showing the channel a completed task
    * came from (#1758). Only that exact view suppresses the completion toast;
    * the channel's inline terminal marker is already the notification there.
@@ -1001,6 +1028,7 @@ export function useEvents(
     onRunEvent,
     onReferral,
     onDispatchTerminal,
+    onDispatchStarted,
     isViewingTaskOrigin,
     onWorkspaceEvent,
     onTurnEvent,
@@ -1033,6 +1061,10 @@ export function useEvents(
     onRunEventRef.current = onRunEvent;
   }, [onRunEvent]);
   const onDispatchTerminalRef = useRef(onDispatchTerminal);
+  const onDispatchStartedRef = useRef(onDispatchStarted);
+  useEffect(() => {
+    onDispatchStartedRef.current = onDispatchStarted;
+  }, [onDispatchStarted]);
   useEffect(() => {
     onDispatchTerminalRef.current = onDispatchTerminal;
   }, [onDispatchTerminal]);
@@ -1162,6 +1194,7 @@ export function useEvents(
             onRunEvent: onRunEventRef.current,
             onReferral: onReferralRef.current,
             onDispatchTerminal: onDispatchTerminalRef.current,
+            onDispatchStarted: onDispatchStartedRef.current,
             isViewingTaskOrigin: isViewingTaskOriginRef.current,
             onWorkspaceEvent: onWorkspaceEventRef.current,
             onTurnEvent: onTurnEventRef.current,
@@ -1219,6 +1252,7 @@ export function handleEvent(
     onRunEvent,
     onReferral,
     onDispatchTerminal,
+    onDispatchStarted,
     isViewingTaskOrigin,
     onWorkspaceEvent,
     onTurnEvent,
@@ -1267,6 +1301,10 @@ export function handleEvent(
         description: "Your company picked up a task.",
       });
       onTaskEvent?.(event);
+      // The conversation half, for the thread that asked: it holds a working
+      // row for as long as the dispatched attempt runs — the window that used
+      // to render as silence.
+      onDispatchStarted?.(event);
       break;
     case "task_steered":
       toast("A task was steered", {

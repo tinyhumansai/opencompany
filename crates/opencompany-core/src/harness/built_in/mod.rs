@@ -2955,11 +2955,15 @@ impl Default for HarnessPool {
 
 /// Whether a turn tees its progress onto the live [`turn_stream`](crate::turn_stream)
 /// bus, and if so which chat thread its frames route to. `Off` for a turn with no
-/// operator chat bubble (a dispatched task card or workflow agent node) — those
-/// frames would misattribute to whatever thread most recently sent, so they
-/// publish nothing (#125 review). `On { chat_id }` streams; `chat_id` is the
-/// thread the durable reply is journaled under (`AgentReply.chat_id`), falling
-/// back to the default desk when the caller addressed none.
+/// operator chat bubble — a workflow agent node, or a card raised on the board
+/// rather than in a conversation — because those frames would misattribute to
+/// whatever thread most recently sent, so they publish nothing (#125 review).
+/// A card raised *in* a conversation does stream, routed by the origin it
+/// recorded rather than by recency (#2369, [`dispatch_live_stream`]).
+///
+/// `On { chat_id }` streams; `chat_id` is the thread the durable reply is
+/// journaled under (`AgentReply.chat_id`), falling back to the default desk
+/// when the caller addressed none.
 #[derive(Clone, Copy)]
 enum LiveStream<'a> {
     Off,
@@ -2988,6 +2992,25 @@ enum LiveStream<'a> {
         run_id: &'a str,
         node_id: &'a str,
     },
+}
+
+/// Where a **dispatched** card's turn streams its live frames.
+///
+/// Named rather than inlined so the rule is testable: the three destinations
+/// are a threaded origin (streams to its desk, with the thread carried on the
+/// `ChatTarget` since issue #1890 I), a channel-level origin (streams to the
+/// desk with no thread root), and a board-created card (streams nowhere).
+///
+/// That last case is the one worth pinning. A board card belongs to no
+/// conversation, so publishing its frames would attribute an agent's work to
+/// whatever thread happened to be open — the misattribution #125 removed.
+fn dispatch_live_stream<'a>(chat: &crate::runtime::delegation::ChatTarget<'a>) -> LiveStream<'a> {
+    match chat.chat_id {
+        Some(chat_id) => LiveStream::On {
+            chat_id: Some(chat_id),
+        },
+        None => LiveStream::Off,
+    }
 }
 
 /// Per-company serialization of the roster's policy-axis decision through its
@@ -4453,6 +4476,17 @@ impl HarnessPool {
         chat: crate::runtime::delegation::ChatTarget<'_>,
         run_sink: Option<Arc<run_trace::RunTraceSink>>,
     ) -> crate::Result<TurnOutcome> {
+        // `LiveStream::Off`, unconditionally. A turn can belong to a
+        // conversation and still publish nothing — issue #1890 I split those
+        // two questions apart precisely because an approval's re-issued call is
+        // both: addressed to the thread the approval was raised in, and
+        // un-streamed, because its answer arrives as the bubble its caller
+        // returns. Inferring the stream from a present `chat_id` collapses the
+        // distinction again and leaks those frames onto whichever thread the
+        // console is watching (CodeRabbit, #2369).
+        //
+        // A dispatched card that *should* stream calls
+        // [`run_steered_dispatch`](Self::run_steered_dispatch) instead.
         self.run_inner(
             company,
             agent_id,
@@ -4460,6 +4494,48 @@ impl HarnessPool {
             deps,
             Some(control),
             LiveStream::Off,
+            chat,
+            run_sink,
+        )
+        .await
+    }
+
+    /// Like [`run_steered_background`](Self::run_steered_background) but
+    /// **streams** its live frames to the conversation `chat` names.
+    ///
+    /// The dispatched-card path. A dispatch runs a real agent turn for minutes,
+    /// and the thread that raised it rendered that as silence: the chat turn
+    /// which handed the work over had already settled, and every frame after it
+    /// named only a card. The card has recorded its origin all along, so the
+    /// frames can route by identity rather than by recency — the same rule
+    /// `LiveStream::Workflow` follows for a workflow node.
+    ///
+    /// Refuses to stream a turn that names no conversation: a board-created
+    /// card belongs to no thread, and publishing its frames is the
+    /// misattribution #125 removed.
+    // Eight arguments, like the un-streamed sibling above and for the same
+    // reason: a turn needs its company, agent, message, deps, steer control,
+    // conversation and attempt sink, and bundling them into a struct here would
+    // hide which of them the two methods differ on — namely none of them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_steered_dispatch(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        deps: &HarnessDeps,
+        control: &SteerControl,
+        chat: crate::runtime::delegation::ChatTarget<'_>,
+        run_sink: Option<Arc<run_trace::RunTraceSink>>,
+    ) -> crate::Result<TurnOutcome> {
+        let live = dispatch_live_stream(&chat);
+        self.run_inner(
+            company,
+            agent_id,
+            message,
+            deps,
+            Some(control),
+            live,
             chat,
             run_sink,
         )

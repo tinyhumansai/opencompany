@@ -229,6 +229,20 @@ impl RunTurn for HarnessRouter {
             .await
     }
 
+    async fn run_steered_dispatch(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        control: &SteerControl,
+        chat: ChatTarget<'_>,
+        run_sink: Option<Arc<RunTraceSink>>,
+    ) -> Result<TurnOutcome> {
+        self.engine_for(agent_id)?
+            .run_steered_dispatch(company, agent_id, message, control, chat, run_sink)
+            .await
+    }
+
     async fn run_background(
         &self,
         company: &CompanyId,

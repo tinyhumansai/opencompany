@@ -392,6 +392,8 @@ fn cycle_task_id_reads_a_dispatch_inherits_a_resolution_and_refuses_to_guess() {
     let dispatched = |id: &str| CompanyEvent::TaskDispatched {
         task_id: id.to_string(),
         run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
     };
     let resolved = |id: &str| CompanyEvent::ApprovalResolved {
         approval_id: ApprovalId::new(id),

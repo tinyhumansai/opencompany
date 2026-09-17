@@ -1146,6 +1146,10 @@ impl HarnessBrain {
         // accumulating operator/agent blocks, but a redirect always re-runs from
         // the original brief plus the fresh instruction — last redirect wins).
         let base_instruction = task_instruction(&card);
+        // The conversation this card was raised from, read once off the card
+        // before the loop below can hand it over and overwrite anything.
+        let card_origin = card.origin.clone();
+        let card_origin_message = card.origin_message_seq;
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
         // Route the background turn through the brain-agnostic `RunTurn` seam
@@ -1202,16 +1206,51 @@ impl HarnessBrain {
                         // are discarded into the note), so its live turn frames
                         // must not leak onto the console timeline — run it
                         // un-streamed (#125 review).
-                        .run_steered_background(
+                        // `run_steered_dispatch`, not `_background`: this is
+                        // the one path whose frames belong in a conversation.
+                        // Its sibling stays un-streamed for the approval
+                        // re-issue, which is addressed to a thread and must
+                        // still publish nothing (#1890 I).
+                        .run_steered_dispatch(
                             &self.record().id,
                             &responder,
                             &instruction,
                             &control,
-                            // No conversation to bind to: a dispatched card's turn
-                            // answers the board, not a thread (#1890 I). Unchanged
-                            // behaviour — including that it does not clear
-                            // history, since one task can span several turns.
-                            ChatTarget::default(),
+                            // **The conversation that raised this card**, when
+                            // one did.
+                            //
+                            // This named nothing, on the reasoning that a
+                            // dispatched card answers the board rather than a
+                            // thread (#1890 I). True of where its *reply* goes,
+                            // and it left the thread that asked with nothing to
+                            // render: the chat turn that dispatched had already
+                            // settled — handing the work over was all it did —
+                            // so a real agent turn ran for minutes as complete
+                            // silence, then an answer arrived from nowhere.
+                            //
+                            // `dispatched_from` addresses without seeding: the
+                            // turn still brings its own instruction and the
+                            // card's history, so what the agent reads is
+                            // unchanged and only where its live frames go
+                            // differs. A board-created card still names nothing
+                            // and still streams nothing.
+                            ChatTarget::dispatched_from(
+                                card_origin.as_ref().map(|o| o.origin_chat_id.as_str()),
+                                card_origin.as_ref().and_then(|o| o.origin_parent),
+                            )
+                            // **The question this attempt answers**, so its live
+                            // rows render under it rather than in a thread-level
+                            // pile.
+                            //
+                            // A frame with no `message_seq` keys by thread, and
+                            // a thread holds ONE row-list: two questions asked
+                            // in the same thread would then share a timeline and
+                            // clear each other. The card has recorded the
+                            // raising message since it was raised, so the
+                            // dispatched attempt renders under exactly the
+                            // question the chat turn that raised it renders
+                            // under — the two halves of one ask, in one place.
+                            .answering(card_origin_message),
                             // Issue #242: un-streamed does not mean unrecorded. The
                             // trace this turn produces is written to the attempt
                             // row as it happens, which is what a redirect re-run
@@ -4664,7 +4703,9 @@ impl HarnessBrain {
                     }
                     channel_responses.extend(turn.bubbles);
                 }
-                CompanyEvent::TaskDispatched { task_id, run_id } => {
+                CompanyEvent::TaskDispatched {
+                    task_id, run_id, ..
+                } => {
                     if let Some(message) = self.run_task(task_id, run_id.as_deref()).await? {
                         channel_responses.push(message);
                     }

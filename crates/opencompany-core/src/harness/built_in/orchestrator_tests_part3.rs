@@ -322,6 +322,8 @@ async fn discussion_posts_fold_to_one_line_instead_of_evicting_the_activity_tail
         event: CompanyEvent::TaskDispatched {
             task_id: "t-1".to_string(),
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         },
         at_millis: 1,
     }];
@@ -426,6 +428,8 @@ async fn query_company_announces_the_dropped_event_tail() {
         event: CompanyEvent::TaskDispatched {
             task_id: format!("t-{seq}"),
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         },
         at_millis: seq + 1,
     };

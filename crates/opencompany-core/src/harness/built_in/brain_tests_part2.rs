@@ -436,6 +436,8 @@ async fn task_dispatch_runs_and_moves_to_in_review() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -530,6 +532,8 @@ async fn a_completed_run_that_published_nothing_records_no_artifact() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t-origin".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )

@@ -186,6 +186,28 @@ pub(super) fn is_triage_request(request: &ModelRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this request is a card-*titling* call rather than an agent turn.
+///
+/// The same hazard [`is_triage_request`] documents, one workload over. Naming
+/// a card rides the same `HarnessModel` handle the roster runs on, so a
+/// fixture that scripts "turn N queues this delegation" has its script shifted
+/// by every title a turn happens to mint — the delegation written for the
+/// relay gets staged by the desk lead instead, one level down, where a nested
+/// drain runs hand-offs by design. That read as the relay re-delegating when
+/// the relay had done nothing of the kind.
+///
+/// Keyed on the system prompt's opening sentence, which
+/// [`title::system_prompt`](super::title) owns, for the reason
+/// [`is_triage_request`] gives. Pinned by
+/// `a_titling_request_is_recognised_as_one`.
+pub(super) fn is_titling_request(request: &ModelRequest) -> bool {
+    request
+        .messages
+        .first()
+        .map(|m| m.text().contains("You name tasks"))
+        .unwrap_or(false)
+}
+
 /// A provider for the selection rung (issue #1835): a request opening with
 /// the selector's own system prompt gets the scripted reply; anything else
 /// echoes. Keyed on the prompt's opening sentence for the reason
@@ -422,6 +444,13 @@ impl ChatModel<()> for DelegatingProvider {
         // verdict is scripted.
         if is_triage_request(&request) {
             return Ok(ModelResponse::assistant("chatter".to_string()));
+        }
+        // A title is not a turn either — see `is_titling_request`. Answered
+        // rather than declined so the card still gets a headline: a refusal
+        // here would fall back to the truncating path and change what these
+        // fixtures assert about card titles.
+        if is_titling_request(&request) {
+            return Ok(ModelResponse::assistant("Handle the request".to_string()));
         }
         let invoke = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if self.faults.fail_from.is_some_and(|from| invoke >= from) {

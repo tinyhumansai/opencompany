@@ -672,3 +672,120 @@ async fn a_dispatch_refused_by_a_quiescing_runtime_settles_its_attempt() {
     );
     assert!(abandoned.finished_at_millis.is_some());
 }
+
+/// Issue #2369: the dispatch event names the conversation the card came from.
+///
+/// The console paints a "working" row from `TaskDispatched`, so the *start*
+/// of an agent turn is only visible in the thread that asked if the event
+/// carries that thread. It used to carry neither field, and a thread that
+/// dispatched went silent from the hand-off until the answer arrived —
+/// minutes of a real turn rendering as nothing, then a reply from nowhere.
+///
+/// Proven on `run_dispatch_cycle` itself rather than on the projection,
+/// because the derivation is a board read inside that function: the card is
+/// the only place `TaskOrigin` lives, so a test that hands the origin in
+/// would prove nothing about the path the runtime actually takes.
+///
+/// The board-created card is the other half, and not a throwaway: it must
+/// emit the event with **no** conversation, or a card raised on the board
+/// would paint a working row in whatever thread happened to be open.
+#[cfg(feature = "openhuman")]
+#[tokio::test]
+async fn a_dispatch_names_the_conversation_its_card_came_from() {
+    use super::CompanyEvent;
+    use crate::ports::TaskRecord;
+    use crate::ports::tasks::COLUMN_IN_PROGRESS;
+    use crate::ports::types::EventSeq;
+
+    let home_dir = tempfile::Builder::new()
+        .prefix("opencompany-dispatch-origin-")
+        .tempdir()
+        .expect("tempdir");
+    let manifest: crate::company::CompanyManifest = toml::from_str(
+        "[company]\nname = \"Acme\"\n[[agent]]\nid = \"ceo\"\nrole = \"Chief\"\n[policy]\nmode = \"full\"\n",
+    )
+    .expect("manifest");
+    let id = crate::ports::types::CompanyId::new("acme");
+    let runtime = Arc::new(
+        crate::runtime::RuntimeBuilder::new(home_dir.path().to_path_buf(), manifest)
+            .with_id(id.clone())
+            .build()
+            .await
+            .expect("runtime"),
+    );
+
+    let card = |task_id: &str, origin: Option<crate::ports::TaskOrigin>| TaskRecord {
+        id: task_id.to_string(),
+        title: TaskTitle::authored("Ship it"),
+        note: None,
+        column: COLUMN_IN_PROGRESS.to_string(),
+        priority: "medium".to_string(),
+        assignee: "ceo".to_string(),
+        updated_at_millis: 0,
+        origin,
+        parent_task_id: None,
+        output: None,
+        plan: None,
+        planning_attempts: Vec::new(),
+        deliverable: crate::ports::tasks::TaskDeliverable::Once,
+        workflow_proposal: None,
+        origin_run_id: None,
+        origin_workflow_id: None,
+        origin_message_seq: None,
+        bounced: None,
+    };
+
+    // Raised inside a thread of `strategy`, and raised on the board.
+    let in_thread = card(
+        "t-thread",
+        crate::ports::TaskOrigin::new(Some("strategy".to_string()), Some(EventSeq::new(41))),
+    );
+    let on_board = card("t-board", None);
+    for record in [&in_thread, &on_board] {
+        runtime
+            .ops
+            .tasks
+            .upsert(&id, record)
+            .await
+            .expect("the card is on the board");
+        let run_id = runtime.open_run(record).await;
+        Arc::clone(&runtime)
+            .run_dispatch_cycle(record.id.clone(), run_id)
+            .await;
+    }
+
+    let events = runtime
+        .events
+        .read_from(&id, EventSeq::new(0), usize::MAX)
+        .await
+        .expect("read journal");
+    let dispatched: Vec<_> = events
+        .iter()
+        .filter_map(|stored| match &stored.event {
+            CompanyEvent::TaskDispatched {
+                task_id,
+                origin_chat_id,
+                origin_parent,
+                ..
+            } => Some((task_id.clone(), origin_chat_id.clone(), *origin_parent)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        dispatched
+            .iter()
+            .find(|(task_id, ..)| task_id == "t-thread")
+            .map(|(_, chat, parent)| (chat.clone(), *parent)),
+        Some((Some("strategy".to_string()), Some(EventSeq::new(41)))),
+        "the dispatch must name the thread that asked, found {dispatched:?}"
+    );
+    assert_eq!(
+        dispatched
+            .iter()
+            .find(|(task_id, ..)| task_id == "t-board")
+            .map(|(_, chat, parent)| (chat.clone(), *parent)),
+        Some((None, None)),
+        "a board-created card belongs to no conversation, found {dispatched:?}"
+    );
+}

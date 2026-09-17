@@ -489,6 +489,8 @@ pub(super) async fn dispatched_task(
             CompanyEvent::TaskDispatched {
                 task_id: "t-1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             },
         )
         .await

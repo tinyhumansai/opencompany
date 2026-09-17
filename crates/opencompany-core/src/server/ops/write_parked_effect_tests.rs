@@ -428,6 +428,8 @@ async fn a_second_task_in_the_same_window_does_not_absorb_the_first_s_approvals(
             CompanyEvent::TaskDispatched {
                 task_id: "t-2".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             },
         )
         .await

@@ -163,10 +163,117 @@ fn projects_task_dispatched() {
     let v = super::project_event(&stored(CompanyEvent::TaskDispatched {
         task_id: "t-42".into(),
         run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
     }))
     .expect("task_dispatched is an attention signal");
     assert_eq!(v["type"], "task_dispatched");
     assert_eq!(v["taskId"], "t-42");
+    assert!(
+        v.get("chatId").is_none() && v.get("parentId").is_none(),
+        "a board-created dispatch belongs to no conversation: {v}"
+    );
+}
+
+/// A dispatch raised at CHANNEL level names the desk and no thread.
+///
+/// A distinct branch from the threaded case, in the projection and in the
+/// console's keying alike: `parentId` absent beside a present `chatId` means
+/// the channel itself, while absent beside an absent `chatId` means no
+/// conversation at all. Only the threaded and the board-created cases were
+/// covered, so a regression that dropped channel-level origins would have gone
+/// unnoticed (tinysweeper, #2369).
+#[test]
+fn a_dispatch_raised_in_a_channel_names_the_channel_and_no_thread() {
+    let v = super::project_event(&stored(CompanyEvent::TaskDispatched {
+        task_id: "t-45".into(),
+        run_id: Some("r-2".into()),
+        origin_chat_id: Some("order_ops".into()),
+        origin_parent: None,
+    }))
+    .expect("task_dispatched is an attention signal");
+
+    assert_eq!(v["chatId"], "order_ops", "the desk that asked");
+    assert!(
+        v.get("parentId").is_none(),
+        "no thread: absent beside a present chatId is the channel itself, and \
+         a null would read as a thread whose root is nothing: {v}"
+    );
+}
+
+/// A dispatch's origin survives the round trip through the journal.
+///
+/// The fields are additive (`serde(default)` + `skip_serializing_if`), and that
+/// combination is easy to get subtly wrong: a line written before they existed
+/// must still replay, and a dispatch that carries no conversation must
+/// serialize exactly as it did before — while one that does must come back with
+/// both halves intact (tinysweeper, #2369).
+#[test]
+fn a_dispatch_origin_survives_serialization() {
+    let raised = CompanyEvent::TaskDispatched {
+        task_id: "t-42".into(),
+        run_id: Some("r-1".into()),
+        origin_chat_id: Some("main".into()),
+        origin_parent: Some(crate::ports::types::EventSeq::new(50)),
+    };
+    let wire = serde_json::to_string(&raised).expect("serializes");
+    assert_eq!(
+        serde_json::from_str::<CompanyEvent>(&wire).expect("round trips"),
+        raised,
+        "both halves of the origin come back: {wire}"
+    );
+
+    // A board-created dispatch adds nothing to the log, which is what keeps
+    // every stored record from needing a migration.
+    let from_the_board = CompanyEvent::TaskDispatched {
+        task_id: "t-43".into(),
+        run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
+    };
+    let bare = serde_json::to_string(&from_the_board).expect("serializes");
+    assert!(
+        !bare.contains("origin_chat_id") && !bare.contains("origin_parent"),
+        "an absent origin is skipped, not written as null: {bare}"
+    );
+
+    // And a line from before the fields existed still replays, reading as the
+    // board-created case rather than failing to decode.
+    let old = r#"{"kind":"TaskDispatched","task_id":"t-44"}"#;
+    assert_eq!(
+        serde_json::from_str::<CompanyEvent>(old).expect("an older line replays"),
+        CompanyEvent::TaskDispatched {
+            task_id: "t-44".into(),
+            run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
+        },
+    );
+}
+
+/// A dispatch raised from a thread says so, the way its completion already
+/// does.
+///
+/// Without this the thread that asked went silent from the moment it
+/// dispatched: the chat turn had genuinely succeeded — it handed the work over
+/// — so its working row settled, and every frame after it named only a card.
+/// The answer then arrived from nowhere minutes later, because
+/// `desk_task_completed` *is* addressed to the conversation.
+#[test]
+fn a_dispatch_raised_in_a_thread_names_that_thread() {
+    let v = super::project_event(&stored(CompanyEvent::TaskDispatched {
+        task_id: "t-42".into(),
+        run_id: Some("r-1".into()),
+        origin_chat_id: Some("main".into()),
+        origin_parent: Some(crate::ports::types::EventSeq::new(50)),
+    }))
+    .expect("task_dispatched is an attention signal");
+
+    assert_eq!(v["chatId"], "main", "the conversation that asked");
+    assert_eq!(
+        v["parentId"], "50",
+        "and the thread within it, as a string like every other parent here"
+    );
 }
 
 /// Issue #464: an opened card reaches the console as its own frame. This is

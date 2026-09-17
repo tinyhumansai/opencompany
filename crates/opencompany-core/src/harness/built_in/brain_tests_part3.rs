@@ -337,6 +337,8 @@ async fn a_cancelled_delegated_card_records_no_artifact() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t-cancel".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -401,6 +403,8 @@ async fn redirect_cap_finalizes_a_card_with_an_origin_to_review() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -438,6 +442,8 @@ async fn task_dispatch_routes_to_assignee() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )

@@ -356,6 +356,8 @@ fn dispatch(task_id: &str) -> CycleRequest {
         events: vec![CompanyEvent::TaskDispatched {
             task_id: task_id.to_string(),
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         }],
         event_seqs: Vec::new(),
         policy: None,

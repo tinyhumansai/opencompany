@@ -128,6 +128,8 @@ fn task_dispatched_carries_its_run_id_without_changing_the_untagged_shape() {
     let untagged = CompanyEvent::TaskDispatched {
         task_id: "t-1".to_string(),
         run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
     };
     assert_eq!(
         serde_json::to_string(&untagged).expect("serialize"),
@@ -137,6 +139,8 @@ fn task_dispatched_carries_its_run_id_without_changing_the_untagged_shape() {
     let tagged = CompanyEvent::TaskDispatched {
         task_id: "t-1".to_string(),
         run_id: Some("run-7".to_string()),
+        origin_chat_id: None,
+        origin_parent: None,
     };
     let line = serde_json::to_string(&tagged).expect("serialize");
     assert!(line.contains(r#""run_id":"run-7""#), "{line}");

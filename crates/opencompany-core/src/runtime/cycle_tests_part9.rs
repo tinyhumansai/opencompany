@@ -57,6 +57,8 @@ fn cycle_thread_id_reads_an_addressed_message_inherits_a_resolution_and_refuses_
     let dispatched = || CompanyEvent::TaskDispatched {
         task_id: "t-1".into(),
         run_id: None,
+        origin_chat_id: None,
+        origin_parent: None,
     };
 
     // An addressed message names the thread outright.
@@ -441,6 +443,8 @@ fn cycle_conversation_carries_the_thread_root_and_degrades_it_before_the_channel
                 CompanyEvent::TaskDispatched {
                     task_id: "t-1".into(),
                     run_id: None,
+                    origin_chat_id: None,
+                    origin_parent: None,
                 },
             ],
             &[],

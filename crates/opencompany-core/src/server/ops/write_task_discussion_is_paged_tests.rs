@@ -271,6 +271,8 @@ async fn task_export_serves_a_readable_document_and_alters_nothing() {
             // point that mints a run row (#242), and the export renders the
             // timeline, which does not read `run_id`.
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         },
         CompanyEvent::AgentReply {
             audience: Vec::new(),
@@ -405,6 +407,8 @@ async fn task_timeline_scopes_approvals_to_the_run_window() {
         CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         },
         // Inside the window — admitted.
         approval("during"),

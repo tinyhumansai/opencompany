@@ -30,6 +30,8 @@ pub(super) async fn dispatch_card(brain: &HarnessBrain, tasks: &Arc<FsOps>, id: 
                 request(vec![CompanyEvent::TaskDispatched {
                     task_id: id.to_string(),
                     run_id: None,
+                    origin_chat_id: None,
+                    origin_parent: None,
                 }]),
                 &NoopHost,
             )

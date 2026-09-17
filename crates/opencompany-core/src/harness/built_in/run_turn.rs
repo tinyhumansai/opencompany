@@ -121,6 +121,22 @@ impl RunTurn for HarnessRunTurn {
         .await
     }
 
+    async fn run_steered_dispatch(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        control: &SteerControl,
+        chat: ChatTarget<'_>,
+        run_sink: Option<Arc<RunTraceSink>>,
+    ) -> Result<TurnOutcome> {
+        self.pool
+            .run_steered_dispatch(
+                company, agent_id, message, &self.deps, control, chat, run_sink,
+            )
+            .await
+    }
+
     async fn run_background(
         &self,
         company: &CompanyId,

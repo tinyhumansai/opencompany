@@ -16,6 +16,8 @@ async fn steer_cancel_returns_to_todo_and_discards_partial() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -49,6 +51,8 @@ async fn steer_pause_parks_in_paused_and_preserves_partial() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -90,6 +94,8 @@ async fn steer_redirect_reruns_and_the_cap_finalizes_to_in_review() {
             request(vec![CompanyEvent::TaskDispatched {
                 task_id: "t1".into(),
                 run_id: None,
+                origin_chat_id: None,
+                origin_parent: None,
             }]),
             &NoopHost,
         )
@@ -162,6 +168,43 @@ fn a_triage_request_is_recognised_as_one() {
     assert!(
         !is_triage_request(&turn),
         "an agent turn is not a classification"
+    );
+}
+
+/// The same guard [`a_triage_request_is_recognised_as_one`] pins, for the
+/// card-titling call — the workload #2364 put on the delegation path.
+///
+/// Without it a title silently ate a scripted push and shifted every later
+/// turn's script by one: the delegation written for the relay was staged by
+/// the desk lead instead, one level down, where a nested drain runs hand-offs
+/// by design. `the_relay_turn_cannot_re_delegate` then read 6 turns for 3 and
+/// accused the relay of re-delegating when the relay had done nothing.
+#[test]
+fn a_titling_request_is_recognised_as_one() {
+    let titling = ModelRequest {
+        messages: vec![
+            tinyinference::message::Message::system(
+                crate::harness::built_in::title::system_prompt_for_test(),
+            ),
+            tinyinference::message::Message::user("draft the launch plan".to_string()),
+        ],
+        ..ModelRequest::default()
+    };
+    assert!(
+        is_titling_request(&titling),
+        "the fixture must recognise the real prompt, or it silently starts \
+         eating scripted turns again"
+    );
+    let turn = ModelRequest {
+        messages: vec![
+            tinyinference::message::Message::system("You are the CEO of Acme.".to_string()),
+            tinyinference::message::Message::user("ship it".to_string()),
+        ],
+        ..ModelRequest::default()
+    };
+    assert!(
+        !is_titling_request(&turn),
+        "an agent turn is not a titling call"
     );
 }
 

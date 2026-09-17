@@ -1717,9 +1717,37 @@ fn project_event_for_viewer(
             }
             o
         }
-        CompanyEvent::TaskDispatched { task_id, .. } => {
+        CompanyEvent::TaskDispatched {
+            task_id,
+            origin_chat_id,
+            origin_parent,
+            ..
+        } => {
             let mut o = envelope("task_dispatched");
             o["taskId"] = json!(task_id);
+            // **Where the work was asked for, so the asking thread can say it
+            // is running.**
+            //
+            // `desk_task_completed` below has carried this pair since #1890 B,
+            // which is why a finished dispatch lands in the thread that raised
+            // it. The start carried neither, so a thread that dispatched went
+            // quiet the moment it did: the chat turn had genuinely succeeded —
+            // it handed the work over — so its working row settled, and every
+            // frame that followed was board-shaped and named only a card.
+            // Minutes of a real agent turn rendered as nothing at all, then a
+            // reply from nowhere.
+            //
+            // Omitted rather than null on exactly the terms the completion's
+            // half uses, and read the same way: a missing `chatId` is a
+            // board-created dispatch that belongs to no conversation, and a
+            // missing `parentId` beside a present `chatId` is the channel
+            // itself.
+            if let Some(chat_id) = origin_chat_id {
+                o["chatId"] = json!(chat_id);
+            }
+            if let Some(parent) = origin_parent {
+                o["parentId"] = json!(parent.value().to_string());
+            }
             o
         }
         // Issue #464: the frame the board was missing. Every other task event

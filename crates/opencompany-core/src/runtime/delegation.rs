@@ -148,6 +148,37 @@ impl<'a> ChatTarget<'a> {
         }
     }
 
+    /// A dispatched card's turn, bound to the conversation that raised it —
+    /// **for addressing only**.
+    ///
+    /// A dispatched turn used to name no conversation at all
+    /// ([`default`](Self::default)), which was the honest answer while nothing
+    /// downstream could use one: its steps go to the card's note, and streaming
+    /// them anywhere risked misattributing to whatever thread most recently
+    /// sent (#125). The card has always known its origin, so the answer was
+    /// available — it simply had no consumer.
+    ///
+    /// It has one now. The console holds a working row for the originating
+    /// thread while the attempt runs, and its live tool frames can route to
+    /// that thread rather than by recency — the same fix
+    /// [`LiveStream::Workflow`] made for a workflow node, which routes by run
+    /// and node instead of by chat.
+    ///
+    /// **Not seeded**, which is the whole reason this is its own constructor
+    /// rather than [`in_thread`](Self::in_thread): the dispatched turn brings
+    /// its own instruction and the card's history, and pouring the originating
+    /// thread's transcript on top would change what the agent reads, not merely
+    /// where its frames go. One task can span several turns, and that is
+    /// unchanged.
+    pub fn dispatched_from(chat_id: Option<&'a str>, thread_root: Option<EventSeq>) -> Self {
+        Self {
+            chat_id,
+            thread_root,
+            history_seed: false,
+            ..Self::default()
+        }
+    }
+
     /// Binds this target to the journaled operator message the turn answers.
     ///
     /// Separate from the constructors because it is true of exactly one turn
@@ -209,6 +240,35 @@ pub trait RunTurn: Send + Sync {
         chat: ChatTarget<'_>,
         run_sink: Option<Arc<RunTraceSink>>,
     ) -> Result<TurnOutcome>;
+
+    /// A steerable turn that **streams** its live frames to the conversation
+    /// `chat` names — a dispatched card whose origin the card recorded.
+    ///
+    /// Beside [`run_steered_background`](Self::run_steered_background) rather
+    /// than a flag on it, because "does this turn belong to a conversation" and
+    /// "should its frames be published" are different questions that issue
+    /// #1890 I deliberately separated. An approval's re-issued call is the
+    /// proof: it is addressed to the thread the approval was raised in *and*
+    /// must stay un-streamed, because its answer arrives as the bubble the
+    /// caller returns. Inferring the stream from a present `chat_id` collapses
+    /// that distinction and leaks those frames onto whichever thread the
+    /// console is watching — the exact misattribution #125 fixed.
+    ///
+    /// Defaults to the un-streamed method, so the sentinel and every test
+    /// double inherit today's behaviour; only the streaming harness engine
+    /// overrides it.
+    async fn run_steered_dispatch(
+        &self,
+        company: &CompanyId,
+        agent_id: &str,
+        message: &str,
+        control: &SteerControl,
+        chat: ChatTarget<'_>,
+        run_sink: Option<Arc<RunTraceSink>>,
+    ) -> Result<TurnOutcome> {
+        self.run_steered_background(company, agent_id, message, control, chat, run_sink)
+            .await
+    }
 
     /// An un-streamed, un-steered turn — a workflow agent node, which shows no
     /// operator chat bubble. Its transient frames must not reach the console

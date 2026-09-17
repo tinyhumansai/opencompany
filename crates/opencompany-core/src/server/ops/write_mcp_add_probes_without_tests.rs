@@ -240,6 +240,8 @@ async fn task_detail_assembles_timeline_and_lineage() {
         CompanyEvent::TaskDispatched {
             task_id: "t-1".into(),
             run_id: None,
+            origin_chat_id: None,
+            origin_parent: None,
         },
         // Tagged to this task — admitted.
         CompanyEvent::AgentReply {

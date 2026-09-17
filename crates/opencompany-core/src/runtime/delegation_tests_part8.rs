@@ -634,3 +634,43 @@ async fn a_task_store_write_failure_on_review_task_surfaces_as_an_error() {
         "the card must be untouched by the failed write"
     );
 }
+
+/// The three shapes a dispatched turn's target can take, which is what decides
+/// where its live frames go.
+///
+/// `run_steered_dispatch` selects its stream from `chat_id` alone — present
+/// streams to that desk, absent streams nothing — so these three cases *are*
+/// the destination table: a threaded origin keeps its thread, a channel-level
+/// origin carries none, and a board-created card names no conversation and so
+/// publishes nothing. A later change to this constructor could silently route
+/// frames to the wrong conversation, or expose board-only work
+/// (tinysweeper, #2369).
+///
+/// And in every case the history seed stays off: the turn brings its own
+/// instruction and the card's history, so binding the conversation must not
+/// change what the agent reads.
+#[test]
+fn a_dispatched_target_names_its_conversation_without_seeding_it() {
+    // Raised inside a thread: both halves, and the thread is preserved.
+    let threaded = ChatTarget::dispatched_from(Some("order_ops"), Some(EventSeq::new(34)));
+    assert_eq!(threaded.chat_id, Some("order_ops"));
+    assert_eq!(threaded.thread_root, Some(EventSeq::new(34)));
+    assert!(
+        !threaded.history_seed,
+        "addressing is not seeding: the turn brings its own context"
+    );
+
+    // Raised at channel level: the desk, with no thread root. `None` here is
+    // the channel itself, not a gap — the same reading `TaskOrigin` documents.
+    let channel = ChatTarget::dispatched_from(Some("order_ops"), None);
+    assert_eq!(channel.chat_id, Some("order_ops"));
+    assert_eq!(channel.thread_root, None);
+    assert!(!channel.history_seed);
+
+    // Raised on the board: no conversation at all, which is what keeps its
+    // frames off whichever thread the console happens to be watching.
+    let from_the_board = ChatTarget::dispatched_from(None, None);
+    assert_eq!(from_the_board.chat_id, None);
+    assert_eq!(from_the_board.thread_root, None);
+    assert!(!from_the_board.history_seed);
+}
