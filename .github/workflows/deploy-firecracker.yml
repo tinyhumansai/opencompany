@@ -1,0 +1,207 @@
+# Build this repo's tenant workload into a Firecracker rootfs and put it in front
+# of NEW tenants on the Firecracker fleet.
+#
+# The Firecracker counterpart of `deploy-staging.yml` (which targets k3s). Same
+# workload, same feature set — a different substrate. Instead of an OCI image in
+# ECR that k3s pulls, the artifact is a read-only ext4 rootfs on the fleet host,
+# and the manager is pointed at it by path (`OCM_FIRECRACKER_ROOTFS`).
+#
+# Policy (deliberate, and the reason this workflow does not touch running
+# tenants): CI keeps the shared rootfs current so every NEW company boots the
+# latest build, and existing companies are NEVER force-rolled. Their owners see
+# "update available" and click Update, which cold-restarts only their VM onto
+# this rootfs (backend `POST /opencompany/instances/{slug}/update` →
+# manager `POST /api/v1/tenants/{slug}/update`). The opt-in `roll_existing` job
+# below exists for an operator who deliberately wants to move the whole fleet.
+#
+# Runs on a self-hosted runner ON the fleet host (labels [self-hosted,
+# firecracker]) so it builds and installs locally: the rootfs is multi-GB, there
+# is nothing to push to a registry, and no inbound SSH is opened. The runner's
+# user needs write to ROOTFS_DIR and MANAGER_ENV and the right to restart the
+# manager unit (a scoped sudoers entry, not blanket root).
+#
+# Required on the fleet host (installed out-of-band, see
+# `opencompany-microvm/deploy/firecracker/`):
+#   - the two build scripts named in BUILD_WORKLOAD / BUILD_ROOTFS below
+#   - a glibc-2.36 build chroot for the guest binaries (see README there)
+#   - the manager env file at MANAGER_ENV with OCM_FIRECRACKER_ROOTFS + OCM_ADMIN_TOKEN
+#
+# Every `uses:` below is pinned to a full commit SHA with the resolved version in
+# a trailing comment, matching `deploy-staging.yml` — re-resolve any hand edit
+# with `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`.
+name: Deploy tenant rootfs to Firecracker fleet
+
+on:
+  push:
+    branches: [main]
+    # Kept identical to deploy-staging.yml: the Firecracker rootfs is built from
+    # exactly the same sources as the k3s image, so a path that changes one must
+    # trigger the other. Dockerfile/.dockerignore are omitted (the rootfs build
+    # does not use Docker); everything else is shared.
+    paths:
+      - 'src/**'
+      - 'frontend/**'
+      - 'companies/**'
+      - 'skills/**'
+      - 'docker/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - 'vendor/**'
+      - '.github/workflows/deploy-firecracker.yml'
+  workflow_dispatch:
+    inputs:
+      roll_existing:
+        description: 'Also cold-boot already-running tenants onto the new rootfs (disruptive; owners normally self-update via the console)'
+        type: boolean
+        default: false
+
+concurrency:
+  # One rootfs swap at a time per host; never cancel a half-finished one.
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Identical to deploy-staging.yml TENANT_FEATURES so the Firecracker build ==
+  # the k3s build. Editing it is a product change — keep the two in lockstep.
+  TENANT_FEATURES: mongodb,openhuman,openhuman-rpc,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,medulla,sidecar,chargebee,paypal,tinymemory,analytics
+  # Where published rootfs files live and where the manager reads its config.
+  ROOTFS_DIR: /var/lib/firecracker/rootfs
+  MANAGER_ENV: /etc/opencompany/manager.env
+  # Build scripts, installed on the host from
+  # opencompany-microvm/deploy/firecracker/. They are the Firecracker equivalent
+  # of the Dockerfile: one assembles the workload (glibc-2.36 chroot, pins
+  # TENANT_FEATURES, stamps the commit), the other assembles a rootfs ext4 from
+  # a base and refuses to overwrite one in place.
+  BUILD_WORKLOAD: /usr/local/lib/opencompany/build-workload.sh
+  BUILD_ROOTFS: /usr/local/lib/opencompany/build-tenant-rootfs.sh
+  MANAGER_UNIT: opencompany-manager
+
+jobs:
+  build-and-publish:
+    runs-on: [self-hosted, firecracker]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+
+      # Same rationale as deploy-staging.yml: `--features openhuman` compiles the
+      # vendored openhuman crate and its nested graph, so both of these must be
+      # present, and recursing from the root would drag in desktop-only submodules
+      # no server build compiles.
+      - name: Fetch build vendor submodules
+        run: |
+          git submodule update --init vendor/openhuman
+          scripts/ci/init-vendored-submodules.sh
+
+      - name: Build workload + console, assemble a new rootfs
+        id: build
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          NEW="${ROOTFS_DIR}/tenant-ro-${SHA}.ext4"
+          if [ -f "${NEW}" ]; then
+            echo "rootfs for ${SHA} already built; reusing"
+            echo "rootfs=${NEW}" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # 1. Workload — the chroot pins TENANT_FEATURES and stamps the commit,
+          #    the same two inputs the Dockerfile passes as build-args.
+          FEATURES="${TENANT_FEATURES}" OPENCOMPANY_BUILD_COMMIT="${SHA}" \
+            "${BUILD_WORKLOAD}" "${SHA}"
+
+          # 2. Console — Vite build, stamped and pointed at the platform.
+          ( cd frontend && npm ci && VITE_BUILD_COMMIT="${SHA}" npm run build )
+
+          # 3. Assemble a NEW rootfs from the current live base (never overwrite
+          #    in place: a tenant mid-boot is reading the current file). The
+          #    script validates glibc + the memory driver and refuses to clobber.
+          CURRENT=$(sed -n 's/^OCM_FIRECRACKER_ROOTFS=//p' "${MANAGER_ENV}" | tail -1)
+          "${BUILD_ROOTFS}" "${CURRENT}" "${NEW}" "${SHA}"
+          echo "rootfs=${NEW}" >>"${GITHUB_OUTPUT}"
+
+      - name: Verify the artifact (absence of prod, presence of the commit)
+        env:
+          NEW: ${{ steps.build.outputs.rootfs }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The production endpoint must be ABSENT. Presence of staging proves
+          # nothing on its own; absence of prod is the test that a tenant built
+          # here cannot talk to the production backend.
+          if strings "${NEW}" | grep -oE 'https://api\.tinyhumans\.ai[a-zA-Z0-9/_-]*' | sort -u | grep .; then
+            echo "FAIL: a production URL is present in ${NEW}" >&2
+            exit 1
+          fi
+          strings "${NEW}" | grep -qE 'https://staging-api\.tinyhumans\.ai' \
+            || { echo "FAIL: the staging backend URL is missing from ${NEW}" >&2; exit 1; }
+          # The build must be able to name itself, or every new tenant reports an
+          # unknown commit and this whole "which build" machinery is blind.
+          strings "${NEW}" | grep -Fq "${SHA}" \
+            || { echo "FAIL: build commit ${SHA} not stamped into ${NEW}" >&2; exit 1; }
+
+      - name: Point the manager at the new rootfs (new tenants only)
+        env:
+          NEW: ${{ steps.build.outputs.rootfs }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Keep a timestamped backup so a bad publish can be reverted by hand.
+          sudo cp "${MANAGER_ENV}" "${MANAGER_ENV}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+          sudo sed -i "s|^OCM_FIRECRACKER_ROOTFS=.*|OCM_FIRECRACKER_ROOTFS=${NEW}|" "${MANAGER_ENV}"
+
+          # Restart so the manager reads the new path. NOTE: a restart briefly
+          # drops the proxy = a short fleet blip. The durable fix (mirroring
+          # deploy-staging.yml's OCM_TENANT_IMAGE_FILE) is OCM_FIRECRACKER_ROOTFS_FILE
+          # — a file the manager re-reads per provision, so publishing a rootfs
+          # needs no restart. Until that lands, this restart is the way to point it.
+          sudo systemctl restart "${MANAGER_UNIT}"
+
+          # Confirm the manager answers before calling the deploy done.
+          curl -fsS -m 15 --retry 30 --retry-delay 1 --retry-connrefused \
+            -o /dev/null http://127.0.0.1:3000/healthz
+          echo "New companies now boot ${SHA}. Existing companies keep their build until their owner clicks Update."
+
+  # OPT-IN, operator-only. Default OFF — owners normally self-update one VM at a
+  # time via the console. This exists for a deliberate whole-fleet move.
+  roll-existing:
+    needs: build-and-publish
+    if: ${{ inputs.roll_existing }}
+    runs-on: [self-hosted, firecracker]
+    environment: firecracker-prod # gate on a required reviewer
+    steps:
+      - name: Cold-restart every tenant onto the current rootfs, one at a time
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(sudo sed -n 's/^OCM_ADMIN_TOKEN=//p' "${MANAGER_ENV}" | tail -1)
+          [ -n "${TOKEN}" ] || { echo "OCM_ADMIN_TOKEN not found in ${MANAGER_ENV}" >&2; exit 1; }
+          # Enumerate tenants from the manager and update each through the same
+          # owner-facing endpoint (cold-restart + auto-rollback on a failed boot),
+          # serially, stopping on the first failure rather than rolling the fleet
+          # onto a build that does not come up.
+          curl -fsS -m 30 http://127.0.0.1:3000/api/v1/tenants \
+            -H "Authorization: Bearer ${TOKEN}" \
+          | python3 -c 'import json,sys; [print(t["slug"]) for t in json.load(sys.stdin)]' \
+          | while read -r slug; do
+              [ -n "${slug}" ] || continue
+              echo "Updating ${slug} -> ${SHA}"
+              code=$(curl -s -o /tmp/update-resp -w '%{http_code}' -m 120 -X POST \
+                "http://127.0.0.1:3000/api/v1/tenants/${slug}/update" \
+                -H "Authorization: Bearer ${TOKEN}")
+              # 200 = came up on the new build; 202 = the manager rolled it back
+              # to its previous build (a failed update, surfaced, not swallowed).
+              if [ "${code}" != "200" ]; then
+                echo "FAIL ${slug}: manager returned ${code}: $(cat /tmp/update-resp)" >&2
+                exit 1
+              fi
+              echo "OK ${slug}"
+            done
