@@ -190,3 +190,53 @@ fn a_declared_or_default_coding_cli_is_not_synthesized_twice() {
         "the default is resolved by the default path, not synthesized here"
     );
 }
+
+/// The adapter's own start-up error is a diagnostic: it can name a resolved
+/// binary path or the argv it was invoked with. The reason recorded here
+/// travels into the router's sentence and from there into company chat, so it
+/// must carry none of it.
+#[cfg(feature = "acp")]
+#[test]
+fn a_failing_adapter_keeps_its_own_error_out_of_the_reason() {
+    const LEAK: &str = "/Users/someone/.secrets/claude --api-key=sk-live-abcdef";
+
+    struct FailingFactory;
+    impl crate::ports::acp::AcpAgentFactory for FailingFactory {
+        fn build(
+            &self,
+            _agent: &str,
+            _model: Option<&str>,
+            _agent_models: &std::collections::HashMap<String, String>,
+            _workspace_root: &std::path::Path,
+        ) -> crate::Result<std::sync::Arc<dyn crate::ports::acp::AcpAgent>> {
+            Err(crate::OpenCompanyError::Harness(format!(
+                "could not start `{LEAK}`: No such file or directory"
+            )))
+        }
+    }
+
+    let harness = Harness::implicit_local("claude");
+    let reason = match resolve_acp_engine(
+        &harness,
+        Some(&FailingFactory),
+        std::path::Path::new("/tmp"),
+        &std::collections::HashMap::new(),
+        Vec::new(),
+    ) {
+        Ok(_) => panic!("the adapter was supposed to fail to start"),
+        Err(reason) => reason,
+    };
+
+    assert!(
+        !reason.contains(".secrets") && !reason.contains("sk-live"),
+        "the adapter's own error must not reach the recorded reason: {reason}"
+    );
+    assert!(
+        !reason.contains("No such file or directory"),
+        "nor any part of it: {reason}"
+    );
+    assert!(
+        reason.contains("claude"),
+        "the operator still learns which adapter failed: {reason}"
+    );
+}

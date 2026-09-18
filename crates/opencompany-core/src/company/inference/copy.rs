@@ -115,7 +115,7 @@ pub fn default_broken(provider_label: &str, why: ProviderGone) -> String {
     )
 }
 
-/// The seven wire codes `docs/key-reworks/in-use-guards.md` §5 names, the
+/// The wire codes `docs/key-reworks/in-use-guards.md` §5 names, the
 /// reverse of [`classify`] (keys rework #2306, round-2 review KR-L2-03).
 pub const NO_MODEL_CHOSEN_CODE: &str = "no_model_chosen";
 pub const PAIR_PROVIDER_REMOVED_CODE: &str = "pair_provider_removed";
@@ -131,6 +131,48 @@ pub const PROVIDER_NO_KEY_CODE: &str = "provider_no_key";
 /// value in it today.
 #[allow(dead_code)]
 pub const MODEL_NOT_LISTED_CODE: &str = "model_not_listed";
+/// The agent's turn never reached a model at all: it is bound to a harness
+/// this host has no engine for, or to one whose last warm-up failed. Not a
+/// resolution failure in the provider/model sense, but the same class of
+/// thing to the person reading the thread — a named setting is wrong, and no
+/// amount of resending clears it — so it travels the same wire fields.
+pub const HARNESS_UNAVAILABLE_CODE: &str = "harness_unavailable";
+
+/// The substring both of [`HarnessRouter::engine_for`]'s sentences carry, and
+/// the only signal [`classify`] keys [`HARNESS_UNAVAILABLE_CODE`] on.
+///
+/// `harness/router_tests.rs` drives the real router and asserts the real
+/// error still classifies, so a reworded sentence there fails CI instead of
+/// quietly dropping this class back into the generic notice.
+///
+/// [`HarnessRouter::engine_for`]: crate::harness::router::HarnessRouter
+const HARNESS_BOUND_MARKER: &str = "` is bound to harness `";
+
+/// How the same sentences open. [`classify`] cuts from here so that whatever
+/// `Display` prefix the error type put in front of them (`configuration
+/// error: `) never reaches a person.
+const HARNESS_SENTENCE_OPENER: &str = "agent `";
+
+/// The two ways [`HarnessRouter::engine_for`]'s sentence continues right after
+/// the closing backtick on the harness name — the only two shapes a real
+/// router sentence takes. [`harness_binding`] requires the text to continue
+/// with one of these, not just carry [`HARNESS_BOUND_MARKER`] and
+/// [`HARNESS_SENTENCE_OPENER`] somewhere: those two substrings alone are
+/// loose enough that an unrelated diagnostic which happens to quote something
+/// shaped like `agent \`x\` is bound to harness \`y\`` — echoed tool output, a
+/// provider error, adversarial message content — would otherwise misclassify
+/// as a harness failure the turn never actually had (tinysweeper, PR #2401).
+///
+/// [`HARNESS_WARMUP_TAIL`] stops before its `: `, so it also matches the cut
+/// sentence [`harness_binding`] itself emits.
+///
+/// [`HarnessRouter::engine_for`]: crate::harness::router::HarnessRouter
+const HARNESS_WARMUP_TAIL: &str = "`, whose last warm-up failed";
+const HARNESS_NO_ENGINE_TAIL: &str = "`, but ";
+
+/// Appended to the harness sentence, which names the gap but not whether
+/// waiting helps.
+const HARNESS_RETRY_NOTE: &str = "Retrying will not help until that harness can run.";
 
 /// One classified turn-time resolution failure — the exact sentence one of
 /// this module's functions produced, plus the wire code and (when
@@ -178,17 +220,63 @@ pub fn with_agent_marker(sentence: String, agent_id: &str) -> String {
 /// `anyhow::Error`), so the sentence text itself (plus, where present,
 /// [`with_agent_marker`]'s hidden trailer) is the only signal.
 ///
-/// `pair_agent_id` is filled in only when the sentence carries
-/// [`with_agent_marker`]'s trailer — today, only the pin pre-check. Every
-/// other caller of `pair_broken`/`provider_has_no_key` (the pin's own
+/// `pair_agent_id` is filled in when the sentence carries
+/// [`with_agent_marker`]'s trailer — today, only the pin pre-check — or, for
+/// [`HARNESS_UNAVAILABLE_CODE`], when the sentence names the agent itself.
+/// Every other caller of `pair_broken`/`provider_has_no_key` (the pin's own
 /// unreachable-in-practice fallback in `resolve_choice`) has no id in hand
 /// to attach, and `default_broken`'s callers never have an agent at all.
 /// `provider_slug` is filled in only for `pair_provider_removed`, whose
 /// sentence names the slug directly (there is no provider row left to read
 /// a display label from in that one case — see [`pair_broken`]).
 ///
-/// Order matters: `default_broken` and `pair_broken`'s sentences both
-/// contain " uses ", so the company-default prefix is checked first.
+/// Order matters. The harness arm runs first because a router `detail` can
+/// itself contain " uses "; after it, `default_broken` and `pair_broken`'s
+/// sentences both contain " uses ", so the company-default prefix is checked
+/// before the pair one.
+/// The agent id a harness-binding failure names, and the sentence itself cut
+/// free of any `Display` prefix — or `None` when `detail` is not one.
+///
+/// Reads the id out of the sentence rather than from a
+/// [`with_agent_marker`] trailer: the router has only the raw id at the point
+/// it fails, and the id is already in the text it wrote.
+///
+/// The warm-up shape is returned cut at `whose last warm-up failed`: the
+/// reason after it is `{err}` from a lane's own warm-up, free-form text that
+/// can carry a path, a command line or provider output, and chat is not where
+/// that belongs. The reason stays on the run record and in the logs. The
+/// no-engine shape keeps its tail, which is an authored `unavailable` string,
+/// not a captured error — an invariant `harness/lanes.rs` holds by never
+/// interpolating a failure it caught into the reason it records.
+///
+/// Idempotent by construction, which [`classify`] depends on: its own output
+/// is a sentence of exactly this shape — the cut form included, which is why
+/// the tail is matched without its `: ` — and both `MessageView::project` and
+/// `chat_history` re-classify the stored text on every read.
+fn harness_binding(detail: &str) -> Option<(String, String)> {
+    let bound = detail.find(HARNESS_BOUND_MARKER)?;
+    let opener = detail[..bound].rfind(HARNESS_SENTENCE_OPENER)?;
+    let agent_id = detail[opener + HARNESS_SENTENCE_OPENER.len()..bound].trim();
+    if agent_id.is_empty() {
+        return None;
+    }
+    let name_start = bound + HARNESS_BOUND_MARKER.len();
+    let tail_at = name_start + detail[name_start..].find('`')?;
+    let tail = &detail[tail_at..];
+
+    if let Some(rest) = tail.strip_prefix(HARNESS_WARMUP_TAIL) {
+        if !(rest.starts_with(": ") || rest.starts_with('.')) {
+            return None;
+        }
+        let named = detail[opener..tail_at + HARNESS_WARMUP_TAIL.len()].trim();
+        return Some((agent_id.to_string(), format!("{named}.")));
+    }
+    if tail.starts_with(HARNESS_NO_ENGINE_TAIL) {
+        return Some((agent_id.to_string(), detail[opener..].trim().to_string()));
+    }
+    None
+}
+
 pub fn classify(detail: &str) -> Option<ResolutionFailure> {
     // Strip the hidden marker, if present, before any pattern match runs —
     // so a marker's own bytes can never accidentally satisfy one.
@@ -211,6 +299,19 @@ pub fn classify(detail: &str) -> Option<ResolutionFailure> {
         }
     }
 
+    if let Some((agent_id, sentence)) = harness_binding(detail) {
+        let message = if sentence.contains(HARNESS_RETRY_NOTE) {
+            sentence
+        } else {
+            format!("{sentence} {HARNESS_RETRY_NOTE}")
+        };
+        return Some(ResolutionFailure {
+            code: HARNESS_UNAVAILABLE_CODE,
+            message,
+            pair_agent_id: Some(agent_id),
+            provider_slug: None,
+        });
+    }
     if detail.contains("The company default uses ") {
         if detail.contains(", which is removed.") {
             return Some(found(DEFAULT_PROVIDER_REMOVED_CODE, detail, None, None));

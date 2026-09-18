@@ -22,10 +22,10 @@ import { connectionsHref } from "@/views/connection-pages";
 import { consoleHref } from "./console-paths";
 
 /**
- * The seven cases the contract names. Kept as a list rather than a type
- * union on {@link TurnFailure.code}: an unrecognised code must still render
- * `message` and fall back to the safe default action, never crash or hide
- * the sentence a person is relying on.
+ * The cases the contract names. Kept as a list rather than a type union on
+ * {@link TurnFailure.code}: an unrecognised code must still render `message`
+ * and fall back to the safe default action, never crash or hide the sentence
+ * a person is relying on.
  */
 export const TURN_FAILURE_CODES = [
   "no_model_chosen",
@@ -35,7 +35,17 @@ export const TURN_FAILURE_CODES = [
   "default_provider_off",
   "provider_no_key",
   "model_not_listed",
+  "harness_unavailable",
 ] as const;
+
+/**
+ * The turn never reached a model at all: the teammate is bound to a harness
+ * this host has no engine for, or to one whose warm-up failed. Its fix is on
+ * the same Model tab a `pair_*` code points at — the tab that owns both the
+ * harness and the model — so it shares that bucket in
+ * {@link turnFailureAction} despite not being a `pair_` code.
+ */
+export const HARNESS_UNAVAILABLE_CODE = "harness_unavailable";
 
 /**
  * A fail-closed turn's structured reason, once the host computed one of its
@@ -94,15 +104,16 @@ export function toTurnFailure(wire: TurnFailureWire | null | undefined): TurnFai
  * only an unrecognised or malformed payload should ever produce.
  *
  * Two buckets, matching the contract's own two-way split and the codes'
- * own naming convention: a `pair_*` code is a fix on that agent's own pin
- * (Team → the agent → Model); every other code — the company default, "no
- * model chosen" at all, a keyless provider, or a model the catalogue no
- * longer lists — is a fix on the company-wide LLM page.
+ * own naming convention: a `pair_*` code — and `harness_unavailable`, whose
+ * fix lives on the same tab — is a fix on that agent's own settings (Team →
+ * the agent → Model); every other code — the company default, "no model
+ * chosen" at all, a keyless provider, or a model the catalogue no longer
+ * lists — is a fix on the company-wide LLM page.
  */
 export function turnFailureAction(
   failure: Pick<TurnFailure, "code" | "pairAgentId">,
 ): { label: string; href: string } | null {
-  if (failure.code.startsWith("pair_")) {
+  if (failure.code.startsWith("pair_") || failure.code === HARNESS_UNAVAILABLE_CODE) {
     if (!failure.pairAgentId) return null;
     return { label: "Open Model settings", href: `${consoleHref("team", failure.pairAgentId)}?tab=model` };
   }

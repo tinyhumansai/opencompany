@@ -486,3 +486,112 @@ fn release_policy_pin_sync_fans_out_to_every_lane() {
         "a named lane must receive the synchronous release"
     );
 }
+
+/// The classifier's harness arm is keyed on `engine_for`'s own wording, so
+/// this drives the real router and asserts the real error still classifies.
+/// A reworded sentence above fails here rather than dropping a bound-harness
+/// failure back into the generic "send the message again" notice.
+#[tokio::test]
+async fn an_unavailable_harness_classifies_for_the_operator() {
+    let router = HarnessRouter::new("embedded")
+        .with_engine("embedded", SpyEngine::new("embedded"))
+        .with_unavailable(
+            "claude-code",
+            "it is an ACP harness and this build has no ACP transport wired",
+        )
+        .bind("researcher", "claude-code");
+
+    let err = router
+        .run(&company(), "researcher", "hi", ChatTarget::default())
+        .await
+        .expect_err("a bound-but-unavailable harness must fail the turn");
+
+    let got = crate::company::inference::copy::classify(&err.to_string())
+        .expect("the router's own sentence must classify");
+    assert_eq!(
+        got.code,
+        crate::company::inference::copy::HARNESS_UNAVAILABLE_CODE
+    );
+    assert_eq!(
+        got.pair_agent_id.as_deref(),
+        Some("researcher"),
+        "the console links its action button at this id"
+    );
+    assert!(
+        got.message.contains("claude-code"),
+        "the harness must be named: {}",
+        got.message
+    );
+    assert!(
+        got.message
+            .contains("this build has no ACP transport wired"),
+        "the specific reason must survive: {}",
+        got.message
+    );
+    assert!(
+        !got.message.starts_with("configuration error"),
+        "the error-type prefix is a diagnostic, not operator copy: {}",
+        got.message
+    );
+}
+
+/// The warm-up-failure sentence is the second spelling of the same shape and
+/// must classify too — a lane that came up and then broke is the case an
+/// operator is most likely to meet.
+#[tokio::test]
+async fn a_failed_warm_up_classifies_for_the_operator() {
+    let flaky = FlakyEngine::new("deep");
+    flaky.set_fail(true);
+    let router = HarnessRouter::new("embedded")
+        .with_engine("embedded", SpyEngine::new("embedded"))
+        .with_engine("deep", flaky.clone())
+        .bind("researcher", "deep");
+    router.ensure(&record()).await.expect("ensure never fails");
+
+    let err = router
+        .run(&company(), "researcher", "hi", ChatTarget::default())
+        .await
+        .expect_err("a lane whose warm-up failed must fail its turns");
+
+    let got = crate::company::inference::copy::classify(&err.to_string())
+        .expect("the warm-up sentence must classify too");
+    assert_eq!(
+        got.code,
+        crate::company::inference::copy::HARNESS_UNAVAILABLE_CODE
+    );
+    assert_eq!(got.pair_agent_id.as_deref(), Some("researcher"));
+    assert!(
+        !got.message.contains("roster warm-up failed"),
+        "the lane's own warm-up error must not reach chat: {}",
+        got.message
+    );
+    assert!(
+        got.message.contains("whose last warm-up failed."),
+        "the operator still learns which harness failed to warm up: {}",
+        got.message
+    );
+}
+
+/// `MessageView::project` and `chat_history` re-classify the stored text on
+/// every read, and what is stored is this arm's own output — so classifying
+/// it again must be a no-op rather than appending the note a second time.
+#[tokio::test]
+async fn reclassifying_the_stored_sentence_is_a_no_op() {
+    let router = HarnessRouter::new("embedded")
+        .with_unavailable("claude-code", "this host wires no engine for it")
+        .bind("researcher", "claude-code");
+
+    let err = router
+        .run(&company(), "researcher", "hi", ChatTarget::default())
+        .await
+        .expect_err("a bound-but-unavailable harness must fail the turn");
+
+    let once = crate::company::inference::copy::classify(&err.to_string())
+        .expect("the router's own sentence must classify");
+    let twice = crate::company::inference::copy::classify(&once.message)
+        .expect("its own output must classify again");
+    assert_eq!(
+        once, twice,
+        "a stored sentence must survive every re-read unchanged"
+    );
+}

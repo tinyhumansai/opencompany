@@ -105,3 +105,41 @@ fn every_producible_code_reaches_the_wire_unmodified() {
         assert_eq!(json["userFacing"], true, "{sentence}");
     }
 }
+
+/// A bound-harness failure reaches the console as a classified reply rather
+/// than the generic notice, whose "Send the message again to retry" closing
+/// is wrong advice for a turn that never reached a model.
+#[test]
+fn a_harness_binding_failure_replaces_the_generic_notice() {
+    let detail = "configuration error: agent `researcher` is bound to harness `claude-code`, \
+                  but it is an ACP harness and this build has no ACP transport wired.";
+
+    let resolution = copy::classify(detail).expect("a harness failure classifies");
+    assert_eq!(resolution.code, "harness_unavailable");
+    assert!(
+        !turn_failure_notice(detail).contains("claude-code"),
+        "the generic notice is exactly what loses the harness name"
+    );
+
+    let mut view = MessageView::for_test("1", "system", &resolution.message, Vec::new());
+    view.resolution_user_facing = true;
+    view.resolution_code = Some(resolution.code.to_string());
+    view.resolution_pair_agent_id = resolution.pair_agent_id.clone();
+
+    let dto = ChatHistoryMessageDto::from(view);
+    let json = serde_json::to_value(&dto).unwrap();
+    assert_eq!(json["userFacing"], true);
+    assert_eq!(json["code"], "harness_unavailable");
+    assert_eq!(json["pairAgentId"], "researcher");
+    assert!(
+        json["message"].as_str().unwrap().contains("claude-code"),
+        "the harness must be named on the wire: {json}"
+    );
+    assert!(
+        !json["message"]
+            .as_str()
+            .unwrap()
+            .contains("Send the message again"),
+        "the retry advice must not survive: {json}"
+    );
+}

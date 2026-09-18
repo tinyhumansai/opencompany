@@ -1249,6 +1249,7 @@ jobs:
         run: |
           scripts/ci/run-scoped-suite.sh "acp server" acp,runner,tinymemory server::acp
           scripts/ci/run-scoped-suite.sh "acp run turn" acp,runner,tinymemory harness::acp::run_turn
+          scripts/ci/run-scoped-suite.sh "acp lanes" acp,runner,tinymemory harness::lanes
 
       # Issue #788: Chargebee billing — the REST layer (`chargebee::`) and the
       # toolbelt bridge (`harness::chargebee`) in one filter, which selects both.
