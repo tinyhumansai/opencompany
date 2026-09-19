@@ -439,10 +439,23 @@ store", true of neither half of it.
 - **What a disconnect reaches**: the tool belt on the next turn, and nothing at
   the server's own end. A manifest server says it cannot be removed at all.
 
-## Pool-staleness caveat
+## Pool staleness — and why it mostly doesn't happen
 
-Agents materialize their MCP registry once, when the
-[`HarnessPool`](../../src/harness/mod.rs) builds a company's roster. Mid-session
-edits (add / disable / token rotation) therefore reach a live agent only on the
-next `HarnessPool.ensure()` rebuild — practically, a company restart. Every
-mutating API response says so. Live pool invalidation is out of scope for v1.
+Agents materialize their MCP registry when the
+[`HarnessPool`](../../src/harness/mod.rs) builds a company's roster, but that
+roster isn't pinned until a restart: `HarnessPool` fingerprints the effective
+MCP config (`mcp_fingerprints`, alongside sibling fingerprints for overlay
+agents, capabilities, Composio config, skills, budgets and grants) and
+`ensure_with_policy` recomputes it on every call, rebuilding only the axes
+that changed. A server add / disable / token rotation changes the MCP
+fingerprint, so it reaches a live agent on its **next turn** — no restart
+needed, which is what every mutating API response already says.
+
+## `read_only_tools` and where this is headed
+
+The single flat allowlist above is being replaced by a per-tool, three-tier
+permission model (Interactive / Read-only / Write-delete, each with a bulk
+default and per-tool override) — see the in-progress design brief at
+[`docs/issues/mcp-refactoring-enhancing/`](../issues/mcp-refactoring-enhancing/README.md)
+(tracking issue #2373). `read_only_tools` stays as the input to that
+migration; nothing here changes until that work lands.
