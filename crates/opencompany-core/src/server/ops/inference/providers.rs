@@ -1103,10 +1103,10 @@ fn plan_add(
         });
     }
     if let Some(cli) = catalogue::cli_login(kind) {
-        // Reachable only if a delegated credential ever becomes available here.
-        // On a server-side host the category is empty and the console says so,
-        // but refusing in the handler is the honest answer rather than storing a
-        // row for a login nothing holds.
+        // Permanent by design, not a placeholder. A CLI login has no key and no
+        // endpoint, so there is nothing a company-level row could hold; the
+        // console offers no add flow for the category, and a teammate binds to
+        // a harness on its own Model tab instead.
         return Err(invalid(format!(
             "{} is a credential held by a command-line tool on someone's own machine. \
              This host cannot reach one.",

@@ -19,25 +19,25 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { COPY } from "./catalogue";
 import { ProviderMark, hasMark } from "./provider-icon";
-import { CLI_LOGINS_REACHABLE, CLI_LOGINS_UNAVAILABLE, addOptions } from "./connect";
+import { addOptions } from "./connect";
 import type { AddOption } from "./connect";
 import type { Provider } from "./types";
 
 /**
- * Add a provider: three categories, because they ask three different questions.
+ * Add a provider: two categories, because they ask two different questions.
  *
  * A modal rather than a section on the page. There are thirty-odd providers and
  * a company connects one or two; listing them inline spends the page on the ones
  * nobody chose and buries the ones actually configured.
  *
- * ## Why three selects and not one list
+ * ## Why two selects and not one list
  *
- * A cloud provider wants an API key, a local runtime wants an endpoint on this
- * machine, and a CLI login wants nothing because another tool already holds the
- * credential. One flat list makes the operator infer that from a group heading;
- * a select per category has a label and a line of helper text to say it outright.
+ * A cloud provider wants an API key and a local runtime wants an endpoint on
+ * this machine. One flat list makes the operator infer that from a group
+ * heading; a select per category has a label and a line of helper text to say
+ * it outright.
  *
- * Custom is deliberately **not** a fourth select. It is one option, and a select
+ * Custom is deliberately **not** a third select. It is one option, and a select
  * over one option is a button wearing a costume.
  *
  * ## Two list rules that are not optional
@@ -95,16 +95,20 @@ export function AddProviderDialog({
             options={options.local}
             onChoose={onChoose}
           />
-          <Category
-            id="cli"
-            label={COPY.groupCli}
-            placeholder={COPY.placeholderCli}
-            helper={COPY.helperCli}
-            // Rendered saying so rather than hidden. See `CLI_LOGINS_REACHABLE`.
-            options={CLI_LOGINS_REACHABLE ? options.cli : []}
-            emptyNote={CLI_LOGINS_UNAVAILABLE}
-            onChoose={onChoose}
-          />
+
+          <Separator />
+
+          <p className="text-xs text-muted-foreground" data-testid="inference-add-harness-hint">
+            Claude Code and Codex are bound per teammate, on an agent&apos;s Model tab.{" "}
+            <a
+              className="underline underline-offset-2 transition-opacity hover:opacity-80"
+              href="#/company/agents"
+              onClick={() => onOpenChange(false)}
+            >
+              Open the roster
+            </a>
+            .
+          </p>
 
           <Separator />
 
@@ -132,7 +136,6 @@ function Category({
   placeholder,
   helper,
   options,
-  emptyNote,
   onChoose,
 }: {
   id: string;
@@ -140,7 +143,6 @@ function Category({
   placeholder: string;
   helper: string;
   options: AddOption[];
-  emptyNote?: string;
   onChoose: (optionSlug: string) => void;
 }) {
   const empty = options.length === 0;
@@ -177,13 +179,7 @@ function Category({
         </SelectContent>
       </Select>
       <p className="text-xs text-muted-foreground">
-        {empty && emptyNote ? (
-          <Fragment>{emptyNote}</Fragment>
-        ) : empty ? (
-          <Fragment>Everything here is already connected.</Fragment>
-        ) : (
-          helper
-        )}
+        {empty ? <Fragment>Everything here is already connected.</Fragment> : helper}
       </p>
     </div>
   );

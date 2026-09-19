@@ -172,6 +172,11 @@ export function addOptions(providers: readonly Provider[]): AddOptions {
       label: r.label,
       detail: COPY.detailLocal,
     })),
+    // No add-provider flow by design: a CLI login has no key and no endpoint,
+    // and a stored "connected" flag would be a second source of truth that
+    // could disagree with the CLI actually being installed. A teammate binds
+    // to one on its own Model tab. Kept populated because the label lookup
+    // still resolves an already-connected CLI row.
     cli: CLI_LOGINS.filter((c) => !isConnected(providers, c.optionSlug)).map((c) => ({
       value: c.optionSlug,
       label: c.label,
@@ -180,24 +185,6 @@ export function addOptions(providers: readonly Provider[]): AddOptions {
   };
 }
 
-/**
- * Whether a CLI login can be reached from this host at all.
- *
- * **False, and it is a fact about the product rather than a build flag.** A CLI
- * login is a credential sitting in a dotfile on the machine a person is typing
- * on; openhuman is a desktop app, where that is the same machine as the one
- * running the model call. OpenCompany is a server-side product, so nothing here
- * holds one and the host refuses the kind outright.
- *
- * The group is still **rendered, saying so**, rather than hidden: the shape is
- * then already right if a delegated credential ever becomes available, and an
- * empty labelled group is more honest than a missing one. `addOptions` still
- * filters the category properly for that day — including the Codex trap.
- */
-export const CLI_LOGINS_REACHABLE = false;
-
-/** What the group says when there is nothing in it. */
-export const CLI_LOGINS_UNAVAILABLE = "Not available on this host.";
 
 /** What the key dialog for a chosen option has to ask for. */
 export interface CredentialAsk {
