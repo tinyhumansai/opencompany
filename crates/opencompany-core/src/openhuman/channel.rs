@@ -1,20 +1,19 @@
 //! [`OpenHumanChannelAdapter`]: a [`ChannelAdapter`] backed by openhuman-core.
 //!
 //! Outbound messages are delivered over JSON-RPC (`openhuman.channels_send`).
-//! Inbound delivery rides a signed webhook route in a later batch, so
-//! [`inbound`](OpenHumanChannelAdapter::inbound) is an empty stream for now —
-//! openhuman-core's `/events` schema is upstream-unstable and drives no control
-//! flow here.
+//! Inbound delivery is not this port's job (issue #1958). This adapter covers
+//! channels such as email whose inbound path is `InboxStore` / `WebhookReceived`,
+//! not `OperatorMessage`. openhuman-core's `/events` schema is upstream-unstable
+//! and drives no control flow here.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 
 use crate::Result;
 use crate::openhuman::rpc::{OpenHumanRpc, rpc_method};
 use crate::ports::channel::ChannelAdapter;
-use crate::ports::types::{InboundMessage, OutboundMessage};
+use crate::ports::types::OutboundMessage;
 
 /// A conversation surface (email, slack, …) delegated to openhuman-core.
 pub struct OpenHumanChannelAdapter {
@@ -36,11 +35,6 @@ impl OpenHumanChannelAdapter {
 impl ChannelAdapter for OpenHumanChannelAdapter {
     fn channel_id(&self) -> &str {
         &self.channel_id
-    }
-
-    fn inbound(&self) -> BoxStream<'static, InboundMessage> {
-        // Inbound arrives via the HMAC webhook route (a later batch), not here.
-        Box::pin(stream::empty())
     }
 
     async fn send(&self, msg: OutboundMessage) -> Result<()> {

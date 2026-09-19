@@ -1,6 +1,5 @@
 use super::*;
 use crate::openhuman::rpc::MockOpenHumanRpc;
-use futures::StreamExt;
 
 #[tokio::test]
 async fn send_issues_channels_send_with_params() {
@@ -28,13 +27,6 @@ async fn send_issues_channels_send_with_params() {
     assert_eq!(calls[0].0, "openhuman.channels_send");
     assert_eq!(calls[0].1["channel"], "email");
     assert_eq!(calls[0].1["text"], "hello");
-}
-
-#[tokio::test]
-async fn inbound_is_empty() {
-    let rpc = Arc::new(MockOpenHumanRpc::new());
-    let adapter = OpenHumanChannelAdapter::new("email", rpc);
-    assert_eq!(adapter.inbound().count().await, 0);
 }
 
 #[tokio::test]

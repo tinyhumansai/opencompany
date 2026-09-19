@@ -1,8 +1,8 @@
 # Cognition and channel ports
 
 The two seams a cycle runs across: the `Brain` that does the thinking, and the
-`ChannelAdapter` that carries the conversation in and out. Part of the port
-contracts indexed by [ports.md](ports.md).
+`ChannelAdapter` — the outbound surface for conversation delivery. Part of the
+port contracts indexed by [ports.md](ports.md).
 
 ## Brain
 
@@ -208,14 +208,35 @@ construction, ≥1 response per cycle) are inherited, not re-verified.
 
 ## ChannelAdapter
 
-Inbound/outbound conversation surfaces. The built-in `"operator"` channel is
+Outbound conversation surfaces. The built-in `"operator"` channel is
 always present; others (email, tinyplace-dm, …) usually delegate to OpenHuman.
+
+Inbound messages do **not** flow through this trait (issue #1958). Ingress is
+route-specific:
+
+- **Operator chat** arrives as `CompanyEvent::OperatorMessage` via the HTTP chat
+  route and the ACP `session/prompt` route.
+- **Email / webhooks** are filed into `InboxStore` and drive
+  `CompanyEvent::WebhookReceived`; they do not become `OperatorMessage`.
+- Other integrations have their own runtime paths.
+
+Every implementation of the old `inbound()` stream returned `stream::empty()`;
+the method was dead. It remains only as a **deprecated default** that still
+returns an empty stream, so out-of-tree implementers keep compiling. Delivery
+mechanisms vary by implementation: `OperatorChannel` appends to the event log,
+`DeskChannel` does the same, and `OpenHumanChannelAdapter` dispatches over
+JSON-RPC.
+
+**API migration (issue #1958):** prefer removing any `inbound()` override and
+never call the method. The trait default preserves source compatibility; there
+is no replacement stream because ingress is route-specific (see above).
 
 ```rust
 // src/ports/channel.rs
 pub trait ChannelAdapter: Send + Sync {
     fn channel_id(&self) -> &str; // "operator", "email", "tinyplace-dm", ...
-    fn inbound(&self) -> BoxStream<'static, InboundMessage>;
+    #[deprecated] // empty default — do not call or override in new code
+    fn inbound(&self) -> BoxStream<'static, InboundMessage> { /* empty */ }
     async fn send(&self, msg: OutboundMessage) -> Result<()>;
 }
 ```
