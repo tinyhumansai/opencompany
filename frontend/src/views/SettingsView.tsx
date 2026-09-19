@@ -40,7 +40,6 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { DomainSettings } from "@/components/domain-settings";
-import { ExternalHarnesses } from "@/components/external-harnesses";
 import { StatusPill } from "@/components/status-pill";
 import type { CompanyFeed } from "@/hooks/use-company";
 import { withHostParam } from "@/hooks/use-host-route";
@@ -109,11 +108,6 @@ export function SettingsView({ client, company, feed, onFlag, onResetCompany }: 
         {/* Device pairing was here. Sessions are the frontend client's own
             business now — the desktop app holds its session the same way the
             browser does — so there is no machine for this page to pair. */}
-
-        {/* Every coding engine an agent can be bound to, joined against
-            whether it can actually run on this machine (issue #1245). Works in
-            a browser; the installed-here half only fills in on the desktop. */}
-        <ExternalHarnesses client={client} company={company} />
 
         {/* Approvals was here — the autonomy tier and the always-ask list
             (issue #562), kept high in the page because an operator who comes to
@@ -533,7 +527,7 @@ function ConfirmAction({
  *
  * Exported for the same reason `LifecycleControls` is: rendering the whole
  * `SettingsView` to assert on one card would drag in
- * `ExternalHarnesses`/`PolicySettings`/`DomainSettings` and every route they
+ * `PolicySettings`/`DomainSettings` and every route they
  * fetch, none of which this behaviour touches (`settings-sign-out.test.ts`).
  */
 export function AccountCard({

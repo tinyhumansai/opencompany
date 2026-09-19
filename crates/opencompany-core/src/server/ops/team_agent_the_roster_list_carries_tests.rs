@@ -527,3 +527,121 @@ async fn an_upload_that_decodes_to_a_huge_size_is_refused() {
         "a named refusal: {refused}"
     );
 }
+
+/// The roster **list** answers for the harness, the model and the provider
+/// too — from the same helpers as the detail read, and with the key *absent*
+/// for a teammate that pins nothing.
+///
+/// The Agents grid draws a card per teammate, and until the list carried
+/// these there was nothing on it to draw: resolving them meant an N+1 over
+/// the detail read, or inventing an answer. Absent has to stay absent, so a
+/// card can say "inherits the company default" instead of naming a model the
+/// record never declared.
+#[tokio::test]
+async fn the_roster_list_carries_the_declared_harness_model_and_provider() {
+    let home_dir = home();
+    const TOML: &str = r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+harness = "laptop"
+model = "claude-opus-4-5"
+
+[[agent]]
+id = "writer"
+role = "Writer"
+
+[[agent]]
+id = "hermit"
+role = "Hermit"
+
+[[harness]]
+id = "main"
+kind = "built_in"
+default = true
+
+[[harness]]
+id = "laptop"
+kind = "acp"
+
+[harness.acp]
+transport = "local"
+agent = "claude"
+"#;
+    let state = state_with_manifest(home_dir.path(), TOML).await;
+    seed_provider(&state, "anthropic", true).await;
+
+    // A blueprint teammate's pin, stored as an overlay edit — the half a read
+    // of the raw manifest row would skip.
+    let (status, patched) = patch_agent(
+        &state,
+        "writer",
+        json!({"harness": "laptop", "model": "gpt-5-codex"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+
+    // An overlay teammate on the default built-in harness, pinning the pair.
+    let jamie = add_overlay(&state, "Jamie", "Growth").await;
+    let (status, pinned) = patch_agent(
+        &state,
+        &jamie,
+        json!({"provider": "anthropic", "model": "claude-sonnet-4-5"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pinned}");
+
+    let (status, roster) = send(&state, "GET", "/api/v1/company/team", None).await;
+    assert_eq!(status, StatusCode::OK, "{roster}");
+    let rows = roster.as_array().unwrap();
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {roster}"))
+            .clone()
+    };
+
+    let ceo = row_of("ceo");
+    assert_eq!(ceo["harness"], "laptop", "{ceo}");
+    assert_eq!(ceo["model"], "claude-opus-4-5", "{ceo}");
+
+    let writer = row_of("writer");
+    assert_eq!(writer["harness"], "laptop", "{writer}");
+    assert_eq!(
+        writer["model"], "gpt-5-codex",
+        "a pin stored in the overlay half reaches the list: {writer}"
+    );
+
+    let jamie_row = row_of(&jamie);
+    assert_eq!(jamie_row["provider"], "anthropic", "{jamie_row}");
+    assert_eq!(jamie_row["model"], "claude-sonnet-4-5", "{jamie_row}");
+
+    // The teammate that declares none: the keys are *missing*, not null and
+    // not empty — absence is what lets a card say "inherits" honestly.
+    let hermit = row_of("hermit");
+    for key in ["harness", "model", "provider"] {
+        assert!(
+            hermit.get(key).is_none(),
+            "a teammate that pins nothing omits `{key}` rather than sending a \
+             default: {hermit}"
+        );
+    }
+
+    // …and the list agrees with the detail read, so the card and the page
+    // cannot disagree about the same teammate.
+    for row in rows {
+        let id = row["id"].as_str().unwrap();
+        let (_, detail) = get_agent(&state, id).await;
+        for key in ["harness", "model", "provider"] {
+            assert_eq!(
+                row.get(key),
+                detail.get(key),
+                "the card reads the list and the page reads the detail; they \
+                 must not disagree about {key} for {id}"
+            );
+        }
+    }
+}

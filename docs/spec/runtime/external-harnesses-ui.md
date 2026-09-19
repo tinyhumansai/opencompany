@@ -24,11 +24,37 @@ That the join works is deliberate, not luck: the manifest vocabulary
 `claude`, `codex`.
 
 ```text
-GET {scope}/harnesses  ──┐
-   declared + detected   ├──▶  joinHarnesses()  ──▶  External harnesses page
-oc_acp_harnesses ────────┘        (lib/harnesses.ts)
-   readiness per id
+GET {scope}/harnesses  ──┐                              ┌─▶ Providers page, Local harnesses
+   declared + detected   ├──▶  joinHarnesses()  ────────┤
+oc_acp_harnesses ────────┘        (lib/harnesses.ts)    └─▶ an agent's Harness & model picker
+   readiness per id                                        (both open the detail view)
 ```
+
+Two surfaces render that join, through the shared `useHarnessRows` hook: the
+**Local harnesses** section of the LLM Providers page, which is *about* the
+harnesses, and the agent editor's picker, where the operator is choosing one.
+Each fetches `GET {scope}/harnesses` itself — the section has to tell a 404
+from an empty list, and the agent page already holds the list for its own
+picker — and both go through the same survey, so the same machine state can
+never be given two different names.
+
+The General settings page carried this list until the Providers page grew the
+section. It sat where nobody looking for a coding engine would look: the
+question "what can a teammate think with" was answered on two pages, one of
+which never mentioned the other.
+
+Both surfaces open the **same** detail view (`components/harness-detail.tsx`),
+a dialog rather than a page — a harness has no address to preserve, and the
+console's route table has an expensive history of entries that left pages
+unreachable. Each caller passes its own survey into it, so a list and the
+dialog opened from it can never disagree. It has no re-check of its own: the
+survey is derived from the declared list, so re-reading that list is what
+re-surveys.
+
+The picker surveys only while its editor is open. Probing on page view would
+start a subprocess per harness every time anyone opened a teammate. Concurrent
+asks about the same harness share one probe (`confirmAcpHarness` keeps an
+in-flight map), so the two surfaces open at once still cost one handshake.
 
 ---
 
@@ -64,6 +90,23 @@ There *is* an Install action, and it is not the same thing. It enrols nothing
 and records no state — it fetches the ACP adapter, then re-runs the same probe
 every other row runs. Afterward the harness is usable for exactly the reason
 it always was: something is installed and signed in on this machine.
+
+This is why a harness row reports **"N agents bound"** and never "connected",
+the word the providers list beside it uses for a credential the company holds.
+A harness holds nothing company-wide; some number of teammates each picked it.
+
+### Who is bound
+
+The detail view resolves that count from the roster read's `harness` field
+(`boundAgents`, `lib/harnesses.ts`), mirroring `agents_on` in
+`harness/lanes.rs`: a teammate that declares no harness is served by the
+**default** one and by no other. `None` there means "the default harness", not
+"undeclared", so the two rules have to be the same rule — the count is a claim
+about which lane a turn will actually route to. There is no endpoint for it;
+duplicating the rule host-side is how the list and the runtime would drift.
+
+Each bound teammate links to its own **Model** tab. The detail view is not a
+second place to change a binding — one editing surface, addressed from here.
 
 ---
 
@@ -132,7 +175,7 @@ from a superseded run is dropped, so pressing "Check again" mid-probe cannot
 let a stale verdict land on the newer list.
 
 `confirm()` runs phase 1's reasoning itself rather than trusting callers to
-filter — the harnesses pane confirms only `Checking` rows, but the agent
+filter — both surveying surfaces confirm only `Checking` rows, but the agent
 editor's model picker calls straight through on whatever harness was selected.
 Spawning something already resolved would replace a specific instruction with
 `No such file or directory (os error 2)`, mislabelled as a *broken* install
@@ -210,6 +253,16 @@ rendered as "can't say from here":
 - a harness that is not a local CLI — `built_in` (no CLI at all) or
   `transport = "runner"` (a CLI on somebody else's machine). Probing either
   against this machine's `PATH` would be a category error.
+
+An unready harness is still **pickable**. The picker never disables an option,
+because `readiness: undefined` is the browser's ordinary state and greying an
+option there would be a guess presented as a verdict. Binding a teammate to a
+harness that turns out to be missing fails that turn with the harness's own
+reason, which is `lanes.rs`'s doctrine and strictly better than pre-empting it.
+
+Readiness is never persisted — no `localStorage`, no app state, per page load
+only. A stored flag is exactly the second source of truth, able to disagree
+with the CLI actually being there, that "There is no connect" above rules out.
 
 Sign-in is probed by **credential file**, not by launching the CLI — see
 `acp::discovery`'s module docs. It can be wrong in one direction (a stale

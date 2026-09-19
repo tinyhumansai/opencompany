@@ -74,6 +74,15 @@ import {
   type AgentDraft,
   type AgentFieldKey,
 } from "@/lib/agent";
+import {
+  desktopHarnessId,
+  harnessAction,
+  readinessNote,
+  statusOf,
+  type HarnessRow,
+} from "@/lib/harnesses";
+import { HarnessDetailDialog } from "@/components/harness-detail";
+import { useHarnessRows } from "@/lib/use-harness-rows";
 import { draftAgentField } from "@/api/agent-copilot";
 import { getInferenceStatus, type CognitionPath, type InferenceStatus } from "@/api/inference";
 import { checkModelId, modelIdErrorCopy } from "@/inference/connect";
@@ -345,6 +354,11 @@ export function AgentDetailView({
    */
   const [harnesses, setHarnesses] = useState<HarnessDto[]>([]);
   /**
+   * Bumped to re-run the fetch below. The survey has no refresh of its own —
+   * re-reading the declared list is what re-surveys it.
+   */
+  const [harnessNonce, setHarnessNonce] = useState(0);
+  /**
    * The company's providers and its default choice (keys rework, issue #2306,
    * slice 3b) — what the Provider select offers, and what an unpinned agent's
    * fallback line names. Loaded once per teammate, not gated on the editor
@@ -506,7 +520,7 @@ export function AgentDetailView({
     return () => {
       live = false;
     };
-  }, [client, company]);
+  }, [client, company, harnessNonce]);
 
 
 
@@ -1169,6 +1183,7 @@ export function AgentDetailView({
               client={client}
               company={company}
               saving={savingHarness}
+              onRecheck={() => setHarnessNonce((n) => n + 1)}
               onEdit={() => {
                 setHarnessDraft(agent.harness ?? HARNESS_DEFAULT);
                 setModelDraft(agent.model ?? "");
@@ -1789,6 +1804,30 @@ function Tools({
 }
 
 /**
+ * Whether this machine can actually run the harness an option names.
+ *
+ * Sibling JSX inside the `SelectItem` rather than part of
+ * `harnessOptionLabel`, which also feeds the closed trigger through
+ * `SelectValue` — that one is a string, with nowhere to put a dot.
+ *
+ * Never renders an option unusable. A browser cannot see a local CLI at all,
+ * so `readiness: undefined` means "we did not look", not "not installed";
+ * greying the option there would be a guess, and binding a teammate to a
+ * harness that turns out to be missing fails the turn with a reason, which is
+ * the honest outcome.
+ */
+function HarnessReadiness({ row }: { row: HarnessRow | undefined }) {
+  if (!row) return null;
+  const status = statusOf(row);
+  return (
+    <span className="ml-1.5 inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+      <span className={cn("size-1.5 rounded-full", status.dot)} />
+      {status.label}
+    </span>
+  );
+}
+
+/**
  * This teammate's harness binding and its own model override (issue #1245's
  * harness-picker follow-up).
  *
@@ -1815,6 +1854,7 @@ function HarnessAndModel({
   client,
   company,
   saving,
+  onRecheck,
   onEdit,
   onHarnessChange,
   onModelChange,
@@ -1840,6 +1880,8 @@ function HarnessAndModel({
   client: OpenCompanyClient;
   company: string | null;
   saving: boolean;
+  /** Re-read the declared harness list, which re-runs the readiness survey. */
+  onRecheck: () => void;
   onEdit: () => void;
   onHarnessChange: (value: string) => void;
   onModelChange: (value: string) => void;
@@ -1890,6 +1932,46 @@ function HarnessAndModel({
     };
   }, [editing, draftKind, draftAgentId]);
 
+  /**
+   * What this machine says about each harness the picker offers.
+   *
+   * Surveyed only while `editing`, the same trigger the model list uses.
+   * Probing on page view would start a subprocess per harness every time
+   * anyone opened a teammate, for an answer nobody had asked for yet.
+   */
+  const { rows, surveying, install, installing, installErrors } = useHarnessRows(harnesses, editing);
+  const rowFor = (id: string | undefined) => rows?.find((row) => row.id === id);
+  /**
+   * Which harness the detail dialog is open on, held as an id rather than as a
+   * row: the survey keeps settling while it is open, and a captured row would
+   * freeze the dialog on the readiness it had when it was opened.
+   */
+  const [managingId, setManagingId] = useState<string | null>(null);
+  const draftRow = rowFor(draftHarnessId);
+  const draftAction = draftRow ? harnessAction(draftRow) : "none";
+
+  /**
+   * The harness the install button is for, as of right now.
+   *
+   * An install takes long enough for the operator to pick a different harness
+   * while it runs, and the model list that comes back belongs to the one it
+   * started on — applying it afterwards would offer claude's models under
+   * codex.
+   */
+  const settledAgentId = useRef(draftAgentId);
+  settledAgentId.current = draftAgentId;
+
+  const installFor = async (row: HarnessRow) => {
+    const failure = await install(row);
+    if (failure) return;
+    // `installAcpHarness` evicts the cached confirmation, and nothing in the
+    // model effect's dependencies changed — so without re-reading here the
+    // list stays empty until the operator toggles the harness away and back.
+    const agentId = desktopHarnessId(row);
+    const found = await ensureAcpModels(agentId);
+    if (settledAgentId.current === agentId) setModels(found);
+  };
+
   const unlistedModel =
     modelDraft && !models.some((m) => m.value === modelDraft) ? modelDraft : undefined;
   /**
@@ -1935,21 +2017,72 @@ function HarnessAndModel({
     >
       {editing ? (
         <div className="space-y-3">
-          <Select value={harnessDraft} onValueChange={(value) => onHarnessChange(value ?? HARNESS_DEFAULT)}>
-            <SelectTrigger className="w-full" data-testid="agent-harness-select">
-              <SelectValue>{harnessLabel}</SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={HARNESS_DEFAULT}>
-                Company default{defaultHarness ? ` (${harnessOptionLabel(defaultHarness)})` : ""}
-              </SelectItem>
-              {harnesses.map((harness) => (
-                <SelectItem key={harness.id} value={harness.id}>
-                  {harnessOptionLabel(harness)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="flex items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <Select value={harnessDraft} onValueChange={(value) => onHarnessChange(value ?? HARNESS_DEFAULT)}>
+                <SelectTrigger className="w-full" data-testid="agent-harness-select">
+                  <SelectValue>{harnessLabel}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={HARNESS_DEFAULT}>
+                    Company default{defaultHarness ? ` (${harnessOptionLabel(defaultHarness)})` : ""}
+                    <HarnessReadiness row={rowFor(defaultHarness?.id)} />
+                  </SelectItem>
+                  {harnesses.map((harness) => (
+                    <SelectItem key={harness.id} value={harness.id}>
+                      {harnessOptionLabel(harness)}
+                      <HarnessReadiness row={rowFor(harness.id)} />
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {/* The closed trigger is a plain string with nowhere to put a
+                badge, so everything this machine knows about the selected
+                harness lives one click away rather than only inside the open
+                dropdown. */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!draftRow}
+              onClick={() => setManagingId(draftHarnessId ?? null)}
+              data-testid="agent-harness-manage"
+            >
+              Manage
+            </Button>
+          </div>
+          {draftRow && draftAction !== "none" && (
+            // Only where there is something this app can do about it. A harness
+            // that is merely unready — not signed in, no Node, unseen from a
+            // browser — already says so on its own option, and repeating it
+            // here beside no button would be an explanation with no next step.
+            <div
+              className="flex items-start justify-between gap-3 rounded-md border p-2.5"
+              data-testid="agent-harness-readiness"
+            >
+              <p
+                className={cn(
+                  "text-xs",
+                  installErrors[draftRow.id] ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {installErrors[draftRow.id] ?? readinessNote(draftRow)}
+              </p>
+              <Button
+                size="sm"
+                variant={draftAction === "install" ? "default" : "outline"}
+                disabled={installing.has(draftRow.id)}
+                onClick={() => void installFor(draftRow)}
+                data-testid="agent-harness-install"
+              >
+                {installing.has(draftRow.id)
+                  ? "Installing…"
+                  : draftAction === "install"
+                    ? "Install add-on"
+                    : "Update"}
+              </Button>
+            </div>
+          )}
           {draftKind === "acp" ? (
             models.length > 0 ? (
               <>
@@ -2161,6 +2294,20 @@ function HarnessAndModel({
       {declaredKind !== "acp" && agent.provider && agent.model && (
         <BrokenPairNote agent={agent} providers={providers} />
       )}
+      <HarnessDetailDialog
+        client={client}
+        company={company}
+        row={rowFor(managingId ?? undefined) ?? null}
+        defaultHarnessId={defaultHarness?.id}
+        onRecheck={onRecheck}
+        checking={surveying}
+        install={install}
+        installing={installing}
+        installErrors={installErrors}
+        onOpenChange={(open) => {
+          if (!open) setManagingId(null);
+        }}
+      />
     </Section>
   );
 }

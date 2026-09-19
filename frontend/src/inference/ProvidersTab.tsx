@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SectionUnreachable } from "@/views/connections/SectionUnreachable";
+import { LocalHarnesses } from "./LocalHarnesses";
 import { AddProviderDialog } from "./AddProviderDialog";
 import { DefaultModelDialog } from "./DefaultModelDialog";
 import { ProviderConnectDialog } from "./ProviderConnectDialog";
@@ -565,6 +566,11 @@ export function ProvidersTab({
           />
         </CardContent>
       </Card>
+
+      {/* The coding CLIs a teammate can be put on, beside the providers it can
+          reach a model through. Renders nothing when this build declares none,
+          which is what a hosted one does. */}
+      <LocalHarnesses client={client} company={company} />
 
       {/* @deprecated keys-rework #2306: describes only the legacy managed
           fallback chain's transitional pre-row state — see `managed-copy.ts`. */}

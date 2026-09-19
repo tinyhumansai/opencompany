@@ -1423,6 +1423,36 @@ export interface TeamMemberDto {
    */
   tier?: string;
   /**
+   * Which declared harness this teammate runs on, by id — the same field, from
+   * the same host-side helper, as `AgentDetailDto.harness`.
+   *
+   * `undefined` means the harness marked `default = true`, **not** "no
+   * harness": every teammate resolves to one. The roster read does not say
+   * which that is, so a surface drawing this must not name it.
+   */
+  harness?: string;
+  /**
+   * This teammate's own model pin, in the two meanings `AgentDetailDto.model`
+   * carries: the hint forwarded to an ACP harness, or the model half of a
+   * `{provider, model}` pair on a built-in one.
+   *
+   * **`undefined` is "declares none and inherits the company default", not "no
+   * model"** — every teammate resolves to some model. Render the inherited
+   * state in words; never coalesce this to a model name the read did not send,
+   * and never to a blank. A host predating the field also sends nothing, so a
+   * teammate with a pin can read as inherited until that host is updated — the
+   * same rollout skew `tier` and `global` carry, and the honest reading either
+   * way is "this host declares no pin here".
+   */
+  model?: string;
+  /**
+   * The provider half of this teammate's `{provider, model}` pair, sent only
+   * together with `model` and only meaningful on a built-in harness.
+   * `undefined` means the company default. A slug, not a label — the roster
+   * read carries no provider catalogue to resolve one against.
+   */
+  provider?: string;
+  /**
    * Whether this teammate is the company's orchestrator (issue #643).
    *
    * **NOT the same question as `tier`** — this is the host's roster rule (the

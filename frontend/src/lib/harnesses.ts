@@ -194,6 +194,49 @@ export function desktopHarnessId(row: Pick<HarnessRow, "id" | "agent">): string 
   return row.agent ?? row.id;
 }
 
+/**
+ * The status dot and word for a row.
+ *
+ * The word carries the meaning and the dot is shorthand — the same rule
+ * `host-switcher.tsx` follows, because hue alone tells someone that something
+ * differs without saying what.
+ *
+ * Lives here rather than beside one of the two surfaces that render it, for
+ * the same reason {@link harnessAction} does: the settings list and the agent
+ * picker must not be able to call the same machine state two different names.
+ */
+export function statusOf(row: HarnessRow): { label: string; dot: string } {
+  if (row.kind === "built_in") return { label: "Managed", dot: "bg-status-done" };
+  if (row.transport === "runner") return { label: "Remote", dot: "bg-muted-foreground/50" };
+  switch (row.readiness?.state) {
+    case "checking":
+      return { label: "Checking…", dot: "bg-status-running animate-pulse" };
+    case "ready":
+      return { label: "Ready", dot: "bg-status-done" };
+    case "notSignedIn":
+      return { label: "Not signed in", dot: "bg-status-blocked" };
+    case "notInstalled":
+      return { label: "Not installed", dot: "bg-muted-foreground/50" };
+    case "adapterMissing":
+      // Not "Not installed": the CLI *is* installed, and this app is one small
+      // add-on away from being able to drive it. Saying otherwise is what sent
+      // people to reinstall software they already had.
+      return { label: "Add-on needed", dot: "bg-status-blocked" };
+    case "adapterOutdated":
+      return { label: "Update available", dot: "bg-status-blocked" };
+    case "nodeMissing":
+      return { label: "Needs Node.js", dot: "bg-muted-foreground/50" };
+    case "spawnFailed":
+      return { label: "Won't start", dot: "bg-destructive" };
+    default:
+      // Nothing probed this machine — a browser, or a desktop shell predating
+      // `oc_acp_harnesses`. Deliberately not "Not installed": those are
+      // different facts, and saying the second here would tell someone to
+      // reinstall a CLI already sitting on their machine, unseen from a tab.
+      return { label: "Desktop only", dot: "bg-muted-foreground/50" };
+  }
+}
+
 /** What to tell the operator about a row, and what to do about it. */
 export function readinessNote(row: HarnessRow): string {
   if (row.kind === "built_in") {
@@ -252,4 +295,46 @@ export function readinessNote(row: HarnessRow): string {
       // turn that will fail.
       return "A coding CLI runs on your own machine, so only the desktop app can see it.";
   }
+}
+
+/** The roster fields {@link boundAgents} resolves a lane from. */
+export interface HarnessBinding {
+  id: string;
+  /** The declared binding, absent when this teammate names none. */
+  harness?: string;
+}
+
+/**
+ * Which teammates run their turns on `harnessId`.
+ *
+ * `defaultHarnessId` is the id of the harness marked `default = true`, and it
+ * is required rather than optional because the rule turns on it: a teammate
+ * that declares no harness is served by the default one **and by no other**.
+ * This is `agents_on` in `harness/lanes.rs`, resolved on the roster read rather
+ * than duplicated as an endpoint — the count is a claim about which lane the
+ * runtime will actually route to, so the two rules have to be the same rule.
+ *
+ * A company whose host names no default passes `undefined`, and an undeclared
+ * teammate then matches nothing: where it lands is a fact this read does not
+ * carry, and picking a row for it would be inventing one.
+ */
+export function boundAgents<T extends HarnessBinding>(
+  members: readonly T[],
+  harnessId: string,
+  defaultHarnessId: string | undefined,
+): T[] {
+  return members.filter((member) => (member.harness ?? defaultHarnessId) === harnessId);
+}
+
+/**
+ * How a harness reports its teammates.
+ *
+ * Deliberately not "connected", the word the Providers page uses for a
+ * credential this company holds: a harness holds nothing company-wide, and
+ * borrowing that word would promise a shared persisted state that does not
+ * exist. Some number of teammates each picked it, which is what this says.
+ */
+export function boundLabel(count: number): string {
+  if (count === 0) return "No agents bound";
+  return `${count} agent${count === 1 ? "" : "s"} bound`;
 }

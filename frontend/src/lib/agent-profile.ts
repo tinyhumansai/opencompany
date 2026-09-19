@@ -86,8 +86,13 @@ function clip(text: string, limit: number): string {
  * `useHashView` splits the hash at `?` before it parses segments — so the flag
  * rides along without the router ever seeing it, and Back closes the editor
  * instead of leaving the page.
+ *
+ * `tab` lands on one of that page's own tabs (`use-hash-tab.ts`), which rides
+ * the same suffix.
  */
-export function agentHref(agentId: string, options: { edit?: boolean } = {}): string {
+export function agentHref(agentId: string, options: { edit?: boolean; tab?: string } = {}): string {
   const path = consoleHref("team", agentId);
-  return options.edit ? `${path}?edit` : path;
+  // `?edit` opens the Instructions tab by itself, so the two never combine.
+  if (options.edit) return `${path}?edit`;
+  return options.tab ? `${path}?tab=${encodeURIComponent(options.tab)}` : path;
 }
