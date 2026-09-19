@@ -229,3 +229,13 @@ machines*. Today there is one machine, the operator's own, and the ephemeral
 in-memory presence map that lane is built around has no user. Reviving it
 would need a dial-out endpoint, a nonce cache, a desktop runner client, and a
 durable enrolment record — see this file's history for the full shape.
+
+---
+
+## Planned: folding this page into the agent Harness & Model picker
+
+An implementation brief at `docs/issues/harness-provider-unification/`
+proposes surfacing this page's readiness data inline in the agent-level
+Harness & Model editor (`AgentDetailView.tsx`), with this page becoming a
+"Manage" detail view reached from there rather than its own top-level
+Settings entry. Not yet implemented — see that brief for the full design.
