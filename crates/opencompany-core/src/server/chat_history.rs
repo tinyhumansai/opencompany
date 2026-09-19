@@ -2507,14 +2507,27 @@ fn strip_relay_note(event: &CompanyEvent) -> Option<String> {
 /// line, so this rewrite lives here and nowhere earlier — a room whose own
 /// transcript had been cleaned could not count itself.
 pub(crate) fn readable_moves(text: String) -> String {
-    if !text
-        .lines()
-        .any(|line| crate::hivemind::line_kind(line).is_some())
-    {
+    if !text.lines().any(|line| {
+        crate::hivemind::line_kind(line).is_some()
+            || crate::hivemind::completion::is_completion_line(line)
+    }) {
         return text;
     }
     text.lines()
-        .map(|line| crate::hivemind::readable(line).unwrap_or_else(|| line.to_string()))
+        .map(|line| {
+            // Completion grammar first: `!broadcast` and `!complete` are this
+            // host's markers addressed to the *host*, and a reader shown them
+            // is being shown plumbing.
+            if let Some(rendered) = crate::hivemind::completion::readable(line) {
+                // Nothing is dropped: a marker line is part of what the member
+                // said, and a row rendering to nothing leaves an operator
+                // looking at a turn that appears not to have happened. A bare
+                // marker renders as a plain sentence instead — see
+                // `completion::readable`.
+                return rendered;
+            }
+            crate::hivemind::readable(line).unwrap_or_else(|| line.to_string())
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

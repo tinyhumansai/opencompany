@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tinyhivemind_hive::{
-    Conversation, EpisodeState, HiveStep, SESSION_WINDOW, Sequence, SessionQuery,
+    Conversation, EpisodeState, SESSION_WINDOW, Sequence, SessionQuery,
     aside::{AsideDecision, AsideInput, Viewer},
     desk::{Desk, DeskSet, ResponderMode},
     dispatch::DispatchConversation,
@@ -32,7 +32,6 @@ use tinyhivemind_hive::{
     pins::{PIN_LIMIT, read_pinboard},
     project_for,
     roster::{Roster, RosterMember},
-    step,
 };
 
 use super::evidential;
@@ -80,7 +79,7 @@ const MAX_NOTE_PINS: usize = 3;
 ///
 /// A multi-line turn is searched line by line, because a member may write prose
 /// and then its move, and only the marked line is the proposal.
-fn carried_proposal(
+pub(super) fn carried_proposal(
     transcript: &[tinyhivemind_hive::SessionMessage],
     topic: &str,
 ) -> Option<String> {
@@ -176,6 +175,21 @@ pub struct EpisodeDriver<'a> {
     /// from it because of a knob about somebody else's desk. Empty is the
     /// default, and an empty list renders nothing.
     context_desks: Vec<super::referral::FederationDesk>,
+    /// A semantic router for `!broadcast`, when this instance has one.
+    ///
+    /// `None` is routing off, not a failure: a broadcast still lands as a desk
+    /// row and still assigns, it just falls to the mechanical responder instead
+    /// of being routed by meaning.
+    #[cfg(feature = "typesafe")]
+    router: Option<std::sync::Arc<dyn tinyhivemind_embed::routing::Router + Send + Sync>>,
+    /// Run this episode on explicit completion reports rather than on quorum.
+    completion: bool,
+    /// Who the episode opens assigned to, when it is completion-driven.
+    ///
+    /// Empty means the desk's first member, which is the mechanical responder
+    /// and what this desk answered with before routing existed. A caller that
+    /// has routed the opening message supplies its recipients instead.
+    opening: Vec<String>,
 }
 
 impl std::fmt::Debug for EpisodeDriver<'_> {
@@ -242,7 +256,127 @@ impl<'a> EpisodeDriver<'a> {
             memory: Arc::new(NullHiveMemory),
             federation: None,
             context_desks: Vec::new(),
+            #[cfg(feature = "typesafe")]
+            router: None,
+            completion: false,
+            opening: Vec::new(),
         }
+    }
+
+    /// Open a completion-driven episode assigned to `ids`.
+    ///
+    /// Only these owe a `!complete`. Every other seat is seeded finished and
+    /// becomes pending only if a routed handoff assigns it — so a room ends
+    /// when the work is done, not when every chair has spoken.
+    #[must_use]
+    pub fn assigned_to(mut self, ids: Vec<String>) -> Self {
+        self.opening = ids;
+        self
+    }
+
+    /// Who should take one `!broadcast`, decided by meaning.
+    ///
+    /// Falls back to the **mechanical** responder — this desk's first other
+    /// member — whenever routing declines: no credential configured, a transport
+    /// outage, a stale roster, a malformed evaluation. The worst case of routing
+    /// by meaning is therefore the routing this desk did before it existed,
+    /// which is the same direction `built_in::selector` takes.
+    ///
+    /// The author is excluded here **and** re-checked by the library: a message
+    /// routed back to its own author is a loop, and the library fails it closed
+    /// without spending a model call.
+    #[cfg(feature = "typesafe")]
+    async fn route_handoff(
+        &self,
+        author: &str,
+        work: &str,
+        members: &[RosterMember],
+        _retired: &[String],
+    ) -> Vec<String> {
+        let candidates: Vec<_> = members
+            .iter()
+            .filter(|member| member.id != author)
+            .map(|member| {
+                super::broadcast::candidate(
+                    &member.id,
+                    member.name.as_deref().unwrap_or(&member.id),
+                    self.desk
+                        .members
+                        .iter()
+                        .find(|seat| seat.id == member.id)
+                        .map(|seat| seat.role.clone()),
+                    None,
+                )
+            })
+            .collect();
+        let mechanical = candidates
+            .first()
+            .map(|candidate| candidate.id.clone())
+            .unwrap_or_else(|| author.to_owned());
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let Some(router) = self.router.as_deref() else {
+            // Routing off: the handoff still lands, mechanically.
+            return vec![mechanical];
+        };
+        super::broadcast::route(
+            router,
+            super::broadcast::Broadcast {
+                message: work,
+                author,
+                desk_id: &self.desk.id,
+                desk_purpose: self.desk.description.clone(),
+                candidates,
+                roster_version: members.len() as u64,
+                fallback_responder: &mechanical,
+            },
+        )
+        .await
+    }
+
+    /// Without the `typesafe` feature there is no router to ask, so a handoff
+    /// goes to the desk's first other member and costs no model call.
+    #[cfg(not(feature = "typesafe"))]
+    #[expect(
+        clippy::unused_async,
+        reason = "one signature for both builds; the routed arm is genuinely async"
+    )]
+    async fn route_handoff(
+        &self,
+        author: &str,
+        _work: &str,
+        members: &[RosterMember],
+        _retired: &[String],
+    ) -> Vec<String> {
+        members
+            .iter()
+            .find(|member| member.id != author)
+            .map(|member| vec![member.id.clone()])
+            .unwrap_or_default()
+    }
+
+    /// Terminate on explicit `!complete` reports instead of on quorum.
+    ///
+    /// The mode the reference runner uses: every seat it gives an agent is
+    /// `broadcast` or `complete_episode`, and the room ends when each assigned
+    /// member has reported. Well-defined at one assignee, which quorum is not.
+    #[must_use]
+    pub const fn completing(mut self) -> Self {
+        self.completion = true;
+        self
+    }
+
+    /// Route `!broadcast` handoffs through `router` rather than to the desk's
+    /// mechanical responder.
+    #[cfg(feature = "typesafe")]
+    #[must_use]
+    pub fn with_router(
+        mut self,
+        router: Option<std::sync::Arc<dyn tinyhivemind_embed::routing::Router + Send + Sync>>,
+    ) -> Self {
+        self.router = router;
+        self
     }
 
     /// Let this desk ask another one a question.
@@ -369,7 +503,38 @@ impl<'a> EpisodeDriver<'a> {
         // renders a prompt for THIS room.
         let episode_quorum = policy.quorum;
 
-        let mut state = EpisodeState::opened(conversation.clone(), Sequence(trigger.value()));
+        // The loop holds no episode state of its own any more: the scheduler
+        // owns it, which is what lets a second termination share this loop.
+        // Two terminations, one loop. Which is chosen is the whole of what the
+        // scheduler seam buys: everything below reads the `HiveTurn` it hands
+        // back and never the state behind it.
+        let mut scheduler: Box<dyn super::schedule::Scheduler> = if self.completion {
+            Box::new(super::schedule::Completion::new(
+                {
+                    let roster: Vec<String> =
+                        members.iter().map(|member| member.id.clone()).collect();
+                    // Falls to the desk's first member, which is the mechanical
+                    // responder this desk used before any of this existed.
+                    let opening = if self.opening.is_empty() {
+                        roster.first().cloned().into_iter().collect()
+                    } else {
+                        self.opening.clone()
+                    };
+                    super::completion::opened(
+                        conversation.clone(),
+                        Sequence(trigger.value()),
+                        &roster,
+                        &opening,
+                    )?
+                },
+                policy.turn_budget,
+            ))
+        } else {
+            Box::new(super::schedule::Quorum::new(
+                EpisodeState::opened(conversation.clone(), Sequence(trigger.value())),
+                policy,
+            ))
+        };
         let mut turns = 0_u32;
         let mut first_seq: Option<EventSeq> = None;
         let mut last_seq: Option<EventSeq> = None;
@@ -496,28 +661,15 @@ impl<'a> EpisodeDriver<'a> {
             let decision = {
                 let roster = Roster::new(&members, &[], &retired);
                 let desk_set = DeskSet::new(&desks, &[], &[], &[], &retired);
-                step(&state, &transcript, &roster, &desk_set, &policy)
-                    .map_err(|error| self.malformed(&error))?
+                scheduler.next(&transcript, &roster, &desk_set)?
             };
 
-            let (round, next_state) = match decision {
-                HiveStep::Speak { turns, next_state } => (turns, next_state),
-                HiveStep::Converged { topic, standing } => {
-                    break EpisodeEnding::Converged {
-                        // Read from the very transcript `step` just decided on,
-                        // so the text reported is the text that carried.
-                        proposal: carried_proposal(&transcript, topic.as_str()),
-                        topic: topic.to_string(),
-                        supporters: standing.supporters.clone(),
-                    };
-                }
-                HiveStep::Deadlocked { topics } => {
-                    break EpisodeEnding::Deadlocked {
-                        topics: topics.iter().map(ToString::to_string).collect(),
-                    };
-                }
-                HiveStep::Exhausted { .. } => break EpisodeEnding::Exhausted,
-                HiveStep::Idle => break EpisodeEnding::Idle,
+            // Two outcomes, not five: which quorum shape ended the room is the
+            // scheduler's vocabulary and it renders its own ending. The loop
+            // only needs turns to run, or a reason to stop.
+            let round = match decision {
+                super::schedule::Scheduled::Round(turns) => turns,
+                super::schedule::Scheduled::Ended(ending) => break ending,
             };
 
             // A round authorizes several members to speak *together*, so each
@@ -610,6 +762,7 @@ impl<'a> EpisodeDriver<'a> {
                         .desks_deliberate(deliberates)
                         .able_to_ask(can_ask)
                         .with_trigger(Sequence(trigger.value()))
+                        .completing(scheduler.completing())
                         .render(&turn, &visible);
 
                 // Cleared per turn: the aside belongs to the reply that produced
@@ -917,6 +1070,7 @@ impl<'a> EpisodeDriver<'a> {
                         .able_to_ask(can_ask)
                         .with_trigger(Sequence(trigger.value()))
                         .continuing()
+                        .completing(scheduler.completing())
                         .render(&turn, &visible);
                         scratch.aside = None;
                         match self
@@ -1041,6 +1195,32 @@ impl<'a> EpisodeDriver<'a> {
                         }
                     }
                 }
+                // **The one place semantic routing is actually spent.**
+                //
+                // A `!broadcast` hands work on without naming who takes it, so
+                // the host decides by meaning. The row is already appended above
+                // — the message is both the desk row and what the Choice matches
+                // against — and only the *assignment* happens here.
+                //
+                // Costs a second model call, which is why nothing else on this
+                // path routes: a seat that already knows who should go next
+                // writes `@id` and pays nothing.
+                // Gated on the scheduler, not just on the marker. A quorum room
+                // picks its own next speaker through the attention market, so a
+                // routed recipient has nowhere to land — `Quorum::assign` is a
+                // no-op — and routing one anyway would spend a provider call to
+                // discard the answer. A handoff in a deliberating room is an
+                // ordinary desk row the fold already reads.
+                if scheduler.completing()
+                    && let Some(work) = super::completion::reply_broadcast(&line)
+                {
+                    let recipients = self
+                        .route_handoff(&turn.agent_id, work, &members, &retired)
+                        .await;
+                    if !recipients.is_empty() {
+                        scheduler.assign(&recipients, Sequence(seq.value()));
+                    }
+                }
                 lines.push((seq, turn.agent_id.clone(), line));
                 // After its own line, never before: see the declaration above.
                 if let Some(second) = continuation {
@@ -1055,7 +1235,7 @@ impl<'a> EpisodeDriver<'a> {
             // failed one as a system row — so, and only now, the state the
             // library returned may be taken up. Committing after a subset
             // would charge a threshold nobody spent.
-            state = *next_state;
+            scheduler.commit();
             turns = turns.saturating_add(round_len);
         };
 
@@ -1273,7 +1453,31 @@ impl<'a> EpisodeDriver<'a> {
     ) -> Result<String> {
         let allowed = self.desk.config.moves_for(agent_id);
         let (line, rode) = split_reply(&self.runner.speak(agent_id, prompt).await?);
+
+        // **A marker carrying nothing is a malformed move, not a message.**
+        //
+        // Observed live: a seat wrote its work as one reply and then `!broadcast`
+        // alone as a second. A bare marker routes nobody — `broadcast_body`
+        // finds no work for the Choice to match — and reports nothing, so it is
+        // a turn that looks taken and did nothing.
+        //
+        // Corrected rather than dropped, on the crate's own rule for a
+        // malformed tool call: the seat is told inside its own turn, "while it
+        // can still call again". Dropping would hide the failure from the room
+        // and from the operator; correcting gets the hand-off the turn was for.
+        let (line, rode) =
+            if let Some(correction) = super::completion::bare_marker_correction(&line) {
+                let corrected = format!("{prompt}\n\n{correction}");
+                // The retry stands even if it is bare again: a second empty marker
+                // is the seat's answer, and journaling it keeps the transcript
+                // honest about a turn that happened. It still surfaces — the row is
+                // the member's reply either way.
+                split_reply(&self.runner.speak(agent_id, &corrected).await?)
+            } else {
+                (line, rode)
+            };
         scratch.aside = rode;
+
         let Some(kind) = moves::line_kind(&line).filter(|kind| !allowed.contains(kind)) else {
             return self
                 .grounded_and_regraded(agent_id, prompt, visible, line, &allowed, scratch)
@@ -1745,6 +1949,19 @@ impl<'a> EpisodeDriver<'a> {
                         .map(|topic| format!("#{topic}"))
                         .collect::<Vec<_>>()
                         .join(" and "),
+                ),
+            },
+            EpisodeEnding::Completed { completed } => HiveMemoryNote {
+                desk_id: self.desk.id.clone(),
+                title: format!("Finished: {task_line}"),
+                body: format!(
+                    "Task: {task_line}\nCompleted after {} turns by: {}.\n",
+                    outcome.turns,
+                    if completed.is_empty() {
+                        "(nobody recorded)".to_owned()
+                    } else {
+                        completed.join(", ")
+                    },
                 ),
             },
             EpisodeEnding::Exhausted => {

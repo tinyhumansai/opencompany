@@ -3540,6 +3540,15 @@ impl HarnessBrain {
                 mentions: mentions.iter().map(tinyhivemind_mention).collect(),
                 orchestrator_id: self.responder.clone(),
                 selection_policy: tinyhivemind::responder::SelectionPolicy::Allowed,
+                // ZERO preserves the behaviour this host had before the field
+                // existed: the ladder had no confidence gate, so any selection
+                // it made was taken. This host's selector is not a distribution
+                // — `MeteredSelector` commits to one id and reports no spread —
+                // so a threshold above zero would reject on a number
+                // `TinyHiveSelector` synthesises rather than measures, which is
+                // a gate on nothing. Raising it is a behaviour change and wants
+                // a real distribution behind it first.
+                minimum_selection_confidence: tinyhivemind::responder::Probability::ZERO,
             };
             (company, members, desks, candidates, request)
         };
@@ -3550,9 +3559,46 @@ impl HarnessBrain {
         if crate::harness::HarnessPool::total_ceiling_spent(&company, &self.deps).await {
             request.selection_policy = tinyhivemind::responder::SelectionPolicy::Disabled;
         }
-        let selector = TinyHiveSelector(self.selector_pass(&company));
+        // **The semantic rung.**
+        //
+        // Jev where this instance has a routing credential, `MeteredSelector`
+        // where it does not. A replacement rather than a layer, matching the
+        // reference runner: one semantic router, no second model selector, the
+        // deterministic destination underneath both.
+        //
+        // What the swap buys is the distribution. `MeteredSelector` commits to
+        // one id and reports no spread, so `TinyHiveSelector` had to synthesise
+        // `ONE`/`ZERO` — and every rule that reads a distribution is inert
+        // against a synthetic one. A Jev evaluation carries the real spread.
+        //
+        // An `@mention` never reaches either: `choose_responder` resolves it on
+        // a rung above this one, without a provider call.
+        #[cfg(feature = "typesafe")]
+        let jev = match crate::hivemind::broadcast::router_from_env() {
+            Ok(router) => router,
+            Err(error) => {
+                tracing::warn!(
+                    company = %company,
+                    %error,
+                    "[tinyhivemind] the routing credential is present but unusable;                      falling back to the metered selector"
+                );
+                None
+            }
+        };
+        let metered = TinyHiveSelector(self.selector_pass(&company));
+        #[cfg(feature = "typesafe")]
+        let jev_selector =
+            jev.map(|router| crate::hivemind::broadcast::JevSelector::new(router, None));
+        #[cfg(feature = "typesafe")]
+        let selector: &dyn tinyhivemind::responder::Selector = match jev_selector.as_ref() {
+            Some(selector) => selector,
+            None => &metered,
+        };
+        #[cfg(not(feature = "typesafe"))]
+        let selector: &dyn tinyhivemind::responder::Selector = &metered;
+
         match tinyhivemind::responder::choose_responder(
-            Some(&selector),
+            Some(selector),
             &request,
             &roster,
             &desks.set(),
@@ -3622,7 +3668,32 @@ impl tinyhivemind::responder::Selector for TinyHiveSelector<'_> {
                 })
                 .collect::<Vec<_>>();
             match self.0.select(&request.message, &candidates).await {
-                crate::harness::selector::SelectorVerdict::Member(id) => Ok(id),
+                // The port asks for a distribution; this host's selector
+                // returns one id and nothing else. Rather than invent a spread
+                // it did not compute, the chosen candidate takes the whole mass
+                // and every other takes none — which is the literal truth about
+                // what `MeteredSelector` decided. `confidence` is ONE for the
+                // same reason: it is documented as "distribution concentration,
+                // not correctness probability", and a one-point distribution is
+                // maximally concentrated whatever its odds of being right.
+                crate::harness::selector::SelectorVerdict::Member(id) => {
+                    Ok(tinyhivemind::responder::SelectionEvaluation {
+                        probabilities: request
+                            .candidates
+                            .iter()
+                            .map(|candidate| tinyhivemind::responder::CandidateProbability {
+                                probability: if candidate.id == id {
+                                    tinyhivemind::responder::Probability::ONE
+                                } else {
+                                    tinyhivemind::responder::Probability::ZERO
+                                },
+                                candidate_id: candidate.id.clone(),
+                            })
+                            .collect(),
+                        choice: id,
+                        confidence: tinyhivemind::responder::Probability::ONE,
+                    })
+                }
                 crate::harness::selector::SelectorVerdict::Unavailable => {
                     Err("the responder selector was unavailable".into())
                 }
@@ -4105,7 +4176,48 @@ impl HarnessBrain {
                         // unlike the federation above: this hands a member what
                         // it can already see, not permission to ask anyone
                         // anything.
-                        .with_context_desks(crate::hivemind::company_desks(&self.record()));
+                        .with_context_desks(crate::hivemind::company_desks(&self.record()))
+                        // **An operator message to a desk runs completion-driven.**
+                        //
+                        // The room ends when every assigned member has reported
+                        // `!complete`, not when a quorum can be named. That is
+                        // what the reference runner in `tinyhivemind`'s OpenHuman
+                        // example does, and it is the only form defined for a
+                        // room of one — `deliberates()` floors a quorum room at
+                        // two members and `desk_episode` additionally needs the
+                        // configured quorum still reachable.
+                        //
+                        // `Quorum` stays reachable for the cross-desk crossing
+                        // below, which asks another room to *decide* something
+                        // rather than to do work.
+                        .completing();
+                        #[cfg(feature = "typesafe")]
+                        {
+                            // Handoffs route by meaning where a credential is
+                            // configured; `None` leaves `!broadcast` falling to
+                            // the desk's first other member, which is what this
+                            // path did before routing existed.
+                            driver = driver.with_router(
+                                match crate::hivemind::broadcast::router_from_env() {
+                                    Ok(router) => router.map(|router| {
+                                        std::sync::Arc::new(router)
+                                            as std::sync::Arc<
+                                                dyn tinyhivemind_embed::routing::Router
+                                                    + Send
+                                                    + Sync,
+                                            >
+                                    }),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            "[hive] the routing credential is present but unusable; \
+                                             handoffs fall back to the mechanical responder"
+                                        );
+                                        None
+                                    }
+                                },
+                            );
+                        }
                         if let Some(federation) = federation {
                             driver = driver.with_federation(federation, &runner);
                         }

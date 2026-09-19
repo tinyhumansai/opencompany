@@ -3953,7 +3953,9 @@ dependencies = [
  "tinyflows",
  "tinyhivemind",
  "tinyhivemind-core",
+ "tinyhivemind-embed",
  "tinyhivemind-hive",
+ "tinyhivemind-typesafe",
  "tinyinference",
  "tinymcp",
  "tinymemory",
@@ -6651,6 +6653,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyhivemind-embed"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
+ "tinyhivemind",
+]
+
+[[package]]
 name = "tinyhivemind-hive"
 version = "0.2.1"
 dependencies = [
@@ -6658,6 +6669,17 @@ dependencies = [
  "thiserror 2.0.20",
  "tinyhivemind",
  "tinyhivemind-core",
+]
+
+[[package]]
+name = "tinyhivemind-typesafe"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tinyhivemind",
+ "tinyhivemind-embed",
 ]
 
 [[package]]

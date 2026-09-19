@@ -48,6 +48,8 @@
 //! # Modules
 //!
 //! - [`aside`] — two members of a desk comparing notes without the room.
+//! - [`completion`] — ending a room on explicit reports instead of quorum,
+//!   which is the only form that is well-defined for a room of one.
 //! - [`episode`] — the host loop, and the one-function turn seam.
 //! - [`evidential`] — whether a `!support` reaches a fact, and the correction
 //!   it gets when it does not.
@@ -57,13 +59,23 @@
 //! - [`prompt`] — what one authorized turn is shown, and how its answer is read.
 //! - [`referral`] — the one mechanism here that leaves the room: asking another
 //!   desk a question, and carrying its answer back without carrying its vote.
+//! - [`schedule`] — who holds the floor and when the room is done, behind a
+//!   trait so a second termination can share one loop.
 //! - [`scope`] — the upper bound a second, concurrent episode in the same
 //!   thread needs and the shared watermark alone does not give it.
 //! - [`types`] — the manifest knob, the desk snapshot, and the outcome.
+//! - `typesafe` — the live System One transport, behind the `typesafe` feature.
+//!   The only module here that reaches a network: everything else is a fold over
+//!   a transcript this host already holds.
 //!
 //! See `docs/spec/runtime/hivemind.md`.
 
 pub mod aside;
+/// Semantic handoff. Behind `typesafe` because routing by meaning is the one
+/// coordination decision that asks a provider.
+#[cfg(feature = "typesafe")]
+pub mod broadcast;
+pub mod completion;
 pub mod episode;
 pub mod evidential;
 pub mod log;
@@ -71,8 +83,13 @@ pub mod memory;
 pub mod moves;
 pub mod prompt;
 pub mod referral;
+pub mod schedule;
 pub mod scope;
 pub mod types;
+/// The live System One transport. Behind `typesafe` because it is the only
+/// part of this module that reaches a network.
+#[cfg(feature = "typesafe")]
+pub mod typesafe;
 
 #[cfg(test)]
 mod aside_test;

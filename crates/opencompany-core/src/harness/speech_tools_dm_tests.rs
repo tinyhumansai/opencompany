@@ -241,9 +241,12 @@ fn the_descriptions_are_the_crates_own() {
             continue;
         }
         let ours = crate_description(name);
+        // `crate_spec_name`, not `bare`: upstream renamed `close` to
+        // `complete_episode` and this assertion is what caught the belt still
+        // looking for the old spelling.
         let theirs = speech::tool_specs()
             .iter()
-            .find(|spec| spec.name == bare(name))
+            .find(|spec| spec.name == super::crate_spec_name(name))
             .expect("every registered tool is one the crate names")
             .description;
         assert_eq!(ours, theirs, "{name} paraphrased the crate");

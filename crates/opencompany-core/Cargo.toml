@@ -498,6 +498,14 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 # and the pure algebra with it, so the types handed to `step` are the same
 # types rather than structural twins.
 tinyhivemind-hive = { path = "../../vendor/tinyhivemind/crates/tinyhivemind-hive" }
+# Semantic routing: the TypeSafe System One adapter (`hivemind::typesafe`) and
+# the routing fold it answers for. Optional and off the default path, because
+# unlike every `tinyhivemind` crate above it is the one that reaches a network:
+# `SystemOneTransport` is a port, and this host's implementation of it needs
+# `reqwest`. A build without `typesafe` still compiles the whole deliberation
+# stack and routes by explicit `@id` alone.
+tinyhivemind-typesafe = { path = "../../vendor/tinyhivemind/crates/tinyhivemind-typesafe", optional = true }
+tinyhivemind-embed = { path = "../../vendor/tinyhivemind/crates/tinyhivemind-embed", optional = true }
 
 [features]
 # `oauth` ships in the standard build: the connection write routes
@@ -530,7 +538,7 @@ tinyhivemind-hive = { path = "../../vendor/tinyhivemind/crates/tinyhivemind-hive
 # those do cost a bundled SQLite build, and the desktop — which offers no
 # in-pod memory surface — keeps them off; it enables `tinymemory` itself in
 # `src-tauri/Cargo.toml`, so the hosted catalog tiles are live there too.
-default = ["oauth", "platform-jwt", "documents", "tinymemory"]
+default = ["oauth", "platform-jwt", "documents", "tinymemory", "hivemind"]
 # Text extraction for files dropped on the Brain page (PDF, Word, Excel,
 # PowerPoint). Without it those formats still upload and are still refused
 # honestly — the route reports "no text could be extracted" rather than
@@ -607,10 +615,32 @@ medulla = ["dep:reqwest"]
 # key parsers, is how a signature check comes to differ between two callers.
 tinyplace = ["dep:reqwest"]
 
-# The `tinyhivemind` session adapter (`runtime::hivemind`). Off by default and
-# wired to nothing: it compiles the port implementation and runs its tests, so
-# the projection can be adopted by a later change that is only about adoption.
+# The `tinyhivemind` session adapter (`runtime::hivemind`).
+#
+# Ships in the standard build since the adoption change this comment used to
+# anticipate. `JournalSessionLog` is no longer wired to nothing: `chat_seed`
+# takes the attributed projection where it is available and keeps the lossy
+# fold only as the fallback. That fold "is lossy in one specific way — it
+# discards the author of every reply — so on a shared desk agent B reads agent
+# A's turns as its OWN", which is the defect `vendor/tinyhivemind` was
+# extracted to fix (its `ROADMAP.md`, P4). A build that leaves this off still
+# compiles and still passes, it just reads the desk in one undifferentiated
+# voice.
+#
+# It pulls no new dependency: `tinyhivemind` and `tinyhivemind-hive` are
+# already unconditional path deps above.
 hivemind = []
+# Semantic routing over the TypeSafe System One endpoint: `hivemind::typesafe`.
+#
+# Off by default and deliberately narrower than `hivemind`. Deliberation,
+# referral and the move grammar are folds over a transcript this host already
+# holds and reach nothing; routing by *meaning* is the one coordination decision
+# that asks a provider. Keeping it a separate feature means a company that routes
+# by explicit `@id` never links an HTTP client for a question it does not ask,
+# and the deliberation stack stays testable without a network.
+#
+# Costs `reqwest`, which `oauth` already ships in the standard build.
+typesafe = ["dep:tinyhivemind-typesafe", "dep:tinyhivemind-embed", "dep:reqwest", "hivemind"]
 # The Agent Client Protocol: the `/acp` endpoint's session/permission surface
 # and the `RunTurn` implementation over an ACP agent.
 #

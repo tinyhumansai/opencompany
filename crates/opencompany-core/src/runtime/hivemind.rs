@@ -741,6 +741,11 @@ impl tinyhivemind::referral::ReferralQueue for JournalReferralQueue {
                         // The chat path still runs a crossing on the target's
                         // desk; only an episode's crossing moves to the pair.
                         conversation: None,
+                        // The marker goes first here and the turns follow, so a
+                        // forward scan finds them — this is the case #2368's
+                        // `rows` is documented as absent on. Only `desk_dm`
+                        // inverts the order and has to carry both ends.
+                        rows: None,
                         from_desk: referral.from.desk_id.clone(),
                         from_desk_name: desk_label(&record, &referral.from.desk_id),
                         asker: referral.source_id.clone(),

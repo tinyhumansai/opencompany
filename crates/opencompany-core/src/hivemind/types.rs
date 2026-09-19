@@ -327,6 +327,15 @@ pub enum EpisodeEnding {
         /// Every tied topic.
         topics: Vec<String>,
     },
+    /// Every assigned member reported its own work finished.
+    ///
+    /// The completion-driven termination, which has no quorum and so cannot
+    /// report a carried topic: what it knows is who finished, in the order the
+    /// episode opened them.
+    Completed {
+        /// Every member that reported, in stable episode order.
+        completed: Vec<String>,
+    },
     /// The turn budget ran out first.
     Exhausted,
     /// Nobody's urge to speak cleared their threshold.
@@ -339,6 +348,7 @@ impl EpisodeEnding {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Converged { .. } => "converged",
+            Self::Completed { .. } => "completed",
             Self::Deadlocked { .. } => "deadlocked",
             Self::Exhausted => "exhausted",
             Self::Idle => "idle",
@@ -580,6 +590,16 @@ impl EpisodeOutcome {
                     .collect::<Vec<_>>()
                     .join(" and "),
             ),
+            EpisodeEnding::Completed { completed } => {
+                // No topic and no supporters to report: a completion room
+                // counts nothing, so what it can say is who finished.
+                let who = if completed.is_empty() {
+                    "nobody".to_owned()
+                } else {
+                    completed.join(", ")
+                };
+                format!("Finished in {turns} {plural}: {who} reported the work done.")
+            }
             EpisodeEnding::Exhausted => {
                 format!("The desk spent its {turns}-turn budget without reaching a decision.",)
             }

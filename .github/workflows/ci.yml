@@ -695,6 +695,16 @@ jobs:
       - name: Test the hivemind session adapter
         run: scripts/ci/run-scoped-suite.sh "hivemind adapter" hivemind runtime::hivemind
 
+      # `typesafe`: the live System One transport (`hivemind::typesafe`).
+      # Narrower than `hivemind` and kept a separate feature for one reason —
+      # it is the only part of the hive stack that reaches a network, so it is
+      # the only part that needs `reqwest`. Its tests are offline regardless:
+      # each serves a canned response on an ephemeral loopback port, the shape
+      # `chargebee::client_tests` uses, so this lane needs no credential and no
+      # egress.
+      - name: Test the System One transport
+        run: scripts/ci/run-scoped-suite.sh "typesafe transport" typesafe hivemind::typesafe
+
       # `imap`/`smtp`: the mail surface. One gated test runs here today — the
       # RFC822 parser — and it is a parser, which is precisely the kind of code
       # that rots silently. `smtp` is compiled alongside deliberately: it carries
