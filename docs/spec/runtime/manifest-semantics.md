@@ -54,6 +54,14 @@ each page under the 500-line cap.
   `update_workflow`, `delete_workflow`) stay orchestrator-only. A member gets what it needs to pass
   a slice on and to leave the rest tracked, and nothing more.
 
+  A dispatched board card accepts one hand-off per turn: it transfers ownership
+  after the current turn finishes and settles from the colleague's output. A
+  second hand-off is refused immediately instead of receiving a success receipt
+  for work the drain would discard. Other permitted board writes still stage.
+  Chat turns can collect multiple colleagues' replies. For several contributors
+  and a final synthesis on a board task, use explicit workflow agent steps and
+  dependencies. A queued receipt is not evidence that the colleague has run.
+
   Three runtime guards bound what it can do, all enforced at the tool boundary
   in the member's own turn rather than by which tools were wired (belts are
   cached per roster, so a tool cannot be withheld from one turn):

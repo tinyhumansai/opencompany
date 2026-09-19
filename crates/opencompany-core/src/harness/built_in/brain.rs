@@ -1118,7 +1118,7 @@ impl HarnessBrain {
         // The per-iteration `clear()` inside the loop stays — it abandons a
         // redirected turn's work, which is a different decision from who is
         // entitled to queue.
-        let _delegation_claim = self.deps.delegations.claim();
+        let _delegation_claim = self.deps.delegations.claim_task();
         // Issue #339, same argument for staged workflow references: an operator
         // chat turn earlier in this cycle may have run a workflow through the
         // orchestrator's tool, and that run belongs to the conversation, not to
@@ -1145,7 +1145,18 @@ impl HarnessBrain {
         // The base turn instruction is frozen at dispatch (the card's note keeps
         // accumulating operator/agent blocks, but a redirect always re-runs from
         // the original brief plus the fresh instruction — last redirect wins).
-        let base_instruction = task_instruction(&card);
+        let base_instruction = format!(
+            "{}\n\nBoard-task coordination: delegate_to_teammate/delegate_to_desk TRANSFERS \
+             this card to one colleague and ends your ownership; it does not consult them and \
+             return a result. Only one hand-off can run. If this task requires several colleagues, \
+             independent review, or your final synthesis, use create_workflow/run_workflow when \
+             available, with separate agent steps, explicit dependencies, and a manual trigger \
+             only. If you lack those tools, hand the full remaining coordination brief to one \
+             authorized coordinator or report the actual limitation. Verify every required \
+             step and saved output before reporting completion. Do not replace \
+             a required colleague's work with your own or claim a queued hand-off is a review.",
+            task_instruction(&card)
+        );
         let mut instruction = base_instruction.clone();
         let mut redirects: u32 = 0;
         // Route the background turn through the brain-agnostic `RunTurn` seam

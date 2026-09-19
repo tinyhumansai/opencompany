@@ -686,6 +686,12 @@ impl DelegationQueue {
         self.claim_as(Self::current_scope(), DrainClaim::Full)
     }
 
+    /// A dispatched card transfers ownership once; unlike chat it cannot collect replies.
+    #[must_use = "the claim releases on drop"]
+    pub fn claim_task(&self) -> DelegationClaim {
+        self.claim_as(Self::current_scope(), DrainClaim::Task)
+    }
+
     /// Claims this queue for a turn whose operator message triaged as a
     /// question (issue #267).
     ///
@@ -853,7 +859,8 @@ impl DelegationQueue {
     /// opposite of what the bound is for.
     #[must_use = "a refused delegation must be reported to the model, not dropped"]
     pub fn push_within_cap(&self, delegation: Delegation, cap: usize, max_depth: usize) -> Staged {
-        match self.claim_state() {
+        let claim = self.claim_state();
+        match claim {
             DrainClaim::Unclaimed => return Staged::NoDrain(NoDrainReason::Unwired),
             // Issue #267: the operator asked a question. A hand-off is how one
             // gets answered, so it stages; the pure board writes do not.
@@ -873,7 +880,7 @@ impl DelegationQueue {
                     _ => NoDrainReason::WorkflowLifecycle,
                 });
             }
-            DrainClaim::Answering | DrainClaim::Full | DrainClaim::Board => {}
+            DrainClaim::Answering | DrainClaim::Full | DrainClaim::Board | DrainClaim::Task => {}
         }
         // Issue #176: checked after the claim (a context that drains nothing is
         // still the only fact worth reporting) and before the queue lock, so the
@@ -894,6 +901,14 @@ impl DelegationQueue {
         }
         let mut guard = self.inner.lock().expect("delegation queue");
         let bucket = guard.entry(Self::current_scope()).or_default();
+        // Match the dispatched-card drain: a second hand-off would otherwise
+        // receive a success receipt and then be discarded without running.
+        if claim == DrainClaim::Task
+            && delegation.answers()
+            && bucket.iter().any(Delegation::answers)
+        {
+            return Staged::NoDrain(NoDrainReason::TaskHandoffAlreadyQueued);
+        }
         if bucket.len() >= cap {
             return Staged::OverCap;
         }
@@ -1147,6 +1162,8 @@ pub enum NoDrainReason {
     /// naming: open a card for the desk instead, which persists and is exactly
     /// what a run *can* do.
     WorkflowHandOff,
+    /// A dispatched card already has its one ownership transfer queued.
+    TaskHandoffAlreadyQueued,
 }
 
 impl NoDrainReason {
@@ -1164,6 +1181,7 @@ impl NoDrainReason {
             Self::Depth => "depth_capped",
             Self::WorkflowLifecycle => "workflow_lifecycle_operator_only",
             Self::WorkflowHandOff => "workflow_handoff_no_reply_target",
+            Self::TaskHandoffAlreadyQueued => "task_handoff_already_queued",
         }
     }
 }
@@ -1189,6 +1207,8 @@ pub enum DrainClaim {
     Unclaimed,
     /// A drain site has claimed the queue and will execute anything staged.
     Full,
+    /// A dispatched board card permits one ownership transfer, not fan-out.
+    Task,
     /// A drain site has claimed the queue for a turn whose operator message
     /// triaged as [`MessageTriage::Answer`](crate::company::task_intent::MessageTriage)
     /// (issue #267). The drain runs exactly as under [`Full`](Self::Full); only
@@ -3104,7 +3124,7 @@ impl Tool for DelegateToDeskTool {
             }
         }
         Ok(ToolResult::success(format!(
-            "Delegated to the {desk} desk. Its lead will answer this turn."
+            "Queued for the {desk} desk. The lead runs AFTER you finish your current turn. Finish this turn after queuing the required work; do not poll for its result before returning. On a board task this transfers ownership of the card; on a chat turn the host collects the reply for your relay."
         )))
     }
 }
@@ -3323,9 +3343,13 @@ impl Tool for DelegateToTeammateTool {
         // name it read, and the id is the token it should write next time.
         Ok(ToolResult::success(
             if target.eq_ignore_ascii_case(&teammate) {
-                format!("Handed to {target}. They will answer this turn.")
+                format!(
+                    "Queued for {target}. They run AFTER you finish your current turn. Finish this turn after queuing the required work; do not poll for their result before returning. On a board task this transfers ownership of the card; on a chat turn the host collects the reply for your relay."
+                )
             } else {
-                format!("Handed to {teammate} (`{target}`). They will answer this turn.")
+                format!(
+                    "Queued for {teammate} (`{target}`). They run AFTER you finish your current turn. Finish this turn after queuing the required work; do not poll for their result before returning. On a board task this transfers ownership of the card; on a chat turn the host collects the reply for your relay."
+                )
             },
         ))
     }
@@ -3572,6 +3596,13 @@ fn no_drain(tool: &str, effect: &str, reason: NoDrainReason) -> String {
          model's own turn rather than queuing into a queue nothing will drain"
     );
     match reason {
+        NoDrainReason::TaskHandoffAlreadyQueued => format!(
+            "Refused: this board task already has an ownership transfer queued, so {effect}. \
+             Only the first colleague will run; a task hand-off does not return their answer \
+             to you. Do not claim this second colleague was assigned or reviewed the result. \
+             For a multi-colleague calculation and review, use a manual workflow with separate \
+             agent steps and explicit dependencies instead of multiple hand-offs on one card."
+        ),
         NoDrainReason::Unwired => format!(
             "Refused: nothing here can carry out board work, so {effect}. Board actions are \
              unavailable in this context. Do not retry — it will fail the same way — and do NOT \
@@ -6086,3 +6117,7 @@ pub(crate) fn create_workflow_parameters_schema() -> Value {
 #[cfg(test)]
 #[path = "orchestrator_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "task_handoff_receipt_tests.rs"]
+mod task_handoff_receipt_tests;
