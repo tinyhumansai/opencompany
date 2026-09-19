@@ -362,3 +362,15 @@ So offer "add anyway" — but gate it on a **typed probe-failure error**, never 
 boolean. Only a probe failure unlocks it; a slug collision or a key-write failure
 must not. And clear it on every retry, so an attempt that fails for an unrelated
 reason does not still offer to skip verification.
+
+## Known gaps in this flow for local runtimes
+
+Issue #2403 documents what this flow does not do when the provider is a local
+runtime: there is no way to test an endpoint before Continue advances, and a
+failed draft probe reports `"Saved, but nothing answered at …"` on a draft
+nothing has saved.
+
+The implementation brief — including the live verification that the model
+dropdown does populate against a reachable runtime, and the two theories that
+turned out to be wrong — is in
+[`docs/issues/local-runtime-setup/`](../../issues/local-runtime-setup/README.md).
