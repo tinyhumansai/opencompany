@@ -1344,20 +1344,16 @@ pub fn build_agent_with_model(
         Box::new(AttrTolerantXmlDispatcher::default())
     };
 
-    // OpenHuman's tool-pack table withholds `composio_*` schemas unless the
-    // session identifies as its integrations specialist. OpenCompany already
-    // narrows this agent's actual belt by the explicit company and agent grants
-    // above; once that grants Composio, use the supported specialist identity
-    // so the model can call the real tools rather than being offered an absent
-    // pack proxy.
+    // OpenCompany has already constructed and narrowed the real tool vector.
+    // Select a disclosure identity that preserves those host-owned tools:
+    // workflow_builder owns both the workflow and Composio packs. Using only
+    // integrations_agent hid create_workflow/run_workflow from our coordinator.
     #[cfg(feature = "composio")]
-    let agent_definition_name = if composio_toolkits.is_some() {
-        "integrations_agent"
-    } else {
-        manifest_agent.id.as_str()
-    };
+    let has_composio = composio_toolkits.is_some();
     #[cfg(not(feature = "composio"))]
-    let agent_definition_name = manifest_agent.id.as_str();
+    let has_composio = false;
+    let agent_definition_name =
+        host_toolpack_identity(manifest_agent.id.as_str(), is_orchestrator, has_composio);
 
     super::tool_posture::declare();
     let mut agent = AgentBuilder::default()
@@ -1714,3 +1710,19 @@ pub(crate) fn file_tools(workspace: &Path) -> Vec<Box<dyn Tool>> {
 #[cfg(test)]
 #[path = "build_tests.rs"]
 mod tests;
+
+/// Select a definition label whose pack disclosure preserves host-granted tools.
+/// This also changes OpenHuman transcript labels; it does not change grants.
+fn host_toolpack_identity(agent_id: &str, orchestrator: bool, composio: bool) -> &str {
+    if orchestrator {
+        "workflow_builder"
+    } else if composio {
+        "integrations_agent"
+    } else {
+        agent_id
+    }
+}
+
+#[cfg(test)]
+#[path = "host_toolpack_tests.rs"]
+mod host_toolpack_tests;
