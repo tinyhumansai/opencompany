@@ -356,7 +356,7 @@ impl Tool for ReadWorkflowTool {
     }
 
     fn description(&self) -> &str {
-        "Read one saved workflow's full graph by id, in the exact shape `update_workflow` accepts, plus the `version` token that tool requires. USE FOR seeing what a workflow actually does before changing it, and to get the `expected_version` for an edit — always read before `update_workflow`. NOT for listing what workflows exist (use `query_company`) and NOT for running one (use `run_workflow`). The reply also says whether the workflow is `editable` (a workflow shipped in the company's source tree is not), whether its schedule is armed, and names any per-node run policy (`on_error`, `retry`, `requires_approval`, `repeatable`) or trigger schedule that only the console can change."
+        "Read one saved workflow's full graph by id. Large graphs return exact JSON text pages: read every page with its read_version and concatenate graph_fragment before editing; never search the filesystem for missing pages. The reconstructed graph has the exact shape `update_workflow` accepts, plus the `version` token that tool requires. USE FOR seeing what a workflow actually does before changing it, and to get the `expected_version` for an edit — always read before `update_workflow`. NOT for listing what workflows exist (use `query_company`) and NOT for running one (use `run_workflow`). The reply also says whether the workflow is `editable` (a workflow shipped in the company's source tree is not), whether its schedule is armed, and names any per-node run policy (`on_error`, `retry`, `requires_approval`, `repeatable`) or trigger schedule that only the console can change."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -366,7 +366,9 @@ impl Tool for ReadWorkflowTool {
                 "id": {
                     "type": "string",
                     "description": "The id of the workflow to read (see the workflows list for valid ids)."
-                }
+                },
+                "page": {"type":"integer","minimum":0,"description":"Zero-based graph page; default 0. Read all pages before editing."},
+                "read_version": {"type":"string","description":"Required for page > 0: copy read_version from page 0 to reject mixed revisions."}
             },
             "required": ["id"],
             "additionalProperties": false
@@ -431,12 +433,21 @@ impl Tool for ReadWorkflowTool {
         // No overlay body: either a seed graph (readable through the union) or
         // an id this company does not answer for at all.
         let Some(raw) = raw else {
-            return Ok(self.read_seed_or_unknown(&overlays, &disable, &wid).await);
+            return Ok(self
+                .read_seed_or_unknown(&overlays, &disable, &wid, &args)
+                .await);
         };
 
         let projection = project_workflow_spec(&raw);
         let enabled = self.enabled_flag(&wid).await;
-        Ok(read_result(&wid, &projection, version, editable, enabled))
+        Ok(read_result(
+            &wid,
+            &projection,
+            version,
+            editable,
+            enabled,
+            &args,
+        ))
     }
 }
 
@@ -449,6 +460,7 @@ impl ReadWorkflowTool {
         overlays: &[OverlayWorkflow],
         disable: &[String],
         wid: &str,
+        args: &Value,
     ) -> ToolResult {
         let file = match load_workflow_with_globals(
             self.admin.source_dir.as_deref(),
@@ -470,7 +482,7 @@ impl ReadWorkflowTool {
         // an overlay read identically apart from `editable`.
         let projection = project_workflow_spec(&seed_draft(&file));
         let enabled = self.enabled_flag(wid).await;
-        read_result(wid, &projection, None, false, enabled)
+        read_result(wid, &projection, None, false, enabled, args)
     }
 
     /// Whether this workflow's schedule is armed, per the company record.
@@ -550,11 +562,59 @@ fn read_result(
     version: Option<String>,
     editable: bool,
     enabled: Option<bool>,
+    args: &Value,
 ) -> ToolResult {
-    let mut md = format!(
-        "Workflow **`{wid}`**\n\n{}\n",
+    let page = match args.get("page") {
+        None => 0,
+        Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(page) => page,
+            None => return ToolResult::error("page must be a non-negative integer"),
+        },
+    };
+    let compact = projection.spec.to_string();
+    let read_version = workflow_version(&compact);
+    if (page > 0 || args.get("read_version").is_some())
+        && args.get("read_version").and_then(Value::as_str) != Some(read_version.as_str())
+    {
+        return ToolResult::error(
+            "Missing or stale read_version. Read page 0 again; do not combine pages from different revisions.",
+        );
+    }
+    let mut pages = Vec::new();
+    let mut remaining = compact.as_str();
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(GRAPH_RENDER_BUDGET_BYTES);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        pages.push(&remaining[..end]);
+        remaining = &remaining[end..];
+    }
+    if page >= pages.len() {
+        return ToolResult::error(format!(
+            "page out of range: this graph has {} page(s)",
+            pages.len()
+        ));
+    }
+    let paged = pages.len() > 1;
+    let graph = if paged {
+        let next = if page + 1 < pages.len() {
+            format!(
+                "Read the next page with read_workflow: id={wid:?}, page={}, read_version={read_version:?}.",
+                page + 1
+            )
+        } else {
+            "This is the last page; assemble all pages before editing.".to_string()
+        };
+        format!(
+            "Graph JSON fragment, page {page} of {} (zero-based). This is NOT a complete workflow. Concatenate graph_fragment from ALL pages in order before parsing or editing. {next} Do not search workspace files for this graph.\n\n```text\n{}\n```\n\nread_version: `{read_version}`\n",
+            pages.len(),
+            pages[page]
+        )
+    } else {
         render_graph(&projection.spec)
-    );
+    };
+    let mut md = format!("Workflow **`{wid}`**\n\n{}\n", graph);
 
     match (&version, editable) {
         (Some(version), true) => md.push_str(&format!(
@@ -587,7 +647,12 @@ fn read_result(
 
     ToolResult::success_with_markdown(
         json!({
-            "workflow": projection.spec,
+            "workflow": if paged { Value::Null } else { projection.spec.clone() },
+            "graph_fragment": if paged { Some(pages[page]) } else { None },
+            "page": page,
+            "page_count": pages.len(),
+            "next_page": if page + 1 < pages.len() { Some(page + 1) } else { None },
+            "read_version": read_version,
             "version": version,
             "editable": editable,
             "enabled": enabled,
