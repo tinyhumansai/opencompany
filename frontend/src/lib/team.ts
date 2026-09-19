@@ -70,6 +70,22 @@ export interface TeamMember {
    */
   isOrchestrator?: boolean;
   /**
+   * Which declared harness this teammate runs on. Undefined means the one the
+   * company marks default — not "no harness".
+   */
+  harness?: string;
+  /**
+   * This teammate's own provider pin (a slug), set only alongside `model`.
+   * Undefined means the company default.
+   */
+  provider?: string;
+  /**
+   * This teammate's own model pin. Undefined means it declares none and
+   * inherits the company default — never "no model", and never a licence to
+   * name one the roster read did not send. See {@link modelSummary}.
+   */
+  model?: string;
+  /**
    * The tool grants this teammate **actually holds** — its own `[[agent]].tools`
    * line narrowed by the company's `[tools].allow`, resolved by the host
    * (issue #601).
@@ -149,6 +165,48 @@ export function roleSubtitle(name: string, role: string): string | null {
   return trimmed.toLowerCase() === name.trim().toLowerCase() ? null : trimmed;
 }
 
+/** What a roster card says a teammate thinks with. */
+export interface ModelSummary {
+  /** The one line the card draws. Never a fabricated model name. */
+  label: string;
+  /** Whether this teammate pins no model of its own. */
+  inherited: boolean;
+  /** The harness it is bound to, when it names one. */
+  harness?: string;
+}
+
+/**
+ * The card's answer to "which model does this teammate run on".
+ *
+ * An absent `model` means **the teammate declares none and inherits**, not
+ * that it has no model — every teammate resolves to one. The roster read
+ * carries no company default and no harness catalogue, so the inherited state
+ * is said in words: naming the inherited model here would mean either an extra
+ * fetch per card or an invented answer, and the wrong one of those is
+ * indistinguishable from a real pin once it is on screen.
+ *
+ * One inherited phrase covers every unpinned teammate, deliberately. The agent
+ * editor has two — "Company default" on a built-in harness, "Whatever the
+ * harness defaults to" on an ACP one — and picking between them needs the
+ * harness's `kind`, which comes from a catalogue this read does not carry and
+ * the grid does not fetch. Guessing from the harness id alone puts the ACP
+ * sentence on a teammate pinned to the built-in harness, which is a claim
+ * about where its model comes from that is simply false. "Inherits the
+ * default" is true either way, and the harness chip beside it says which
+ * default is in play.
+ */
+export function modelSummary(
+  member: Pick<TeamMember, "harness" | "provider" | "model">,
+): ModelSummary {
+  const { harness, provider, model } = member;
+  if (!model) {
+    return { label: "Inherits the default", inherited: true, harness };
+  }
+  // The provider is a slug rather than a label: the roster read carries no
+  // provider catalogue, and a guessed label would be a second invention.
+  return { label: provider ? `${provider} · ${model}` : model, inherited: false, harness };
+}
+
 /** Map a host roster entry into the console's team model. */
 export function fromDto(dto: TeamMemberDto): TeamMember {
   const name = dto.name?.trim() || dto.role;
@@ -178,6 +236,12 @@ export function fromDto(dto: TeamMemberDto): TeamMember {
     // either into a tier string is the bug this closed.
     tier: dto.tier,
     isOrchestrator: dto.isOrchestrator,
+    // Carried through untouched for the same reason: undefined is "declares
+    // none and inherits", which the card renders in words rather than as a
+    // resolved name it was never given.
+    harness: dto.harness,
+    provider: dto.provider,
+    model: dto.model,
     // A host predating issue #601 sends neither, and an empty list is the
     // honest reading of that: it draws no tools and no desk rather than a
     // guess at either.

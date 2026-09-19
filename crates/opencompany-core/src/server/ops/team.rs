@@ -126,6 +126,32 @@ struct TeamMemberDto {
     /// the bug: it is indistinguishable from a declaration on the wire.
     #[serde(skip_serializing_if = "Option::is_none")]
     tier: Option<String>,
+    /// Which `[[harness]]` this teammate runs its turns on, by declared id —
+    /// the same field, from the same helper, as `GET …/team/{agent_id}`.
+    ///
+    /// Absent means the harness marked `default = true`, **not** "no harness":
+    /// every teammate resolves to one. Skipped rather than defaulted for
+    /// `tier`'s reason — a default is indistinguishable from a declaration on
+    /// the wire, and a roster card that named the default as though this
+    /// teammate had pinned it would be claiming something the record does not
+    /// say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    /// This teammate's own model pin: the hint forwarded to an ACP harness, or
+    /// the model half of its `{provider, model}` pair on a built-in one.
+    ///
+    /// Absent means it declares none and inherits the company default. Carried
+    /// on the list for the reason `tier` and `desks` are: the roster grid draws
+    /// a card per teammate, and a field the list omitted was a field the card
+    /// had to invent or leave blank — with no way to resolve it short of an
+    /// N+1 over the detail read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// The provider half of this teammate's own `{provider, model}` pair, set
+    /// only together with [`model`](Self::model) and only meaningful on a
+    /// built-in harness. Absent means the company default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     /// Whether this teammate is the company's orchestrator, resolved by the
     /// roster rule (tagged tier first, else the first declared agent) — the
     /// same field, from the same helper, as the detail read (issue #643).
@@ -430,12 +456,15 @@ fn member_row(
         name,
         role,
         description,
-        // All four through `team_agent`'s helpers, never recomputed here: the
+        // Through `team_agent`'s helpers, never recomputed here: the
         // roster list and the detail read must not be able to disagree about
         // the same teammate (issues #264, #601, #643). A second copy of the
         // orchestrator rule in particular would be a copy of a rule that has
         // two arms, and the arm it dropped would be invisible on screen.
         tier: super::team_agent::declared_tier(record, agent_id),
+        harness: super::team_agent::declared_harness(record, agent_id),
+        model: super::team_agent::declared_model(record, agent_id),
+        provider: super::team_agent::declared_provider(record, agent_id),
         is_orchestrator: super::team_agent::is_orchestrator(record, agent_id),
         tools: super::team_agent::agent_tools(record, agent_id),
         desks: super::team_agent::desks_for(record, agent_id),
@@ -762,6 +791,9 @@ async fn add_member(
     // written out here, so this response cannot drift from the two reads
     // (issues #601, #643).
     let tier = super::team_agent::declared_tier(&record, &agent.id);
+    let harness = super::team_agent::declared_harness(&record, &agent.id);
+    let model = super::team_agent::declared_model(&record, &agent.id);
+    let provider = super::team_agent::declared_provider(&record, &agent.id);
     let is_orchestrator = super::team_agent::is_orchestrator(&record, &agent.id);
     let tools = super::team_agent::agent_tools(&record, &agent.id);
     let desks = super::team_agent::desks_for(&record, &agent.id);
@@ -771,6 +803,9 @@ async fn add_member(
         role: agent.role,
         description: agent.description,
         tier,
+        harness,
+        model,
+        provider,
         is_orchestrator,
         tools,
         desks,

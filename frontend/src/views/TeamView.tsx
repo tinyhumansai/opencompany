@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Cpu,
   MessageSquare,
   MoreHorizontal,
   Network,
@@ -38,7 +39,7 @@ import {
   reportAddMember,
   type MissedStep,
 } from "@/lib/member-feedback";
-import { fromDto, newMember, roleSubtitle, type TeamMember } from "@/lib/team";
+import { fromDto, modelSummary, newMember, roleSubtitle, type TeamMember } from "@/lib/team";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
 import { usd } from "@/lib/money";
 import { cn } from "@/lib/utils";
@@ -567,6 +568,11 @@ export function TeamView({
                   // record behind it would 404 on its id, and the detail view
                   // would report a teammate that was never removed.
                   onOpen={hostBackedCard(m, fromHost, consoleOnly) ? () => onOpenAgent(m.id) : undefined}
+                  // The same gate again: only a row the host holds has a
+                  // binding to report. A console-only placeholder runs on
+                  // nothing yet, and "Company default" over it would describe a
+                  // teammate that does not exist.
+                  hostBacked={hostBackedCard(m, fromHost, consoleOnly)}
                   // The same gate, because it is the same question: a row no
                   // host holds has no DM either, and the room would answer with
                   // its unknown-channel fallback rather than a conversation.
@@ -705,6 +711,7 @@ function MemberCard({
   messageHref,
   workload,
   onNavigateToDesk,
+  hostBacked,
 }: {
   member: TeamMember;
   onRemove: () => void;
@@ -726,6 +733,11 @@ function MemberCard({
    * does not offer desk navigation; the chips then render as plain text.
    */
   onNavigateToDesk?: (deskId: string) => void;
+  /**
+   * Whether the host holds this row, and so whether it has a harness and model
+   * binding to report at all.
+   */
+  hostBacked?: boolean;
 }) {
   // Issue #1208: the role only earns its line when it is not the name again.
   // Every manifest-declared agent in the shipped companies resolves both to one
@@ -956,6 +968,7 @@ function MemberCard({
           shapes of card disagree again.
         */}
         <div className="mt-auto space-y-1.5 empty:hidden">
+          {hostBacked && <ModelLine member={member} />}
           {workload && <WorkloadLine workload={workload} />}
           {member.budgetUsdDaily !== undefined && (
             <DailyBudgetLine
@@ -982,6 +995,41 @@ function MemberCard({
         */}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Which model this teammate runs on, and the harness it runs it through.
+ *
+ * Read-only here like the desk chips and the budget line: the picker lives on
+ * the teammate's own page. The label comes from {@link modelSummary}, which
+ * never names a model the roster read did not send — an unpinned teammate
+ * inherits, and saying so is the honest answer a resolved-looking name would
+ * not be.
+ *
+ * The harness rides along as a chip rather than another `·` segment: it is a
+ * different kind of fact from the model, it is what tells an operator a
+ * teammate runs through their own CLI rather than the built-in harness, and a
+ * chip keeps its width off the model text, which is what truncates.
+ */
+function ModelLine({ member }: { member: TeamMember }) {
+  const summary = modelSummary(member);
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground" data-testid="team-card-model">
+      <Cpu className="size-3 shrink-0" aria-hidden />
+      <span
+        className={cn("min-w-0 truncate", summary.inherited && "italic")}
+        title={summary.label}
+        data-testid="team-card-model-label"
+      >
+        {summary.label}
+      </span>
+      {summary.harness && (
+        <Badge variant="outline" className="text-3xs" data-testid="team-card-harness">
+          {summary.harness}
+        </Badge>
+      )}
+    </p>
   );
 }
 
