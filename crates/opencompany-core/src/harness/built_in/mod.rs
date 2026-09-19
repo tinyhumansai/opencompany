@@ -1394,8 +1394,8 @@ impl CompanyAgent {
         let mut session_cues: Option<String> = None;
         // A card attempt is one bounded work context, not the continuation of
         // whatever this teammate last did on another card or in a channel.
-        // `run_sink` uniquely identifies the dispatched-card path here. Start
-        // it clean and clear it again below, while the card note carries the
+        // Unthreaded workflow steps also bring their own brief, even without
+        // a run sink. Start clean and clear again below, while the card note carries the
         // explicit prior-attempt history it is allowed to use. This also lets a
         // rebuilt agent's current system prompt take effect instead of reviving
         // a transcript whose frozen prompt predates newly wired tools.
@@ -1407,6 +1407,7 @@ impl CompanyAgent {
                 agent.clear_history();
             }
             overrides.suppress_transcript_autoload = true;
+            overrides.suppress_active_goal = true;
         }
         // Codex P1: a session delta's `next_state` must not land in
         // `self.session` until the turn it was cued into actually succeeds.
@@ -1478,6 +1479,7 @@ impl CompanyAgent {
                     agent.clear_history();
                 }
                 overrides.suppress_transcript_autoload = true;
+                overrides.suppress_active_goal = true;
                 // The episode prompt already contains the triggering message,
                 // but it does not contain unrelated unseen channel/DM rows.
                 // Preserve the company-wide watermark and mark only the trigger
@@ -2165,8 +2167,8 @@ impl CompanyAgent {
         (outcome, usages)
     }
 
-    fn isolates_background_history(turn_chat_id: Option<&str>, has_run_sink: bool) -> bool {
-        turn_chat_id.is_none() && has_run_sink
+    fn isolates_background_history(turn_chat_id: Option<&str>, _has_run_sink: bool) -> bool {
+        turn_chat_id.is_none()
     }
 
     /// This turn's in-turn spend ceiling, in USD — the value that
@@ -4985,7 +4987,7 @@ impl HarnessPool {
         // Skipped entirely for a chat-only turn (issue #1725): a greeting /
         // "Just chatting" reply must not be grounded in prior task outcomes, and
         // pulling them is the exact context leak the fast path exists to stop.
-        let augmented = if crate::runtime::delegation::is_chat_only_turn() {
+        let augmented = if crate::runtime::delegation::is_chat_only_turn() || !chat.history_seed {
             message.to_string()
         } else {
             // **Retrieved on the operator's own words, injected into the

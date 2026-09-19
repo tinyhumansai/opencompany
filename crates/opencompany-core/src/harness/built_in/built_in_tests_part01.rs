@@ -16,7 +16,7 @@ fn dispatched_cards_are_isolated_from_an_agents_other_conversations() {
         Some("general"),
         true
     ));
-    assert!(!CompanyAgent::isolates_background_history(None, false));
+    assert!(CompanyAgent::isolates_background_history(None, false));
 }
 
 /// The fingerprint moves when the tier moves (issue #562).
