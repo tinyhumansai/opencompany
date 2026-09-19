@@ -519,6 +519,20 @@ export interface AcpConfirmation {
 const confirmations = new Map<string, AcpConfirmation>();
 
 /**
+ * The confirmations still in flight, keyed by id.
+ *
+ * Distinct from {@link confirmations}, which holds settled answers: this one
+ * holds the *promise*, and only until it resolves. Two surfaces asking about
+ * the same harness at the same moment — Settings open behind the agent
+ * picker — would otherwise each spawn the CLI and run their own handshake for
+ * an answer that is the same one twice, at roughly two seconds apiece.
+ *
+ * Cleared the moment the call settles, so this de-duplicates concurrent asks
+ * without ever serving a stale verdict: the next ask starts a fresh probe.
+ */
+const inFlightConfirmations = new Map<string, Promise<AcpConfirmation | null>>();
+
+/**
  * Starts one harness, resolving its `checking` state to `ready` or
  * `spawnFailed`, and reporting the models it advertises.
  *
@@ -526,11 +540,24 @@ const confirmations = new Map<string, AcpConfirmation>();
  * cheap filesystem probe straight away and each row settles on its own, so one
  * slow CLI cannot hold up the rest of the pane.
  *
+ * Concurrent calls for the same id share one probe; a call made after that one
+ * settles starts another. See {@link inFlightConfirmations}.
+ *
  * `null` when nothing can answer — a browser, or a shell predating the
  * command. Callers should leave the row on `checking` in that case rather than
  * inventing a verdict.
  */
-export async function confirmAcpHarness(id: string): Promise<AcpConfirmation | null> {
+export function confirmAcpHarness(id: string): Promise<AcpConfirmation | null> {
+  const running = inFlightConfirmations.get(id);
+  if (running) return running;
+  const started = runConfirmation(id).finally(() => {
+    inFlightConfirmations.delete(id);
+  });
+  inFlightConfirmations.set(id, started);
+  return started;
+}
+
+async function runConfirmation(id: string): Promise<AcpConfirmation | null> {
   const desktop = tauriCore();
   if (!desktop) return null;
   try {

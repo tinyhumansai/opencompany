@@ -24,11 +24,23 @@ That the join works is deliberate, not luck: the manifest vocabulary
 `claude`, `codex`.
 
 ```text
-GET {scope}/harnesses  ──┐
-   declared + detected   ├──▶  joinHarnesses()  ──▶  External harnesses page
-oc_acp_harnesses ────────┘        (lib/harnesses.ts)
+GET {scope}/harnesses  ──┐                              ┌─▶ External harnesses page
+   declared + detected   ├──▶  joinHarnesses()  ────────┤
+oc_acp_harnesses ────────┘        (lib/harnesses.ts)    └─▶ an agent's Harness & model picker
    readiness per id
 ```
+
+Two surfaces render that join, through the shared `useHarnessRows` hook: the
+Settings page, which is *about* the harnesses, and the agent editor's picker,
+where the operator is choosing one. Each fetches `GET {scope}/harnesses`
+itself — Settings has to tell a 404 from an empty list, and the agent page
+already holds the list for its own picker — and both go through the same
+survey, so the same machine state can never be given two different names.
+
+The picker surveys only while its editor is open. Probing on page view would
+start a subprocess per harness every time anyone opened a teammate. Concurrent
+asks about the same harness share one probe (`confirmAcpHarness` keeps an
+in-flight map), so the two surfaces open at once still cost one handshake.
 
 ---
 
@@ -132,7 +144,7 @@ from a superseded run is dropped, so pressing "Check again" mid-probe cannot
 let a stale verdict land on the newer list.
 
 `confirm()` runs phase 1's reasoning itself rather than trusting callers to
-filter — the harnesses pane confirms only `Checking` rows, but the agent
+filter — both surveying surfaces confirm only `Checking` rows, but the agent
 editor's model picker calls straight through on whatever harness was selected.
 Spawning something already resolved would replace a specific instruction with
 `No such file or directory (os error 2)`, mislabelled as a *broken* install
@@ -210,6 +222,16 @@ rendered as "can't say from here":
 - a harness that is not a local CLI — `built_in` (no CLI at all) or
   `transport = "runner"` (a CLI on somebody else's machine). Probing either
   against this machine's `PATH` would be a category error.
+
+An unready harness is still **pickable**. The picker never disables an option,
+because `readiness: undefined` is the browser's ordinary state and greying an
+option there would be a guess presented as a verdict. Binding a teammate to a
+harness that turns out to be missing fails that turn with the harness's own
+reason, which is `lanes.rs`'s doctrine and strictly better than pre-empting it.
+
+Readiness is never persisted — no `localStorage`, no app state, per page load
+only. A stored flag is exactly the second source of truth, able to disagree
+with the CLI actually being there, that "There is no connect" above rules out.
 
 Sign-in is probed by **credential file**, not by launching the CLI — see
 `acp::discovery`'s module docs. It can be wrong in one direction (a stale
