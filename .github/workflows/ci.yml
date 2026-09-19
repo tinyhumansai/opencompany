@@ -1242,13 +1242,27 @@ jobs:
       - name: Test the runner lane
         run: scripts/ci/run-scoped-suite.sh "runner" acp,runner,tinymemory runner
 
-      # The ACP surface. Two invocations, not one: `run-scoped-suite.sh` takes
+      # The ACP surface. One invocation per filter: `run-scoped-suite.sh` takes
       # exactly one filter, and a second bare argument to `cargo test` narrows
       # the selection to nothing rather than adding a module.
+      # Two feature sets for issue #1979's reserved-path matrix:
+      # - with `acp`: GET /acp → 405 (POST-only route mounted)
+      # - without `acp`: GET /acp → 404 (reserved-prefix fallback)
+      # The default `cargo test --locked` above also covers the no-acp arm; the
+      # pinned step below keeps that arm from silently disappearing if the
+      # default selection ever changes.
       - name: Test the ACP surface
         run: |
           scripts/ci/run-scoped-suite.sh "acp server" acp,runner,tinymemory server::acp
           scripts/ci/run-scoped-suite.sh "acp run turn" acp,runner,tinymemory harness::acp::run_turn
+          scripts/ci/run-scoped-suite.sh "acp routes" acp,runner,tinymemory server::routes
+
+      - name: Test reserved routes without ACP
+        run: >
+          scripts/ci/run-scoped-suite.sh
+          "routes no-acp"
+          oauth,platform-jwt,documents,tinymemory
+          console_does_not_shadow_unmatched_reserved_paths
 
       # Issue #788: Chargebee billing — the REST layer (`chargebee::`) and the
       # toolbelt bridge (`harness::chargebee`) in one filter, which selects both.

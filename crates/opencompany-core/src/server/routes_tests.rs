@@ -208,19 +208,15 @@ async fn console_does_not_shadow_unmatched_reserved_paths() {
     let (_guard, dir) = console_fixture();
     let app = router_with_console(AppState::new(AppConfig::default()), Some(dir));
 
-    // An unmatched path under a reserved API/discovery prefix (e.g. a
-    // feature-gated route in a build without that feature) must 404, not
-    // fall through to the SPA shell, so callers can still detect the
-    // surface as unwired.
+    // Paths under reserved API/discovery prefixes must never fall through
+    // to the SPA shell, so API and protocol clients can distinguish "this
+    // surface is absent" from "here is your JSON response". The invariant
+    // is on the *property* — no HTML shell — not on the specific 4xx code,
+    // which depends on whether a route is mounted at all.
     for path in [
         "/api/v1/does-not-exist",
         "/.well-known/agent-card.json",
         "/companies/acme/.well-known/agent-card.json",
-        // The ACP endpoint in a build that does not mount it. An ACP client
-        // probing a host cannot distinguish "no ACP here" from "here is
-        // your JSON-RPC" if both answer `200` with an HTML body — it would
-        // try to parse the console shell as a protocol response.
-        "/acp",
     ] {
         let response = app
             .clone()
@@ -228,9 +224,57 @@ async fn console_does_not_shadow_unmatched_reserved_paths() {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
-        assert!(!body_text(response).await.contains("<title>console</title>"));
+        let status = response.status();
+        let body = body_text(response).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "reserved path {path} must 404 when unmatched; got {status}, body starts: {:?}",
+            body.chars().take(120).collect::<String>(),
+        );
+        assert!(
+            !body.contains("<title>console</title>"),
+            "reserved path {path} must not fall through to the SPA shell; body starts: {:?}",
+            body.chars().take(120).collect::<String>(),
+        );
     }
+
+    // `/acp` is a reserved prefix in both feature states (see `RESERVED_PREFIXES`
+    // in routes.rs), so the console shell must never answer it. The specific
+    // status code is feature-dependent:
+    //
+    // - Without `acp`: no route is mounted; the fallback sees the reserved
+    //   prefix and returns 404 — the honest "no ACP here" signal.
+    // - With    `acp`: the route is mounted as POST-only; a GET receives 405 —
+    //   the correct method-level rejection from the mounted handler.
+    //
+    // A 405 is still proof the console did not shadow the path, so both codes
+    // satisfy the invariant (issue #1979). CI covers both arms: the default
+    // `cargo test --locked` lane (no `acp`) and the ACP lane (`--features acp,…`).
+    let acp_response = app
+        .oneshot(Request::builder().uri("/acp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let expected_acp_status = if cfg!(feature = "acp") {
+        StatusCode::METHOD_NOT_ALLOWED
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    let acp_status = acp_response.status();
+    let acp_body = body_text(acp_response).await;
+    assert_eq!(
+        acp_status,
+        expected_acp_status,
+        "GET /acp with feature acp={} must be {expected_acp_status}; got {acp_status}, body starts: {:?}",
+        cfg!(feature = "acp"),
+        acp_body.chars().take(120).collect::<String>(),
+    );
+    assert!(
+        !acp_body.contains("<title>console</title>"),
+        "GET /acp must not fall through to the SPA shell (feature acp={}); body starts: {:?}",
+        cfg!(feature = "acp"),
+        acp_body.chars().take(120).collect::<String>(),
+    );
 }
 
 #[test]

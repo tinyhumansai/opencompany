@@ -57,7 +57,7 @@ tinyplace      | tested       | tinyplace                       | Runs the whole
 sqlite         | partial      | sqlite                          | store::sqlite
 hivemind       | partial      | hivemind                        | runtime::hivemind
 mongodb        | partial      | mongodb                         | store::mongodb store::select
-acp            | partial      | acp,runner,tinymemory | server::acp harness::acp::run_turn
+acp            | partial      | acp,runner,tinymemory | server::acp harness::acp::run_turn server::routes
 runner         | partial      | acp,runner,tinymemory | runner
 mcp            | partial      | openhuman,mcp,media    | harness::built_in::build::tests app::types
 media          | partial      | openhuman,mcp,media    | harness::built_in::build::tests harness::built_in::toolbelt
