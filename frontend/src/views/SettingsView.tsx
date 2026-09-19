@@ -749,6 +749,21 @@ function MemoryEngineCard({
                 : `${engine.unreachableFamilies.join(", ")} — reads against these will fail`}
           </span>
         </InfoRow>
+        {/*
+          The optional half of the same observation, shown only when there is
+          something to show: an engine serving everything it advertises would
+          otherwise carry a permanent "none" row for a check most operators
+          never think about. A refusal here is not a reason to replace the
+          engine — every cycle still runs — but it is the reason a tool will
+          fail, which is worth having on the page before it does.
+        */}
+        {engine.degradedFamilies !== undefined && engine.degradedFamilies.length > 0 && (
+          <InfoRow label="Optional families refused">
+            <span className="text-sm">
+              {`${engine.degradedFamilies.join(", ")} — advertised, but the engine refused a read; the tools these back will fail`}
+            </span>
+          </InfoRow>
+        )}
         {engine.slowFamilies !== undefined && engine.slowFamilies.length > 0 && (
           <InfoRow label="Slow at probe">
             <span className="text-sm">

@@ -371,6 +371,49 @@ async fn read_reprobes_the_live_memory_engine() {
         "the probed-family verdict must reach the console under this name"
     );
     assert_eq!(body["slowFamilies"], serde_json::json!([]));
+    assert_eq!(
+        body["degradedFamilies"],
+        serde_json::json!([]),
+        "the optional half of the same verdict must reach the console too"
+    );
+}
+
+/// An optional family the engine refuses must be reported and must not block
+/// the bind.
+///
+/// The two verdicts are separate fields precisely so this distinction survives
+/// the wire: `unreachableFamilies` is what apply turns an engine away for, and
+/// folding `people` into it would take a mostly-working engine away from an
+/// operator who has no other one. `bindable_caveat` is the sentence the console
+/// shows instead, and it must carry both non-blocking observations rather than
+/// whichever was checked first.
+#[test]
+fn a_refused_optional_family_is_a_caveat_and_not_a_refusal() {
+    let degraded = ["people".to_string()];
+
+    assert!(
+        super::family_refusal("supermemory", None).is_none()
+            && super::probe_is_bindable(Some(true), None),
+        "nothing about a degraded family may reach the refusal path"
+    );
+
+    let caveat = super::bindable_caveat(Some(&degraded), None).expect("a caveat is reported");
+    assert!(caveat.contains("people"), "{caveat}");
+
+    // Both, not one: an engine can refuse one optional family and time out on
+    // another in the same probe.
+    let both = super::bindable_caveat(Some(&degraded), Some(&["graph".to_string()]))
+        .expect("a caveat is reported");
+    assert!(
+        both.contains("people") && both.contains("graph"),
+        "a caveat must name every non-blocking observation: {both}"
+    );
+
+    assert!(
+        super::bindable_caveat(Some(&[]), Some(&[])).is_none(),
+        "a clean probe carries no caveat"
+    );
+    assert!(super::bindable_caveat(None, None).is_none());
 }
 
 /// Apply must refuse a candidate that refused a mandatory family, and must not

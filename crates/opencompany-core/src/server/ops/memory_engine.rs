@@ -68,6 +68,17 @@ use crate::store::{MemoryBackend, MemorySelection, StorageSettings};
 /// check is not one an operator should be told is fine.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How stale a probe answer [`read`] will reuse rather than ask again.
+///
+/// The probe is one read per advertised family plus health, so re-running it
+/// per `GET` charged a console page load — and every re-render and poll behind
+/// it — a full round against an engine that may meter each call. Fifteen
+/// seconds is long enough that opening the page, switching tabs and coming
+/// back costs one round, and short enough that an operator who has just fixed
+/// an endpoint sees the new verdict without wondering whether the page is
+/// stuck. `test` and `apply` never reuse: they act on the answer.
+const PROBE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Builds the memory-engine route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/memory/engine", get(read).put(apply))
@@ -129,6 +140,16 @@ struct EngineDto {
     /// mandatory families. This is what the engine actually answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     unreachable_families: Option<Vec<String>>,
+    /// Advertised **optional** families the live engine refused when probed.
+    ///
+    /// Reported, never blocking: an engine that cannot serve `people` still
+    /// serves every cycle, and taking it away from an operator who has no
+    /// other one would be the worse failure. The harm it does name is real —
+    /// the agent tools and routes these families gate are offered and fail on
+    /// their first call — which is why it is on the page rather than only in a
+    /// log line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_families: Option<Vec<String>>,
     /// Families the engine did not answer inside the probe budget. Slow is not
     /// the same verdict as refused, so it is reported separately.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,6 +233,11 @@ struct ProbeDto {
     /// here, because health hits a different endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     unreachable_families: Option<Vec<String>>,
+    /// Optional families the candidate advertised and did not answer. Reported,
+    /// but not a failure — apply binds an engine whose optional surface is
+    /// partly down, so Test must not say otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_families: Option<Vec<String>>,
     /// Families that did not answer inside the budget. Reported, but not a
     /// failure: the console must not turn a loaded engine into a refusal.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -399,26 +425,29 @@ fn snapshot(
     let (selection, layer) = saved_selection(state)?;
     // The live overlay is the honest answer to "what is bound"; its absence
     // means the base store serves memory, which is exactly `store`.
-    let (active, capabilities, healthy, unreachable_families, slow_families) = match &live {
-        Some(overlay) => (
-            engine_id(&MemorySelection {
-                backend: overlay.descriptor.backend,
-                driver: Some(overlay.descriptor.driver_id.clone()),
-                url: None,
-                api_key: None,
-            }),
-            overlay.descriptor.capabilities.clone(),
-            overlay.descriptor.healthy,
-            overlay.descriptor.unreachable_families.clone(),
-            overlay.descriptor.slow_families.clone(),
-        ),
-        None => ("store".to_string(), Vec::new(), None, None, None),
-    };
+    let (active, capabilities, healthy, unreachable_families, degraded_families, slow_families) =
+        match &live {
+            Some(overlay) => (
+                engine_id(&MemorySelection {
+                    backend: overlay.descriptor.backend,
+                    driver: Some(overlay.descriptor.driver_id.clone()),
+                    url: None,
+                    api_key: None,
+                }),
+                overlay.descriptor.capabilities.clone(),
+                overlay.descriptor.healthy,
+                overlay.descriptor.unreachable_families.clone(),
+                overlay.descriptor.degraded_families.clone(),
+                overlay.descriptor.slow_families.clone(),
+            ),
+            None => ("store".to_string(), Vec::new(), None, None, None, None),
+        };
     Ok(EngineDto {
         active,
         capabilities,
         healthy,
         unreachable_families,
+        degraded_families,
         slow_families,
         selected: engine_id(&selection),
         url: selection.url.clone(),
@@ -444,7 +473,9 @@ async fn read(
     let _ = company.id();
     let mut live = state.memory_overlay();
     if let Some(overlay) = &mut live {
-        overlay.refresh_health(PROBE_TIMEOUT).await;
+        overlay
+            .refresh_health_within(PROBE_TIMEOUT, PROBE_MAX_AGE)
+            .await;
     }
     Ok(Json(snapshot(&state, live)?))
 }
@@ -582,11 +613,13 @@ async fn test_engine(
             healthy: true,
             capabilities: Vec::new(),
             unreachable_families: None,
+            degraded_families: None,
             slow_families: None,
             detail: None,
         })),
         Ok(Some(overlay)) => {
             let unreachable = overlay.descriptor.unreachable_families.clone();
+            let degraded = overlay.descriptor.degraded_families.clone();
             let slow = overlay.descriptor.slow_families.clone();
             let refused = refused_families(unreachable.as_deref()).is_some();
             // `healthy` is what the console branches on, and it must mean "you
@@ -610,20 +643,19 @@ async fn test_engine(
                     )
                 })
             } else {
-                // Slow is reported but is not a failure, so it rides the
-                // success branch as a caveat rather than a verdict.
-                slow.as_ref().filter(|f| !f.is_empty()).map(|f| {
-                    format!(
-                        "answered, but {} did not return inside the probe budget — the engine \
-                         may simply be loaded",
-                        f.join(", ")
-                    )
-                })
+                // Neither degraded nor slow is a failure, so both ride the
+                // success branch as caveats rather than verdicts — and both,
+                // rather than whichever was checked first: an engine can
+                // refuse one optional family and time out on another, and
+                // reporting only one of those was how the apply toasts used to
+                // lose the other.
+                bindable_caveat(degraded.as_deref(), slow.as_deref())
             };
             Ok(Json(ProbeDto {
                 healthy,
                 capabilities: overlay.descriptor.capabilities.clone(),
                 unreachable_families: unreachable,
+                degraded_families: degraded,
                 slow_families: slow,
                 detail,
             }))
@@ -632,6 +664,7 @@ async fn test_engine(
             healthy: false,
             capabilities: Vec::new(),
             unreachable_families: None,
+            degraded_families: None,
             slow_families: None,
             detail: Some(error.to_string()),
         })),
@@ -647,6 +680,29 @@ async fn test_engine(
 /// remembering to.
 fn refused_families(unreachable: Option<&[String]>) -> Option<&[String]> {
     unreachable.filter(|families| !families.is_empty())
+}
+
+/// The caveats a bindable candidate still carries, as one sentence.
+///
+/// Both lists are non-blocking and independent — an engine can refuse `people`
+/// and time out on `graph` in the same probe — so they are joined rather than
+/// branched between. `None` when the probe was clean, or when there was no
+/// provider seam to ask.
+fn bindable_caveat(degraded: Option<&[String]>, slow: Option<&[String]>) -> Option<String> {
+    let mut caveats = Vec::new();
+    if let Some(families) = degraded.filter(|f| !f.is_empty()) {
+        caveats.push(format!(
+            "it refused {}, so the tools those families back will fail",
+            families.join(", ")
+        ));
+    }
+    if let Some(families) = slow.filter(|f| !f.is_empty()) {
+        caveats.push(format!(
+            "{} did not return inside the probe budget — the engine may simply be loaded",
+            families.join(", ")
+        ));
+    }
+    (!caveats.is_empty()).then(|| format!("answered, but {}", caveats.join("; and ")))
 }
 
 /// Whether `test` may report a probed candidate as bindable.

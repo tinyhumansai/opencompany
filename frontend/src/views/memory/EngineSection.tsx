@@ -65,12 +65,19 @@ function healthLabel(
   healthy: boolean | undefined,
   slow?: string[],
   unreachable?: string[],
+  degraded?: string[],
 ): string {
   if (healthy === false) return "not answering — check the endpoint and key";
   if (unreachable?.length) {
     return `answering, but refusing ${unreachable.join(", ")} — reads against those will fail`;
   }
   if (healthy === true) {
+    // Degraded outranks slow: "it refused this" is a verdict and "it was slow"
+    // is not, so the stronger one is what the line has room to say. Both are
+    // listed in full on the Settings panel.
+    if (degraded?.length) {
+      return `answering, but refusing ${degraded.join(", ")} — the tools those back will fail`;
+    }
     return slow?.length ? `answering, but ${slow.join(", ")} timed out at the last probe` : "answering";
   }
   return "no probe — this engine has no health check to ask";
@@ -172,6 +179,11 @@ export function EngineSection({ client, company, onApplied }: Props) {
       // Independent facts, so independent toasts. These were an `if/else if`,
       // which meant an apply that both needed a restart and had a family time
       // out reported only the restart.
+      if (applied.engineState.degradedFamilies?.length) {
+        toast.warning(
+          `Bound, but ${applied.engineState.degradedFamilies.join(", ")} refused a read — the tools those families back will fail.`,
+        );
+      }
       if (applied.engineState.slowFamilies?.length) {
         toast.warning(
           `${applied.engineState.slowFamilies.join(", ")} did not answer inside the probe budget — the engine may simply be loaded.`,
@@ -238,15 +250,22 @@ export function EngineSection({ client, company, onApplied }: Props) {
                     // serve the ports. Green here said the opposite.
                     state.unreachableFamilies?.length
                     ? "bg-status-failed"
-                    : state.healthy === true
-                      ? "bg-status-done"
-                      : state.healthy === false
-                        ? "bg-status-failed"
-                        : "bg-muted-foreground/40",
+                    : // A refused *optional* family is not that: every cycle
+                      // still runs, and only the tools that family backs fail.
+                      // Amber, because red would tell an operator to replace an
+                      // engine that is mostly working, and green would hide a
+                      // surface that is going to fail on its first call.
+                      state.degradedFamilies?.length
+                      ? "bg-status-blocked"
+                      : state.healthy === true
+                        ? "bg-status-done"
+                        : state.healthy === false
+                          ? "bg-status-failed"
+                          : "bg-muted-foreground/40",
               )}
             />
             <span className="font-medium">{state.active}</span>
-            <span className="text-muted-foreground">· {healthLabel(state.healthy, state.slowFamilies, state.unreachableFamilies)}</span>
+            <span className="text-muted-foreground">· {healthLabel(state.healthy, state.slowFamilies, state.unreachableFamilies, state.degradedFamilies)}</span>
           </span>
           {state.capabilities.length > 0 && (
             <span className="flex flex-wrap items-center gap-1.5">

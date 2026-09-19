@@ -258,6 +258,33 @@ pub struct MemoryOverlay {
     /// construction. The ports above are the only data path.
     #[cfg(feature = "tinymemory")]
     probe: Option<Arc<dyn tinymemory_api::provider::MemoryProvider>>,
+    /// The last probe's answer, shared by every clone of this overlay.
+    ///
+    /// [`AppState::memory_overlay`](crate::AppState::memory_overlay) hands out
+    /// a clone, so a probe run on one clone would otherwise be dropped with it
+    /// and the next console read would pay for the whole round again — a keyed
+    /// read, an account-wide search, and one read per advertised family,
+    /// against an engine that may meter every one of them. An `Arc` here means
+    /// the answer outlives the clone that fetched it.
+    ///
+    /// Deliberately *not* stored on [`AppState`]: writing a probed clone back
+    /// there would race a concurrent apply and could restore the engine the
+    /// operator just replaced. The cache belongs to the overlay it describes,
+    /// which also means a newly applied engine starts with an empty one rather
+    /// than inheriting the previous engine's verdict.
+    #[cfg(feature = "tinymemory")]
+    probe_cache: Arc<std::sync::Mutex<Option<CachedProbe>>>,
+}
+
+/// One probe answer, with when it was taken.
+#[cfg(feature = "tinymemory")]
+#[derive(Clone, Debug)]
+struct CachedProbe {
+    at: std::time::Instant,
+    healthy: bool,
+    unreachable: Vec<String>,
+    degraded: Vec<String>,
+    slow: Vec<String>,
 }
 
 impl MemoryOverlay {
@@ -283,10 +310,13 @@ impl MemoryOverlay {
                 capabilities: Vec::new(),
                 healthy: None,
                 unreachable_families: None,
+                degraded_families: None,
                 slow_families: None,
             },
             #[cfg(feature = "tinymemory")]
             probe: None,
+            #[cfg(feature = "tinymemory")]
+            probe_cache: Arc::default(),
         }
     }
 
@@ -304,12 +334,71 @@ impl MemoryOverlay {
     /// overlay path, or a build without the provider seam.
     #[cfg(feature = "tinymemory")]
     pub async fn refresh_health(&mut self, timeout: std::time::Duration) {
-        let Some(probe) = &self.probe else {
+        self.refresh_health_within(timeout, std::time::Duration::ZERO)
+            .await;
+    }
+
+    /// [`Self::refresh_health`], reusing an answer younger than `max_age`
+    /// instead of asking the engine again.
+    ///
+    /// For read paths that run on every page load. The boot and apply paths
+    /// pass `ZERO` and always ask: both are acting on the answer, and an
+    /// operator who has just fixed a credential must not be shown the verdict
+    /// from before the fix.
+    ///
+    /// Reusing changes what the caller *pays*, never what it is told: a reused
+    /// answer is written onto the descriptor exactly as a fresh one would be.
+    /// It is not re-logged, because nothing new was observed — a warning per
+    /// console poll would bury the boot line that says the engine is broken.
+    #[cfg(feature = "tinymemory")]
+    pub async fn refresh_health_within(
+        &mut self,
+        timeout: std::time::Duration,
+        max_age: std::time::Duration,
+    ) {
+        if self.probe.is_none() {
+            return;
+        }
+        if !max_age.is_zero()
+            && let Some(cached) = self.cached_probe(max_age)
+        {
+            self.record_probe(&cached);
+            return;
+        }
+        self.probe_now(timeout).await;
+    }
+
+    /// The cached answer, if one was taken inside `max_age`.
+    #[cfg(feature = "tinymemory")]
+    fn cached_probe(&self, max_age: std::time::Duration) -> Option<CachedProbe> {
+        self.probe_cache
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|cached| cached.at.elapsed() <= max_age)
+            .cloned()
+    }
+
+    /// Copies a probe answer onto the descriptor. The one place the two
+    /// agree, so a reused answer and a fresh one cannot report differently.
+    #[cfg(feature = "tinymemory")]
+    fn record_probe(&mut self, probed: &CachedProbe) {
+        self.descriptor.healthy = Some(probed.healthy);
+        self.descriptor.unreachable_families = Some(probed.unreachable.clone());
+        self.descriptor.degraded_families = Some(probed.degraded.clone());
+        self.descriptor.slow_families = Some(probed.slow.clone());
+    }
+
+    /// Asks the engine, warns about whatever it found, and records the answer
+    /// in the cache and on the descriptor.
+    #[cfg(feature = "tinymemory")]
+    async fn probe_now(&mut self, timeout: std::time::Duration) {
+        let Some(probe) = self.probe.clone() else {
             return;
         };
-        // Health and both family reads go out together under one deadline. Run
-        // in sequence they would cost three timeouts before the listener binds,
-        // and `/healthz` has to answer before the wake proxy gives up.
+        // Health and every family read go out together under one deadline. Run
+        // in sequence they would cost one timeout per leg before the listener
+        // binds, and `/healthz` has to answer before the wake proxy gives up.
         let outcome = probe_engine(probe.as_ref(), timeout).await;
 
         if !outcome.healthy {
@@ -330,6 +419,16 @@ impl MemoryOverlay {
                  when the memory is needed"
             );
         }
+        if !outcome.degraded.is_empty() {
+            tracing::warn!(
+                driver_id = %self.descriptor.driver_id,
+                families = ?outcome.degraded,
+                "memory engine advertises optional families its live surface refused. The \
+                 audit cannot catch this either -- `provides()` is `self.as_x().is_some()`, a \
+                 property of the adapter, not of the engine. The agent tools and routes these \
+                 families gate are offered and will fail on their first call"
+            );
+        }
         if !outcome.slow.is_empty() {
             tracing::warn!(
                 driver_id = %self.descriptor.driver_id,
@@ -339,65 +438,265 @@ impl MemoryOverlay {
                  not the same verdict as refused -- the engine may be fine and merely loaded"
             );
         }
-        self.descriptor.healthy = Some(outcome.healthy);
-        self.descriptor.unreachable_families = Some(outcome.unreachable);
-        self.descriptor.slow_families = Some(outcome.slow);
+        let probed = CachedProbe {
+            at: std::time::Instant::now(),
+            healthy: outcome.healthy,
+            unreachable: outcome.unreachable,
+            degraded: outcome.degraded,
+            slow: outcome.slow,
+        };
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            *cache = Some(probed.clone());
+        }
+        self.record_probe(&probed);
     }
 
     /// Without the provider seam there is nothing to probe; `healthy` stays
     /// `None` ("not probed"), which is the truth.
     #[cfg(not(feature = "tinymemory"))]
     pub async fn refresh_health(&mut self, _timeout: std::time::Duration) {}
+
+    /// Nothing to probe, so nothing to reuse either.
+    #[cfg(not(feature = "tinymemory"))]
+    pub async fn refresh_health_within(
+        &mut self,
+        _timeout: std::time::Duration,
+        _max_age: std::time::Duration,
+    ) {
+    }
 }
 
 /// What one round of engine probing found.
 ///
-/// The two lists are different verdicts and are kept apart deliberately.
-/// `unreachable` is the engine answering *no*; `slow` is it not answering
-/// inside the budget. Only the first justifies refusing a bind — "loaded right
-/// now" and "does not serve this" are not the same thing, and collapsing them
-/// turns a busy afternoon into a refusal an operator cannot argue with.
+/// The three lists are different verdicts and are kept apart deliberately.
+/// `unreachable` is a **mandatory** family answering *no*; `degraded` is an
+/// **optional** family answering no; `slow` is either not answering inside the
+/// budget. Only the first justifies refusing a bind.
+///
+/// The mandatory/optional split is a split in consequence, not in confidence.
+/// Core and Recall are what `MemoryStore`, `ContextStore` and `FactStore` are
+/// built on, so an engine refusing one cannot serve a cycle at all; an engine
+/// refusing `people` serves every cycle and fails one agent tool. Refusing to
+/// bind over the second would take a mostly-working engine away from an
+/// operator who has no other one — so it is reported, loudly, and bound.
+///
+/// `slow` stays one list across both, because "did not answer in three
+/// seconds" is the same non-verdict wherever it lands.
 #[cfg(feature = "tinymemory")]
 #[derive(Debug, Default)]
 pub struct EngineProbeOutcome {
     /// `Ready` or `Degraded` — reachable and serving, possibly reduced.
     pub healthy: bool,
-    /// Families whose read returned an error.
+    /// Mandatory families whose read returned an error.
     pub unreachable: Vec<String>,
+    /// Advertised optional families whose read returned an error.
+    pub degraded: Vec<String>,
     /// Families whose read did not return inside the budget.
     pub slow: Vec<String>,
 }
 
-/// Probes health and the mandatory families that answer in a single round trip.
+/// One family's probe read, type-erased so families with unrelated call shapes
+/// can share a list and go out together.
+#[cfg(feature = "tinymemory")]
+type ProbeLeg<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+
+/// A namespace no company can produce: [`CompanyId`] namespaces are
+/// sanitize-plus-hash derived, so nothing a tenant owns collides with these,
+/// and every probe read below is therefore a miss on a live store.
+#[cfg(feature = "tinymemory")]
+const PROBE_NS: &str = "__host_probe__";
+/// The key, chunk id, facet key, person id, tool name, source id, session id
+/// and connection id every keyed probe read asks for. One constant because the
+/// point is only that no tenant owns it.
+#[cfg(feature = "tinymemory")]
+const PROBE_KEY: &str = "__host_probe__";
+/// Non-empty on purpose. `RemoteMemory::recall` returns `Ok(vec![])` without
+/// reaching the network when the query trims to empty, so an empty probe query
+/// would report a revoked credential as healthy — the failure this probe
+/// exists to catch.
+#[cfg(feature = "tinymemory")]
+const PROBE_QUERY: &str = "__host_probe__";
+
+/// How one family is read at probe time, or `None` for a family this host
+/// does not probe.
 ///
-/// Only mandatory families are probed. `MemoryProvider::provides` reports Core,
-/// Recall and Portability `true` unconditionally, so the bind-time audit can
-/// never fail them, and they are the three this host binds `MemoryStore`,
-/// `ContextStore` and `FactStore` to. The optional families are *not* covered
-/// by the audit either — `provides()` is `self.as_x().is_some()` for those, the
-/// same structural check — but each needs its own call shape, so probing them
-/// is separate work rather than a line here.
+/// The `match` is exhaustive over [`Capability`] on purpose, and that is the
+/// whole mechanism: the contract's enum is not `#[non_exhaustive]`, so a family
+/// added upstream fails to compile here until somebody decides how — or
+/// whether — it is probed. A `_ => None` arm would turn every future family
+/// into silent non-coverage, which is the shape of defect this probe exists to
+/// close.
 ///
-/// **Portability is deliberately not probed.** `MemoryPortability` offers only
-/// `export_page` and `import_records`, and `export_page` calls
-/// `namespace_summaries()` then an unbounded `list()`; `limit` slices the
-/// returned records, not the walk. On a hosted engine that is a container-tag
-/// listing plus a paged walk per tag — round trips that grow with everything
-/// the company remembers. It would time out and report a working engine broken.
-/// There is no cheap read on that family to substitute, so it is left unprobed
-/// rather than probed badly.
+/// Every probed leg is a **required** trait method, read-only, and either keyed
+/// or limited to one record. Required matters: a defaulted method answers
+/// `Unsupported` for a driver that implements the family perfectly well, and
+/// probing one would report working engines broken. Read-only matters because
+/// this runs on every bind, against a store that belongs to a tenant.
 ///
-/// The `get` leg is keyed and bounded: it uses a namespace no company can
-/// produce, so it writes nothing and cannot collide with tenant data. The
-/// `recall` leg is **not** namespace-scoped — it passes
-/// `OwnedRecallOpts::default()`, so it is an unscoped search. That is
-/// deliberate: scoping it would make some dialects short-circuit before the
-/// network and re-break the leg. Results are discarded either way, but the read
-/// is account-wide, not contained.
+/// The families that return `None` have no such read:
+///
+/// - `Ingest`, `Sources`, `DocumentIngest`, `ConversationIngest`,
+///   `LearningIngest`, `EventIngest` — every required method writes. Probing
+///   them would mean storing something in a tenant's engine on every boot, and
+///   `MemorySourceSink::forget_source` *deletes*.
+/// - `Maintenance` — its four required methods are `reembed`, `compact`,
+///   `consolidate` and `doctor`: whole-store jobs, not reads. `store_stats` and
+///   `queue_stats` would be the cheap ones and are defaulted, so see above.
+/// - `Answer` — `answer` is grounded synthesis: an inference call, metered and
+///   measured in seconds.
+/// - `Portability` — mandatory, and deliberately unprobed. Its only read is
+///   `export_page`, which calls `namespace_summaries()` then an unbounded
+///   `list()`; `limit` slices the returned records, not the walk. On a hosted
+///   engine that is a container-tag listing plus a paged walk per tag — round
+///   trips that grow with everything the company remembers. It would time out
+///   and report a working engine broken, and there is no cheap read on that
+///   family to substitute.
+#[cfg(feature = "tinymemory")]
+fn family_leg<'a>(
+    probe: &'a dyn tinymemory_api::provider::MemoryProvider,
+    family: tinymemory_api::capabilities::Capability,
+    opts: &'a tinymemory_api::types::OwnedRecallOpts,
+) -> Option<ProbeLeg<'a>> {
+    use tinymemory_api::capabilities::Capability;
+
+    match family {
+        // The two mandatory families that answer in one round trip. Reached
+        // directly on the trait object: they are supertraits, so there is no
+        // accessor to ask and no way for them to be absent.
+        Capability::Core => Some(Box::pin(async move {
+            probe.get(PROBE_NS, PROBE_KEY).await.is_ok()
+        })),
+        // Not namespace-scoped, deliberately: scoping it makes some dialects
+        // short-circuit before the network and re-breaks the leg. Results are
+        // discarded, but the read is account-wide, not contained.
+        Capability::Recall => Some(Box::pin(async move {
+            probe.recall(PROBE_QUERY, 1, opts, None).await.is_ok()
+        })),
+        Capability::Documents => probe.as_documents().map(|f| {
+            Box::pin(async move { f.get_document(PROBE_NS, PROBE_KEY).await.is_ok() }) as ProbeLeg
+        }),
+        Capability::Tree => probe.as_tree().map(|f| {
+            Box::pin(async move { f.query_source(PROBE_NS, PROBE_KEY, 1, None).await.is_ok() })
+                as ProbeLeg
+        }),
+        Capability::Entities => probe.as_entities().map(|f| {
+            Box::pin(async move { f.entities(PROBE_NS, None, 1).await.is_ok() }) as ProbeLeg
+        }),
+        Capability::Graph => probe.as_graph().map(|f| {
+            Box::pin(async move { f.kv_get(Some(PROBE_NS), PROBE_KEY).await.is_ok() }) as ProbeLeg
+        }),
+        Capability::Diff => probe
+            .as_diff()
+            .map(|f| Box::pin(async move { f.snapshots(PROBE_KEY, 1).await.is_ok() }) as ProbeLeg),
+        // The one whole-record read here, and the only one the family offers:
+        // `goals` is a single document, not a walk.
+        Capability::Goals => probe
+            .as_goals()
+            .map(|f| Box::pin(async move { f.goals().await.is_ok() }) as ProbeLeg),
+        Capability::ToolMemory => probe
+            .as_tool_memory()
+            .map(|f| Box::pin(async move { f.tool_rules(PROBE_KEY).await.is_ok() }) as ProbeLeg),
+        Capability::People => probe
+            .as_people()
+            .map(|f| Box::pin(async move { f.list_people(Some(1)).await.is_ok() }) as ProbeLeg),
+        Capability::Chunks => probe
+            .as_chunks()
+            .map(|f| Box::pin(async move { f.get_chunk(PROBE_KEY).await.is_ok() }) as ProbeLeg),
+        // `recall_namespace_recent`, not `fast_retrieve`: both are required,
+        // and the first is a bounded read of one namespace while the second is
+        // a ranked search the engine may pay a model for.
+        Capability::Retrieval => probe.as_retrieval().map(|f| {
+            Box::pin(async move { f.recall_namespace_recent(PROBE_NS, 1).await.is_ok() })
+                as ProbeLeg
+        }),
+        Capability::Profile => probe
+            .as_profile()
+            .map(|f| Box::pin(async move { f.get_facet(PROBE_KEY).await.is_ok() }) as ProbeLeg),
+        Capability::Episodic => probe
+            .as_episodic()
+            .map(|f| Box::pin(async move { f.session_turns(PROBE_KEY).await.is_ok() }) as ProbeLeg),
+        Capability::SourceSync => probe.as_source_sync().map(|f| {
+            Box::pin(async move { f.source_sync_state(PROBE_KEY, PROBE_KEY).await.is_ok() })
+                as ProbeLeg
+        }),
+        Capability::CodingSessions => probe
+            .as_coding_sessions()
+            .map(|f| Box::pin(async move { f.coding_session_status().await.is_ok() }) as ProbeLeg),
+        // `embedder_slug`, not `embed_text`: identifying the embedder is the
+        // read that proves the family is wired, and embedding costs a model
+        // call on a metered engine.
+        Capability::Scoring => probe
+            .as_scoring()
+            .map(|f| Box::pin(async move { f.embedder_slug().await.is_ok() }) as ProbeLeg),
+        // Deliberately unprobed — see this function's docs for each.
+        Capability::Portability
+        | Capability::Ingest
+        | Capability::Sources
+        | Capability::Maintenance
+        | Capability::DocumentIngest
+        | Capability::ConversationIngest
+        | Capability::LearningIngest
+        | Capability::EventIngest
+        | Capability::Answer => None,
+    }
+}
+
+/// The family reads one probe round will issue, in `Capability::ALL` order so
+/// the reported lists are stable across runs and across engines.
+///
+/// A family the driver does not advertise is skipped: absence is a legitimate
+/// answer, and reading a family nobody claims would report every minimal driver
+/// broken. What remains is filtered by [`family_leg`], which is where a family
+/// with no cheap read of its own drops out.
+#[cfg(feature = "tinymemory")]
+fn probe_legs<'a>(
+    probe: &'a dyn tinymemory_api::provider::MemoryProvider,
+    opts: &'a tinymemory_api::types::OwnedRecallOpts,
+) -> Vec<(tinymemory_api::capabilities::Capability, ProbeLeg<'a>)> {
+    tinymemory_api::capabilities::Capability::ALL
+        .into_iter()
+        .filter(|family| probe.provides(*family))
+        .filter_map(|family| family_leg(probe, family, opts).map(|leg| (family, leg)))
+        .collect()
+}
+
+/// Which families [`probe_engine`] would read on this driver.
+///
+/// Exists so the per-family table can be asserted against a driver that
+/// advertises everything, without a double that can fail one method per family.
+/// Without it, deleting an arm from [`family_leg`] silently narrows what this
+/// host checks and every test still passes.
+#[cfg(all(test, feature = "tinymemory"))]
+pub(crate) fn probed_families(
+    probe: &dyn tinymemory_api::provider::MemoryProvider,
+) -> Vec<&'static str> {
+    let opts = tinymemory_api::types::OwnedRecallOpts::default();
+    probe_legs(probe, &opts)
+        .into_iter()
+        .map(|(family, _)| family.as_str())
+        .collect()
+}
+
+/// Probes health and every advertised family that has a cheap read, in one
+/// concurrent round.
+///
+/// The bind-time audit compares a driver's `capabilities()` claim against
+/// `provides()`. Both are properties of the **adapter**: `provides()` is
+/// `self.as_x().is_some()` for the optional families and an unconditional
+/// `true` for the mandatory three. Neither side asks whether the engine behind
+/// the adapter answers, so an engine that exposes a family's surface, reports
+/// itself healthy and serves nothing passes the bind cleanly and fails inside a
+/// tenant. This is the read that asks (issue #1968).
+///
+/// Which families are read, and which are not, is [`family_leg`]'s exhaustive
+/// table. A family the driver does not advertise is not probed at all: absence
+/// is a legitimate answer, and reading a family nobody claims would report
+/// every minimal driver broken.
 ///
 /// An empty answer is success. A freshly provisioned engine holds nothing, and
 /// treating "no rows" as "broken" would refuse every family on day one. Only an
-/// error or a timeout counts, and those are reported separately.
+/// error or a timeout counts, and those are reported separately — and the
+/// mandatory/optional consequence split is [`EngineProbeOutcome`]'s.
 ///
 /// This does not catch an engine that answers `Ok(empty)` forever while storing
 /// nothing; separating that from a new instance needs an engine-specific signal,
@@ -410,37 +709,29 @@ pub async fn probe_engine(
     use tinymemory_api::capabilities::Capability;
     use tinymemory_api::types::OwnedRecallOpts;
 
-    // Not a valid `Namespace`: those are sanitize-plus-hash derived from a
-    // company id, so nothing a tenant owns can collide with these.
-    const PROBE_NS: &str = "__host_probe__";
-    const PROBE_KEY: &str = "__host_probe__";
-    // Non-empty on purpose. `RemoteMemory::recall` returns `Ok(vec![])` without
-    // reaching the network when the query trims to empty, so an empty probe
-    // query would report a revoked credential as healthy — the failure this
-    // probe exists to catch.
-    const PROBE_QUERY: &str = "__host_probe__";
-
     let opts = OwnedRecallOpts::default();
+    let legs = probe_legs(probe, &opts);
+
     // Concurrently, under one deadline each: the pre-listener budget is one
     // timeout, not one per leg.
-    let (health, core, recall) = tokio::join!(
+    let (health, answers) = tokio::join!(
         tokio::time::timeout(timeout, probe.health()),
-        tokio::time::timeout(timeout, probe.get(PROBE_NS, PROBE_KEY)),
-        tokio::time::timeout(timeout, probe.recall(PROBE_QUERY, 1, &opts, None)),
+        futures::future::join_all(legs.into_iter().map(|(family, leg)| async move {
+            (family, tokio::time::timeout(timeout, leg).await)
+        })),
     );
 
     let mut outcome = EngineProbeOutcome {
         healthy: probe_answer_is_healthy(&health.ok()),
         ..EngineProbeOutcome::default()
     };
-    for (family, result) in [
-        (Capability::Core, core.map(|r| r.is_ok())),
-        (Capability::Recall, recall.map(|r| r.is_ok())),
-    ] {
-        match result {
+    for (family, answer) in answers {
+        let name = family.as_str().to_string();
+        match answer {
             Ok(true) => {}
-            Ok(false) => outcome.unreachable.push(family.as_str().to_string()),
-            Err(_elapsed) => outcome.slow.push(family.as_str().to_string()),
+            Ok(false) if Capability::MANDATORY.contains(&family) => outcome.unreachable.push(name),
+            Ok(false) => outcome.degraded.push(name),
+            Err(_elapsed) => outcome.slow.push(name),
         }
     }
     outcome
@@ -507,6 +798,24 @@ pub struct MemoryDescriptor {
     /// nothing, so "returned no rows" must not be read as "does not work";
     /// only an error is a failure.
     pub unreachable_families: Option<Vec<String>>,
+    /// Advertised **optional** families that refused a live read at probe time.
+    ///
+    /// The same observation as [`Self::unreachable_families`], split off by
+    /// consequence rather than by confidence: an engine refusing `people`
+    /// still serves every cycle, so it is reported and bound, while one
+    /// refusing `recall` cannot serve a cycle at all and the console apply
+    /// route turns it away.
+    ///
+    /// These are the families the audit is structurally blind to in the other
+    /// direction: `provides()` is `self.as_x().is_some()`, so a driver whose
+    /// accessor returns an object that the engine will not serve advertises
+    /// the family, passes the audit, and hands an agent a tool that fails on
+    /// its first call.
+    ///
+    /// Empty is the healthy case; `None` means "not probed". Families with no
+    /// cheap read of their own are never probed and so never appear here —
+    /// `store::select::family_leg` is the list and the reason for each.
+    pub degraded_families: Option<Vec<String>>,
     /// Families whose read did not return inside the probe budget.
     ///
     /// Separate from [`Self::unreachable_families`] on purpose: an engine that
@@ -1050,9 +1359,11 @@ fn open_provider(settings: &StorageSettings) -> Result<Option<MemoryOverlay>> {
             // the caller's boot-time step (`refresh_health`).
             healthy: None,
             unreachable_families: None,
+            degraded_families: None,
             slow_families: None,
         },
         probe: Some(probe),
+        probe_cache: Arc::default(),
     }))
 }
 
