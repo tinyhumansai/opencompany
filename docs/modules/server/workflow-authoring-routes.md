@@ -120,3 +120,11 @@ Two deliberate non-changes:
 
 A host predating #874 sends no `unwired` key; the client defaults it to `[]`,
 which reads identically to a fully wired deployment.
+
+## Agent-triggered workflow deadlines
+
+`run_workflow` uses the workflow runner's supervision rather than the generic
+per-tool deadline (120 seconds by default). A multi-step workflow may exceed
+that single-call deadline and still return and stage its completed run. Nested
+agent and tool limits, workflow depth/capacity guards, and `RunSupervisor`
+cancellation continue to apply; this does not move the run into a detached task.
