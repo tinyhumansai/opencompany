@@ -47,14 +47,11 @@ path = "src/main.rs"
 # The host, linked rather than spawned. `sqlite` is the desktop's backend;
 # `mongodb` is deliberately absent — a per-tenant cluster is a hosting concern.
 #
-# `mcp` is what puts an agent harness in the app at all. Without it this build
-# has no `openhuman` feature, so `src/harness/` is not compiled, no company can
-# reach a model, and the console's inference test answers "This build cannot
-# reach a model — the agent harness is not compiled in." `mcp` implies
-# `openhuman`, and the host's `openhuman_core` dependency is declared
-# `default-features = false, features = ["skills", "mcp", "hosting"]` — so what
-# a desktop agent gets is exactly the minimal belt: built-in tools, MCP servers
-# and skills.
+# OpenHuman upstream's current `main` removed the legacy embedded-harness API
+# this shell still uses. Keep the desktop host free of `mcp` (which enables that
+# API) until the harness is migrated to OpenHuman's session-host interface.
+# The desktop remains usable for its local company, storage, and console
+# surfaces; inference reports that no embedded harness is compiled.
 #
 # ## What is NOT in this list is not the same as what the app ships without
 #
@@ -145,7 +142,7 @@ path = "src/main.rs"
 # `crash-reporting` gives the shell and every embedded host the same optional,
 # operator-configured Sentry client as the server binary. It remains inert
 # without `OPENCOMPANY_SENTRY_DSN`.
-opencompany-core = { path = "../opencompany-core", default-features = false, features = ["sqlite", "platform-jwt", "oauth", "mcp", "tinymemory", "tinyhumans", "crash-reporting"] }
+opencompany-core = { path = "../opencompany-core", default-features = false, features = ["sqlite", "platform-jwt", "oauth", "tinymemory", "tinyhumans", "crash-reporting"] }
 
 tauri = { version = "2", features = [] }
 # The OS credential store, so a device session token never has to live in the
@@ -188,7 +185,7 @@ tauri-build = { version = "2", features = [] }
 tinymemory-api = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory-api" }
 
 [patch."https://github.com/tinyhumansai/tinyinference"]
-tinyinference = { path = "../../vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference" }
+tinyinference-llm = { path = "../../vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-llm" }
 
 [patch.crates-io]
 tinyflows = { path = "../../vendor/openhuman/vendor/tinyflows/crates/tinyflows" }

@@ -67,7 +67,7 @@ tinymemory-api = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemory-
 # this crate use, and the two `ChatModel`s are different types. Replicated from
 # openhuman's own Cargo.toml with the path rebased onto the vendored checkout.
 [patch."https://github.com/tinyhumansai/tinyinference"]
-tinyinference = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference" }
+tinyinference-llm = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-llm" }
 
 [patch.crates-io]
 # No `tinyagents` entry: the crate no longer exists as a package (the workspace

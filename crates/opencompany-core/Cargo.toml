@@ -198,7 +198,7 @@ tower = { version = "0.5", features = ["util"] }
 tinyagents-harness = { path = "../../vendor/openhuman/vendor/tinyagents/crates/tinyagents-harness", optional = true, features = [
     "sqlite",
 ] }
-tinyinference = { path = "../../vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference", optional = true }
+tinyinference = { package = "tinyinference-llm", path = "../../vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-llm", optional = true }
 
 # WS4: openhuman embedded as a library (the harness). Only links under the
 # `openhuman` feature; the default build pulls none of this enormous native
