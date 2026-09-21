@@ -2455,7 +2455,7 @@ impl<'a> DelegationRunner<'a> {
                 &member,
                 &instruction,
                 &control,
-                self.target(chat_id),
+                ChatTarget::deliberating(chat_id, self.thread_root),
                 // Issue #242: when this drain is running inside a
                 // dispatched card, the delegate's turn is part of that
                 // card's attempt — its steps and its spend belong to the

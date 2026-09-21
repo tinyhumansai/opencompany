@@ -219,6 +219,8 @@ async fn a_background_turn_does_not_leak_into_the_next_turn_on_its_bound_chat() 
         .0
         .expect("chat turn 1 runs");
 
+    let background_request_index = model_calls(&script);
+
     // ── The background task: unthreaded — `stream: None`, same shared Agent. ──
     let (outcome_bg, _usage_bg) = agent
         .run_with_steer(
@@ -239,6 +241,9 @@ async fn a_background_turn_does_not_leak_into_the_next_turn_on_its_bound_chat() 
     );
     {
         let seen = script.seen.lock().unwrap();
+        let request = seen[background_request_index].to_string();
+        assert!(!request.contains("hello from sports"));
+        assert!(!request.contains("Sure, tracking the sports desk."));
         assert!(
             seen.iter().any(|r| r.to_string().contains(FETCHED)),
             "the background task's fetched content must reach the model on \
@@ -283,4 +288,51 @@ async fn a_background_turn_does_not_leak_into_the_next_turn_on_its_bound_chat() 
          turn on the chat it happened to be bound to before the background \
          task ran"
     );
+}
+
+#[tokio::test]
+async fn self_contained_delegation_skips_retrieved_task_outcomes() {
+    let (model_url, script) = spawn_script(vec![Turn::Say("Assigned slice completed.")], 4).await;
+    let dir = tempfile::tempdir().unwrap();
+    let dependencies = deps(model_url.clone(), dir.path());
+    let agent = company_agent(model_url, dir.path(), None, 1).await;
+    let company = CompanyId::new("acme");
+    dependencies
+        .context
+        .put(
+            &company,
+            crate::ports::types::ContextChunk {
+                label: "task-outcome/ceo".into(),
+                body: "UNRELATED_PRIOR_TASK_MARKER Read the budget regression note".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let hits = dependencies
+        .context
+        .search(&company, "Read the budget regression note", 5)
+        .await
+        .unwrap();
+    assert!(
+        !hits.is_empty(),
+        "the test must have retrievable prior context"
+    );
+    let pool = super::super::HarnessPool::new();
+    pool.agents
+        .write()
+        .await
+        .insert(company.clone(), vec![Arc::new(agent)]);
+    let result = pool
+        .run(
+            &company,
+            "ceo",
+            "Read the budget regression note",
+            &dependencies,
+            ChatTarget::deliberating(Some("delegation"), None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.reply, "Assigned slice completed.");
+    let seen = script.seen.lock().unwrap();
+    assert!(!seen[0].to_string().contains("UNRELATED_PRIOR_TASK_MARKER"));
 }

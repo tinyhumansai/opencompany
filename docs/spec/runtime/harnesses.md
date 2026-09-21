@@ -462,3 +462,16 @@ constants are the only pieces of the front door this crate uses.
 | the desktop's own wiring | `crates/opencompany-app/src/embedded.rs` |
 | runner transport (declared, not yet an engine) | `src/runner/dispatch.rs` |
 | per-harness roster narrowing | `HarnessDeps::serves` |
+
+## Self-contained delegated work
+
+A delegated colleague receives its assigned brief with `history_seed: false`.
+Its live history, transcript autoload, and active goal from an unrelated turn
+must not enter that work. The pool also skips automatic retrieval of prior task
+outcomes for this explicit context mode; the agent's memory tools remain
+available for deliberate recall. The parent and its final relay keep their
+normal conversation context.
+
+Unthreaded background work, including workflow steps without a run sink, starts
+with empty live history and leaves none for the next turn. Ordinary channel
+turns retain the existing continuous-session and audience rules.

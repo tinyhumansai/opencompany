@@ -478,6 +478,10 @@ async fn a_desk_lead_hands_a_slice_to_the_teammate_the_operator_named() {
         brief,
         "and it must be handed the instruction, not the operator's raw message"
     );
+    assert_eq!(
+        *turns.history_seed_at_turn.lock().unwrap(),
+        vec![true, false, true]
+    );
     // The hand-off is tracked by construction, assigned to the teammate that
     // ran it — the same guarantee #442 gave the desk form.
     let cards = fx.cards().await;
