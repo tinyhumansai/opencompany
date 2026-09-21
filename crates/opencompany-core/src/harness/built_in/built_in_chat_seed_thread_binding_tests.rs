@@ -73,6 +73,21 @@ impl InMemoryLog {
             mention_depth: 0,
         });
     }
+    /// A reply by `agent_id` posted inside the thread rooted at `parent`.
+    fn reply_in(&self, chat_id: &str, agent_id: &str, text: &str, parent: u64) {
+        self.push(CompanyEvent::AgentReply {
+            audience: Vec::new(),
+            chat_id: chat_id.to_string(),
+            agent_id: agent_id.to_string(),
+            text: text.to_string(),
+            steps: Vec::new(),
+            task_id: None,
+            outputs: Vec::new(),
+            parent: Some(EventSeq::new(parent)),
+            mentions: Vec::new(),
+            mention_depth: 0,
+        });
+    }
     fn push(&self, event: CompanyEvent) {
         let mut log = self.events.lock().unwrap();
         let seq = EventSeq::new(log.len() as u64);
@@ -452,5 +467,64 @@ async fn a_seed_that_cannot_be_built_starts_blind_rather_than_leaking_the_bound_
     assert!(
         last.contains("hello beta"),
         "the turn still has to answer the message it was given: {last:?}"
+    );
+}
+
+/// Issue #1957: a teammate's reply in the same thread reaches the next turn.
+///
+/// A second turn in the same thread is not a switch, and before the session
+/// was continuous that meant nothing was re-read: the agent answered from its
+/// own history, and a teammate who had spoken in the thread in between was
+/// invisible to it. The session delta is what hands that line over now.
+#[tokio::test]
+async fn a_teammate_reply_in_the_same_thread_reaches_the_next_turn() {
+    let (mut fx, log, seen) = recording_fixture();
+    let rec = record();
+    // `session_delta` reads the desks this agent sits on from the company
+    // record, which the default fixture store does not hold.
+    fx.deps.store = Arc::new(super::built_in_test_fixtures_2::LiveStore {
+        record: StdMutex::new(Some(rec.clone())),
+    });
+    log.operator("general", "root"); // seq 0
+    log.operator_in("general", "first", 0); // seq 1
+
+    let pool = HarnessPool::new();
+    pool.ensure(&rec, &fx.deps).await.expect("ensure");
+    let thread =
+        crate::runtime::delegation::ChatTarget::in_thread(Some("general"), Some(EventSeq::new(0)));
+
+    // Each turn is bound to the journaled message it answers, as the chat
+    // route does. Without that the session never gets a watermark, every turn
+    // is a cold start that re-seeds the whole thread, and this test would pass
+    // without the delta ever running.
+    pool.run(
+        &rec.id,
+        "ceo",
+        "first",
+        &fx.deps,
+        thread.answering(Some(EventSeq::new(1))),
+    )
+    .await
+    .expect("first chat turn");
+    let before = seen.lock().unwrap().len();
+
+    log.reply_in("general", "ceo", "ceo answers first", 0); // seq 2
+    log.reply_in("general", "engineer", "TEAMMATE_REPLY_MARKER", 0); // seq 3
+    log.operator_in("general", "second", 0); // seq 4
+    pool.run(
+        &rec.id,
+        "ceo",
+        "second",
+        &fx.deps,
+        thread.answering(Some(EventSeq::new(4))),
+    )
+    .await
+    .expect("second chat turn");
+
+    let after: Vec<String> = seen.lock().unwrap()[before..].to_vec();
+    let last = after.last().expect("the second turn made a model call");
+    assert!(
+        last.contains("TEAMMATE_REPLY_MARKER"),
+        "a teammate's reply in the same thread never reached the next turn: {last:?}"
     );
 }
