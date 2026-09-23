@@ -110,7 +110,7 @@ const SEARCH_GRANTED_COMPANIES: [&str; 21] = [
 /// a desk that could reach the web would answer about vending machines in general
 /// instead of about these eight. Withholding the network is what makes a decision
 /// there attributable to the fleet it was made about.
-const SEARCH_DENIED_COMPANIES: [&str; 8] = [
+const SEARCH_DENIED_COMPANIES: [&str; 9] = [
     "math_lab",
     "hive_math_lab",
     "e2e_harness",
@@ -127,6 +127,13 @@ const SEARCH_DENIED_COMPANIES: [&str; 8] = [
     // instead of about THIS order. It is also scored against that state, so a
     // fact from outside it is not merely off-topic, it is unattributable.
     "retail_co",
+    // The same argument again, against a cluster that is real rather than
+    // simulated. Every fact this bundle reasons from is a reading taken through
+    // its monitoring server, and a finding is worth something only if it can be
+    // traced back to one. A desk that could search would answer about Kubernetes
+    // in general — plausibly, fluently, and about somebody else's cluster, which
+    // is the one failure a monitor cannot afford.
+    "ops_watch",
 ];
 
 /// Templates that simply do not grant `search` today. Unlike

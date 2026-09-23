@@ -1,0 +1,11 @@
+{
+  "$comment": "This company's entire world is one MCP server. It serves read-only production monitoring — Kubernetes, Prometheus and Grafana — and holds the cluster credential itself, so no credential reaches an agent and no tool here can change anything. It ships DISABLED with an authSecret because the endpoint below is one deployment's, and because a shipped template must not send an agent's traffic at a server nobody has provisioned. Point it at your own deployment and supply a tenant bearer before enabling it. Source, specs and manifests: github.com/tinyhumansai/k8s-monitoring-mcp.",
+  "mcpServers": {
+    "k8s-monitoring": {
+      "url": "https://k8s-admin-mcp-23nkd3.tinyhumans.ai/mcp",
+      "description": "Read-only production Kubernetes, Prometheus and Grafana. Nine questions, each bounded and paged: cluster overview, unhealthy pods, one workload's status, what is close to a resource limit, recent events, Grafana alerts, a dashboard's current numbers, a curated metric query, and whether the service answers from outside. No write verb, no exec, no Secret read, no unbounded log.",
+      "enabled": false,
+      "authSecret": "mcp/k8s-monitoring/auth"
+    }
+  }
+}

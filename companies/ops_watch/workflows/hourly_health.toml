@@ -1,0 +1,90 @@
+# Workflow graph: hourly_health
+#
+# Referenced by `[workflows].enabled = ["hourly_health"]` in ../company.toml.
+#
+# The shape worth noticing is the condition in the middle. Both of its branches
+# reach the same report node, because the decision it makes is not *whether the
+# run finishes* but *whether the runbook keeper is involved*: a changed
+# condition gets written up as a finding, an unchanged one gets its row updated
+# and nobody is told. The report node runs either way, and on the quiet path it
+# delivers the recorded run rather than a message.
+#
+# That is the whole "report once, not hourly" rule made structural. Leaving it
+# implicit in a prompt would mean the twenty-fourth identical restarting pod of
+# the day is one forgetful pass away from being announced again.
+
+id = "hourly_health"
+name = "Hourly health check"
+description = "Take the reading, compare it against the last one, and report only what changed."
+
+[[node]]
+id = "cadence"
+kind = "trigger"
+name = "Hourly"
+summary = "The hourly cadence fires, whether or not anybody is looking."
+
+[[node]]
+id = "sweep"
+kind = "agent"
+name = "Take the reading"
+summary = "Call every question the server offers and record what production said."
+agent = "health_watch"
+
+[[node]]
+id = "compare"
+kind = "agent"
+name = "Compare against the last run"
+summary = "Pair this reading with the open conditions and classify each one."
+agent = "incident_analyst"
+
+[[node]]
+id = "gate"
+kind = "condition"
+name = "Did anything change?"
+summary = "Write it up, or record the run and stay quiet."
+[node.config]
+field = "=item.changed"
+
+[[node]]
+id = "explain"
+kind = "agent"
+name = "Write the finding"
+summary = "Turn the changed condition into something actionable from a phone, at night."
+agent = "runbook_keeper"
+
+[[node]]
+id = "report"
+kind = "output"
+name = "Report"
+summary = "Deliver the finding — or, when nothing changed, the recorded run and no message."
+# The ops desk, because the person who has to act on a finding should be
+# reading it in the same place it was argued about.
+[node.destination]
+kind = "channel"
+target = "ops_desk"
+
+[[edge]]
+from = "cadence"
+to = "sweep"
+
+[[edge]]
+from = "sweep"
+to = "compare"
+
+[[edge]]
+from = "compare"
+to = "gate"
+
+[[edge]]
+from = "gate"
+to = "explain"
+label = "yes"
+
+[[edge]]
+from = "gate"
+to = "report"
+label = "no"
+
+[[edge]]
+from = "explain"
+to = "report"

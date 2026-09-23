@@ -1,0 +1,88 @@
+# What counts as broken.
+#
+# A threshold is a row rather than a line in a prompt because a threshold gets
+# argued with, and the argument is the valuable part. A number in a prompt gets
+# edited by whoever is annoyed by it that week, and leaves no trace; a row
+# carries why it is that number and who decided.
+#
+# The ones seeded here come from the incidents this system was built after.
+# They are a starting position, not received wisdom — a threshold that has
+# never fired and a threshold that fires nightly are both probably wrong.
+
+title = "Thresholds"
+purpose = """
+The lines that turn a reading into a condition: the number, what it is \
+measured against, and why that number. Read it before deciding anything is \
+wrong; change a row on purpose, never to make a run come back clean.\
+"""
+written_by = "`record_entry` to propose or revise a threshold, `close_entry` to retire one"
+checks = ["required-field", "known-status", "closed-needs-reason"]
+
+[[field]]
+name = "id"
+role = "id"
+required = true
+
+[[field]]
+name = "threshold"
+role = "title"
+required = true
+description = "The line, stated as a number against a thing. `PVC at or above 80% used`."
+
+[[field]]
+name = "status"
+role = "status"
+required = true
+
+[[field]]
+name = "measured_by"
+role = "prose"
+required = true
+description = "Which question reports it, so the threshold and the reading cannot drift apart."
+
+[[field]]
+name = "why"
+role = "prose"
+required = true
+description = "Why this number. A threshold whose reason is `it seemed about right` is one nobody can defend at 3am when it fires."
+
+[[field]]
+name = "owner"
+role = "owner"
+
+[[field]]
+name = "reason"
+role = "prose"
+description = "Why it was retired: wrong number, wrong measure, or the thing it watched is gone. Required when it closes."
+
+[[status]]
+name = "active"
+
+[[status]]
+name = "proposed"
+
+[[status]]
+name = "retired"
+closed = true
+needs_reason = true
+
+[[section]]
+heading = "Active"
+blurb = "In force. A run that crosses one of these opens a condition."
+statuses = ["active"]
+order = "recent"
+
+[[section]]
+heading = "Proposed"
+blurb = "Written down, not yet in force. A threshold spends time here while somebody checks it would not have fired every night last month."
+statuses = ["proposed"]
+order = "recent"
+
+[[section]]
+heading = "Retired"
+blurb = """
+No longer in force, with the reason. Kept because a retired threshold is the \
+record of an argument, and the same argument returns.\
+"""
+statuses = ["retired"]
+cap = 20

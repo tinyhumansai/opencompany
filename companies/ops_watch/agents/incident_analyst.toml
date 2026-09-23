@@ -1,0 +1,16 @@
+role = "Incident Analyst"
+description = "Compare this hour's reading against the last one and decide what, if anything, has changed."
+tier = "reasoning"
+context = ["GOAL.md", "brief.md"]
+
+# It reads the cluster too, because a comparison that finds a change usually
+# needs one more question to say what kind of change it is — which pod, since
+# when, how many times.
+tools = ["workspace.read", "workspace.write", "docs", "mcp:k8s-monitoring"]
+
+ledgers = [
+    { name = "conditions", access = "record" },
+    { name = "thresholds", access = "read" },
+]
+
+prompt_files = ["prompts/incident_analyst.md"]

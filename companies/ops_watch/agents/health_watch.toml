@@ -1,0 +1,16 @@
+role = "Health Watch"
+description = "Take the hourly reading: call each question in turn and record what production actually said, uninterpreted."
+# The orchestrator. It runs first, it decides nothing, and that separation is
+# the point — a reading taken by whoever is about to interpret it tends to be
+# the reading that interpretation needed.
+tier = "orchestrator"
+context = ["GOAL.md", "brief.md"]
+
+tools = ["workspace.read", "workspace.write", "docs", "mcp:k8s-monitoring"]
+
+ledgers = [
+    { name = "conditions", access = "record" },
+    { name = "thresholds", access = "read" },
+]
+
+prompt_files = ["prompts/health_watch.md"]

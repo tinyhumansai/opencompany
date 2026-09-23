@@ -1,0 +1,17 @@
+role = "Runbook Keeper"
+description = "Own what counts as broken, and turn a changed condition into a finding somebody can act on."
+tier = "reasoning"
+context = ["GOAL.md", "brief.md"]
+
+# No cluster grant. This seat's whole job is judgement about readings somebody
+# else took: what the threshold should be, what the runbook says, whether this
+# is the same thing as last Tuesday. A seat that could take its own reading
+# would start answering with a fresh one instead of with the record.
+tools = ["workspace.read", "workspace.write", "docs"]
+
+ledgers = [
+    { name = "thresholds", access = "record" },
+    { name = "conditions", access = "read" },
+]
+
+prompt_files = ["prompts/runbook_keeper.md"]

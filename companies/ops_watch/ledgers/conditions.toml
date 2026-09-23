@@ -1,0 +1,104 @@
+# What is currently wrong with production, and what used to be.
+#
+# This ledger is what makes "report once, not hourly" possible. The rule is a
+# comparison — is this condition already open, and is it worse — and a
+# comparison needs somewhere the last answer was written down. Without this,
+# every run is the first run, and the company reports the same restarting pod
+# twenty-four times a day until nobody reads it.
+#
+# Closed rows are kept, including the ones that turned out to be nothing. The
+# same condition arrives again, and "we saw this in September, it was the
+# node draining" is worth more the second time than the first.
+
+title = "Conditions"
+purpose = """
+One row per thing that is wrong with production, opened when it starts and \
+closed when it clears. Read it before reporting anything: a condition already \
+open is not news, and the whole value of this company is the difference \
+between those two.\
+"""
+written_by = "`record_entry` when a condition starts or worsens, `close_entry` when it clears or turns out to be nothing"
+checks = ["required-field", "known-status", "closed-needs-reason"]
+
+[[field]]
+name = "id"
+role = "id"
+required = true
+
+[[field]]
+name = "condition"
+role = "title"
+required = true
+description = "What is wrong, naming the thing. `Six pods restarting in sentry`, not `instability`."
+
+[[field]]
+name = "status"
+role = "status"
+required = true
+
+[[field]]
+name = "reading"
+role = "prose"
+required = true
+description = "The numbers this is based on, and when the server collected them. The claim has to be checkable without opening a terminal."
+
+[[field]]
+name = "first_seen"
+role = "date"
+description = "When this condition first appeared in a run. Not when the underlying problem started, which is usually earlier and usually unknowable."
+
+[[field]]
+name = "threshold"
+role = "refs"
+description = "The `thresholds` row this crossed. A condition with no threshold behind it is a judgement call, which is fine — say so here."
+
+[[field]]
+name = "owner"
+role = "owner"
+
+[[field]]
+name = "reason"
+role = "prose"
+description = "Why it closed: what cleared it, or why it was never a problem. Required when it closes."
+
+[[status]]
+name = "firing"
+
+[[status]]
+name = "degraded"
+
+[[status]]
+name = "cleared"
+closed = true
+needs_reason = true
+
+[[status]]
+name = "dismissed"
+closed = true
+needs_reason = true
+
+[[section]]
+heading = "Degraded"
+blurb = "Open and getting worse. These are the ones where the next run matters."
+statuses = ["degraded"]
+order = "recent"
+
+[[section]]
+heading = "Firing"
+blurb = """
+Open and unchanged. Deliberately quiet: an open condition is reported when it \
+starts and when it clears, never in between, so a long list here is not a \
+backlog of unsent messages.\
+"""
+statuses = ["firing"]
+order = "recent"
+
+[[section]]
+heading = "Closed"
+blurb = """
+Cleared or dismissed, with the reason. Kept, including the false alarms — the \
+same condition comes back, and knowing what it was last time is most of the \
+answer.\
+"""
+statuses = ["cleared", "dismissed"]
+cap = 30

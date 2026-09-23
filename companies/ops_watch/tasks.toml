@@ -1,0 +1,108 @@
+# The setup work this company starts with, on the board in To-do at first boot.
+#
+# The baseline in `companies/_globals/tasks.toml` already covers the brief, the
+# first goals, the standing decisions and the connections. What is here is the
+# setup a monitoring company is defined by: the credential that lets it read
+# anything at all, the lines it measures against, and the one honest gap in
+# what it can see.
+#
+# Each card names what it produces, so an agent picking it up hands back the
+# thing rather than an essay about the thing.
+
+[[task]]
+id = "connect-the-monitoring-server"
+title = "Connect the monitoring server"
+priority = "high"
+assignee = "health_watch"
+note = """
+The `k8s-monitoring` server in `mcp.json` ships disabled and pointed at one \
+deployment. Point it at yours, put a tenant bearer in the secret store at \
+`mcp/k8s-monitoring/auth`, and enable it.
+
+Until this is done every run reports the same thing: that it could not ask \
+anything.
+
+Done when `tools/list` comes back and the reply is recorded here, including \
+which of the nine questions this deployment actually offers.\
+"""
+
+[[task]]
+id = "confirm-what-can-be-answered"
+title = "Confirm what this deployment can actually answer"
+priority = "high"
+assignee = "health_watch"
+note = """
+The server offers only the questions it has a source for. A deployment with \
+no Grafana token does not offer the Grafana questions; one with no probe \
+targets does not offer the outside-in check; the curated metric query needs \
+a query catalogue pinned against your own Prometheus.
+
+A question that is absent is a blind spot, not an all-clear, and the roster \
+has to know which ones it has.
+
+Done when a `decisions` row lists the questions offered, the ones missing, \
+and what each missing one is waiting on.\
+"""
+
+[[task]]
+id = "set-the-thresholds"
+title = "Set the thresholds"
+priority = "high"
+assignee = "runbook_keeper"
+note = """
+Open a `thresholds` row for each line this company measures against: the \
+number, the question that reports it, and why that number.
+
+The seeds in the skill are a starting position from somebody else's \
+incidents. A threshold nobody has checked against a month of real readings \
+either never fires or fires every night.
+
+Done when the active thresholds are rows, each with a reason somebody could \
+defend at 3am.\
+"""
+
+[[task]]
+id = "write-the-first-runbook-entries"
+title = "Write the first runbook entries"
+priority = "medium"
+assignee = "runbook_keeper"
+note = """
+For each active threshold, one workspace note saying what to do first when it \
+fires. "I do not know yet" is an acceptable entry and a better one than a \
+guess — it tells the reader the finding is real and the response is not \
+established.
+
+Done when every active threshold has an entry, and the gaps are named as \
+gaps.\
+"""
+
+[[task]]
+id = "decide-what-up-means"
+title = "Decide what \"up\" means from outside"
+priority = "medium"
+note = """
+The outside-in check watches a fixed list of endpoints, set in the server's \
+configuration rather than named per call — a caller that could name a URL \
+would have the server make requests on its behalf.
+
+Somebody has to say which addresses count as production being up, and what \
+each should return. That is a judgement, not a lookup.
+
+Done when the list is a `decisions` row and the server is configured with it.\
+"""
+
+[[task]]
+id = "name-the-independent-check"
+title = "Name the gap: nothing watches this watcher"
+priority = "medium"
+note = """
+The monitoring server runs inside the cluster it monitors. That is what lets \
+it see pod-level detail at all, and it means a cluster-wide outage silences \
+it at exactly the moment it is needed.
+
+The answer is not to move it but to pair it with a small check from outside, \
+on different infrastructure, that watches for the hourly run going missing.
+
+Done when the gap is a `risks` row with an owner, so it is a known limit \
+rather than a surprise during the first real outage.\
+"""

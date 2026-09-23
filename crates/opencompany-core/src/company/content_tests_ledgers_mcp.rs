@@ -189,7 +189,7 @@ fn every_company_ledger_can_be_closed_and_says_why() {
 /// "the board is empty because this vertical has no setup work" and "the board
 /// is empty because whoever added this bundle forgot" are indistinguishable
 /// afterwards.
-const SETUP_SEEDED_COMPANIES: [&str; 24] = [
+const SETUP_SEEDED_COMPANIES: [&str; 25] = [
     "accounting_firm",
     "consultation_firm",
     "customer_support",
@@ -201,6 +201,7 @@ const SETUP_SEEDED_COMPANIES: [&str; 24] = [
     "law_firm",
     "marketing_agency",
     "math_lab",
+    "ops_watch",
     "media_company",
     "pharma_startup",
     "product_team",

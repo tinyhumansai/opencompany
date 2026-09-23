@@ -90,6 +90,7 @@ The operator console is a separate, company-agnostic app at
 | [`research_lab`](research_lab/) | Source-backed research reports with the evidence attached | Setting the question & accepting findings |
 | [`math_lab`](math_lab/) | Verified answers to computational problems, with the programs that produced them | Stating the problem & accepting the answer |
 | [`signals_opportunity_studio`](signals_opportunity_studio/) | A ranked weekly opportunity brief | Which opportunities to fund |
+| [`ops_watch`](ops_watch/) | An hourly production health check, and a finding only when something changed | What to do about a finding, and what counts as broken |
 
 Signals and the Opportunity Engine ship as the
 [`signals_opportunity_studio`](signals_opportunity_studio/) **template, not

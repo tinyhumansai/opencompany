@@ -1,0 +1,88 @@
+# The ops desk: one company whose entire job is to notice that production
+# broke, before a person does.
+#
+# It is the smallest bundle here on purpose. Every other vertical produces
+# something — a brief, a campaign, a portfolio. This one produces silence, and
+# speaks only when silence would be wrong. That shape decides nearly everything
+# below: three teammates rather than nine, one desk, no web, and a cadence that
+# runs whether or not anybody is looking.
+#
+# The company models none of production itself. It reads it through one MCP
+# server (`k8s-monitoring`, see `mcp.json`), which serves read-only Kubernetes,
+# Prometheus and Grafana and can change nothing. That boundary is the whole
+# safety argument: an agent here reads text written by things nobody controls —
+# an event message, a pod annotation, a container's termination reason — and
+# the worst a successful injection can reach is nine read-only questions.
+
+[company]
+name = "Ops Watch"
+output = "A production health check every hour, and a finding only when something changed"
+human_role = "Deciding what to do about a finding, and what counts as broken"
+handle = "opswatch"
+
+[brain]
+mode = "hosted"
+# Lower than most bundles. An hourly run that reasons for twelve passes is an
+# hourly bill; the work here is comparing two readings, not deliberating.
+max_passes = 6
+
+[tools]
+# `mcp:k8s-monitoring` is named explicitly rather than covered by a wildcard:
+# `grants_cover_server` refuses to let `*` reach an MCP server, so a company
+# that wildcarded its belt would silently acquire every server an operator
+# later installed. For a company holding a production cluster's read
+# credential, that is exactly the direction not to be loose in.
+#
+# No `web`, no `search`, no `composio`, no `media`. Every fact this company
+# reasons from is a tool call against our own cluster. A desk that could reach
+# the internet would answer about Kubernetes in general instead of about this
+# cluster, and a finding that cannot be traced to a reading is not a finding.
+# No `shell` and no `code` either: the whole point of the MCP boundary is that
+# there is no other way in, and a teammate with a shell walks around it.
+allow = ["files", "docs", "workspace", "workspace.*", "mcp:k8s-monitoring"]
+
+[channels.operator]
+enabled = true
+
+[channels.email]
+enabled = true
+
+[policy]
+mode = "supervised"
+# Nothing this company does spends money or changes anything, so there is no
+# tier of action worth stopping. The cap is here because a runaway hourly loop
+# is the one cost this bundle can incur.
+auto_approve_under_usd = 1.0
+
+[place]
+discoverable = false
+
+# One desk. A second would mean a finding could be discussed somewhere the
+# person who has to act on it is not.
+[[group_chat]]
+id = "ops_desk"
+name = "Ops desk"
+description = "Where each run's reading is compared against the last, and where a finding is written before it goes out."
+members = ["health_watch", "incident_analyst", "runbook_keeper"]
+
+[workflows]
+enabled = ["hourly_health"]
+
+[budget]
+# Twenty-four runs a day, every day. The number is the cadence, not the
+# ambition: raise the cadence and this is the line that notices.
+monthly_usd = 120.0
+
+# The hourly sweep. Every hour, on the hour, whether or not anybody asked.
+[[schedule]]
+cron = "0 * * * *"
+prompt = "Run the hourly production health check."
+
+# The daily all-clear, 09:00.
+#
+# This exists so silence is never ambiguous. A monitor that only speaks when
+# something is wrong is indistinguishable from a monitor that has stopped, and
+# the second one is discovered during an incident.
+[[schedule]]
+cron = "0 9 * * *"
+prompt = "Post the daily all-clear with the headline numbers, and say when the last finding was."
