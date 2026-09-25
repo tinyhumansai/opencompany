@@ -526,7 +526,7 @@ function closesMention(text: string, idx: number): boolean {
 /**
  * Every `@name` in `text` the directory can resolve to exactly one target.
  *
- * This is the composer side of the host's `extract_with_known`: longest alias
+ * This is the composer side of the host's `mentions::scan`: longest alias
  * first, a name shared by two targets resolves to nobody, and code regions are
  * masked so an `@` inside backticks never names anyone. The composer sends the
  * picker's picks *and* what this resolves, because the host uses a non-empty

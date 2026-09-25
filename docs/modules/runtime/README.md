@@ -39,9 +39,7 @@ deadline drains a backlog over a few minutes instead of bursting. Enforcement is
 not here — the gate re-checks the deadline under the lock that removes a parked
 entry, so an overdue approval default-denies on the operator's click whether or
 not this ever ran; what this adds is that the queue empties and the badge goes
-back to describing current state. `CompanyScheduler::tick_maintenance` remains
-as a thin delegate over the same `sweep_company`, so the two callers cannot
-drift.
+back to describing current state.
 
 `workflow_scheduler.rs` drives the *other* kind of cron: the `schedule` a saved
 workflow graph's `trigger` node carries (issue #169). Same `CronExpr` matcher,

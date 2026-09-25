@@ -5162,8 +5162,8 @@ impl CompanyRuntime {
     ///
     /// **Driven by [`MaintenanceTicker`](crate::runtime::maintenance::MaintenanceTicker)**
     /// — a process-wide ticker over the registry, not the per-company cron
-    /// scheduler. Until issue #971 the only production caller was
-    /// `CompanyScheduler::tick_maintenance`, and that scheduler is only spawned
+    /// scheduler. Until issue #971 the only production caller was the
+    /// `CompanyScheduler` minute loop, and that scheduler is only spawned
     /// for a company whose manifest declares a `[[schedule]]`. So a company with
     /// no manifest cron — including one whose work is driven entirely by
     /// *workflow* schedules, which run on a different loop — parked approvals

@@ -190,31 +190,6 @@ impl WorkflowSpawn {
         Ok(self.spawn_admitted(ctx, guard, workflow, input, dry_run))
     }
 
-    /// [`spawn`](Self::spawn), for a caller that knows who is really behind the
-    /// run and wants the journal to say so rather than settle for `begin`'s
-    /// `scheduled`-derived default (issue #1862 prerequisite).
-    ///
-    /// A resumed workflow — a paused gate approved, or a blocked agent node's
-    /// call approved — is exactly this caller: `scheduled` is always `false`
-    /// for a resume (issue #542), which on its own would stamp every
-    /// continuation `StartedBy::Operator` regardless of who or what actually
-    /// triggered the run that paused. `started_by` overrides that default on
-    /// the admitted context before the task is spawned, so the attribution the
-    /// paused run carried (or the trigger site stamped) survives the re-run
-    /// rather than resetting.
-    pub fn spawn_as(
-        self,
-        workflow: WorkflowFile,
-        input: Value,
-        scheduled: bool,
-        dry_run: bool,
-        started_by: crate::ports::types::StartedBy,
-    ) -> Result<(String, JoinHandle<Result<WorkflowRun>>)> {
-        let (ctx, guard) = self.supervisor.begin(&workflow.id, scheduled)?;
-        let ctx = ctx.with_started_by(started_by);
-        Ok(self.spawn_admitted(ctx, guard, workflow, input, dry_run))
-    }
-
     /// Spawns a run whose slot the caller has **already** admitted through
     /// [`RunSupervisor::begin`], threading in the resulting `(ctx, guard)`.
     ///

@@ -2,8 +2,8 @@
 //!
 //! The settle sites in `brain.rs` and `planning.rs` reach this module holding an
 //! error and one question: is this something the operator could fix if we asked
-//! them? [`classify_blocker`] is the single answer, so the three sites cannot
-//! each decide it differently.
+//! them? [`classify_blocker_message`] is the single answer, so the three sites
+//! cannot each decide it differently.
 //!
 //! # Matching on the message, and why that is the only option here
 //!
@@ -134,8 +134,8 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
-/// Classifies a settle-site error, or `None` when the shape is not one we are
-/// willing to name.
+/// Classifies a settle-site error message, or `None` when the shape is not one
+/// we are willing to name.
 ///
 /// `None` is the ordinary answer and means "settle as before". Callers must not
 /// read it as "not a blocker" in any deeper sense — it means this function does
@@ -146,15 +146,6 @@ const SHAPES: &[Shape] = &[
 /// still must not park; callers gate on
 /// [`BlockerKind::parks`](crate::ports::blockers::BlockerKind::parks) rather
 /// than on `is_some`.
-pub fn classify_blocker(err: &anyhow::Error) -> Option<BlockerClass> {
-    classify_blocker_message(&format!("{err:#}"))
-}
-
-/// [`classify_blocker`] over an already-flattened message.
-///
-/// Split out because two callers have a `String` rather than an
-/// `anyhow::Error`: `planning.rs`'s `settle_blocked`, whose reason is composed
-/// rather than raised, and the tests below.
 pub fn classify_blocker_message(message: &str) -> Option<BlockerClass> {
     let haystack = message.to_ascii_lowercase();
     SHAPES

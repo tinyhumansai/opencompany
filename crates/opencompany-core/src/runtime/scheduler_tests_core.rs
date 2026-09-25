@@ -2,11 +2,9 @@ pub(super) use super::*;
 pub(super) use async_trait::async_trait;
 
 pub(super) use crate::company::CompanyManifest;
-pub(super) use crate::policy::ManifestApprovalGate;
 pub(super) use crate::ports::brain::{Brain, CycleHost};
 pub(super) use crate::ports::types::{
-    CompressedTrace, CycleRequest, CycleResult, Effect, EffectGroup, EventSeq, OutboundMessage,
-    TokenUsage,
+    CompressedTrace, CycleRequest, CycleResult, EventSeq, OutboundMessage, TokenUsage,
 };
 pub(super) use crate::runtime::RuntimeBuilder;
 pub(super) use crate::runtime::cron::CivilTime;
@@ -103,25 +101,6 @@ pub(super) fn scheduled_manifest() -> CompanyManifest {
 
         [policy]
         mode = "full"
-    "#;
-    toml::from_str(toml_src).expect("parse manifest")
-}
-
-pub(super) fn scheduled_manifest_supervised() -> CompanyManifest {
-    let toml_src = r#"
-        [company]
-        name = "Acme"
-
-        [[agent]]
-        id = "ceo"
-        role = "Chief"
-
-        [[schedule]]
-        cron = "0 9 * * MON"
-        prompt = "weekly standup"
-
-        [policy]
-        mode = "supervised"
     "#;
     toml::from_str(toml_src).expect("parse manifest")
 }

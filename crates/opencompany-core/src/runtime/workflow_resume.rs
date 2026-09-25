@@ -1448,13 +1448,10 @@ pub async fn spawn_blocked_node_continuation(
     // so a refusal here writes no marker for a run that never started.
     let ws = WorkflowSpawn::new(runtime, runner);
     let (ctx, guard) = runtime.run_supervisor().begin(&workflow.id, false)?;
-    // Issue #1862 prerequisite: `started_by` is the blocked run's own
-    // attribution, stashed at block-settle by `BlockedNodeQueue::arm` and
-    // handed back on release — stamped onto the admitted context here so it
-    // overrides `begin`'s `scheduled`-derived `Operator` default, the same as
-    // `spawn_as` does for the gate path in `spawn_continuation`. Done on the
-    // already-admitted `ctx` (rather than via `spawn_as`, which owns its own
-    // `begin` call) so this still gets the split-`begin`/dispatch-marker
+    // `started_by` is the blocked run's own attribution, stashed at
+    // block-settle by `BlockedNodeQueue::arm` and handed back on release; it
+    // overrides `begin`'s `scheduled`-derived `Operator` default and is set on
+    // the already-admitted `ctx` to keep the split-`begin`/dispatch-marker
     // ordering below.
     // Issue #1991 review (`3904397452`/`3904304754`): the blocked-node twin of
     // `spawn_continuation`'s own `graph_unchanged_since_park` check — a

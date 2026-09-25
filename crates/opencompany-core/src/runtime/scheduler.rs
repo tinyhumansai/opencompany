@@ -454,27 +454,6 @@ impl CompanyScheduler {
         Ok(fired)
     }
 
-    /// Runs one company's maintenance pass: sweep parked approvals past their
-    /// TTL to a default-deny, sweep single-use grants the agent never redeemed
-    /// (issue #243), and prune stale fire claims (issue #241).
-    ///
-    /// **No longer driven by this scheduler's loop** (issue #971). It delegates
-    /// to [`MaintenanceTicker`], the process-wide ticker that runs the same pass
-    /// for *every* registered company — including the ones with no manifest
-    /// `[[schedule]]`, which never spawned a scheduler and so were never swept
-    /// at all. Calling it from the cron loop too would sweep a scheduled company
-    /// twice a minute for no gain.
-    ///
-    /// Kept as a thin delegate rather than deleted so there is exactly one
-    /// implementation of "a company's maintenance pass". Its tests still hold
-    /// this scheduler to that behaviour, which is the point: the two callers
-    /// cannot drift, because there is only one thing to drift from.
-    pub async fn tick_maintenance(&self) -> Result<Vec<crate::ports::types::ApprovalId>> {
-        let runtime = self.runtime();
-        let minute = self.clock.now_millis() / MINUTE_MS;
-        Ok(crate::runtime::maintenance::sweep_company(runtime.id(), &runtime, minute).await)
-    }
-
     /// Spawns a background task that ticks on every minute boundary until
     /// `shutdown` is notified, then returns. Boot holds the join handle and the
     /// shared `shutdown` so the scheduler stops cleanly when the server does.

@@ -112,7 +112,7 @@ async fn park(runtime: &Arc<CompanyRuntime>) -> Result<ApprovalId> {
 /// passes its deadline, a maintenance tick runs, and the approval is gone.
 ///
 /// This was **inexpressible** before this module existed. The only thing
-/// that swept approvals in production was `CompanyScheduler::tick_maintenance`,
+/// that swept approvals in production was the scheduler's maintenance tick,
 /// and `spawn_scheduler` returns `None` for a company with no schedules — so
 /// there was no production path from "a scheduleless company's approval is
 /// overdue" to "it is retired", at any age, ever. The test could only be

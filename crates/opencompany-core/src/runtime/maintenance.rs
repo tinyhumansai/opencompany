@@ -8,11 +8,12 @@
 //! retirement transaction, and both were covered by tests. What was missing was
 //! anything to run it.
 //!
-//! Its only production caller was `CompanyScheduler::tick_maintenance`, reached
-//! only from that scheduler's minute loop — and the scheduler is spawned only
-//! for a company whose manifest declares a `[[schedule]]`. **A company that
-//! declares no `[[schedule]]` never spawned a scheduler and therefore never
-//! swept approvals, grants or fire claims, at any age.** The tenant that
+//! Its only production caller was the per-company
+//! [`CompanyScheduler`](super::scheduler::CompanyScheduler)'s minute loop — and
+//! the scheduler is spawned only for a company whose manifest declares a
+//! `[[schedule]]`. **A company that declares no `[[schedule]]` never spawned a
+//! scheduler and therefore never swept approvals, grants or fire claims, at any
+//! age.** The tenant that
 //! surfaced #971 ran a weekly digest as a *workflow*, driven by
 //! [`WorkflowScheduler`](super::workflow_scheduler::WorkflowScheduler), whose
 //! loop calls only `tick` — so it minted approvals every week and swept none of
@@ -205,9 +206,7 @@ fn should_evict_archived(status: &crate::Result<crate::runtime::types::CompanySt
 /// One company's maintenance pass: retire overdue approvals, expire unredeemed
 /// grants, prune stale fire claims. Returns the approvals that were retired.
 ///
-/// **The single implementation**, shared by [`MaintenanceTicker::tick`] and
-/// [`CompanyScheduler::tick_maintenance`](super::scheduler::CompanyScheduler::tick_maintenance)
-/// so the two cannot drift into meaning different things by "maintenance".
+/// **The single implementation**, driven by [`MaintenanceTicker::tick`].
 ///
 /// Every chore is best-effort and independent: a failure on one must not stop
 /// the next, and — at the tick above — a failure on one company must not stop

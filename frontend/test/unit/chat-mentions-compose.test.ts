@@ -307,7 +307,7 @@ describe("insertMention", () => {
   });
 
   /**
-   * The `#` spelling is desk-only server-side (`extract_with_known` narrows
+   * The `#` spelling is desk-only server-side (`mentions::scan` narrows
    * `@#…` to desk targets), so a user whose display label starts with `#`
    * must fall back to a plain alias rather than inserting a visually
    * desk-shaped `@#Ada` that revalidation would still accept as the user.

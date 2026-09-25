@@ -189,64 +189,6 @@ async fn empty_schedule_set_is_a_noop() {
     assert_eq!(scheduler.tick().await.unwrap(), 0);
 }
 
-#[tokio::test]
-async fn tick_maintenance_expires_parked_approval() {
-    let home_dir = tmp_home();
-    let home = home_dir.path().to_path_buf();
-    // A brain that parks a Sign effect so there is something to expire.
-    struct ParkBrain;
-    #[async_trait]
-    impl Brain for ParkBrain {
-        async fn run_cycle(&self, req: CycleRequest, host: &dyn CycleHost) -> Result<CycleResult> {
-            for event in &req.events {
-                if let CompanyEvent::ScheduleFired { .. } = event {
-                    host.emit_effect(Effect {
-                        kind: "filing.submit".into(),
-                        group: EffectGroup::Sign,
-                        amount_usd: None,
-                        established_thread: false,
-                        first_time_counterparty: false,
-                        payload: serde_json::Value::Null,
-                        agent: None,
-                        run_id: None,
-                    })
-                    .await?;
-                }
-            }
-            Ok(CycleResult {
-                channel_responses: Vec::new(),
-                new_traces: vec![CompressedTrace::now(&req.cycle_id, "park")],
-                ledger_deltas: Vec::new(),
-                token_usage: TokenUsage::default(),
-            })
-        }
-    }
-
-    let manifest = scheduled_manifest_supervised();
-    let schedules = manifest.schedules.clone();
-    // Zero-TTL gate: anything parked is instantly past its deadline.
-    let gate = Arc::new(ManifestApprovalGate::new(manifest.policy.clone()).with_ttl_millis(0));
-    let rt = Arc::new(
-        RuntimeBuilder::new(home.clone(), manifest)
-            .with_brain(Arc::new(ParkBrain))
-            .with_approvals(gate)
-            .build()
-            .await
-            .unwrap(),
-    );
-    let clock = Arc::new(FakeClock::new(millis_at(2026, 7, 13, 9, 0)));
-    let mut scheduler = CompanyScheduler::new(rt.clone(), &schedules, clock).unwrap();
-
-    // The scheduled cycle parks one approval.
-    assert_eq!(scheduler.tick().await.unwrap(), 1);
-    assert_eq!(rt.pending_approvals().len(), 1);
-
-    // Maintenance sweeps it to a default-deny.
-    let expired = scheduler.tick_maintenance().await.unwrap();
-    assert_eq!(expired.len(), 1);
-    assert!(rt.pending_approvals().is_empty());
-}
-
 /// A shutdown delivered *while a tick is running* must still stop the loop.
 ///
 /// Boot signals with `notify_waiters()`, which wakes only the waiters

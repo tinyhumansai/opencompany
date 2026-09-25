@@ -17,7 +17,7 @@
 //! # The shape of the problem
 //!
 //! ```text
-//! body text ──► strip_code_regions ──► extract_with_known ──┐
+//! body text ──► strip_code_regions ──► scan ────────────────┐
 //!                                                            ├─► normalize ─► Vec<Mention>
 //! client-supplied mentions (the picker's answer) ────────────┘
 //!                            │
@@ -83,7 +83,7 @@ pub struct MentionAlias {
 /// # Ambiguity is preserved, not resolved
 ///
 /// An alias shared by two targets appears on both, and
-/// [`extract_with_known`] then refuses it. Deduplicating here — keeping the
+/// [`scan`] then refuses it. Deduplicating here — keeping the
 /// first target for a repeated name — would bury the collision at the one point
 /// where it is still cheap to notice.
 pub fn directory(record: &CompanyRecord, users: &[UserRecord]) -> Vec<MentionAlias> {
@@ -486,43 +486,6 @@ fn closes_mention(bytes: &[u8], idx: usize) -> bool {
     }
 }
 
-/// Every `@name` candidate in `text`, as `(byte offset of the '@', the name)`.
-///
-/// The single-word pass: the name charset is `[A-Za-z0-9._-]`, which is what a
-/// slug or a roster id looks like. Multi-word display names are the business of
-/// [`extract_with_known`], which needs the directory to know where a name ends.
-///
-/// Does **not** strip code regions — pass [`strip_code_regions`]'s output if
-/// that is wanted, which every caller here does.
-pub fn extract_at_names(text: &str) -> Vec<(usize, String)> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if opens_mention(text, bytes, i) {
-            let mut j = i + 1;
-            while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'-' | b'.'))
-            {
-                j += 1;
-            }
-            // Trailing `.` is sentence punctuation far more often than part of
-            // a name, so it is not eaten.
-            let mut end = j;
-            while end > i + 1 && bytes[end - 1] == b'.' {
-                end -= 1;
-            }
-            if end > i + 1 {
-                out.push((i, text[i + 1..end].to_string()));
-            }
-            i = j.max(i + 1);
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
 /// An `@name` that named **more than one** thing and therefore named nobody
 /// (B-101).
 ///
@@ -614,15 +577,6 @@ pub fn ambiguity_note(refused: &[AmbiguousMention]) -> Option<String> {
         "{head}, so {subject} pinged nobody. Pick the one you mean from the @ list and send again — \
          a name that reaches two people is never guessed at."
     ))
-}
-
-/// Resolve `text` against `dir`, returning one [`Mention`] per `@` that names
-/// exactly one thing.
-///
-/// [`scan`] with the refusals dropped. Kept because most callers only route,
-/// and routing has nothing to do with a span that reached nobody.
-pub fn extract_with_known(text: &str, dir: &[MentionAlias]) -> Vec<Mention> {
-    scan(text, dir).mentions
 }
 
 /// Resolve `text` against `dir`, reporting both what each `@` named and what it
@@ -819,18 +773,18 @@ pub fn normalize(mut mentions: Vec<Mention>, sender: Option<&Actor>) -> Vec<Ment
 /// against.
 ///
 /// The comparison strips the leading `@` (or `#` — [`directory`] aliases carry
-/// neither) and folds ASCII case, mirroring [`extract_with_known`]'s own
+/// neither) and folds ASCII case, mirroring [`scan`]'s own
 /// matching rule so a span the extractor would have accepted is never rejected
 /// here. `Everyone` and `Desk` targets are covered the same way, since a
 /// caller can misclaim those exactly as easily as an agent or a user.
 fn is_valid_alias_for(mention: &Mention, dir: &[MentionAlias]) -> bool {
-    // Strips `@` and, for the desk spelling `opens_mention`/`extract_with_known`
+    // Strips `@` and, for the desk spelling `opens_mention`/`scan`
     // both accept, the `#` right after it too — `@#engineering` must compare
     // against the same `"engineering"` alias `@engineering` does, not against
     // `"#engineering"`, which is nobody's alias and would fail every desk
     // mention the console's own picker can produce for that spelling.
     let body = mention.text.strip_prefix('@').unwrap_or(&mention.text);
-    // `@#…` is the desk-only spelling. `extract_with_known` narrows a hashed
+    // `@#…` is the desk-only spelling. `scan` narrows a hashed
     // body to desk targets when scanning text, and revalidation must apply the
     // same rule: without it, a user or agent whose label happens to start with
     // `#` would pass the alias check below (the hash is stripped, leaving a
