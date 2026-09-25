@@ -74,6 +74,47 @@ fn a_turn_whose_last_iteration_is_the_cap_paused_at_it() {
     let mut retried = capped.clone();
     retried.extend(finished.clone());
     assert!(!hit_iteration_cap(&retried));
+
+    // The same two turns as `retried`, in the shape a *real* stream has: no
+    // `TurnStarted` anywhere. The boundary must still be found, or the first
+    // turn's cap leaks into the second and a finished turn reports a pause it
+    // never took — which is exactly what reached CI.
+    let real_capped = vec![
+        AgentProgress::IterationStarted {
+            iteration: 25,
+            max_iterations: 25,
+        },
+        AgentProgress::TurnCompleted { iterations: 25 },
+    ];
+    let real_finished = vec![
+        AgentProgress::IterationStarted {
+            iteration: 1,
+            max_iterations: 25,
+        },
+        AgentProgress::TurnCompleted { iterations: 1 },
+    ];
+    assert!(
+        hit_iteration_cap(&real_capped),
+        "a real capped turn must still be detected without a TurnStarted"
+    );
+    let mut real_retried = real_capped.clone();
+    real_retried.extend(real_finished);
+    assert!(
+        !hit_iteration_cap(&real_retried),
+        "the previous turn's TurnCompleted bounds the scan: this turn ran one \
+         iteration of twenty-five and finished"
+    );
+
+    // Mid-turn, nothing completed yet: the cap belongs to the turn in flight.
+    let mut real_inflight = real_capped.clone();
+    real_inflight.extend(vec![AgentProgress::IterationStarted {
+        iteration: 25,
+        max_iterations: 25,
+    }]);
+    assert!(
+        hit_iteration_cap(&real_inflight),
+        "a turn still running at the ceiling has hit the cap"
+    );
 }
 
 #[tokio::test]
@@ -88,4 +129,25 @@ async fn the_pump_returns_every_event_in_order_after_finish() {
     let events = pump.finish().await;
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], AgentProgress::TurnStarted));
+}
+
+/// #988's invariant, pinned where it can be checked without running a turn.
+///
+/// The end-to-end pair in `spend_halt_turn_tests` covers the same ground but
+/// drives a live scripted turn, so it only catches a regression when timing
+/// lines up — it passed locally five runs in a row while failing in CI. This
+/// is the same rule with the timing removed.
+#[test]
+fn a_spend_halt_is_never_also_reported_as_a_step_pause() {
+    assert!(
+        reportable_iteration_cap(true, false),
+        "a turn that only hit the cap reports it"
+    );
+    assert!(
+        !reportable_iteration_cap(true, true),
+        "a turn that hit the cap AND ran out of money reports the halt, not a \
+         resumable pause — \"continue\" would invite spending a spent budget"
+    );
+    assert!(!reportable_iteration_cap(false, true));
+    assert!(!reportable_iteration_cap(false, false));
 }

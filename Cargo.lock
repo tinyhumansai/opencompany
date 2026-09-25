@@ -4004,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman"
-version = "0.63.32"
+version = "0.64.0"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -4060,6 +4060,8 @@ dependencies = [
  "tinyagents-registry",
  "tinyagents-runtime",
  "tinyagents-session",
+ "tinybrowser-bus",
+ "tinybrowser-control",
  "tinybus",
  "tinychannels-bus",
  "tinyconnectors-bus",
@@ -4070,6 +4072,7 @@ dependencies = [
  "tinyinference-local",
  "tinyinference-providers",
  "tinyinference-voice",
+ "tinyjevclient",
  "tinyjuice",
  "tinyjuice-bus",
  "tinymcp",
@@ -4100,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman-embed"
-version = "0.63.32"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "log",
@@ -4116,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman-rpc"
-version = "0.63.32"
+version = "0.64.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4124,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "openhuman-tinyhumans"
-version = "0.63.32"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6661,8 +6664,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinybrowser-bus"
+version = "0.2.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tinybrowser-control"
+version = "0.2.2"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.20",
+ "tinybrowser-bus",
+ "tinyjevclient",
+]
+
+[[package]]
 name = "tinybus"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -6675,7 +6696,7 @@ dependencies = [
 
 [[package]]
 name = "tinybus-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6684,20 +6705,19 @@ dependencies = [
 
 [[package]]
 name = "tinychannels-bus"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "chrono",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "parking_lot",
  "rand 0.10.2",
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -6706,7 +6726,7 @@ dependencies = [
 
 [[package]]
 name = "tinyconnectors-bus"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6714,12 +6734,13 @@ dependencies = [
 
 [[package]]
 name = "tinyflows"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "async-trait",
  "futures-timer",
  "futures-util",
  "getrandom 0.4.3",
+ "hex",
  "jaq-core",
  "jaq-json",
  "jaq-std",
@@ -6829,7 +6850,7 @@ dependencies = [
 
 [[package]]
 name = "tinyhosts"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6988,8 +7009,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyjevclient"
+version = "0.2.1"
+dependencies = [
+ "httpdate",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "tinyjuice"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "dirs 7.0.0",
@@ -7009,7 +7042,7 @@ dependencies = [
 
 [[package]]
 name = "tinyjuice-bus"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -7017,7 +7050,7 @@ dependencies = [
 
 [[package]]
 name = "tinymcp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "dirs 7.0.0",
@@ -7037,7 +7070,7 @@ dependencies = [
 
 [[package]]
 name = "tinymcp-bus"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "schemars",
  "serde",
@@ -7046,11 +7079,10 @@ dependencies = [
 
 [[package]]
 name = "tinymemory"
-version = "1.16.0"
+version = "1.16.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "log",
  "serde",
  "serde_json",
  "tinymemory-api",
@@ -7131,7 +7163,7 @@ dependencies = [
 
 [[package]]
 name = "tinyruntime-bus"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -7139,15 +7171,15 @@ dependencies = [
 
 [[package]]
 name = "tinyskills"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
- "tracing",
  "url",
 ]
 
@@ -8666,7 +8698,7 @@ version = "0.2.1"
 
 [[patch.unused]]
 name = "tinychannels"
-version = "0.1.2"
+version = "0.1.3"
 
 [[patch.unused]]
 name = "tinycortex"

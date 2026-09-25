@@ -83,7 +83,16 @@ fn truncation_markers_still_appear_in_the_vendored_tool_pipeline() {
         ),
     ]
     .concat();
-    for marker in TRUNCATION_MARKERS {
+    // Only the markers upstream still writes. `truncated by tool cap:` was
+    // dropped from the vendored source by `6865c81eb` (uncapped tool
+    // summaries) and appears there no longer — but it stays in
+    // `TRUNCATION_MARKERS`, because that classifies results rather than
+    // source and an older trace still carries the phrase. Asserting it here
+    // would fail on a string the pipeline is right to have stopped writing.
+    for marker in TRUNCATION_MARKERS
+        .iter()
+        .filter(|marker| **marker != "truncated by tool cap:")
+    {
         assert!(
             sources.contains(marker),
             "'{marker}' no longer appears in the vendored tool pipeline — \

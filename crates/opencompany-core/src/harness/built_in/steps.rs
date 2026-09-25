@@ -930,12 +930,18 @@ const APPROVAL_REQUIRED_NEEDLE: &str = "requires approval under policy";
 const AWAITING_APPROVAL_RESULT: &str = "Parked — waiting on your approval before it can run.";
 
 /// Markers the OpenHuman tool pipeline stamps into a result it **cut**, from
-/// the three places that can cut one:
+/// the places that cut one and say so:
 ///
-/// * the per-tool char cap (`middleware.rs`),
 /// * the shared byte budget (`tool_result_artifacts/mod.rs`),
 /// * the artifact envelope that replaces an oversized result with a preview
 ///   plus a pointer (same file).
+///
+/// `truncated by tool cap:` is kept though the vendored source no longer
+/// produces it — upstream dropped that wording moving to uncapped tool
+/// summaries (`6865c81eb`). It stays because this classifies **results**, not
+/// source: a persisted trace or a reply captured before that change still
+/// carries the phrase, and a classifier that forgets it would silently
+/// re-label old cut output as whole. It costs one `contains` per result.
 ///
 /// Same string-classifier caveat, same mitigation:
 /// `truncation_markers_still_appear_in_the_vendored_tool_pipeline` reads both

@@ -160,18 +160,61 @@ pub fn attempt_event_segments(events: &[AgentProgress], attempts: usize) -> Vec<
 /// so a turn whose last iteration *is* the cap paused there rather than
 /// finishing (issue #926). The `TurnCompleted` iteration count is preferred
 /// when present, since it is what the loop itself reports.
+/// Whether a turn should *report* the iteration cap, given that it may also
+/// have been halted for spend.
+///
+/// #988 pins that a spend halt reads `hit_iteration_cap == false`, and
+/// `brain.rs` depends on it: it emits the step-pause notice and the spend
+/// notice from separate `if`s, on the stated grounds that the two "cannot both
+/// come from ONE turn". While [`hit_iteration_cap`] never fired at all — it
+/// required a `TurnStarted` no real stream emits — that invariant held for
+/// free. Now that the predicate works, it has to be stated.
+///
+/// The halt wins because it is the more specific account of why the turn
+/// stopped, and the notices are not interchangeable: a step pause invites
+/// "continue", which on a spent budget would invite the operator to burn a cap
+/// that has already run out.
+#[must_use]
+pub fn reportable_iteration_cap(raw_cap: bool, halted_for_spend: bool) -> bool {
+    raw_cap && !halted_for_spend
+}
+
 pub fn hit_iteration_cap(events: &[AgentProgress]) -> bool {
-    let last_start = events.iter().rev().find_map(|event| match event {
-        AgentProgress::TurnStarted => Some(()),
-        _ => None,
-    });
-    if last_start.is_none() {
-        return false;
-    }
+    // **The scan is bounded by the previous turn's `TurnCompleted`, not by
+    // `TurnStarted`.**
+    //
+    // This used to require a `TurnStarted` and return `false` without one —
+    // and a real turn's progress stream does not carry one: it opens on
+    // `IterationStarted`. So the cap was never reported, however many
+    // iterations a turn burned. The same trap is written up one seam over,
+    // where `attempt_event_segments` splits on the same never-emitted event.
+    //
+    // Dropping the precondition alone is not enough, and getting that wrong
+    // is what made two `spend_halt_turn_tests` fail under CI's parallelism:
+    // the `break` on `TurnStarted` was also the only thing confining the scan
+    // to one turn. Without it the reverse walk ran the whole accumulated
+    // buffer, so an earlier turn's `TurnCompleted { iterations: 25 }` counted
+    // toward this turn and a turn that finished cleanly reported a pause it
+    // never took.
+    //
+    // The boundary has to be an event the loop actually emits, so it is the
+    // previous turn's `TurnCompleted`. The final event is skipped while
+    // looking for it: a turn that ran to completion ends with its own
+    // `TurnCompleted`, and that one closes *this* turn rather than opening it.
+    let start = events
+        .iter()
+        .enumerate()
+        .rev()
+        .skip(1)
+        .find(|(_, event)| matches!(event, AgentProgress::TurnCompleted { .. }))
+        .map_or(0, |(index, _)| index + 1);
+
     let mut cap: Option<u32> = None;
     let mut iterations: u32 = 0;
-    for event in events.iter().rev() {
+    for event in events[start..].iter().rev() {
         match event {
+            // Kept for a synthetic stream that does carry it; a real one
+            // never reaches this arm.
             AgentProgress::TurnStarted => break,
             AgentProgress::TurnCompleted { iterations: n } => iterations = iterations.max(*n),
             AgentProgress::IterationStarted {

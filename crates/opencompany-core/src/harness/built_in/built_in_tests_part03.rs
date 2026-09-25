@@ -272,7 +272,23 @@ async fn a_broken_workspace_root_reports_once_across_repeated_dispatches() {
     let mut fx = fixture();
     fx.deps.workspace_root = not_a_dir.clone();
     let pool = HarnessPool::new();
-    let rec = record();
+    // A company id of this test's own, not the shared `acme`.
+    //
+    // The OpenHuman transcript root is process-wide (one
+    // `OPENHUMAN_WORKSPACE` per test binary), while a session's durable
+    // identity is derived from the company and agent ids. Every test that
+    // runs `ceo` on the bare `acme` therefore reads and writes *one*
+    // transcript, including the `{"kind":"tools"}` record. This agent is
+    // built with no skills, so when it resumed a transcript another test had
+    // stamped with `list_skills`/`describe_skill`/`read_skill_resource`, the
+    // driver refused the turn: "session tool snapshot declares
+    // non-executable tools". It only bites when the other test wins the race,
+    // which is why it passed locally and failed under CI's parallelism.
+    let mut rec = record();
+    rec.id = CompanyId::new(format!(
+        "acme-broken-workspace-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     pool.ensure(&rec, &fx.deps).await.expect("ensure");
 
     // Sanity: the condition really is a hard, repeatable failure.
