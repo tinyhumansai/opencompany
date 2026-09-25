@@ -6,11 +6,17 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { OpenCompanyClient } from "@/api/client";
-import type { ComposioConnectedAccount, ComposioToolkitEntry } from "@/api/composio";
-import type { ConnectionState, McpHealth, McpServer, UsageDto } from "@/api/types";
+import type {
+  ComposioConnectedAccount,
+  ComposioToolkitEntry,
+} from "@/api/composio";
+import type { ConnectionState, UsageDto } from "@/api/types";
 import type { ComposioReach } from "@/lib/connections";
 import { buildGridProviders, type GridProvider } from "@/lib/provider-grid";
-import { ProviderDetail, type ConnectionSubject } from "@/views/connections/ProviderDetail";
+
+const { ProviderDetail } = await import("@/views/connections/ProviderDetail");
+type ConnectionSubject =
+  import("@/views/connections/ProviderDetail").ConnectionSubject;
 
 /**
  * The connection detail view's claims (issues #404, #821).
@@ -55,12 +61,17 @@ function entry(slug: string, name: string): ComposioToolkitEntry {
   return { slug, name, description: "", logo: null, categories: [] };
 }
 
-function account(over: Partial<ComposioConnectedAccount> = {}): ComposioConnectedAccount {
+function account(
+  over: Partial<ComposioConnectedAccount> = {},
+): ComposioConnectedAccount {
   return { id: "conn-1", status: "ACTIVE", connected: true, ...over };
 }
 
 /** A real grid row, built the way the page builds it. */
-function gmail(accounts: ComposioConnectedAccount[], via: ConnectionState["via"] = ["composio"]) {
+function gmail(
+  accounts: ComposioConnectedAccount[],
+  via: ConnectionState["via"] = ["composio"],
+) {
   const rows = buildGridProviders(
     [entry("gmail", "Gmail")],
     [],
@@ -74,7 +85,13 @@ function gmail(accounts: ComposioConnectedAccount[], via: ConnectionState["via"]
 
 /** The same provider, connected to nothing. */
 function unconnectedGmail() {
-  const rows = buildGridProviders([entry("gmail", "Gmail")], [], {}, OPEN, false);
+  const rows = buildGridProviders(
+    [entry("gmail", "Gmail")],
+    [],
+    {},
+    OPEN,
+    false,
+  );
   return rows.find((p) => p.slug === "gmail")!;
 }
 
@@ -108,7 +125,11 @@ async function render(
 }
 
 /** Open the panel on any subject — the shared half of `render` and `openMcp`. */
-async function open(subject: ConnectionSubject, canManage: boolean, client = clientWith([])) {
+async function open(
+  subject: ConnectionSubject,
+  canManage: boolean,
+  client = clientWith([]),
+) {
   await act(async () => {
     root.render(
       createElement(ProviderDetail, {
@@ -129,7 +150,9 @@ function text(): string {
 }
 
 beforeEach(() => {
-  (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  (
+    globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
+  ).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -145,7 +168,12 @@ describe("the provider detail view", () => {
     await render(
       gmail([
         account({ id: "conn-gmail-1", account: "ops@acme.test" }),
-        account({ id: "conn-gmail-2", account: "billing@acme.test", status: "EXPIRED", connected: false }),
+        account({
+          id: "conn-gmail-2",
+          account: "billing@acme.test",
+          status: "EXPIRED",
+          connected: false,
+        }),
       ]),
       true,
     );
@@ -248,7 +276,11 @@ describe("the provider detail view", () => {
 
   it("keeps the usage figure on a disconnected provider that was used", async () => {
     // The interesting case: the calls happened, then the account went away.
-    await render(unconnectedGmail(), true, clientWith([{ provider: "gmail", calls: 7 }]));
+    await render(
+      unconnectedGmail(),
+      true,
+      clientWith([{ provider: "gmail", calls: 7 }]),
+    );
     expect(text()).toContain("7");
     expect(text()).toContain("in the last 30 days");
   });
@@ -256,7 +288,9 @@ describe("the provider detail view", () => {
   it("says why a connect cannot be started when no credential resolves", async () => {
     // Stated where the button is, not only on the page behind the panel.
     await render(unconnectedGmail(), true, clientWith([]), true);
-    expect(text()).toContain("no credential for this company to authorize against");
+    expect(text()).toContain(
+      "no credential for this company to authorize against",
+    );
   });
 
   it("names the inert native credential as a caveat, not as a second connection", async () => {
@@ -268,134 +302,6 @@ describe("the provider detail view", () => {
 });
 
 /** A server as `.../mcp/servers` returns it. */
-function mcpServer(over: Partial<McpServer> = {}): McpServer {
-  return {
-    name: "linear",
-    endpoint: "https://mcp.linear.app/mcp",
-    source: "runtime",
-    enabled: true,
-    allowedTools: [],
-    disallowedTools: [],
-    readOnlyTools: [],
-    timeoutSecs: 30,
-    authConfigured: true,
-    ...over,
-  };
-}
-
-async function openMcp(
-  server: McpServer,
-  health: McpHealth | undefined = undefined,
-  canManage = true,
-  client = clientWith([]),
-) {
-  await open({ kind: "mcp", server, health }, canManage, client);
-}
-
-describe("the same panel, opened on a remote MCP server (#821)", () => {
-  it("says which of the three systems this is, and what it is calling as", async () => {
-    await openMcp(mcpServer());
-    expect(text()).toContain("MCP");
-    expect(text()).toContain("on, calling with a stored credential");
-    // What an operator opened it to see: the URL their agents actually call.
-    expect(text()).toContain("https://mcp.linear.app/mcp");
-  });
-
-  it("does not report a probe that was never run as a health verdict", async () => {
-    // The case with no honest single-badge rendering. A server nobody has
-    // pressed Test on is neither reachable nor broken, and the list's badge
-    // renders nothing at all for it — which on a detail view reads as "fine".
-    await openMcp(mcpServer(), undefined);
-    expect(text()).toContain("has not been probed from here");
-    expect(text()).not.toContain("reachable —");
-    expect(text()).not.toContain("last probed");
-  });
-
-  it("keeps 'turned off' apart from 'unreachable'", async () => {
-    // Two independent facts one badge would collapse: a disabled server whose
-    // endpoint answers perfectly still contributes nothing, and that is the
-    // fact the panel was opened to learn.
-    await openMcp(
-      mcpServer({ enabled: false }),
-      { status: "ok", message: "", toolCount: 9, checkedAtMillis: 1_760_000_000_000 },
-    );
-    expect(text()).toContain("turned off");
-    expect(text()).toContain("reachable — 9 tools on the last probe");
-    expect(text()).toContain("no agent receives its tools");
-  });
-
-  it("reads usage under mcp:<server>, never as the same-named toolkit's", async () => {
-    // The collision `mcp:` was named to prevent (#698). A company with a
-    // Composio `linear` and an MCP server called `linear` has two connections,
-    // and one row's total is not the other's.
-    await openMcp(mcpServer({ name: "linear" }), undefined, true, clientWith([
-      { provider: "mcp:linear", calls: 31 },
-      { provider: "linear", calls: 4 },
-    ]));
-    expect(text()).toContain("31");
-    expect(text()).toContain("in the last 30 days");
-    expect(text()).toContain("mcp:linear");
-    expect(text()).not.toContain("4 calls");
-  });
-
-  it("does not report a zero when the host records no usage at all", async () => {
-    const broken = {
-      usage: async () => {
-        throw new Error("no usage route on this host");
-      },
-    } as unknown as OpenCompanyClient;
-    await openMcp(mcpServer(), undefined, true, broken);
-    expect(text()).toContain("does not report usage");
-    expect(text()).not.toContain("0 calls");
-  });
-
-  it("says a connection date is not recorded, and why there is none to record", async () => {
-    // The same answer the native path gets, for the same reason — MCP has no
-    // connect step at all. A blank here would read as "never connected".
-    await openMcp(mcpServer());
-    expect(text()).toContain("connection date not recorded");
-    expect(text()).toContain("no connect step to record one");
-  });
-
-  it("states what removing a runtime server reaches, and what it does not", async () => {
-    await openMcp(mcpServer({ source: "runtime" }));
-    expect(text()).toContain("drops it from every agent's tool belt on the next turn");
-    expect(text()).toContain("Nothing is revoked at the server's own end");
-  });
-
-  it("does not offer to remove a server the manifest owns", async () => {
-    // A manifest server can be disabled but not deleted, and it returns on the
-    // next boot — a "removing it deletes it" sentence would be false there.
-    await openMcp(mcpServer({ source: "manifest" }));
-    expect(text()).toContain("cannot be removed from the console");
-    expect(text()).toContain("returns on the next boot");
-  });
-
-  it("tells a member the controls are an admin's rather than offering them", async () => {
-    await openMcp(mcpServer(), undefined, false);
-    expect(text()).toContain("Only an admin can turn a tool server off");
-  });
-
-  it("flags an enabled server no agent's grants cover", async () => {
-    // #568, restated where the panel can afford the sentence the row could not:
-    // usage above it is history, not evidence that it is reachable now.
-    await openMcp(mcpServer({ reachableBy: [] }));
-    expect(text()).toContain("No agent can reach this server");
-    // #931: the line prints each teammate's display name. An operator-added
-    // teammate's id is a minted internal string, and printing it told a reader
-    // nothing about who can reach the server — which is the line's whole point.
-    await openMcp(
-      mcpServer({
-        reachableBy: [
-          { id: "ceo", name: "Chief" },
-          { id: "019fa75dbc9b-000000000001", name: "Jamie" },
-        ],
-      }),
-    );
-    expect(text()).toContain("Chief, Jamie");
-    expect(text()).not.toContain("019fa75dbc9b");
-  });
-});
 
 /** A host whose usage answer is released by the test, one call at a time. */
 function gatedClient(byProvider: UsageDto["byProvider"]) {
@@ -411,7 +317,10 @@ function gatedClient(byProvider: UsageDto["byProvider"]) {
 
 /** The Usage section's own text, so a figure cannot be matched from elsewhere. */
 function usageText(): string {
-  return document.querySelector('[data-testid="connection-detail-usage"]')?.textContent ?? "";
+  return (
+    document.querySelector('[data-testid="connection-detail-usage"]')
+      ?.textContent ?? ""
+  );
 }
 
 /** A connected Composio provider by slug, with one account. */
@@ -480,7 +389,10 @@ describe("the same panel, changed from one subject to another", () => {
     // can be flushed — deliberately, rather than trusting it to have run by the
     // scheduler's grace, since `gates[1]` does not exist until it has.
     await act(async () => {});
-    expect(gates, "the subject change must have issued a usage read of its own").toHaveLength(2);
+    expect(
+      gates,
+      "the subject change must have issued a usage read of its own",
+    ).toHaveLength(2);
 
     // And Slack's own answer, when it arrives, is Slack's. Read from the Usage
     // section itself: a bare `7` would be satisfied by any digit anywhere on a

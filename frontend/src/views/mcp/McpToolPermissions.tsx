@@ -1,24 +1,12 @@
-// Per-tool permissions for one MCP server (issue #2373).
-//
-// Opens under the server's row and is addressed by `?permissions=<name>`, so a
-// link reaches the server whose permissions are in question rather than the
-// page that lists it.
-//
-// Everything rendered here is the document the host echoed back. A control
-// writes and then re-renders from the response, never from what was clicked:
-// the host resolves a mode out of the override, the tier's bulk default and the
-// declaration, so the answer to "what did that click do" is not derivable in the
-// console without shipping a second copy of that ladder — the drift issue #414
-// is about.
-
-import { useCallback, useEffect, useState } from "react";
-import { Loader2, RotateCcw, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, Loader2, RotateCcw } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import {
   type ApprovalMode,
   type ToolPolicyDocument,
   type ToolPolicyPatch,
+  type ToolPolicyRow,
   type ToolTier,
   policyTarget,
   readToolPolicy,
@@ -28,7 +16,6 @@ import {
 import { ApiError, type McpServer } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -36,13 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-/** What each mode does, in the words the operator is choosing between. */
-const MODE_LABELS: Record<ApprovalMode, string> = {
-  always_allow: "Runs",
-  needs_approval: "Asks",
-  blocked: "Blocked",
-};
+import { MODE_LABELS, ModeChoice } from "@/views/mcp/McpToolPermissionsControl";
 
 /**
  * The value the tier control carries when nothing is stored for that tier.
@@ -62,23 +43,45 @@ const TIER_DEFAULT_LABELS: Record<string, string> = {
 /** The tiers, in the order they escalate. */
 const TIERS: readonly ToolTier[] = ["read_only", "interactive", "write_delete"];
 
+/** The order the sections are read in: what can do the most damage, first. */
+const SECTION_ORDER: readonly ToolTier[] = [
+  "write_delete",
+  "interactive",
+  "read_only",
+];
+
 const TIER_LABELS: Record<ToolTier, string> = {
   read_only: "Read-only",
   interactive: "Interactive",
   write_delete: "Write & delete",
 };
 
+/** How a suggestion is written on a row, in the brief's shorthand. */
+const SUGGESTION_LABELS: Record<ToolTier, string> = {
+  read_only: "read-only",
+  interactive: "interactive",
+  write_delete: "write/delete",
+};
+
+const SECTION_TITLES: Record<ToolTier, string> = {
+  read_only: "Read-only tools",
+  interactive: "Interactive tools",
+  write_delete: "Write & delete tools",
+};
+
+/** How many unremarkable rows a section shows before it offers the rest. */
+const VISIBLE_CAP = 8;
+
 /**
  * Why a tool the panel lists is unreachable regardless of what its row says.
  *
  * `allowedTools` / `disallowedTools` are a separate gate, enforced where the
  * server is attached to an agent rather than at the approval ladder — so a row
- * can read "Asks" while the transport refuses the call outright. Rendering the
- * row without saying so invites an operator to set a mode that will never be
- * consulted.
+ * can read "Needs approval" while the transport refuses the call outright.
  */
 function exclusion(server: McpServer, tool: string): string | null {
-  if (server.disallowedTools.includes(tool)) return "Not sent — on the deny list";
+  if (server.disallowedTools.includes(tool))
+    return "Not sent — on the deny list";
   if (server.allowedTools.length > 0 && !server.allowedTools.includes(tool)) {
     return "Not sent — off the allow list";
   }
@@ -88,13 +91,14 @@ function exclusion(server: McpServer, tool: string): string | null {
 /**
  * The patch a choice in the tier control means on the wire.
  *
- * The sentinel and the absence it stands for are two vocabularies, and the
- * translation between them is the whole of issue #2373's tier half: a tier
+ * The sentinel and the absence it stands for are two vocabularies: a tier
  * cleared back to unset has to arrive as `null`, because the host reads a
- * missing key as "leave it alone" and would keep the bulk allow standing.
+ * missing key as "leave it alone".
  */
 export function tierPatch(tier: ToolTier, value: string): ToolPolicyPatch {
-  return { tierDefaults: { [tier]: value === UNSET ? null : (value as ApprovalMode) } };
+  return {
+    tierDefaults: { [tier]: value === UNSET ? null : (value as ApprovalMode) },
+  };
 }
 
 interface Props {
@@ -107,12 +111,11 @@ interface Props {
    * Bumped by the page when a probe re-ran against this server.
    *
    * A probe rewrites the stored inventory, and the inventory is what a tier
-   * default resolves against — so a panel that re-checked a server while open
-   * goes on rendering the tool list from before the probe, empty state and all,
-   * until it is closed and reopened.
+   * default resolves against.
    */
   reloadKey?: number;
-  onClose: () => void;
+  /** Scroll this into view once it has something to show. */
+  focus?: boolean;
 }
 
 type State =
@@ -132,11 +135,22 @@ export function McpToolPermissions({
   server,
   canManage,
   reloadKey = 0,
-  onClose,
+  focus = false,
 }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [busy, setBusy] = useState(false);
   const [writeError, setWriteError] = useState<string | null>(null);
+  const [opened, setOpened] = useState<Partial<Record<ToolTier, boolean>>>({});
+  const [showAll, setShowAll] = useState<Partial<Record<ToolTier, boolean>>>(
+    {},
+  );
+  const root = useRef<HTMLDivElement | null>(null);
+
+  const tools = state.kind === "ready" ? state.doc.tools : [];
+  const openByDefault =
+    SECTION_ORDER.find((tier) =>
+      tools.some((row) => row.effectiveTier === tier),
+    ) ?? SECTION_ORDER[0];
 
   const target = policyTarget(server);
   const targetKey = target
@@ -144,12 +158,18 @@ export function McpToolPermissions({
       ? `registry:${target.serverId}`
       : `declared:${target.name}`
     : null;
+  // Read by `apply`/`reset` after their await resolves, so a write started
+  // against one server never lands on another's panel if the selection moves
+  // to a different server while the request is in flight.
+  const targetKeyRef = useRef(targetKey);
+  targetKeyRef.current = targetKey;
 
   useEffect(() => {
     if (!target) {
       setState({
         kind: "failed",
-        message: "This row has no install behind it, so it carries no permissions.",
+        message:
+          "This row has no install behind it, so it carries no permissions.",
       });
       return;
     }
@@ -176,16 +196,22 @@ export function McpToolPermissions({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, company, targetKey, reloadKey]);
 
+  useEffect(() => {
+    if (focus && state.kind !== "loading")
+      root.current?.scrollIntoView({ block: "nearest" });
+  }, [focus, state.kind]);
+
   const apply = useCallback(
     async (patch: ToolPolicyPatch) => {
       if (!target) return;
+      const key = targetKey;
       setBusy(true);
       setWriteError(null);
       try {
         const doc = await writeToolPolicy(client, company, target, patch);
-        setState({ kind: "ready", doc });
+        if (targetKeyRef.current === key) setState({ kind: "ready", doc });
       } catch (err) {
-        setWriteError(message(err));
+        if (targetKeyRef.current === key) setWriteError(message(err));
       } finally {
         setBusy(false);
       }
@@ -196,13 +222,14 @@ export function McpToolPermissions({
 
   const reset = useCallback(async () => {
     if (!target) return;
+    const key = targetKey;
     setBusy(true);
     setWriteError(null);
     try {
       const doc = await resetToolPolicy(client, company, target);
-      setState({ kind: "ready", doc });
+      if (targetKeyRef.current === key) setState({ kind: "ready", doc });
     } catch (err) {
-      setWriteError(message(err));
+      if (targetKeyRef.current === key) setWriteError(message(err));
     } finally {
       setBusy(false);
     }
@@ -210,37 +237,28 @@ export function McpToolPermissions({
   }, [client, company, targetKey]);
 
   return (
-    <div
-      className="space-y-3 rounded-md bg-muted/40 p-3"
-      data-testid="mcp-tool-permissions"
-    >
-      <div className="flex items-start justify-between gap-2">
-        <div className="space-y-0.5">
-          <p className="text-sm font-medium">Tool permissions</p>
-          <p className="text-xs text-muted-foreground">
-            What happens when a teammate calls one of {server.name}&apos;s tools.
-            Blocked refuses the call outright — no approver can wave it through.
-          </p>
-        </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={onClose}
-          aria-label="Close tool permissions"
-          data-testid="mcp-permissions-close"
-        >
-          <X className="size-4" />
-        </Button>
+    <div className="space-y-3" data-testid="mcp-tool-permissions" ref={root}>
+      <div className="space-y-0.5">
+        <p className="text-sm font-medium">Tool permissions</p>
+        <p className="text-xs text-muted-foreground">
+          Suggested tiers below are a starting guess, not enforced — set your
+          own to override. &ldquo;Block&rdquo; refuses the call outright: no
+          approver can wave it through.
+        </p>
       </div>
 
       {state.kind === "loading" && (
         <p className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="size-3 animate-spin" /> Reading this server&apos;s permissions…
+          <Loader2 className="size-3 animate-spin" /> Reading this server&apos;s
+          permissions…
         </p>
       )}
 
       {state.kind === "failed" && (
-        <p className="text-xs text-destructive" data-testid="mcp-permissions-failed">
+        <p
+          className="text-xs text-destructive"
+          data-testid="mcp-permissions-failed"
+        >
           {state.message}
         </p>
       )}
@@ -256,7 +274,11 @@ export function McpToolPermissions({
               onClick={() => void reset()}
               data-testid="mcp-permissions-clear"
             >
-              {busy ? <Loader2 className="size-4 animate-spin" /> : "Clear stored permissions"}
+              {busy ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                "Clear stored permissions"
+              )}
             </Button>
           )}
         </div>
@@ -264,133 +286,278 @@ export function McpToolPermissions({
 
       {state.kind === "ready" && (
         <>
-          <div className="space-y-1">
-            <p className="text-xs font-medium">Per tier</p>
-            <div className="flex flex-wrap gap-3">
-              {TIERS.map((tier) => (
-                <div key={tier} className="space-y-1">
-                  <Label htmlFor={`tier-${tier}`} className="text-xs text-muted-foreground">
-                    {TIER_LABELS[tier]}
-                  </Label>
-                  <Select
-                    value={
-                      state.doc.tierDefaults[tier].stored
-                        ? state.doc.tierDefaults[tier].mode
-                        : UNSET
-                    }
-                    onValueChange={(v) => v && void apply(tierPatch(tier, v))}
-                    items={TIER_DEFAULT_LABELS}
-                    disabled={!canManage || busy}
-                  >
-                    <SelectTrigger id={`tier-${tier}`} className="w-36">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={UNSET}>Not set</SelectItem>
-                      {(Object.keys(MODE_LABELS) as ApprovalMode[]).map((mode) => (
-                        <SelectItem key={mode} value={mode}>
-                          {MODE_LABELS[mode]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {state.doc.tools.length === 0 ? (
-            <p className="text-xs text-muted-foreground" data-testid="mcp-permissions-empty">
-              No tools are listed for this server yet. A tier above still applies to
-              every tool in it; re-check the server to list what it actually has.
+          {state.doc.tools.length === 0 && (
+            <p
+              className="text-xs text-muted-foreground"
+              data-testid="mcp-permissions-empty"
+            >
+              No tools are listed for this server yet. A tier default below
+              still applies to every tool in it; re-check the server to list
+              what it actually has.
             </p>
-          ) : (
-            <ul className="space-y-2">
-              {state.doc.tools.map((row) => (
-                <li
-                  key={row.tool}
-                  className="flex flex-wrap items-center gap-2"
-                  data-testid="mcp-permission-row"
-                >
-                  <span className="min-w-40 flex-1 font-mono text-xs">{row.tool}</span>
-                  {exclusion(server, row.tool) && (
-                    <Badge variant="outline" className="text-3xs text-muted-foreground">
-                      {exclusion(server, row.tool)}
-                    </Badge>
-                  )}
-                  {row.suggestedTier && row.suggestedTier !== row.effectiveTier && (
-                    <Badge variant="outline" className="text-3xs">
-                      discovery said {TIER_LABELS[row.suggestedTier]}
-                    </Badge>
-                  )}
-                  <Select
-                    value={row.effectiveTier}
-                    onValueChange={(v) =>
-                      v && void apply({ tools: [{ tool: row.tool, tier: v as ToolTier }] })
-                    }
-                    items={TIER_LABELS}
-                    disabled={!canManage || busy}
-                  >
-                    <SelectTrigger
-                      aria-label={`Tier for ${row.tool}`}
-                      className="w-36"
-                    >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TIERS.map((tier) => (
-                        <SelectItem key={tier} value={tier}>
-                          {TIER_LABELS[tier]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Select
-                    value={row.mode}
-                    onValueChange={(v) =>
-                      v && void apply({ tools: [{ tool: row.tool, mode: v as ApprovalMode }] })
-                    }
-                    items={MODE_LABELS}
-                    disabled={!canManage || busy}
-                  >
-                    <SelectTrigger
-                      aria-label={`What happens when ${row.tool} is called`}
-                      className="w-32"
-                    >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(Object.keys(MODE_LABELS) as ApprovalMode[]).map((mode) => (
-                        <SelectItem key={mode} value={mode}>
-                          {MODE_LABELS[mode]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  {row.isOverride && canManage && (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={busy}
-                      aria-label={`Clear the decision on ${row.tool}`}
-                      data-testid="mcp-permission-clear-row"
-                      onClick={() => void apply({ tools: [{ tool: row.tool }] })}
-                    >
-                      <RotateCcw className="size-3.5" />
-                    </Button>
-                  )}
-                </li>
-              ))}
-            </ul>
           )}
 
+          <div className="space-y-3">
+            {SECTION_ORDER.map((tier) => (
+              <TierSection
+                key={tier}
+                tier={tier}
+                server={server}
+                rows={state.doc.tools.filter(
+                  (row) => row.effectiveTier === tier,
+                )}
+                bulk={state.doc.tierDefaults[tier]}
+                canManage={canManage}
+                busy={busy}
+                open={opened[tier] ?? tier === openByDefault}
+                showAll={showAll[tier] === true}
+                onToggleOpen={() =>
+                  setOpened((was) => ({
+                    ...was,
+                    [tier]: !(was[tier] ?? tier === openByDefault),
+                  }))
+                }
+                onToggleShowAll={() =>
+                  setShowAll((was) => ({
+                    ...was,
+                    [tier]: !(was[tier] ?? false),
+                  }))
+                }
+                apply={apply}
+              />
+            ))}
+          </div>
+
           {writeError && (
-            <p className="text-xs text-destructive" data-testid="mcp-permissions-write-error">
+            <p
+              className="text-xs text-destructive"
+              data-testid="mcp-permissions-write-error"
+            >
               {writeError}
             </p>
           )}
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * Which rows a section shows.
+ *
+ * The cap is applied to the unremarkable rows only. A row an operator decided,
+ * or one the transport will never send, is shown whatever the cap says —
+ * otherwise blocking the twelfth read-only tool hides that decision behind
+ * "8 more" and the section reads as though it was never made.
+ */
+function visibleRows(
+  server: McpServer,
+  rows: ToolPolicyRow[],
+  showAll: boolean,
+): { shown: ToolPolicyRow[]; hidden: number } {
+  if (showAll) return { shown: rows, hidden: 0 };
+  const pinned = (row: ToolPolicyRow) =>
+    row.isOverride || exclusion(server, row.tool) !== null;
+  let budget = VISIBLE_CAP;
+  const shown = rows.filter((row) => {
+    if (pinned(row)) return true;
+    if (budget === 0) return false;
+    budget -= 1;
+    return true;
+  });
+  return { shown, hidden: rows.length - shown.length };
+}
+
+function TierSection({
+  tier,
+  server,
+  rows,
+  bulk,
+  canManage,
+  busy,
+  open,
+  showAll,
+  onToggleOpen,
+  onToggleShowAll,
+  apply,
+}: {
+  tier: ToolTier;
+  server: McpServer;
+  rows: ToolPolicyRow[];
+  bulk: { mode: ApprovalMode; stored: boolean };
+  canManage: boolean;
+  busy: boolean;
+  open: boolean;
+  showAll: boolean;
+  onToggleOpen: () => void;
+  onToggleShowAll: () => void;
+  apply: (patch: ToolPolicyPatch) => void;
+}) {
+  const bodyId = `tier-body-${tier}`;
+  const { shown, hidden } = visibleRows(server, rows, showAll);
+
+  return (
+    <section
+      className="space-y-2 rounded-md border border-border p-2"
+      data-testid={`mcp-tier-section-${tier}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onToggleOpen}
+          aria-expanded={open}
+          aria-controls={bodyId}
+          className="flex flex-1 items-center gap-1 text-left text-xs font-medium"
+          data-testid={`mcp-tier-toggle-${tier}`}
+        >
+          {open ? (
+            <ChevronDown className="size-3.5" />
+          ) : (
+            <ChevronRight className="size-3.5" />
+          )}
+          {SECTION_TITLES[tier]}
+          <span
+            className="text-muted-foreground"
+            data-testid={`mcp-tier-count-${tier}`}
+          >
+            ({rows.length})
+          </span>
+        </button>
+        <Select
+          value={bulk.stored ? bulk.mode : UNSET}
+          onValueChange={(v) => v && apply(tierPatch(tier, v))}
+          items={TIER_DEFAULT_LABELS}
+          disabled={!canManage || busy}
+        >
+          <SelectTrigger
+            id={`tier-${tier}`}
+            aria-label={`Default for ${SECTION_TITLES[tier].toLowerCase()}`}
+            className="w-40"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={UNSET}>Not set</SelectItem>
+            {(Object.keys(MODE_LABELS) as ApprovalMode[]).map((mode) => (
+              <SelectItem key={mode} value={mode}>
+                {MODE_LABELS[mode]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {open && (
+        <div id={bodyId} className="space-y-2">
+          {rows.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No tool here yet. The default above still applies to any this
+              server turns out to have.
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {shown.map((row) => (
+                <ToolRow
+                  key={row.tool}
+                  row={row}
+                  server={server}
+                  canManage={canManage}
+                  busy={busy}
+                  apply={apply}
+                />
+              ))}
+            </ul>
+          )}
+          {(hidden > 0 || showAll) && rows.length > 0 && (
+            <button
+              type="button"
+              onClick={onToggleShowAll}
+              className="text-xs text-muted-foreground underline"
+              data-testid={`mcp-tier-more-${tier}`}
+            >
+              {showAll ? "Show fewer" : `${hidden} more`}
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ToolRow({
+  row,
+  server,
+  canManage,
+  busy,
+  apply,
+}: {
+  row: ToolPolicyRow;
+  server: McpServer;
+  canManage: boolean;
+  busy: boolean;
+  apply: (patch: ToolPolicyPatch) => void;
+}) {
+  const note = exclusion(server, row.tool);
+
+  return (
+    <li className="space-y-1" data-testid="mcp-permission-row">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono text-xs">{row.tool}</span>
+        {row.suggestedTier && (
+          <span className="text-3xs text-muted-foreground">
+            suggested: {SUGGESTION_LABELS[row.suggestedTier]}
+          </span>
+        )}
+        {note && (
+          <Badge variant="outline" className="text-3xs text-muted-foreground">
+            {note}
+          </Badge>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <ModeChoice
+          value={row.mode}
+          label={`What happens when ${row.tool} is called`}
+          disabled={!canManage}
+          onChange={(mode) => {
+            if (!busy) apply({ tools: [{ tool: row.tool, mode }] });
+          }}
+        />
+        <Select
+          value={row.effectiveTier}
+          onValueChange={(v) =>
+            v && apply({ tools: [{ tool: row.tool, tier: v as ToolTier }] })
+          }
+          items={TIER_LABELS}
+          disabled={!canManage || busy}
+        >
+          <SelectTrigger
+            aria-label={`Tier for ${row.tool}`}
+            className="h-7 w-36"
+          >
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIERS.map((tier) => (
+              <SelectItem key={tier} value={tier}>
+                {TIER_LABELS[tier]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {row.isOverride && canManage && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            aria-label={`Clear the decision on ${row.tool}`}
+            data-testid="mcp-permission-clear-row"
+            onClick={() => apply({ tools: [{ tool: row.tool }] })}
+          >
+            <RotateCcw className="size-3.5" />
+          </Button>
+        )}
+      </div>
+    </li>
   );
 }

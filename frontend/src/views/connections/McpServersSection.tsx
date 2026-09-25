@@ -80,10 +80,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { McpIconButton } from "@/views/mcp/McpIconButton";
-import { McpToolPermissions } from "@/views/mcp/McpToolPermissions";
 import { useHashParam } from "@/hooks/use-hash-param";
 import { McpRegistryBrowser } from "@/views/connections/McpRegistryBrowser";
-import { ProviderDetail } from "@/views/connections/ProviderDetail";
+import { McpServerPage } from "@/views/mcp/McpServerPage";
 
 /**
  * What a server's health entitles its row to offer (issues #1260, #1270).
@@ -229,14 +228,18 @@ export function McpServersSection({
   // click can't spawn a second overlapping poll. Cleared on unmount so stale
   // callbacks don't fire against a gone component.
   const pollTimers = useRef<Record<string, number>>({});
-  // The row whose tool permissions are open, carried in the address so the
-  // panel is linkable (issue #2373). A name rather than the row, for the same
-  // reason `opened` is one.
+  // Opens the detail panel on the permissions section. Kept as its own key so
+  // links already written against it keep landing where they meant to.
   const [permissionsFor, setPermissionsFor] = useHashParam("permissions");
-  // The name of the server whose detail panel is open, or `null` (issue #821).
-  // A name rather than the row itself, so an open panel re-derives from
-  // `servers` after a refresh instead of showing the row as it was when clicked.
-  const [opened, setOpened] = useState<string | null>(null);
+  // The server whose detail panel is open. A name rather than the row itself,
+  // so an open panel re-derives from `servers` after a refresh.
+  const [openedName, setOpenedName] = useHashParam("server");
+  const opened = openedName ?? permissionsFor;
+  const closeDetail = () => {
+    setOpenedName(null);
+    setPermissionsFor(null);
+  };
+
   /**
    * The server whose inline credential field is open, and its draft value
    * (issue #1260).
@@ -418,7 +421,11 @@ export function McpServersSection({
           server: res.server.name,
         });
       } else if (res.warning) {
-        setAddError({ message: res.warning, added: true, server: res.server.name });
+        setAddError({
+          message: res.warning,
+          added: true,
+          server: res.server.name,
+        });
       } else {
         // The success path has to agree with the banner (issue #567): a toast
         // promising pickup, fired at the moment the operator acts, undoes a
@@ -809,6 +816,42 @@ export function McpServersSection({
   // Re-derived from the list every render rather than captured on click, so the
   // open panel reflects the last refresh — a toggle, a completed sign-in or a
   // removal all reach it without a second copy of the row to keep in step.
+  const removalDialog = (
+    <AlertDialog
+      open={pendingRemoval !== null}
+      onOpenChange={(open) => !open && setPendingRemoval(null)}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Remove {pendingRemoval?.name}?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Its agents stop seeing this server&apos;s tools on their next turn,
+            and the stored credential goes with it — a token is never shown
+            again, so adding the server back means pasting a new one.
+          </AlertDialogDescription>
+          <AlertDialogDescription>
+            Its per-tool permissions are removed too.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={busy !== null}>
+            Keep it
+          </AlertDialogCancel>
+          <AlertDialogAction
+            disabled={busy !== null}
+            onClick={() => {
+              const server = pendingRemoval;
+              setPendingRemoval(null);
+              if (server) void remove(server);
+            }}
+          >
+            Remove
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+
   const openedServer = useMemo(
     () => servers.find((s) => s.name === opened) ?? null,
     [servers, opened],
@@ -825,6 +868,33 @@ export function McpServersSection({
           yet.
         </AlertDescription>
       </Alert>
+    );
+  }
+
+  if (openedServer !== null) {
+    return (
+      <>
+        <McpServerPage
+          client={client}
+          company={company}
+          server={openedServer}
+          health={tested[openedServer.name] ?? openedServer.health}
+          canManage={canManage}
+          bridge={bridge}
+          reloadKey={probedAt[openedServer.name] ?? 0}
+          focusPermissions={openedName === null && permissionsFor !== null}
+          onDisconnect={
+            mcpRowControls(
+              openedServer,
+              tested[openedServer.name] ?? openedServer.health,
+            ).removal.kind === "none"
+              ? null
+              : () => setPendingRemoval(openedServer)
+          }
+          onBack={closeDetail}
+        />
+        {removalDialog}
+      </>
     );
   }
 
@@ -965,7 +1035,7 @@ export function McpServersSection({
                               type="button"
                               data-testid="mcp-server-open"
                               className="inline-flex cursor-pointer items-center gap-0.5 rounded-sm font-medium focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none transition-opacity hover:opacity-80"
-                              onClick={() => setOpened(server.name)}
+                              onClick={() => setOpenedName(server.name)}
                               aria-label={`Open ${server.name}`}
                             >
                               {server.name}
@@ -1116,19 +1186,11 @@ export function McpServersSection({
                             />
                           )}
                           <McpIconButton
-                            label={
-                              permissionsFor === server.name
-                                ? `Hide ${server.name}'s tool permissions`
-                                : `Tool permissions for ${server.name}`
-                            }
+                            label={`Tool permissions for ${server.name}`}
                             icon={ShieldCheck}
                             testId="mcp-permissions"
                             disabled={busy !== null}
-                            onClick={() =>
-                              setPermissionsFor(
-                                permissionsFor === server.name ? null : server.name,
-                              )
-                            }
+                            onClick={() => setPermissionsFor(server.name)}
                           />
                           {controls.removal.kind !== "none" && canManage && (
                             <McpIconButton
@@ -1203,16 +1265,6 @@ export function McpServersSection({
                         >
                           {REGISTRY_OAUTH_UNSUPPORTED_NOTICE}
                         </p>
-                      )}
-                      {permissionsFor === server.name && (
-                        <McpToolPermissions
-                          client={client}
-                          company={company}
-                          server={server}
-                          canManage={canManage}
-                          reloadKey={probedAt[server.name] ?? 0}
-                          onClose={() => setPermissionsFor(null)}
-                        />
                       )}
                       {credentialFor === server.name && canManage && (
                         <div
@@ -1373,42 +1425,7 @@ export function McpServersSection({
                 deliberately leaves those open. */}
             {canManage && (
               <div className="space-y-2 border-t border-border pt-3">
-                <AlertDialog
-                  open={pendingRemoval !== null}
-                  onOpenChange={(open) => !open && setPendingRemoval(null)}
-                >
-                  <AlertDialogContent>
-                    <AlertDialogHeader>
-                      <AlertDialogTitle>
-                        Remove {pendingRemoval?.name}?
-                      </AlertDialogTitle>
-                      <AlertDialogDescription>
-                        Its agents stop seeing this server&apos;s tools on their
-                        next turn, and the stored credential goes with it — a
-                        token is never shown again, so adding the server back
-                        means pasting a new one.
-                      </AlertDialogDescription>
-                      <AlertDialogDescription>
-                        Its per-tool permissions are removed too.
-                      </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                      <AlertDialogCancel disabled={busy !== null}>
-                        Keep it
-                      </AlertDialogCancel>
-                      <AlertDialogAction
-                        disabled={busy !== null}
-                        onClick={() => {
-                          const server = pendingRemoval;
-                          setPendingRemoval(null);
-                          if (server) void remove(server);
-                        }}
-                      >
-                        Remove
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
+                {removalDialog}
                 {addError && (
                   <Alert variant={addError.added ? "default" : "destructive"}>
                     <AlertTriangle className="size-4" />
@@ -1547,36 +1564,6 @@ export function McpServersSection({
           </CardContent>
         </Card>
       )}
-
-      {/* A server as an object you open, in the same panel a Composio provider
-          opens into (issue #821). Rendered from here rather than from the page
-          above, because the live health an operator just pressed Test for lives
-          in this component's state — and because this section is also the whole
-          of Settings, MCP Servers, which gets the detail view for free.
-
-          `openedServer` is re-derived from `servers` every render, so a removed
-          server closes its own panel rather than leaving a page describing
-          something that is gone. */}
-      <ProviderDetail
-        client={client}
-        company={company}
-        subject={
-          openedServer === null
-            ? null
-            : {
-                kind: "mcp",
-                server: openedServer,
-                // The live Test result when there has been one this session,
-                // else the server's own persisted probe — the same precedence
-                // the row's badge uses, so the panel and the row it opened from
-                // cannot report different health.
-                health: tested[openedServer.name] ?? openedServer.health,
-              }
-        }
-        canManage={canManage}
-        busy={busy !== null}
-        onClose={() => setOpened(null)}
-      />
     </section>
   );
 }
