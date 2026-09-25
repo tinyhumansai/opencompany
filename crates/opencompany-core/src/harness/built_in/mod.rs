@@ -6371,6 +6371,9 @@ mod built_in_tests_part09;
 #[cfg(test)]
 #[path = "built_in_tests_part10.rs"]
 mod built_in_tests_part10;
+#[cfg(test)]
+#[path = "built_in_tests_part11.rs"]
+mod built_in_tests_part11;
 #[cfg(all(test, feature = "openhuman"))]
 #[path = "mcp_reads_tests.rs"]
 mod mcp_reads_tests;

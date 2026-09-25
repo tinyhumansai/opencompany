@@ -29,6 +29,25 @@ pub(super) fn scripted_agent(
 /// As [`scripted_agent`], over an already-configured provider — the seam a
 /// case that needs the provider to *report usage* builds through.
 pub(super) fn scripted_agent_over(provider: ScriptedProvider) -> (Arc<CompanyAgent>, HarnessDeps) {
+    scripted_agent_over_arc(Arc::new(provider) as Arc<dyn HarnessModel>)
+}
+
+/// Build a [`CompanyAgent`] over a scripted provider and return a shared
+/// reference to the provider so tests can inspect per-call captures
+/// (`ScriptedProvider::captured`) after the run (issue #1871).
+pub(super) fn scripted_agent_with_capture(
+    outcomes: Vec<Result<String, String>>,
+) -> (Arc<CompanyAgent>, HarnessDeps, Arc<ScriptedProvider>) {
+    let provider = Arc::new(ScriptedProvider::new(outcomes));
+    let capture = Arc::clone(&provider);
+    let (agent, deps) = scripted_agent_over_arc(provider as Arc<dyn HarnessModel>);
+    (agent, deps, capture)
+}
+
+/// Internal: build a [`CompanyAgent`] with the given `Arc<dyn HarnessModel>`
+/// provider, shared by [`scripted_agent_over`] and [`scripted_agent_with_capture`]
+/// so both paths use exactly the same `HarnessDeps` structure.
+fn scripted_agent_over_arc(provider: Arc<dyn HarnessModel>) -> (Arc<CompanyAgent>, HarnessDeps) {
     let dir = tempfile::tempdir().expect("tempdir");
     let deps = HarnessDeps {
         takeovers: Default::default(),
@@ -36,7 +55,7 @@ pub(super) fn scripted_agent_over(provider: ScriptedProvider) -> (Arc<CompanyAge
         notifications: None,
         ledgers: None,
         ledger_registry: Default::default(),
-        provider: Arc::new(provider),
+        provider,
         provider_slug: "scripted".to_string(),
         serves: None,
         context: Arc::new(MockContext::default()),

@@ -404,6 +404,40 @@ impl HarnessModel for AlwaysFailsProvider {
     }
 }
 
+/// One request the scripted provider observed, for tests that assert on what
+/// each individual provider call carried (issue #1871).
+#[derive(Clone, Debug)]
+pub(super) struct CapturedCall {
+    /// Tool declaration names sent with the call, in wire order.
+    pub(super) tools: Vec<String>,
+    /// The request's message kinds, in wire order.
+    pub(super) roles: Vec<CapturedRole>,
+}
+
+impl CapturedCall {
+    /// How many messages of one kind the call carried.
+    pub(super) fn count(&self, role: CapturedRole) -> usize {
+        self.roles.iter().filter(|seen| **seen == role).count()
+    }
+}
+
+/// The provider-visible kind of one request message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CapturedRole {
+    /// A system/developer instruction row.
+    System,
+    /// A user input row.
+    User,
+    /// Assistant prose carrying no tool calls.
+    Assistant,
+    /// An assistant message carrying native tool calls.
+    AssistantToolCalls,
+    /// A tool-result row.
+    ToolResult,
+    /// A host out-of-band record, if one ever reaches the wire.
+    Custom,
+}
+
 /// A model that plays back a scripted sequence of outcomes, one per
 /// [`invoke`](ChatModel::invoke) call, so the empty-response retry wrapper can
 /// be driven deterministically. `Ok("")` is the transient empty class (the
@@ -427,6 +461,11 @@ pub(super) struct ScriptedProvider {
     /// turn then succeeds on the fallback reply, which is how this
     /// scripting seam quietly turned a failure case into a passing one.
     pub(super) fail_when_exhausted: bool,
+    /// Per-call snapshot of what each individual provider call actually
+    /// carried — without this a test could only check the final history,
+    /// which merges both attempts into one view and hides per-attempt
+    /// differences (issue #1871).
+    pub(super) captured: StdMutex<Vec<CapturedCall>>,
 }
 
 impl ScriptedProvider {
@@ -436,6 +475,7 @@ impl ScriptedProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
             usage: None,
             fail_when_exhausted: false,
+            captured: StdMutex::new(Vec::new()),
         }
     }
 
@@ -460,6 +500,31 @@ impl ChatModel<()> for ScriptedProvider {
         _request: ModelRequest,
     ) -> tinyinference::Result<ModelResponse> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Record the call's tool count and per-message kinds, in wire order,
+        // for tests that need to inspect what each individual provider call
+        // actually saw.
+        let roles = _request
+            .messages
+            .iter()
+            .map(|message| match message {
+                tinyinference::Message::System(_) => CapturedRole::System,
+                tinyinference::Message::User(_) => CapturedRole::User,
+                tinyinference::Message::Assistant(assistant) if assistant.tool_calls.is_empty() => {
+                    CapturedRole::Assistant
+                }
+                tinyinference::Message::Assistant(_) => CapturedRole::AssistantToolCalls,
+                tinyinference::Message::Tool(_) => CapturedRole::ToolResult,
+                tinyinference::Message::Custom(_) => CapturedRole::Custom,
+            })
+            .collect();
+        self.captured.lock().unwrap().push(CapturedCall {
+            tools: _request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
+            roles,
+        });
         let with_usage = |reply: &str| {
             let mut response = ModelResponse::assistant(reply);
             response.usage = self.usage;
