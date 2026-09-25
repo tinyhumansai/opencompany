@@ -28,6 +28,7 @@ fn delta(slug: &str, enabled: bool, source: SkillSource, custom_doc: Option<&str
         enabled,
         source,
         custom_doc: custom_doc.map(str::to_string),
+        updated_at_millis: None,
     }
 }
 
@@ -206,6 +207,7 @@ fn a_registry_delta_with_no_snapshot_contributes_no_document() {
         category: Some("Research".to_string()),
         version: Some("1.0.0".to_string()),
         body: "\n## Steps\n\n1. Pick.\n".to_string(),
+        extra_frontmatter: Vec::new(),
     }];
 
     let set = resolve(

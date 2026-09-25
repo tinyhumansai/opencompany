@@ -78,6 +78,10 @@ pub mod profile_draft;
 /// First-run company setup's pass: one tool-less model call that designs a
 /// company's starting team from three answers. See [`roster_build`].
 pub mod roster_build;
+/// The pass that drafts ONE skill document for an operator who then keeps it or
+/// throws it away. One tool-less model call on the same drafter
+/// [`profile_draft`] builds, writing nothing. See [`skill_draft`].
+pub mod skill_draft;
 /// Issue #1032: the in-turn spend brake — the
 /// [`StopHook`](oh::agent::stop_hooks::StopHook) wrapper that makes a budget
 /// halt observable to this crate, and the [`SpendHalt`] record the

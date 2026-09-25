@@ -61,6 +61,11 @@ pub struct EffectiveSkill {
     /// slug that has no bundle, no global, and no snapshot. Such a row reaches
     /// no agent, and the readers render it from its slug alone.
     pub content: Option<SkillContent>,
+    /// When the operator last wrote a delta over this slug, in epoch
+    /// milliseconds. `None` for a slug no delta covers: a baseline or bundled
+    /// skill is authored in the repository, not edited here, so it has no
+    /// operator edit to date.
+    pub updated_at_millis: Option<u64>,
 }
 
 impl EffectiveSkill {
@@ -102,6 +107,7 @@ pub fn globals_skill_disables(disable: &[String]) -> Vec<SkillState> {
             // reports the skill the way it would have been reported unopposed.
             source: SkillSource::Company,
             custom_doc: None,
+            updated_at_millis: None,
         })
         .collect()
 }
@@ -147,6 +153,7 @@ pub fn resolve(
                     doc: doc.clone(),
                     body: SkillBody::Inline(render_skill_md(doc)),
                 }),
+                updated_at_millis: None,
             },
         );
     }
@@ -166,6 +173,7 @@ pub fn resolve(
                         doc,
                         body: SkillBody::Bundle(bundle),
                     }),
+                    updated_at_millis: None,
                 },
             );
         }
@@ -190,9 +198,16 @@ pub fn resolve(
                 enabled: delta.enabled,
                 source: delta.source,
                 content: None,
+                updated_at_millis: delta.updated_at_millis,
             });
         entry.enabled = delta.enabled;
         entry.source = delta.source;
+        // A delta with no stamp — a pre-field row, or a manifest-synthesized
+        // disable — must not erase one an earlier delta over the same slug
+        // supplied.
+        if delta.updated_at_millis.is_some() {
+            entry.updated_at_millis = delta.updated_at_millis;
+        }
         if let Some(content) = delta_content(delta, registry) {
             entry.content = Some(content);
         }

@@ -123,8 +123,25 @@ pub mod search;
 // polish pass and the fallback when that pass cannot run, so a company with no
 // inference credential still gets a real team.
 pub mod setup;
+/// One turn of the copilot that drafts a whole skill document, and what it is
+/// allowed to see.
+pub mod skill_draft;
 pub mod skill_effective;
 mod skill_file;
+/// The scan every skill an operator did not write passes through, and the
+/// sanitizer that renders untrusted catalogue text as data. Always compiled:
+/// the write plane runs it on every install in every build, and the sanitizer
+/// is the structural half of the same control.
+pub mod skill_scan;
+/// Reading a skill an operator uploaded — a bare `SKILL.md`, or an archive
+/// carrying one — with the archive's shape refused before anything is
+/// decompressed.
+pub mod skill_upload;
+/// The rules a skill document must satisfy before the product will store it.
+/// Always compiled: registry install, the empty-registry fallback and console
+/// authoring share it, and three entry points that validated separately are
+/// exactly how they drift apart.
+pub mod skill_validate;
 // Steer (issue #111): pause / cancel / redirect an in-flight task or delegation
 // from the operator chat. Always compiled + openhuman-free so the operator
 // control plane can steer in any build and no agent tool can ever reach it.

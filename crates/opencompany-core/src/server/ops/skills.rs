@@ -29,9 +29,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
-use crate::company::skill_effective::{self, EffectiveSkill, valid_slug};
+use crate::company::skill_effective::{self, EffectiveSkill};
+use crate::company::skill_scan::{Verdict, scan_skill};
+use crate::company::skill_validate::{
+    RESERVED_SLUGS, slugify, validate_skill_md, validate_slug, validate_slug_shape,
+};
 use crate::company::{SkillDoc, parse_skill_md, render_skill_md};
 use crate::error::OpenCompanyError;
+use crate::ports::now_millis;
 use crate::ports::skills_state::{SkillSource, SkillState};
 use crate::ports::types::CompanyId;
 use crate::server::error::ApiError;
@@ -70,6 +75,90 @@ fn check_skill_doc_size(doc: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// What the shared validator and the scan said about a document, as the
+/// console renders it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanSummary {
+    verdict: Verdict,
+    /// One line per finding, in operator-facing language.
+    findings: Vec<String>,
+    /// Spec rules this document diverges from without being refused.
+    spec_deltas: Vec<String>,
+    /// Whether a blocking verdict was overridden for this one request.
+    forced: bool,
+}
+/// Why [`vet_skill`] refused a document.
+///
+/// The two are not interchangeable to a caller: a blocking scan verdict is the
+/// one refusal `force` overrides, so the console offers to send it again and
+/// the drafting route reports it as a scan refusal. Everything else is a
+/// document that is simply not valid, which resending cannot fix. Carrying that
+/// as a variant rather than leaving callers to read the sentence keeps the
+/// distinction from depending on the wording of the sentence.
+enum VetRefusal {
+    /// The document did not validate — unparseable, or failing a stated limit.
+    Invalid { message: String },
+    /// The content scan blocked it, and `force` was not set.
+    Blocked { message: String },
+}
+
+impl VetRefusal {
+    /// The operator-facing sentence.
+    fn message(&self) -> &str {
+        match self {
+            Self::Invalid { message } | Self::Blocked { message } => message,
+        }
+    }
+
+    /// Whether resending with `force` would store this document.
+    fn is_scan_block(&self) -> bool {
+        matches!(self, Self::Blocked { .. })
+    }
+}
+
+impl From<VetRefusal> for ApiError {
+    fn from(refusal: VetRefusal) -> Self {
+        ApiError(OpenCompanyError::InvalidRequest(
+            refusal.message().to_string(),
+        ))
+    }
+}
+
+/// Validates and scans an assembled `SKILL.md` before it can be stored.
+///
+/// Every entry point that accepts content an operator did not write calls this,
+/// so registry install, the empty-registry fallback and console authoring
+/// cannot disagree about what a skill is or what is wrong with one.
+///
+/// A blocking verdict refuses the write outright. `force` overrides that for
+/// the one request and records that it did; there is deliberately no setting
+/// that turns a class of finding off for a whole host, because a switch that
+/// silences an alarm is the failure this scan exists to prevent.
+fn vet_skill(slug: &str, doc: &str, force: bool) -> Result<ScanSummary, VetRefusal> {
+    let valid = validate_skill_md(slug, doc).map_err(|problems| VetRefusal::Invalid {
+        message: problems.join(" "),
+    })?;
+    let report = scan_skill(&valid.doc, &[]);
+
+    if report.is_blocked() && !force {
+        return Err(VetRefusal::Blocked {
+            message: format!(
+                "that skill was refused by the content scan: {}. Review it, or resend with \
+                 `force: true` to install it anyway.",
+                report.messages().join("; ")
+            ),
+        });
+    }
+
+    Ok(ScanSummary {
+        verdict: report.verdict(),
+        findings: report.messages(),
+        spec_deltas: valid.deltas.iter().map(|delta| delta.message()).collect(),
+        forced: force && report.is_blocked(),
+    })
+}
+
 /// Per-company serialization for the skill write routes.
 ///
 /// `install` and `create_custom` write a fresh [`SkillState`] straight through
@@ -97,9 +186,14 @@ fn write_lock(company: &CompanyId) -> Arc<tokio::sync::Mutex<()>> {
     )
 }
 
+mod draft;
+mod upload;
+
 /// Builds the skills route fragment.
 pub fn router() -> Router<AppState> {
     scoped("/skills/{slug}/install", post(install))
+        .merge(upload::router())
+        .merge(draft::router())
         .merge(scoped("/skills/{slug}/uninstall", post(uninstall)))
         // `registry` is a static segment, so it wins over the `{slug}` pattern
         // above regardless of registration order (and the methods differ anyway).
@@ -122,6 +216,15 @@ struct InstalledSkill {
     /// Lets a future "update available" affordance diff an install against the
     /// live registry without any extra stored state.
     version: Option<String>,
+    /// When the operator last wrote this skill's delta, in epoch milliseconds.
+    /// `None` for a skill no delta covers — a bundled or baseline skill nobody
+    /// has touched — and for a row stored before the field existed.
+    updated_at_millis: Option<u64>,
+    /// What the scan said, on the write that stored this skill. Absent on a
+    /// read: the report belongs to the write that produced the document, and
+    /// re-deriving one on every list would report a verdict nobody acted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan: Option<ScanSummary>,
 }
 
 impl InstalledSkill {
@@ -159,7 +262,15 @@ impl InstalledSkill {
             source: state.source,
             enabled: state.enabled,
             version,
+            updated_at_millis: state.updated_at_millis,
+            scan: None,
         }
+    }
+
+    /// Attaches the report of the write that stored this skill.
+    fn with_scan(mut self, scan: ScanSummary) -> Self {
+        self.scan = Some(scan);
+        self
     }
 
     /// Projects one entry of the company's effective set
@@ -179,6 +290,8 @@ impl InstalledSkill {
             source: skill.source,
             enabled: skill.enabled,
             version: doc.and_then(|doc| doc.version.clone()),
+            updated_at_millis: skill.updated_at_millis,
+            scan: None,
         }
     }
 }
@@ -240,6 +353,9 @@ struct InstallSkill {
     description: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    /// Install despite a blocking scan verdict, for this request only.
+    #[serde(default)]
+    force: bool,
 }
 
 /// The custom-skill body.
@@ -247,6 +363,9 @@ struct InstallSkill {
 struct CreateSkill {
     name: String,
     description: String,
+    /// Save despite a blocking scan verdict, for this request only.
+    #[serde(default)]
+    force: bool,
     #[serde(default)]
     category: Option<String>,
     #[serde(default)]
@@ -298,7 +417,8 @@ async fn list_skills(
 ///    empty registry means this host serves no shared library at all
 ///    (platform-provisioned mode, no `skills_root`), so there is nothing to
 ///    resolve against and refusing every install would break hosted tenants
-///    outright.
+///    outright. The row records [`SkillSource::Custom`], because the document
+///    is the client's own and no library copy exists to compare it against.
 ///
 /// A *configured* library that fails to load is a `500`, never case 3: silently
 /// degrading a broken shared library to "no library" would hand the client
@@ -310,17 +430,16 @@ async fn install(
     Path(SlugPath { slug }): Path<SlugPath>,
     body: Option<Json<InstallSkill>>,
 ) -> Result<Json<InstalledSkill>, ApiError> {
-    if !valid_slug(&slug) {
-        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
-            "`{slug}` is not a valid skill slug. Skills live under `skills/<slug>/`, so a slug \
-             is `[a-z0-9][a-z0-9-]*`."
-        ))));
+    if let Err(problem) = validate_slug(&slug) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(problem)));
     }
+    let meta = body.map(|Json(body)| body).unwrap_or_default();
+    let force = meta.force;
     let lock = write_lock(company.id());
     let _guard = lock.lock().await;
     let registry = state.shared_skill_registry()?;
-    let doc = match registry.iter().find(|doc| doc.slug == slug) {
-        Some(doc) => render_skill_md(doc),
+    let (doc, source) = match registry.iter().find(|doc| doc.slug == slug) {
+        Some(doc) => (render_skill_md(doc), SkillSource::Registry),
         None if !registry.is_empty() => {
             return Err(ApiError(OpenCompanyError::NotFound(
                 language::SKILL_NOT_IN_REGISTRY.to_string(),
@@ -330,25 +449,38 @@ async fn install(
             // No shared library backs this host. Persist a real `SKILL.md` built
             // from the client's metadata (the description doubles as the body) so
             // `EffectiveSkills::materialize` surfaces the skill to the agent
-            // instead of skipping a content-less delta.
-            let meta = body.map(|Json(b)| b).unwrap_or_default();
+            // instead of skipping a content-less delta. A client that supplies no
+            // description gets the name as one: an empty scalar is a document the
+            // parser refuses, and the delta it stored reached no agent.
+            //
+            // `Custom` is the honest provenance: nothing about this document
+            // came from a shared library, so nothing can ever be diffed against
+            // one to say it is stale or authentic.
             let name = meta
                 .name
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| titleize(&slug));
-            let description = meta.description.unwrap_or_default();
-            skill_md(&name, &description, meta.category.as_deref(), &description)
+            let description = meta
+                .description
+                .filter(|description| !description.trim().is_empty())
+                .unwrap_or_else(|| name.clone());
+            (
+                skill_md(&name, &description, meta.category.as_deref(), &description),
+                SkillSource::Custom,
+            )
         }
     };
     check_skill_doc_size(&doc)?;
+    let scan = vet_skill(&slug, &doc, force).map_err(ApiError::from)?;
     let delta = SkillState {
         slug,
         enabled: true,
-        source: SkillSource::Registry,
+        source,
         custom_doc: Some(doc),
+        updated_at_millis: Some(now_millis()),
     };
     company.runtime.skills().set(company.id(), &delta).await?;
-    Ok(Json(InstalledSkill::from_state(&delta)))
+    Ok(Json(InstalledSkill::from_state(&delta).with_scan(scan)))
 }
 
 /// `GET …/skills/registry` — the shared skill library the console's registry tab
@@ -406,11 +538,8 @@ async fn set_enabled(
     Path(SlugPath { slug }): Path<SlugPath>,
     Json(body): Json<SetEnabled>,
 ) -> Result<Json<InstalledSkill>, ApiError> {
-    if !valid_slug(&slug) {
-        return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
-            "`{slug}` is not a valid skill slug. Skills live under `skills/<slug>/`, so a slug \
-             is `[a-z0-9][a-z0-9-]*`."
-        ))));
+    if let Err(problem) = validate_slug_shape(&slug) {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(problem)));
     }
     let lock = write_lock(company.id());
     let _guard = lock.lock().await;
@@ -431,6 +560,7 @@ async fn set_enabled(
             .map(|s| s.source)
             .unwrap_or(SkillSource::Company),
         custom_doc: existing.and_then(|s| s.custom_doc),
+        updated_at_millis: Some(now_millis()),
     };
     company.runtime.skills().set(company.id(), &state).await?;
     Ok(Json(InstalledSkill::from_state(&state)))
@@ -447,7 +577,17 @@ async fn create_custom(
     }
     let lock = write_lock(company.id());
     let _guard = lock.lock().await;
-    let slug = slugify(&body.name);
+    // A display name is free text and can land on a name the routes already
+    // hold. Stepping off it keeps the skill addressable; refusing the name
+    // would ask the operator to rename a skill to avoid a URL they cannot see.
+    let slug = {
+        let base = slugify(&body.name);
+        if RESERVED_SLUGS.contains(&base.as_str()) {
+            format!("{base}-2")
+        } else {
+            base
+        }
+    };
     let doc = skill_md(
         &body.name,
         &body.description,
@@ -455,14 +595,16 @@ async fn create_custom(
         body.body.as_deref().unwrap_or(""),
     );
     check_skill_doc_size(&doc)?;
+    let scan = vet_skill(&slug, &doc, body.force).map_err(ApiError::from)?;
     let state = SkillState {
         slug,
         enabled: true,
         source: SkillSource::Custom,
         custom_doc: Some(doc),
+        updated_at_millis: Some(now_millis()),
     };
     company.runtime.skills().set(company.id(), &state).await?;
-    Ok(Json(InstalledSkill::from_state(&state)))
+    Ok(Json(InstalledSkill::from_state(&state).with_scan(scan)))
 }
 
 /// Builds a `SKILL.md` document from a name, description, optional category, and
@@ -487,27 +629,6 @@ fn skill_md(name: &str, description: &str, category: Option<&str>, content: &str
     format!("---\n{frontmatter}---\n{content}\n")
 }
 
-/// Turns a display name into a filesystem-and-URL-safe slug.
-fn slugify(name: &str) -> String {
-    let mut slug = String::with_capacity(name.len());
-    let mut prev_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let trimmed = slug.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "skill".to_string()
-    } else {
-        trimmed
-    }
-}
-
 /// Turns a slug into a human title (`web-research` → `Web Research`).
 fn titleize(slug: &str) -> String {
     slug.split('-')
@@ -526,6 +647,9 @@ fn titleize(slug: &str) -> String {
 #[cfg(test)]
 #[path = "skills_part2_tests.rs"]
 mod tests_part2;
+#[cfg(test)]
+#[path = "skills_scan_tests.rs"]
+mod tests_scan;
 #[cfg(test)]
 #[path = "skills_skill_md_frontmatter_resists_tests.rs"]
 mod tests_skill_md_frontmatter_resists;

@@ -2,6 +2,8 @@ use std::path::Path as FsPath;
 
 use super::*;
 
+use crate::company::skill_validate::MAX_SLUG_CHARS;
+
 fn write_bundle(root: &FsPath, slug: &str, contents: &str) {
     let dir = root.join("skills").join(slug);
     std::fs::create_dir_all(&dir).unwrap();
@@ -76,6 +78,7 @@ fn a_disabled_global_is_listed_as_disabled_rather_than_hidden() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            updated_at_millis: None,
         }],
     );
 
@@ -112,6 +115,7 @@ fn the_list_unions_bundles_with_deltas() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            updated_at_millis: None,
         },
         SkillState {
             slug: "my-skill".to_string(),
@@ -120,6 +124,7 @@ fn the_list_unions_bundles_with_deltas() {
             custom_doc: Some(
                 "---\nname: My Skill\ndescription: Does a thing\n---\n# body\n".to_string(),
             ),
+            updated_at_millis: None,
         },
     ];
 
@@ -173,6 +178,7 @@ fn the_rest_list_and_the_graphql_resolver_agree() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+                    updated_at_millis: None,
         },
         SkillState {
             slug: "onboard".to_string(),
@@ -182,6 +188,7 @@ fn the_rest_list_and_the_graphql_resolver_agree() {
                 "---\nname: Onboard v2\ndescription: Rewritten\ncategory: Ops\nversion: 3.0.0\n---\n# v2\n"
                     .to_string(),
             ),
+                    updated_at_millis: None,
         },
     ];
 
@@ -231,6 +238,7 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            updated_at_millis: None,
         },
         SkillState {
             slug: "my-skill".to_string(),
@@ -239,6 +247,7 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
             custom_doc: Some(
                 "---\nname: My Skill\ndescription: Does a thing\n---\n# body\n".to_string(),
             ),
+            updated_at_millis: None,
         },
     ];
 
@@ -286,32 +295,44 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
     }
 }
 
-/// `valid_slug` is the gate both write handlers share: a slug is also a
+/// `validate_slug` is the gate both write handlers share: a slug is also a
 /// directory name under `skills/<slug>/`, so a traversal (`..`) or a path
-/// separator (`/`) must never reach the filesystem, and the alphabet is
-/// lowercase-only. The path extractor can only ever hand a handler a single
-/// segment, so `a/b` cannot arrive as a path — but the function is the
-/// contract every slug-bearing caller routes through, so it is the right
-/// place to pin all three shapes the review named.
+/// separator (`/`) must never reach the filesystem, the alphabet is
+/// lowercase-only, and the length is bounded. The path extractor can only ever
+/// hand a handler a single segment, so `a/b` cannot arrive as a path — but the
+/// function is the contract every slug-bearing caller routes through, so it is
+/// the right place to pin every shape at once.
 #[test]
-fn valid_slug_rejects_traversal_separator_and_case() {
-    // The shapes the review named.
-    assert!(!valid_slug(".."), "parent traversal");
-    assert!(!valid_slug("a/b"), "path separator");
-    assert!(!valid_slug("A"), "uppercase start");
-    // And the rest of the boundary.
-    assert!(!valid_slug(""), "empty");
-    assert!(!valid_slug("-leading"), "leading dash");
-    assert!(!valid_slug("has space"), "interior space");
+fn validate_slug_rejects_traversal_separator_case_and_length() {
+    for (slug, why) in [
+        ("..", "parent traversal"),
+        ("a/b", "path separator"),
+        ("A", "uppercase start"),
+        ("", "empty"),
+        ("-leading", "leading dash"),
+        ("has space", "interior space"),
+        ("under_score", "underscore is not in the alphabet"),
+        ("UPPER", "all uppercase"),
+    ] {
+        assert!(validate_slug(slug).is_err(), "{why}");
+    }
+    let over_cap = "a".repeat(MAX_SLUG_CHARS + 1);
     assert!(
-        !valid_slug("under_score"),
-        "underscore is not in the alphabet"
+        validate_slug(&over_cap).is_err(),
+        "one character over the cap"
     );
-    assert!(!valid_slug("UPPER"), "all uppercase");
-    // And the shape that must pass.
-    assert!(valid_slug("a-1"), "lowercase, digit, dash");
-    assert!(valid_slug("0"), "single digit");
-    assert!(valid_slug("seo-audit"), "typical slug");
+
+    for (slug, why) in [
+        ("a-1", "lowercase, digit, dash"),
+        ("0", "single digit"),
+        ("seo-audit", "typical slug"),
+    ] {
+        assert!(validate_slug(slug).is_ok(), "{why}");
+    }
+    assert!(
+        validate_slug(&"a".repeat(MAX_SLUG_CHARS)).is_ok(),
+        "at the cap"
+    );
 }
 
 #[test]

@@ -74,3 +74,41 @@ export function registryEmptyLabel(hasError: boolean, registryIsEmpty: boolean):
   if (registryIsEmpty) return "This host serves no shared skill registry.";
   return "No skills match that search.";
 }
+
+/**
+ * The longest description the host will store, in Unicode scalar values.
+ *
+ * The Agent Skills spec's limit, enforced by
+ * `company::skill_validate::MAX_DESCRIPTION_CHARS`. The two numbers are coupled
+ * by a host test that reads this file, so a change on either side fails CI
+ * rather than leaving the console counting against a limit the host does not
+ * have.
+ */
+export const SKILL_DESCRIPTION_MAX_CHARS = 1024;
+
+/**
+ * What the description field shows before anything is typed.
+ *
+ * An example rather than a category label. The description is what every agent
+ * reads when it decides whether to open the skill at all, so a vague one makes
+ * a skill inert — and "One line about the skill" invites exactly the vague one.
+ */
+export const SKILL_DESCRIPTION_PLACEHOLDER =
+  "Generate weekly status reports from recent work. Use when asked for updates.";
+
+/** The one-line rule under the description field. */
+export const SKILL_DESCRIPTION_HINT =
+  "Say what it does and when an agent should use it — this line is all an agent " +
+  "reads before deciding to open the skill.";
+
+/**
+ * How many characters of the description limit `value` spends.
+ *
+ * Counts Unicode scalar values, matching the host's `chars().count()`. A
+ * JavaScript `.length` counts UTF-16 code units, so an emoji or any astral
+ * character would be counted twice here and once there — and the operator would
+ * be stopped short of a limit the host would have accepted.
+ */
+export function skillDescriptionCount(value: string): number {
+  return [...value].length;
+}

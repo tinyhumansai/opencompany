@@ -69,6 +69,14 @@ fn reads_the_optional_version_key() {
 }
 
 #[test]
+fn a_repeated_recognised_key_keeps_its_first_value_and_scans_the_rest() {
+    let src = "---\nname: First\nname: Second\ndescription: A demo\n---\n# Demo\n";
+    let doc = parse_skill_md("demo", src).expect("valid");
+    assert_eq!(doc.name, "First");
+    assert_eq!(doc.extra_frontmatter, vec!["name: Second".to_string()]);
+}
+
+#[test]
 fn every_baseline_skill_carries_a_version() {
     // The baseline's skills are installed in every company, so an install
     // of one must be pinnable to the revision it was made from.
@@ -163,6 +171,7 @@ fn render_collapses_newlines_so_a_value_cannot_inject_frontmatter() {
         category: None,
         version: None,
         body: "body\n".to_string(),
+        extra_frontmatter: Vec::new(),
     };
     let parsed = parse_skill_md("evil", &render_skill_md(&doc)).expect("stays parseable");
     assert_eq!(parsed.name, "Evil --- description: hijacked");

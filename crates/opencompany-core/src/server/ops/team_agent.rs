@@ -2216,7 +2216,7 @@ fn siblings_of(record: &CompanyRecord, agent_id: &str) -> Vec<Sibling> {
 // Compiled where it can run: the drafting pass itself is behind `openhuman`,
 // and `test` so the default lane still exercises the rule.
 #[cfg(any(feature = "openhuman", test))]
-async fn reserve_draft_budget(
+pub(super) async fn reserve_draft_budget(
     company: &crate::ports::types::CompanyId,
     meter: &dyn crate::ports::UsageMeter,
     manifest_plan: &crate::company::Plan,

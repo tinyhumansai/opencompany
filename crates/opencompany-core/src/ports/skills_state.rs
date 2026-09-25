@@ -39,6 +39,14 @@ pub struct SkillState {
     /// a built-in or registry skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_doc: Option<String>,
+    /// When this delta was last written, in epoch milliseconds.
+    ///
+    /// `None` for a row stored before the field existed, and for the
+    /// disabling deltas a manifest's `[globals].disable` synthesizes — neither
+    /// was ever edited by anyone, and a fabricated stamp would date them to
+    /// whenever the process happened to read the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_millis: Option<u64>,
 }
 
 /// Durable per-company skill deltas. Company A's deltas MUST be invisible to
@@ -52,3 +60,7 @@ pub trait SkillStateStore: Send + Sync {
     /// Removes a delta by slug; returns whether one was removed.
     async fn remove(&self, company: &CompanyId, slug: &str) -> Result<bool>;
 }
+
+#[cfg(test)]
+#[path = "skills_state_tests.rs"]
+mod tests;

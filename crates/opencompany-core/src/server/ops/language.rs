@@ -79,3 +79,7 @@ pub const SKILL_NOT_IN_REGISTRY: &str = "That skill isn't in the registry.";
 /// Error shown when a workflow id is not safe to use as a filename.
 pub const WORKFLOW_ID_INVALID: &str =
     "A workflow id can't be empty or contain slashes or `..` — use a plain name.";
+
+#[cfg(test)]
+#[path = "language_tests.rs"]
+mod tests;

@@ -144,11 +144,16 @@ describe("uninstall lifecycle", () => {
     await act(async () => {});
 
     expect(container.textContent).toContain("Standup writer");
-    const uninstallButton = container.querySelector<HTMLButtonElement>(
-      '[data-testid="installed-card"] button[aria-label="Uninstall"]',
-    )!;
+    // Uninstall lives in the row's ⋮ menu, which renders through a portal.
     await act(async () => {
-      uninstallButton.click();
+      container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="installed-card"] [data-testid="skill-row-menu"]',
+        )!
+        .click();
+    });
+    await act(async () => {
+      document.querySelector<HTMLElement>('[data-testid="skill-menu-uninstall"]')!.click();
     });
 
     // Still on screen — the refusal must not have removed the card.
