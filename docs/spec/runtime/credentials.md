@@ -2,7 +2,7 @@
 
 How a company proves who it is to the surfaces the platform brokers on its
 behalf (issue #586). The routes are listed in
-[`api-write-plane.md`](api-write-plane.md#credential-bearing-surfaces-feature-gated); this is the model
+[`api-write-plane-credentials.md`](api-write-plane-credentials.md); this is the model
 behind them.
 
 ## One key per company

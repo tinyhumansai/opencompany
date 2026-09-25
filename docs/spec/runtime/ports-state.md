@@ -173,7 +173,7 @@ back into per-task, per-approval and per-run views:
 
 * [Variants](events.md#variants)
 * [Per-task event correlation (issue #185)](events.md#per-task-event-correlation-issue-185)
-* [Per-task approval correlation (issue #333)](events.md#per-task-approval-correlation-issue-333)
+* [Per-task approval correlation (issue #333)](events-approvals.md)
 * [What a retry would repeat (issue #351)](events.md#what-a-retry-would-repeat-issue-351)
 * [Workflow run progress (issue #371)](events.md#workflow-run-progress-issue-371)
 

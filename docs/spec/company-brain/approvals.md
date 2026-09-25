@@ -15,6 +15,14 @@ thresholds and per-call judgement do not manufacture cards. `readonly` and the
 emergency stop remain hard denials. An operator-authored workflow node with
 `requires_approval = true` remains an explicit gate.
 
+Installing a **skill** is not a checkpoint and does not create one. It is an
+admin configuration action, in the same category as adding a teammate or an MCP
+server, rather than an agent effect crossing the trust boundary. A skill is a
+document an agent reads ([`docs/modules/skills.md`](../../modules/skills.md)): it
+neither adds an approval nor bypasses one, so an effect its text asks for is
+gated here unchanged. See
+[Skills are text an agent reads](../security/agent-isolation.md#skills-are-text-an-agent-reads).
+
 ## Dormant policy-HITL taxonomy
 
 This legacy classifier remains for audit, hard denials, and a possible future

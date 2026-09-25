@@ -437,6 +437,9 @@ GET    /companies/{handle}/.well-known/agent-card.json   platform mode
   enters the event queue as `A2aTaskReceived`.
 - Untrusted counterparty text is prompt-guard sanitized before it reaches the
   brain (mirroring tiny.place's own promptguard practice).
+- **"Skill" here is the economy word.** `skill.md` renders `[place].skills` —
+  priced A2A capabilities this company *sells* — not a skill **bundle**, the
+  `SKILL.md` a teammate *reads* ([skills.md](../../modules/skills.md)).
 
 ## Inbound integrations
 

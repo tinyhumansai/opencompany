@@ -28,7 +28,7 @@ agent that has been prompt-injected is not a cooperative component.
 The attacker does not have an account. They write text that an agent reads:
 an issue body, a pull-request description, a web page fetched by `web_fetch`,
 an inbound email, a page an agent fetched,
-a Composio trigger payload. Any of those can carry instructions, and the agent
+a Composio trigger payload, the body of a registry-sourced `SKILL.md`. Any of those can carry instructions, and the agent
 that reads them is the one holding the grants.
 
 Assume, therefore: **the attacker can issue any tool call the agent is granted,
@@ -180,6 +180,92 @@ What C6 actually buys, stated exactly: the sanctioned write paths refuse the
 sink, and the intent line of the command that destroys it is on disk before it
 runs.
 
+## Skills are text an agent reads
+
+A skill is a `SKILL.md` document an agent can list, describe and read. See
+[`docs/modules/skills.md`](../../modules/skills.md) for the subsystem. It is
+named here because `grep -ci skill` returned `0` for this file, and for
+[grants.md](../company-brain/grants.md), [approvals.md](../company-brain/approvals.md)
+and [tools.md](../runtime/tools.md), until now — not because skills were judged
+safe, but because nobody had written the judgement down.
+
+**A skill confers no capability.** It is inert text. The three tools that reach
+one — `list_skills`, `describe_skill`, `read_skill_resource` — are declared
+`EffectGroup::Other, Reach::Nothing` in
+[`policy/consequence.rs`](../../../crates/opencompany-core/src/policy/consequence.rs),
+the same bucket as any other local metadata read, and that classification is
+correct: they read a materialized directory under the agent's own workspace and
+touch nothing else. Skill *execution* is not wired at all
+([`skills.md`](../../modules/skills.md#execution-is-deliberately-not-wired)), so
+there is no path from installing a skill to running code.
+
+**The content is untrusted all the same.** A registry- or upload-sourced
+`SKILL.md` — body, description, and every bundled resource — was authored by
+someone other than the operator, and it reaches an agent's context verbatim
+through `describe_skill` and `read_skill_resource`, and its description reaches
+the persona prompt through the catalogue. This document already treats a fetched
+page and a remote MCP tool description that way. A skill is the same class of
+input and was simply never named.
+
+### The load-bearing sentence
+
+**If a skill's text persuades an agent to take an action, that action still
+crosses every gate it would have crossed anyway.** The tool call is resolved by
+the three-level grant — `[tools].allow ∩ desk.tools ∩ agent.tools`
+([tools.md](../runtime/tools.md)) — and whatever the company's approval policy
+would do with the effect, it does the same whether or not a skill argued for it
+([approvals.md](../company-brain/approvals.md)). What that is depends on the
+mode, and today on little else: `readonly` denies applicable effects and the
+emergency stop denies ahead of every policy rule, while policy HITL is disabled,
+so `supervised`, `auto`, `full` and `always_approve` are classification and audit
+data and an effect parks when an agent calls `request_approval`. A skill changes
+none of that. It cannot widen a grant, add
+a tool, name a credential, or mark an effect pre-approved. It has no field for
+any of those, and nothing reads it as configuration.
+
+That is the whole reason skills are lower-risk than MCP servers *today*: an MCP
+server is a capability whose grant must be scoped, while a skill is an argument
+an agent may find persuasive. The bottleneck is the tool call, and the tool call
+is already gated.
+
+### Installing one is configuration, not an effect
+
+Every skill write — install, uninstall, toggle, author — is gated
+`AdminScopedCompany`, the same category as adding a teammate or adding an MCP
+server. It is an operator deciding something about the company, not an agent
+reaching across the trust boundary mid-cycle.
+
+Skill writes are therefore **not** `ApprovalGate` checkpoints, and that is
+correct rather than an omission: the gate exists for effects an agent produces,
+and an admin configuring their own company is not one. Nothing about the admin
+route makes installing a skill a privilege grant either — the grant tables are
+elsewhere and a skill never touches them.
+
+### What is not true today
+
+Two properties a reader might assume from the above are **not** in place:
+
+- **A skill reaches every agent in the company.** There is no per-agent or
+  per-desk scope on a skill; `materialize` takes no agent id, so an installed
+  skill lands in every agent's catalogue on the next cycle. Tools get a
+  three-level grant and skills get nothing analogous. Per-agent scope is in
+  flight (issue #2213); until it merges, "install for one teammate" cannot be
+  expressed.
+- **Nothing inspects installed content.** Neither the registry install nor the
+  console author path scans a document for instruction-manipulation patterns,
+  invisible or bidirectional code points, hard-coded credentials, or references
+  to other tools. An install-time scan is in flight on a parallel branch; until
+  it merges, the only thing standing between a hostile `SKILL.md` and an agent's
+  prompt is the frontmatter newline collapse, which stops key injection and
+  nothing else.
+
+When execution ships, none of this section survives unchanged. A skill that runs
+is a process, and it inherits every gap in this document — no sandbox, no egress
+policy, no uid separation. The prerequisites are stated with the deferral in
+[`skills.md`](../../modules/skills.md#execution-is-deliberately-not-wired):
+configuration injected rather than self-loaded, spend metered through the
+harness, and egress bounded. That last one is C1, which is still open.
+
 ## Residual capability after every control in #752 lands
 
 **Read this section as if C0–C5 are already done, because that is when it
@@ -271,6 +357,12 @@ directory:
   in `opencompany-microservice`.
 - Any claim about egress justified by a passing test in this repository. No
   test here can demonstrate that a packet was blocked.
+- "Skills are sandboxed", or "a skill runs in a sandbox". Nothing sandboxes a
+  skill. Today one is never executed at all, and the day execution ships it will
+  run under exactly the controls above.
+- "Installing a skill is gated, so its content is trusted." The gate is on the
+  operator's write, not on the document. See
+  [Skills are text an agent reads](#skills-are-text-an-agent-reads).
 
 ## The children of #752
 
@@ -294,3 +386,5 @@ this one — but see the precondition above.
 - [ports-state.md](../runtime/ports-state.md) — the `SecretStore` contract.
 - [company-brain/approvals.md](../company-brain/approvals.md) — the approval
   model the publish gate sits in.
+- [../../modules/skills.md](../../modules/skills.md) — the skills subsystem: what
+  a skill is, how the effective set is resolved, and why execution is deferred.

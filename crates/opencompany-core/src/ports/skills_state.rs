@@ -35,8 +35,10 @@ pub struct SkillState {
     pub enabled: bool,
     /// Where the skill came from.
     pub source: SkillSource,
-    /// The full `SKILL.md` document for a custom skill; `None` for a delta over
-    /// a built-in or registry skill.
+    /// The `SKILL.md` document this delta carries: the authored one for a
+    /// custom skill, the pinned snapshot for a registry install. `None` for a
+    /// `Company`-source delta, which is only an enable/disable override over a
+    /// document that lives on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_doc: Option<String>,
 }

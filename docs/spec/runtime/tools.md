@@ -261,3 +261,9 @@ namespace may spend, which is the capability plan (`[plan]`), nor what an agent
 can reach once it holds `shell`. On that last point see
 [security/agent-isolation.md](../security/agent-isolation.md), which is blunt
 about what is not enforced.
+
+Installing a **skill** decides nothing here. A skill is a document an agent
+reads ([`docs/modules/skills.md`](../../modules/skills.md)); it adds no grant and
+bypasses none, so a call a skill's text asks for is resolved by the same
+`[tools].allow ∩ desk.tools ∩ agent.tools` intersection as any other. See
+[Skills are text an agent reads](../security/agent-isolation.md#skills-are-text-an-agent-reads).

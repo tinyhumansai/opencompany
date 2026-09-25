@@ -64,6 +64,10 @@ Supporting docs:
     than in a `before_send`, and why Session Replay is evaluated and declined
 - [events.md](events.md) — the `CompanyEvent` vocabulary those ports carry, and
   the run/task/approval correlation rules a journal reader folds on
+  - [events-approvals.md](events-approvals.md) — the approval half of those
+    rules: the card link on `ApprovalParked`, which of the two correlation keys
+    is authoritative, and the event that raises a request inside the
+    conversation that produced it (issues #333/#379)
   - [workflow-events.md](workflow-events.md) — the workflow-run progress
     brackets (`WorkflowRunStarted` / `WorkflowNodeStarted` /
     `WorkflowNodeFinished` / `WorkflowRunFinished`), run-id correlation, the
@@ -86,6 +90,10 @@ Supporting docs:
   form and the one-file-per-teammate `agents/<id>.toml` bundle form, custom
   prompts, checked-in briefing documents versus routed workspace documents, and
   the `classes` routing exclusions
+  - [agents-turn-limits.md](agents-turn-limits.md) — the two ceilings on one
+    turn: the 25-round tool-iteration cap, the in-turn spend brake armed only
+    for a teammate with a declared daily budget, and why a cap pause and a
+    budget halt are reported separately
 - [tools.md](tools.md) — the three-level tool grant
   (`[tools].allow ∩ desk.tools ∩ agent.tools`), why an absent grant means
   "inherit" rather than "nothing" (and why an explicit empty agent grant is a
@@ -140,6 +148,10 @@ Supporting docs:
     - [api-tool-grants.md](api-tool-grants.md) — the three tool-grant routes
       that widen `[tools].allow` from a connect page, and when a grant takes
       effect
+    - [api-write-plane-credentials.md](api-write-plane-credentials.md) — the
+      subset that writes to the `SecretStore`: the company credential, the
+      custom domain, SMTP's password-as-patch rule, and the retired native
+      OAuth bridge
   - [api-graphql.md](api-graphql.md) — the `/graphql` read plane
 - [credentials.md](credentials.md) — the company's own TinyHumans key: the one
   seam a brokered surface resolves through (Composio today), why rotating it

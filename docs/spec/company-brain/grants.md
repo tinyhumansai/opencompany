@@ -414,6 +414,12 @@ Note this is the *tool* gate (`ApprovalPolicy`), which is a different path from
 the *effect* gate (`ManifestApprovalGate::evaluate`) the taxonomy above
 describes. A harness tool call parks directly and never reaches `evaluate`.
 
+Note also that a **skill** is not a grant of any kind. A skill is a document an
+agent reads ([`docs/modules/skills.md`](../../modules/skills.md)) — installing one
+adds no grant, removes no gate, and cannot mark a call pre-approved; a call its
+text asks for parks here exactly as it would have anyway. See
+[Skills are text an agent reads](../security/agent-isolation.md#skills-are-text-an-agent-reads).
+
 ### Per-call judgement (issue #338)
 
 Steps 1–6 are all decided before the run starts, by an operator writing a
