@@ -649,3 +649,51 @@ async fn run_workflow_tool_separates_blocked_nodes_from_paused_gates() {
         "approvals_parked must exclude the ParkFailed receipt: {payload}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn workflow_tool_survives_single_call_deadline_and_stages_result() {
+    struct SlowRunner;
+    #[async_trait::async_trait]
+    impl WorkflowRunner for SlowRunner {
+        async fn run(
+            &self,
+            _company: &CompanyId,
+            _workflow: &WorkflowFile,
+            _input: Value,
+            _ctx: &crate::ports::WorkflowRunContext,
+        ) -> crate::Result<WorkflowRun> {
+            tokio::time::sleep(std::time::Duration::from_secs(121)).await;
+            Ok(StubRunner::empty().run)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    seed_demo_workflow(dir.path());
+    let runner: Arc<dyn WorkflowRunner> = Arc::new(SlowRunner);
+    let handle = WorkflowRunnerHandle::default();
+    handle.set(&runner);
+    let refs = WorkflowRefQueue::default();
+    let tool = RunWorkflowTool::new(
+        CompanyId::new("acme"),
+        Some(dir.path().to_path_buf()),
+        Arc::new(MemStore::default()),
+        handle,
+        crate::runtime::RunSupervisor::default(),
+        None,
+        refs.clone(),
+        RunOutputCache::default(),
+        None,
+    );
+    let args = json!({"id": "demo"});
+    let (deadline, _) = oh::tools::timeout::resolve_tool_deadline(tool.timeout_policy(&args));
+    assert!(
+        deadline.is_none(),
+        "the harness must not truncate a supervised workflow"
+    );
+    let result = tool.execute(args).await.unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(
+        refs.drain().len(),
+        1,
+        "completion still stages the real workflow result"
+    );
+}
