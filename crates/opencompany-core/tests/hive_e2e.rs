@@ -1423,6 +1423,23 @@ async fn an_ask_opens_a_conversation_the_desk_only_references() {
         );
     }
 
+    let seated: Vec<String> = script
+        .asks()
+        .iter()
+        .filter(|ask| seat_of(ask).is_some())
+        .flat_map(|ask| ask.tools.clone())
+        .collect();
+    assert!(
+        seated.iter().any(|name| name == "desk_read"),
+        "a seat reads the room with the episode's own verb: {seated:?}",
+    );
+    for absent in ["read", "mcp_call_tool", "mcp_list_tools"] {
+        assert!(
+            !seated.iter().any(|name| name == absent),
+            "`{absent}` was offered to an episode seat: {seated:?}",
+        );
+    }
+
     // **And the prose that describes them goes too.**
     //
     // Taking the tools without the briefs is worse than taking neither: the

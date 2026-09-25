@@ -416,6 +416,41 @@ async fn read_serves_the_conversation_narrowed_to_what_the_agent_may_see() {
 }
 
 #[tokio::test]
+async fn the_belt_read_answers_what_the_served_read_answers() {
+    let (host, _agent, client) = boot(plain_agent()).await;
+    let bound = Arc::new(std::sync::OnceLock::new());
+    let read = crate::hive::tools::ConversationReadTool::new(
+        Arc::clone(host.in_flight()),
+        Arc::clone(&bound),
+        journal(),
+    );
+    assert_eq!(read.name(), crate::hive::tools::READ_TOOL);
+    assert_eq!(
+        read.parameters_schema()["properties"]["limit"]["maximum"],
+        100
+    );
+
+    let unbound = read.execute(json!({})).await.unwrap();
+    assert!(unbound.is_error, "an unbound read has no turn to read");
+    bound.set(RUNTIME_ID.to_string()).unwrap();
+    let idle = read.execute(json!({})).await.unwrap();
+    assert!(idle.is_error);
+    assert!(
+        idle.output().contains("no turn is in flight"),
+        "{}",
+        idle.output()
+    );
+
+    let _ticket = host.in_flight().begin(desk_turn()).unwrap();
+    for args in [json!({}), json!({ "limit": 1 })] {
+        let native = read.execute(args.clone()).await.unwrap();
+        let served = client.call_tool("read", args).await.unwrap();
+        assert!(!native.is_error, "{}", native.output());
+        assert_eq!(native.output(), served.rendered.output());
+    }
+}
+
+#[tokio::test]
 async fn a_custom_tool_runs_with_the_in_flight_turn_as_its_context() {
     let (host, _agent, client) = boot(plain_agent()).await;
     let ticket = host.in_flight().begin(desk_turn()).unwrap();

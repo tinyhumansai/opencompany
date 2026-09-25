@@ -58,6 +58,7 @@ paypal_get_wallet_balance group=Other reach=Nothing standing=PerCall
 paypal_list_transactions group=Other reach=Nothing standing=PerCall
 publish_artifact group=Publish reach=Consequence standing=Grantable
 query_company group=Other reach=Nothing standing=PerCall
+read group=Other reach=Nothing standing=PerCall
 read_run group=Other reach=Nothing standing=PerCall
 read_run_output group=Other reach=Nothing standing=PerCall
 read_skill_resource group=Other reach=Nothing standing=PerCall

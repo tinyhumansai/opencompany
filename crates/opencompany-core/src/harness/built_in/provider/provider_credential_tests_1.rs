@@ -497,6 +497,49 @@ fn a_recovered_batch_pairing_request_approval_with_a_sibling_is_refused() {
     );
 }
 
+#[test]
+fn a_recovered_call_keeps_its_name_when_the_wire_offers_it_natively() {
+    let payload = || {
+        serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Checking. {\"call\":\"read\",\"arguments\":{\"limit\":5}}"
+                }
+            }]
+        })
+    };
+    let offered = std::collections::BTreeSet::from(["read".to_string()]);
+    let native = std::collections::BTreeMap::from([(
+        "read".to_string(),
+        serde_json::json!({ "type": "object", "properties": { "limit": { "type": "integer" } } }),
+    )]);
+    let resp = model_response_from_payload_offering(payload(), &offered, &native)
+        .expect("the recovered call parses");
+    let calls = &resp.message.tool_calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].name, "read",
+        "a belt tool is dispatched by its own name"
+    );
+    assert_eq!(calls[0].arguments["limit"], 5);
+
+    let resp = model_response_from_payload_offering(
+        payload(),
+        &offered,
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("the recovered call parses");
+    let calls = &resp.message.tool_calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].name, "mcp_call_tool",
+        "a name offered only by the MCP brief is still bridged"
+    );
+    assert_eq!(calls[0].arguments["tool"], "read");
+}
+
 /// A refusal turn: `content: null`, `finish_reason: "stop"`, a nonempty
 /// `message.refusal`, and `reasoning` the model emitted before declining.
 /// The refusal is the provider's own visible safety response and must win

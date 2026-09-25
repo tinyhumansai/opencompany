@@ -265,6 +265,29 @@ async fn a_yesterday_stamped_spend_does_not_refuse_todays_dispatch() {
     );
 }
 
+#[tokio::test]
+async fn a_pooled_teammate_reads_its_conversation_by_name_on_its_own_belt() {
+    let dir = tempfile::tempdir().unwrap();
+    let context = Arc::new(MockContext::default());
+    let rec = capped_record();
+    let mut deps = deps_with_plan(dir.path(), context, None, None);
+    deps.events = Some(Arc::new(crate::hive::test_support::MemoryLog::default()));
+    let pool = HarnessPool::new();
+    pool.ensure(&rec, &deps).await.expect("ensure");
+    let agent = pool.agent(&rec.id, "ceo").await.expect("ceo");
+    assert!(
+        agent
+            .tools()
+            .iter()
+            .any(|tool| tool.name() == crate::hive::tools::READ_TOOL),
+        "`read` rides the belt"
+    );
+    assert!(
+        agent.served_catalogue().is_empty(),
+        "nothing is left for an MCP brief to name"
+    );
+}
+
 /// **The mechanism issue #443 asks for.** Every tool this crate can put in
 /// front of an agent must be classified in
 /// [`crate::policy::consequence`], or this fails.

@@ -458,6 +458,8 @@ const DECLARED: &[Declared] = &[
     d("list_tasks", EffectGroup::Other, Reach::Nothing),
     d("read_task", EffectGroup::Other, Reach::Nothing),
     d("read_run", EffectGroup::Other, Reach::Nothing),
+    // A pooled turn reading its own conversation back from the journal.
+    d("read", EffectGroup::Other, Reach::Nothing),
     // ---- The agent's own sandboxed workspace: reads ------------------------
     // All six are pure reads inside the workspace the agent is pinned to.
     // `file_read`, `glob`, `grep` and `image_info` PARKED before this table

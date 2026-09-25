@@ -1345,15 +1345,17 @@ fn model_response_from_payload_offering(
         // it cannot cross there (Codex review on #2011).
         refuse_approval_siblings(&recovered)?;
         content = cleaned;
-        // A recovered call to a tool the turn offers only through the
-        // `opencompany` MCP server (plan hive-desks Phase 3) is dispatched the
-        // way a native-channel call to it would be: as `mcp_call_tool`. The
-        // name is only in `offered` because `mcp_served_tools` put it there.
+        // A recovered call to a tool on the wire keeps its own name; one the
+        // turn offers only through the `opencompany` MCP server (named in
+        // `offered` by `mcp_served_tools`) is dispatched as `mcp_call_tool`.
         tool_calls = recovered
             .into_iter()
             .map(|call| {
-                let (name, arguments) =
-                    crate::hive::tools::via_opencompany_mcp(&call.name, call.arguments);
+                let (name, arguments) = if schemas.contains_key(&call.name) {
+                    (call.name, call.arguments)
+                } else {
+                    crate::hive::tools::via_opencompany_mcp(&call.name, call.arguments)
+                };
                 ToolCall {
                     id: call.id,
                     name,

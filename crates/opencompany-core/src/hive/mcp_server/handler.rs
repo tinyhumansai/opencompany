@@ -15,11 +15,11 @@ use openhuman_core::agent::tool_policy::{
     ToolCallContext, ToolPolicy, ToolPolicyDecision, ToolPolicyRequest,
 };
 use serde_json::{Value, json};
-use tinyhivemind::{SessionAuthor, SessionLog};
-use tinyhivemind_core::aside::Viewer;
 
 use super::{HEADER_SESSION_ID, McpAgent, McpHost, SERVER_SLUG, constant_time_eq};
-use crate::hive::tools::{InFlight, InFlightContext, Speech, ToolJob, is_speech_tool};
+use crate::hive::tools::{
+    InFlight, InFlightContext, Speech, ToolJob, is_speech_tool, read_conversation,
+};
 
 fn bearer_of(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -300,58 +300,8 @@ async fn read(host: &McpHost, agent: &McpAgent, limit: usize) -> Value {
     else {
         return tool_result("refused: no turn is in flight for this agent", true);
     };
-    let log = crate::hive::session_log::EventLogSessionLog::new(
-        events,
-        agent.company.clone(),
-        surface.id.clone(),
-        surface.id.clone(),
-        // No pair channels. This reads a desk's own history back to an agent
-        // asking for it; a private exchange between two seats is theirs, and
-        // reaching it needs the turn that is inside it, not a read of the
-        // room. Empty admits none.
-        Vec::new(),
-    );
-    let page = match log.read_before(None, limit).await {
-        Ok(page) => page,
-        Err(error) => {
-            return tool_result(
-                format!("this conversation could not be read: {error}"),
-                true,
-            );
-        }
-    };
-    let viewer = Viewer::Agent {
-        id: agent.agent_id.clone(),
-    };
-    let mut lines: Vec<String> = page
-        .messages
-        .iter()
-        .filter(|message| {
-            let author_id = match &message.author {
-                SessionAuthor::Agent { id, .. } => Some(id.as_str()),
-                _ => None,
-            };
-            message.audience.admits(&viewer, author_id)
-        })
-        .map(|message| {
-            let author = match &message.author {
-                SessionAuthor::Operator => "operator".to_string(),
-                SessionAuthor::Person { label, .. } => label.clone(),
-                SessionAuthor::Agent { id, .. } => id.clone(),
-                SessionAuthor::System { kind, .. } => kind.clone(),
-            };
-            format!("[{}] {author}: {}", message.sequence.0, message.content)
-        })
-        .collect();
-    lines.reverse();
-    if lines.is_empty() {
-        return tool_result("Nothing has been said in this conversation yet.", false);
+    match read_conversation(events, &agent.company, &agent.agent_id, &surface, limit).await {
+        Ok(body) => tool_result(body, false),
+        Err(text) => tool_result(text, true),
     }
-    let mut body = lines.join("\n");
-    if page.next_before.is_some() {
-        body.push_str(&format!(
-            "\n\n(Showing the most recent {limit}. Older messages are not in this reply.)"
-        ));
-    }
-    tool_result(body, false)
 }
