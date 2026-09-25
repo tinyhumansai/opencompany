@@ -176,17 +176,6 @@ async fn a_teammate_that_takes_over_says_so_in_a_line_the_operator_can_reach() {
     );
 }
 
-/// The notice the asker may leave behind says only what is true.
-#[test]
-fn the_hand_off_notice_names_the_line_and_promises_no_timing() {
-    let notice = crate::hive::dispatch::hand_off_notice("engineer", "dm:engineer");
-    assert!(notice.contains("dm:engineer"), "it says where: {notice}");
-    assert!(
-        !notice.to_lowercase().contains("this turn"),
-        "and does not promise when: {notice}"
-    );
-}
-
 /// Reproduces the stall: a teammate announces, then the operator replies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn announce_then_reply_does_not_stall() {

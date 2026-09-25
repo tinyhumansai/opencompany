@@ -704,10 +704,9 @@ async fn a_blank_operator_message_is_omitted_like_a_blank_agent_reply() {
 /// A running episode's rows stay out of a rival episode on the same desk.
 ///
 /// Episodes are keyed `(desk, thread_root)`, so a threaded one and a channel
-/// one coexist — `open_episode_for` only joins a second message to the first
-/// when the thread matches. The fold narrowed by desk alone, so a second
-/// question read the first episode's in-flight rows, including a request it
-/// had parked and never made itself.
+/// one coexist on a desk; narrowing the fold by desk alone would let the
+/// second read the first's in-flight rows, including a request it had parked
+/// and never made itself.
 ///
 /// A **completed** episode is different and must still be read: a desk is a
 /// room, not a series of meetings, and scoping by episode identity would make

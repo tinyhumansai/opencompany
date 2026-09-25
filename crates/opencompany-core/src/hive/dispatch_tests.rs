@@ -2,7 +2,7 @@
 //!
 //! Extracted from `dispatch.rs`: an inline `#[cfg(test)] mod` is rejected by
 //! `scripts/ci/assert-rs-source-layout.sh`, and it also put every item after
-//! it -- `announce_takeover` and `hand_off_notice` -- behind a test module,
+//! it -- `announce_takeover` -- behind a test module,
 //! which `clippy::items_after_test_module` denies.
 
 use super::*;

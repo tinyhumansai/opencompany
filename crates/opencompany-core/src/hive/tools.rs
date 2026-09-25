@@ -46,13 +46,6 @@ use crate::ports::types::CompanyId;
 
 /// The bare speech tool names, in the order [`speech::tool_specs`] presents
 /// them. Every other name the server serves is an OpenCompany tool.
-/// The room's speech tools, named by the library that defines them.
-///
-/// Derived rather than mirrored. This used to be a hand-written list beside
-/// `speech_descriptors`, which builds from the same specs, so the two could
-/// disagree -- and did, the first time the vocabulary grew a verb (`ask`,
-/// which opens a conversation with one seat). A list that cannot drift is
-/// worth more than a `const`.
 #[must_use]
 pub fn speech_tool_names() -> Vec<&'static str> {
     speech::tool_specs().iter().map(|spec| spec.name).collect()
@@ -613,12 +606,6 @@ pub fn speech_descriptor(spec: &ToolSpec) -> Value {
             "additionalProperties": false,
         },
     })
-}
-
-/// Every speech tool as an MCP descriptor, in [`speech::tool_specs`] order.
-#[must_use]
-pub fn speech_descriptors() -> Vec<Value> {
-    speech::tool_specs().iter().map(speech_descriptor).collect()
 }
 
 #[cfg(test)]

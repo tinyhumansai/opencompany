@@ -1,6 +1,5 @@
-//! The journal as the episode store: the fold behind `GET {scope}/episodes`,
-//! the driver checkpoint a resume reads back, and the "is one already open
-//! here?" lookup a desk message needs before it opens another.
+//! The journal as the episode store: the fold behind `GET {scope}/episodes`
+//! and the driver checkpoint a resume reads back.
 //!
 //! There is no second store. An episode is its `EpisodeOpened` and
 //! `EpisodeCompleted` rows, the `TurnStarted` rows between them -- which
@@ -18,7 +17,7 @@
 //! episodes an operator asks about are the recent ones, and a forward scan
 //! from sequence zero would grow with the company's whole history.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use tinyhivemind::SharingState;
@@ -26,9 +25,7 @@ use tinyhivemind::SharingState;
 use crate::error::Result;
 use crate::hive::routing::RoutingPlanDto;
 use crate::ports::events::EventLog;
-use crate::ports::types::{
-    CompanyEvent, CompanyId, EpisodeReason, EventSeq, ReplyEpisode, StoredEvent,
-};
+use crate::ports::types::{CompanyEvent, CompanyId, EpisodeReason, EventSeq, StoredEvent};
 
 /// Raw journal entries read per underlying page.
 const RAW_CHUNK: usize = 256;
@@ -392,15 +389,6 @@ impl PersistedEpisode {
     }
 }
 
-/// Journals the driver's state after a committed round.
-pub async fn save_state(
-    events: &dyn EventLog,
-    company: &CompanyId,
-    persisted: &PersistedEpisode,
-) -> Result<EventSeq> {
-    events.append(company, persisted.to_event()).await
-}
-
 /// The latest checkpoint of one episode, if any was written.
 pub async fn latest_state(
     events: &dyn EventLog,
@@ -421,54 +409,6 @@ pub async fn latest_state(
         .find(|persisted| persisted.episode_id == episode_id))
 }
 
-/// One reply row committed into an episode — what a resume replays through
-/// `apply_committed` when the checkpoint predates it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedReply {
-    /// The row's sequence.
-    pub seq: EventSeq,
-    /// The seat.
-    pub agent_id: String,
-    /// The text.
-    pub text: String,
-    /// What the reply was inside the episode.
-    pub episode: ReplyEpisode,
-}
-
-/// The reply rows an episode committed at a revision **above** `revision`,
-/// oldest first — the rows a checkpoint at `revision` has not folded.
-pub async fn replies_after(
-    events: &dyn EventLog,
-    company: &CompanyId,
-    episode_id: &str,
-    revision: u64,
-) -> Result<Vec<CommittedReply>> {
-    let entries = tail(events, company, |stored| {
-        matches!(
-            &stored.event,
-            CompanyEvent::EpisodeOpened { episode_id: id, .. } if id == episode_id
-        )
-    })
-    .await?;
-    Ok(entries
-        .into_iter()
-        .filter_map(|stored| match stored.event {
-            CompanyEvent::AgentReply {
-                agent_id,
-                text,
-                episode: Some(episode),
-                ..
-            } if episode.id == episode_id && episode.revision >= revision => Some(CommittedReply {
-                seq: stored.seq,
-                agent_id,
-                text,
-                episode,
-            }),
-            _ => None,
-        })
-        .collect())
-}
-
 /// Every row since `episode_id` opened, oldest first: what a resumed
 /// episode's host reads its open conversations and parked seats back from.
 pub async fn episode_rows(
@@ -483,64 +423,6 @@ pub async fn episode_rows(
         )
     })
     .await
-}
-
-/// An episode still running on a desk thread.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenEpisode {
-    /// The episode.
-    pub episode_id: String,
-    /// The message that opened it.
-    pub opened_by_seq: u64,
-    /// The seats assigned at opening.
-    pub participants: Vec<String>,
-    /// The referral hop.
-    pub hop: u32,
-}
-
-/// The episode already open on `(desk, thread_root)`, if any.
-///
-/// An episode is keyed by the desk and the thread its opening message was in
-/// (the channel itself when it was not in one), so a second message in the
-/// same thread joins the room that is already answering it rather than
-/// opening a rival.
-pub async fn open_episode_for(
-    events: &dyn EventLog,
-    company: &CompanyId,
-    desk: &str,
-    thread_root: Option<EventSeq>,
-) -> Result<Option<OpenEpisode>> {
-    let mut completed: HashSet<String> = HashSet::new();
-    let mut found: Option<OpenEpisode> = None;
-    tail(events, company, |stored| match &stored.event {
-        CompanyEvent::EpisodeCompleted { episode_id, .. } => {
-            completed.insert(episode_id.clone());
-            false
-        }
-        CompanyEvent::EpisodeOpened {
-            chat_id,
-            episode_id,
-            opened_by_seq,
-            parent,
-            participants,
-            hop,
-            ..
-        } if chat_id.eq_ignore_ascii_case(desk)
-            && *parent == thread_root
-            && !completed.contains(episode_id) =>
-        {
-            found = Some(OpenEpisode {
-                episode_id: episode_id.clone(),
-                opened_by_seq: *opened_by_seq,
-                participants: participants.clone(),
-                hop: *hop,
-            });
-            true
-        }
-        _ => false,
-    })
-    .await?;
-    Ok(found)
 }
 
 #[cfg(test)]

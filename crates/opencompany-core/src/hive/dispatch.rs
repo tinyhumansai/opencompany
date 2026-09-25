@@ -552,21 +552,6 @@ pub async fn brief_takeover(
         .await
 }
 
-/// What the teammate that handed work on tells the operator, if it says
-/// anything at all.
-///
-/// Fixed wording. The tool that handed work over used to return a sentence for
-/// the agent to paraphrase, and it paraphrased it into a promise -- "they will
-/// answer this turn" -- that nothing could keep. What is true is that somebody
-/// else has it and where they will be reached; that is what this says.
-#[must_use]
-pub fn hand_off_notice(to: &str, chat: &str) -> String {
-    format!(
-        "@{to} has picked this up. Their line with you ({chat}) is where they \
-         will reply."
-    )
-}
-
 #[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod tests;

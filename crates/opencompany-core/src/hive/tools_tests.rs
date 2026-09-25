@@ -218,7 +218,7 @@ fn finishing_a_turn_frees_the_agent_for_the_next_one() {
 
 #[test]
 fn speech_specs_render_to_mcp_descriptors_with_the_contract_argument_names() {
-    let descriptors = speech_descriptors();
+    let descriptors: Vec<Value> = speech::tool_specs().iter().map(speech_descriptor).collect();
     let names: Vec<&str> = descriptors
         .iter()
         .map(|d| d["name"].as_str().unwrap())

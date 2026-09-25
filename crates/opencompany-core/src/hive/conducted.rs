@@ -374,12 +374,6 @@ impl HiveDispatcher {
         self.hives.get(desk_id).cloned()
     }
 
-    /// Whether `desk_id` runs episodes at all.
-    #[must_use]
-    pub fn runs_episodes(&self, desk_id: &str) -> bool {
-        self.hives.contains_key(desk_id)
-    }
-
     /// Open one episode for an operator message and run it to quiescence.
     ///
     /// # Errors
@@ -629,6 +623,3 @@ impl HiveDispatcher {
         Ok((starters, dto))
     }
 }
-
-/// The journal as the episode store, for a follow-up that joins an open one.
-pub use episode_store::open_episode_for;

@@ -7,11 +7,8 @@
 //! runs and webhook receipts as well as chat, and an episode may only fold what
 //! was actually said on its desk.
 //!
-//! Moved from `src/hivemind/log.rs` (plan hive-desks, Phase 4) without the
-//! per-episode fold scope it carried: two episodes can no longer run in one
-//! thread (`episode_store::open_episode_for` joins the second message to the
-//! first's room), and what a seat has already seen is the sharing watermark
-//! `hive::prompt` keeps per seat, not a boundary on the log.
+//! There is no per-episode fold scope: what a seat has already seen is the
+//! sharing watermark `hive::prompt` keeps per seat, not a boundary on the log.
 //!
 //! # Why the read loops
 //!

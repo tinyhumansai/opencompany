@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::hive::routing::RoutingPlanDto;
-use crate::hive::test_support::{MemoryLog, agent_reply_in, operator_message};
+use crate::hive::test_support::{MemoryLog, operator_message};
 use crate::ports::events::EventLog;
 use crate::ports::types::{RoundUtteranceRecord, UtteranceKind};
 
@@ -123,45 +123,7 @@ async fn episodes_fold_newest_first_with_their_status_and_revision() {
 }
 
 #[tokio::test]
-async fn the_open_episode_on_a_thread_is_found_and_a_completed_one_is_not() {
-    let log = MemoryLog::default();
-    let company = MemoryLog::company();
-    log.append(&company, opened("engineering", "ep-1", 1, None))
-        .await
-        .unwrap();
-    log.append(&company, opened("engineering", "ep-2", 2, Some(2)))
-        .await
-        .unwrap();
-    let found = open_episode_for(&log, &company, "engineering", None)
-        .await
-        .unwrap()
-        .expect("the channel-level episode is open");
-    assert_eq!(found.episode_id, "ep-1");
-    assert_eq!(found.participants, vec!["engineer", "ceo"]);
-    let threaded = open_episode_for(&log, &company, "ENGINEERING", Some(EventSeq::new(2)))
-        .await
-        .unwrap()
-        .expect("the threaded episode is open");
-    assert_eq!(threaded.episode_id, "ep-2");
-    assert!(
-        open_episode_for(&log, &company, "content", None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    log.append(&company, completed("engineering", "ep-1", 2))
-        .await
-        .unwrap();
-    assert!(
-        open_episode_for(&log, &company, "engineering", None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn the_checkpoint_round_trips_and_later_replies_replay() {
+async fn the_checkpoint_round_trips() {
     let log = MemoryLog::default();
     let company = MemoryLog::company();
     log.append(&company, opened("engineering", "ep-1", 1, None))
@@ -201,19 +163,19 @@ async fn the_checkpoint_round_trips_and_later_replies_replay() {
             .unwrap()
             .is_none()
     );
-    save_state(&log, &company, &persisted).await.unwrap();
+    log.append(&company, persisted.to_event()).await.unwrap();
     let older = PersistedEpisode {
         revision: 0,
         ..persisted.clone()
     };
     // A checkpoint for another episode does not shadow this one.
-    save_state(
-        &log,
+    log.append(
         &company,
-        &PersistedEpisode {
+        PersistedEpisode {
             episode_id: "ep-9".into(),
             ..older
-        },
+        }
+        .to_event(),
     )
     .await
     .unwrap();
@@ -222,55 +184,6 @@ async fn the_checkpoint_round_trips_and_later_replies_replay() {
         .unwrap()
         .expect("the checkpoint is found");
     assert_eq!(read, persisted);
-
-    let in_episode = |revision: u64| ReplyEpisode {
-        id: "ep-1".into(),
-        revision,
-        kind: UtteranceKind::Post,
-        to: Vec::new(),
-        routed_by: None,
-    };
-    log.append(
-        &company,
-        agent_reply_in(
-            "engineering",
-            "engineer",
-            "r0",
-            Vec::new(),
-            Some(in_episode(0)),
-        ),
-    )
-    .await
-    .unwrap();
-    log.append(
-        &company,
-        agent_reply_in("engineering", "ceo", "r1", Vec::new(), Some(in_episode(1))),
-    )
-    .await
-    .unwrap();
-    log.append(
-        &company,
-        agent_reply_in(
-            "engineering",
-            "ceo",
-            "other",
-            Vec::new(),
-            Some(ReplyEpisode {
-                id: "ep-9".into(),
-                ..in_episode(5)
-            }),
-        ),
-    )
-    .await
-    .unwrap();
-    let later = replies_after(&log, &company, "ep-1", 1).await.unwrap();
-    assert_eq!(later.len(), 1);
-    assert_eq!(later[0].agent_id, "ceo");
-    assert_eq!(later[0].text, "r1");
-    assert_eq!(later[0].episode.revision, 1);
-    let all = replies_after(&log, &company, "ep-1", 0).await.unwrap();
-    assert_eq!(all.len(), 2);
-    assert!(all[0].seq < all[1].seq);
 }
 
 fn seat_parked(id: &str, seat: &str) -> CompanyEvent {
