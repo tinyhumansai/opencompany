@@ -21,8 +21,7 @@ module's own shape and the reasoning behind its boundaries.
 | `episode_store.rs` | `EpisodeStateSaved` — persisting `DriverState` + `SharingState`s, resume, replay of later `AgentReply` rows |
 | `routing.rs` | `RoutingConfig` (`[group_chat.routing]`), `EffectiveRouting` → `RoutingPolicy` / `ReferralPolicy`, the overlay, `RoutingPlanDto`, `DeskRoutingDto` |
 | `jev.rs` | `TinyHumansSystemOne: SystemOneTransport` over the TinyHumans System One proxy; `jev_router(env, key) -> Option<JevRouter<_>>` |
-| `referral.rs` | `JournalReferralQueue: ReferralQueue` (idempotent on `(episode, hop)`), `dispatch_referral`, the answer's return under `hive-referral` |
-| `prompt.rs` | the `Hive turn: desk …, episode …, round N.` sentinel, the unseen delta (`sharing::prepare_delta`), the fenced instruction |
+| `referral.rs` | the read side of a crossing: the reserved `hive-referral` author, the pair-conversation key, the question and answer heads, the `ReturnAddress` a far episode's checkpoint keeps |
 | `session_log.rs` | `EventLogSessionLog` — the company journal read as a `tinyhivemind::SessionLog`, narrowed to one desk and one viewer |
 | `mcp_server.rs` | the `opencompany` MCP server (`McpHost`): JSON-RPC over Streamable HTTP on a loopback listener, `POST /internal/mcp/{company}/{runtime_agent_id}`, one bearer per agent; `attach_opencompany_mcp` fixes it on an `AgentSpec` |
 | `tools.rs` | `InFlightRegistry` (one in-flight turn per agent), the `InFlight` speech fold, `InFlightContext`, `McpToolAdapter` |

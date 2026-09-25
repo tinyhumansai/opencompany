@@ -289,10 +289,9 @@ things, so the only pooling that helps is across the boundary. With
 `[group_chat.routing.referral]` enabled, a `post` or `dm` that names a desk
 (`@#content`) or a member of another desk is decided by
 `tinyhivemind_core::referral::referral(policy, input, roster, desks)`; a
-`MessageRoute::DeskReferral{desk_id}` is enqueued once through
-`hive::referral::JournalReferralQueue` — the journal's `ReferralEnqueued` row
-keyed by `(episode, hop)` is the idempotency record — and `dispatch_referral`
-opens an episode on the target desk seeded with the question, authored
+`MessageRoute::DeskReferral{desk_id}` is enqueued once — the journal's
+`ReferralEnqueued` row keyed by `(episode, hop)` is the idempotency record —
+and an episode opens on the target desk seeded with the question, authored
 `hive-referral`.
 
 When that episode completes, its answer is appended to the origin desk under
@@ -355,8 +354,7 @@ Gone with the quorum hive: the `hive-report` and `hive-failure` authors, the
 | `src/hive/episode_store.rs` | `EpisodeStateSaved`, resume and replay |
 | `src/hive/routing.rs` | `[group_chat.routing]` → `EffectiveRouting` → `RoutingPolicy`, the overlay, `RoutingPlanDto` |
 | `src/hive/jev.rs` | `TinyHumansSystemOne`, `jev_router` |
-| `src/hive/referral.rs` | `JournalReferralQueue`, `dispatch_referral`, the answer's return |
-| `src/hive/prompt.rs` | the sentinel, the delta, the fence |
+| `src/hive/referral.rs` | the reserved `hive-referral` author, the pair key, the question and answer heads, `ReturnAddress` |
 | `src/hive/session_log.rs` | `EventLogSessionLog` — the journal as a `SessionLog` |
 | `src/hive/mcp_server.rs`, `tools.rs` | the `opencompany` MCP server, `InFlightRegistry`, the speech fold, `McpToolAdapter` |
 | `src/harness/openhuman_runtime.rs` | the one `Runtime` |
