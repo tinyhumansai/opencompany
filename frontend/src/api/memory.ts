@@ -226,6 +226,15 @@ export interface MemoryEngineState {
    */
   unreachableFamilies?: string[];
   /**
+   * Optional families the engine advertised and refused when probed.
+   *
+   * Reported, never blocking: an engine that cannot serve `people` still
+   * serves every cycle. What it does cost is real — the agent tools those
+   * families back are offered and fail on their first call — so it belongs on
+   * the page rather than only in a log.
+   */
+  degradedFamilies?: string[];
+  /**
    * Families that did not answer inside the probe budget. Not the same verdict
    * as refused — the engine may simply be loaded.
    */
@@ -264,6 +273,8 @@ export interface EngineProbe {
   capabilities: string[];
   /** Mandatory families the candidate refused. Apply will reject these. */
   unreachableFamilies?: string[];
+  /** Optional families it refused. Reported, but does not block a bind. */
+  degradedFamilies?: string[];
   /** Families that were merely slow. Reported, but does not block a bind. */
   slowFamilies?: string[];
   detail?: string;
