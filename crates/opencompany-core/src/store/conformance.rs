@@ -38,7 +38,7 @@ use crate::ports::run_output::{
     MAX_RUN_OUTPUTS_PER_COMPANY, WorkflowRunOutputRecord, WorkflowRunOutputStore,
 };
 use crate::ports::sessions::{SessionKind, SessionRecord, SessionStore};
-use crate::ports::skills_state::{SkillSource, SkillState, SkillStateStore};
+use crate::ports::skills_state::{SkillInstall, SkillSource, SkillState, SkillStateStore};
 use crate::ports::store::CompanyStore;
 use crate::ports::tasks::{TaskOrigin, TaskRecord, TaskStore, TaskTitle};
 use crate::ports::types::{
@@ -4229,6 +4229,8 @@ pub async fn assert_notification_store(notes: Arc<dyn NotificationStore>) {
 }
 
 pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
+    use crate::ports::types::{Actor, ActorKind};
+
     let alpha = CompanyId::new("alpha");
     let beta = CompanyId::new("beta");
     let state = |slug: &str, enabled: bool, source: SkillSource| SkillState {
@@ -4236,6 +4238,7 @@ pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
         enabled,
         source,
         custom_doc: None,
+        install: None,
     };
 
     skills
@@ -4268,6 +4271,7 @@ pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
                 enabled: true,
                 source: SkillSource::Custom,
                 custom_doc: Some("---\nname: Mine\n---\nbody".to_string()),
+                install: None,
             },
         )
         .await
@@ -4285,6 +4289,53 @@ pub async fn assert_skill_state_store(skills: Arc<dyn SkillStateStore>) {
     assert!(skills.remove(&alpha, "web-research").await.unwrap());
     assert!(!skills.remove(&alpha, "web-research").await.unwrap());
     assert_eq!(skills.list(&alpha).await.unwrap().len(), 1);
+
+    // An install's provenance round-trips whole. Every backend persists the
+    // whole delta as JSON, so a dropped digest would be a serialization bug,
+    // not a schema one — and it would leave a pin nothing can check.
+    let pinned = SkillInstall {
+        digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+        version: Some("1.2.0".to_string()),
+        installed_by: Some(Actor {
+            kind: ActorKind::Operator,
+            id: "ops@example.com".to_string(),
+        }),
+        installed_at_millis: 1_700_000_000_000,
+    };
+    skills
+        .set(
+            &alpha,
+            &SkillState {
+                slug: "pinned".to_string(),
+                enabled: true,
+                source: SkillSource::Registry,
+                custom_doc: Some("---\nname: Pinned\nversion: 1.2.0\n---\nsteps".to_string()),
+                install: Some(pinned.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let stored = skills
+        .list(&alpha)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.slug == "pinned")
+        .unwrap();
+    assert_eq!(stored.install, Some(pinned));
+
+    // A delta that installed nothing carries no pin, and reads back as none.
+    assert!(
+        skills
+            .list(&alpha)
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.slug == "my-skill")
+            .unwrap()
+            .install
+            .is_none()
+    );
 }
 
 /// Asserts the [`WorkspaceStore`] contract: isolation, create/read/write,

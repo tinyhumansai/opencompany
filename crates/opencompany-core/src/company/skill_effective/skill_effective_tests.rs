@@ -28,6 +28,7 @@ fn delta(slug: &str, enabled: bool, source: SkillSource, custom_doc: Option<&str
         enabled,
         source,
         custom_doc: custom_doc.map(str::to_string),
+        install: None,
     }
 }
 

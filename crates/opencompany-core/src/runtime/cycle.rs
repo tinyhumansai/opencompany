@@ -3000,6 +3000,7 @@ fn cycle_task_id(
             | CompanyEvent::DeskDeleted { .. }
             | CompanyEvent::DeskMembersChanged { .. }
             | CompanyEvent::DeskRoutingConfigured { .. }
+            | CompanyEvent::SkillChanged { .. }
             // Plan hive-desks, Phase 4: the episode record — brackets around
             // the `AgentReply` rows a room wrote, and the driver's checkpoint.
             // Records of a round that already ran, not stimuli for a cycle.
@@ -3255,6 +3256,7 @@ fn cycle_conversation(
             | CompanyEvent::DeskDeleted { .. }
             | CompanyEvent::DeskMembersChanged { .. }
             | CompanyEvent::DeskRoutingConfigured { .. }
+            | CompanyEvent::SkillChanged { .. }
             // Plan hive-desks, Phase 4: the episode record — brackets around
             // the `AgentReply` rows a room wrote, and the driver's checkpoint.
             // Records of a round that already ran, not stimuli for a cycle.

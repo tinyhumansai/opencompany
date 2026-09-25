@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::company::{CompanyManifest, POLICY_MODES, Policy};
 use crate::ports::ids::{agent_slug, generate_id, now_millis};
+use crate::ports::skills_state::SkillTier;
 use crate::ports::workflow_runner::{
     DeliveryReport, WorkflowBlockedNode, WorkflowRunApprovalRow, WorkflowRunBoardRow,
 };
@@ -269,6 +270,19 @@ pub enum ActorKind {
     /// Fieldless on purpose: `ActorKind` is `Copy`, and a variant carrying a
     /// `String` would silently take that away from every existing holder.
     User,
+}
+
+/// What happened to a skill delta in a [`CompanyEvent::SkillChanged`] row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillChange {
+    /// A skill was installed from the shared registry or authored in the
+    /// console.
+    Installed,
+    /// An existing install was re-pinned to the library's current document.
+    Updated,
+    /// The delta was removed.
+    Removed,
 }
 
 /// An identified actor.
@@ -1689,6 +1703,45 @@ pub enum CompanyEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<Actor>,
     },
+    /// A skill delta was installed, re-pinned to the library's current
+    /// document, or removed.
+    ///
+    /// Journaled because nothing else answers "when did this skill change, and
+    /// who changed it". The store holds one row per slug and rewrites it in
+    /// place, so an install, every later update and the uninstall all land on
+    /// the same row and only the last one survives — the record of the change
+    /// exists nowhere but here.
+    ///
+    /// **The document is deliberately NOT carried**, the same rule
+    /// [`WorkflowUpdated`](Self::WorkflowUpdated) and
+    /// [`DeskRoutingConfigured`](Self::DeskRoutingConfigured) follow. A skill
+    /// body is instructions an agent will read, and the journal is one
+    /// append-only log shared by chat, audit and run history whose readers have
+    /// no business holding it. `digest` is what an audit reader actually needs:
+    /// it pins *which* document without reproducing it, and it is the same
+    /// value the install recorded, so a row and a pin can be matched.
+    ///
+    /// Permanent under the retention rule, for the reason its structural
+    /// siblings above are: it is evidence, and low-cardinality by construction
+    /// because an operator authors these by hand.
+    SkillChanged {
+        /// The skill's slug.
+        slug: String,
+        /// What happened to it.
+        change: SkillChange,
+        /// The trust tier the skill carried at the moment of the change, so a
+        /// reader can tell a library install from a document the client wrote
+        /// without resolving the slug against a registry that has since moved.
+        tier: SkillTier,
+        /// Lowercase-hex SHA-256 of the document written. `None` on a removal,
+        /// which writes no document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+        /// Who did it, when known. `None` from a surface that carries no
+        /// attributed actor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<Actor>,
+    },
     /// A desk opened an episode: a message on a desk of two or more was
     /// routed to seats, and those seats will now run in rounds until every
     /// assigned one calls `complete_episode` (plan hive-desks, Phase 4).
@@ -2692,6 +2745,7 @@ impl CompanyEvent {
             Self::DeskDeleted { .. } => "DeskDeleted",
             Self::DeskMembersChanged { .. } => "DeskMembersChanged",
             Self::DeskRoutingConfigured { .. } => "DeskRoutingConfigured",
+            Self::SkillChanged { .. } => "SkillChanged",
             Self::EpisodeOpened { .. } => "EpisodeOpened",
             Self::RoundStarted { .. } => "RoundStarted",
             Self::RoundCommitted { .. } => "RoundCommitted",
@@ -2863,6 +2917,7 @@ impl CompanyEvent {
             | Self::DeskDeleted { .. }
             | Self::DeskMembersChanged { .. }
             | Self::DeskRoutingConfigured { .. }
+            | Self::SkillChanged { .. }
             // Plan hive-desks, Phase 4: the episode record. Together with the
             // `AgentReply` rows they bracket these ARE what a room did, and
             // `EpisodeStateSaved` is the checkpoint a resume reads.
@@ -6726,6 +6781,9 @@ mod tests_overlay_and_run;
 #[cfg(test)]
 #[path = "types_run_events_tests.rs"]
 mod tests_run_events;
+#[cfg(test)]
+#[path = "types_skill_events_tests.rs"]
+mod tests_skill_events;
 #[cfg(test)]
 #[path = "types_task_discussion_effects_tests.rs"]
 mod tests_task_discussion_effects;

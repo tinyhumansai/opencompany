@@ -28,6 +28,7 @@ fn delta(slug: &str, enabled: bool, custom_doc: Option<&str>) -> SkillState {
             SkillSource::Company
         },
         custom_doc: custom_doc.map(str::to_string),
+        install: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn registry_delta(slug: &str, custom_doc: &str) -> SkillState {
         enabled: true,
         source: SkillSource::Registry,
         custom_doc: Some(custom_doc.to_string()),
+        install: None,
     }
 }
 
@@ -441,6 +443,7 @@ async fn console_custom_docs_surface_content_through_read_tools() {
              # Web Research\n\nBODY-RESEARCH-MARKER\n"
                 .to_string(),
         ),
+        install: None,
     };
     // Console-authored custom skill with an empty body (frontmatter only).
     let empty_body = SkillState {
@@ -448,6 +451,7 @@ async fn console_custom_docs_surface_content_through_read_tools() {
         enabled: true,
         source: SkillSource::Custom,
         custom_doc: Some("---\nname: Quick Note\ndescription: Jot a quick note\n---\n".to_string()),
+        install: None,
     };
 
     let eff =

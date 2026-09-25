@@ -2476,3 +2476,6 @@ where
 #[cfg(test)]
 #[path = "fs_ops_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "fs_ops_skill_provenance_tests.rs"]
+mod tests_skill_provenance;

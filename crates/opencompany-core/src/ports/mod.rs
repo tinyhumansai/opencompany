@@ -85,7 +85,7 @@ pub use runs::{
 pub use schedule_fires::ScheduleFireStore;
 pub use secrets::SecretStore;
 pub use sessions::{SessionKind, SessionRecord, SessionStore};
-pub use skills_state::{SkillSource, SkillState, SkillStateStore};
+pub use skills_state::{SkillInstall, SkillSource, SkillState, SkillStateStore, SkillTier};
 pub use store::CompanyStore;
 pub use tasks::{TaskOrigin, TaskRecord, TaskStore};
 pub use tools::ToolProvider;

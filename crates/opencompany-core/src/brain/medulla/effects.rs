@@ -10,9 +10,10 @@
 use serde_json::{Value, json};
 
 use crate::ports::now_millis;
+use crate::ports::skills_state::SkillTier;
 use crate::ports::types::{
     Attachment, ChunkAddr, CompanyEvent, ContextChunk, ContextOp, ContextOpResult, Effect,
-    EffectGroup, LedgerEntry, OnboardingStep, OutboundMessage, Verdict,
+    EffectGroup, LedgerEntry, OnboardingStep, OutboundMessage, SkillChange, Verdict,
 };
 
 use super::wire::{EffectFrame, Role, WireEvent};
@@ -552,6 +553,18 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             },
             "desk.routing_configured",
         ),
+        CompanyEvent::SkillChanged {
+            slug, change, tier, ..
+        } => (
+            Role::System,
+            "company".to_string(),
+            format!(
+                "{} {slug} ({})",
+                skill_change_word(*change),
+                tier_word(*tier)
+            ),
+            "skill.changed",
+        ),
         // Plan hive-desks, Phase 4: the episode record. Structural only, like
         // every arm here — ids, seats and the closed-vocabulary reason; the
         // utterances themselves ride on the `AgentReply` rows they bracket.
@@ -912,6 +925,25 @@ pub(crate) fn verdict_word(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::Approve => "approved",
         Verdict::Deny => "denied",
+    }
+}
+
+/// The lowercase wire word for what happened to a skill.
+fn skill_change_word(change: SkillChange) -> &'static str {
+    match change {
+        SkillChange::Installed => "installed",
+        SkillChange::Updated => "updated",
+        SkillChange::Removed => "removed",
+    }
+}
+
+/// The lowercase wire word for a skill's trust tier.
+fn tier_word(tier: SkillTier) -> &'static str {
+    match tier {
+        SkillTier::Builtin => "builtin",
+        SkillTier::Company => "company",
+        SkillTier::Registry => "registry",
+        SkillTier::Custom => "custom",
     }
 }
 

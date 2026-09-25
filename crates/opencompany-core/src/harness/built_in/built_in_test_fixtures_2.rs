@@ -188,6 +188,7 @@ pub(super) fn custom_skill(slug: &str, enabled: bool, body: &str) -> SkillState 
         enabled,
         source: crate::ports::skills_state::SkillSource::Custom,
         custom_doc: Some(body.to_string()),
+        install: None,
     }
 }
 

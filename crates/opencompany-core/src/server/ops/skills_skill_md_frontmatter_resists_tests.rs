@@ -76,6 +76,7 @@ fn a_disabled_global_is_listed_as_disabled_rather_than_hidden() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            install: None,
         }],
     );
 
@@ -112,6 +113,7 @@ fn the_list_unions_bundles_with_deltas() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            install: None,
         },
         SkillState {
             slug: "my-skill".to_string(),
@@ -120,6 +122,7 @@ fn the_list_unions_bundles_with_deltas() {
             custom_doc: Some(
                 "---\nname: My Skill\ndescription: Does a thing\n---\n# body\n".to_string(),
             ),
+            install: None,
         },
     ];
 
@@ -173,6 +176,7 @@ fn the_rest_list_and_the_graphql_resolver_agree() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            install: None,
         },
         SkillState {
             slug: "onboard".to_string(),
@@ -182,6 +186,7 @@ fn the_rest_list_and_the_graphql_resolver_agree() {
                 "---\nname: Onboard v2\ndescription: Rewritten\ncategory: Ops\nversion: 3.0.0\n---\n# v2\n"
                     .to_string(),
             ),
+            install: None,
         },
     ];
 
@@ -231,6 +236,7 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
             enabled: false,
             source: SkillSource::Company,
             custom_doc: None,
+            install: None,
         },
         SkillState {
             slug: "my-skill".to_string(),
@@ -239,6 +245,7 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
             custom_doc: Some(
                 "---\nname: My Skill\ndescription: Does a thing\n---\n# body\n".to_string(),
             ),
+            install: None,
         },
     ];
 

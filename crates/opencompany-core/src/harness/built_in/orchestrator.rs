@@ -96,7 +96,8 @@ use crate::ports::tasks::{
     TaskStore, column_label, is_board_column,
 };
 use crate::ports::types::{
-    CompanyEvent, CompanyId, EventSeq, OnboardingStep, OverlayAgent, WorkflowNodeStatus,
+    CompanyEvent, CompanyId, EventSeq, OnboardingStep, OverlayAgent, SkillChange,
+    WorkflowNodeStatus,
 };
 use crate::ports::{CompanyStore, WorkflowRun, WorkflowRunner};
 
@@ -2560,6 +2561,14 @@ fn summarize_event(event: &CompanyEvent) -> String {
             } else {
                 "desk routing configured".into()
             }
+        }
+        CompanyEvent::SkillChanged { slug, change, .. } => {
+            let what = match change {
+                SkillChange::Installed => "installed",
+                SkillChange::Updated => "updated",
+                SkillChange::Removed => "removed",
+            };
+            format!("skill {what}: {slug}")
         }
         // Plan hive-desks: the episode ledger. Structural only — ids and
         // counts, never an utterance — for the same reason every arm here is.

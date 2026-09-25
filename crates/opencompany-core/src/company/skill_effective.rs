@@ -102,6 +102,7 @@ pub fn globals_skill_disables(disable: &[String]) -> Vec<SkillState> {
             // reports the skill the way it would have been reported unopposed.
             source: SkillSource::Company,
             custom_doc: None,
+            install: None,
         })
         .collect()
 }
