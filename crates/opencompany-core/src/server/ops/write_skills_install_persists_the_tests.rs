@@ -118,7 +118,14 @@ async fn skills_install_falls_back_to_client_metadata_when_no_registry_is_served
         "an empty registry must not 404 every install"
     );
     assert_eq!(skill["name"], "Tenant Only");
-    assert_eq!(skill["source"], "registry");
+    assert_eq!(skill["source"], "custom");
+
+    let deltas = persisted_skills(&state).await;
+    let row = deltas
+        .iter()
+        .find(|s| s.slug == "tenant-only-skill")
+        .expect("the fallback persisted a row");
+    assert_eq!(row.source, crate::ports::skills_state::SkillSource::Custom);
 }
 
 /// A *configured* shared library that cannot load must not degrade to the
@@ -285,8 +292,8 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home).await;
 
-    // Install from registry, carrying the entry's metadata so the host persists
-    // a real SKILL.md the agent can act on (not a content-less slug).
+    // No shared library is served, so the install persists a SKILL.md built from
+    // the client's metadata and records it as custom.
     let (status, skill) = send(
         &state,
         "POST",
@@ -299,7 +306,7 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(skill["source"], "registry");
+    assert_eq!(skill["source"], "custom");
     assert!(skill["enabled"].as_bool().unwrap());
     // The install response reflects the persisted custom_doc (parsed back), so a
     // non-empty description proves content was stored — the fix for the agent
@@ -310,7 +317,7 @@ async fn skills_install_toggle_custom_and_builtin_uninstall_conflict() {
         "Answer a question from multiple sources with citations."
     );
 
-    // Uninstall the registry skill: 204.
+    // Uninstall the installed skill: 204.
     let (status, _) = send(
         &state,
         "POST",
