@@ -242,6 +242,7 @@ fn a_persisted_teammate_named_workflow_does_not_shadow_the_reply_author() {
             role: "Worker".to_string(),
             description: None,
             tools: Some(Vec::new()),
+            skills: None,
             model: None,
             harness: None,
         });

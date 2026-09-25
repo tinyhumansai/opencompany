@@ -714,6 +714,25 @@ pub struct Agent {
     /// key), so no existing on-disk record moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
+    /// Skill slugs this teammate may read, narrowed against the company's
+    /// effective skill set.
+    ///
+    /// Three states, spelled the same way as [`tools`](Self::tools):
+    ///
+    /// * `None` — **inherit**: every skill the company has enabled. The default,
+    ///   and how every record written before this field existed deserializes, so
+    ///   promoting it moves no existing manifest.
+    /// * `Some(vec![])` — an **explicit no-skills** scope: this teammate gets no
+    ///   catalogue and no skill read tools.
+    /// * `Some(slugs)` — **narrow** to those slugs, intersected with the
+    ///   company's effective set at roster-build time.
+    ///
+    /// The intersection is narrow-only: a scope can never re-enable a skill the
+    /// company disabled. Entries are exact slugs — unlike `tools`, which globs
+    /// over a namespace, a slug is a flat identifier, so a prefix would silently
+    /// reach a skill installed later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
     /// Desks this agent may hand work on to (issue #176).
     ///
     /// Every roster agent carries `spawn_task` + `delegate_to_desk` +

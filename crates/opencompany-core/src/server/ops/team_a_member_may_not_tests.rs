@@ -464,6 +464,7 @@ async fn removing_an_overlay_teammate_at_the_operator_id_keeps_the_feed_diverted
             role: "Chief of Staff".to_string(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });

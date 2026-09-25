@@ -112,6 +112,7 @@ async fn ensure_rebuilds_when_an_overlay_agent_is_added() {
         role: "Growth Lead".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

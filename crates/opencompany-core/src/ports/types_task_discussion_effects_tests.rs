@@ -430,6 +430,7 @@ fn is_roster_agent_covers_manifest_and_overlay() {
         role: "Growth".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -468,6 +469,7 @@ fn overlay_agent_tools_three_state_serde_round_trip() {
         role: "r".into(),
         description: None,
         tools: Some(Vec::new()),
+        skills: None,
         model: None,
         harness: None,
     };
@@ -489,6 +491,7 @@ fn overlay_agent_tools_three_state_serde_round_trip() {
         role: "r".into(),
         description: None,
         tools: Some(vec!["docs.*".into(), "email".into()]),
+        skills: None,
         model: None,
         harness: None,
     };
@@ -517,6 +520,7 @@ fn add_overlay(record: &mut CompanyRecord, id: &str, name: &str) {
         role: "Worker".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

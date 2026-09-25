@@ -76,6 +76,7 @@ provider = "anthropic"                  # this agent's own {provider, model}
 model = "claude-sonnet-5"               # pair — see below. Omit both to
                                         # follow the company default.
 tools = ["docs.*", "mcp:notion"]        # grant globs — see tools.md
+skills = ["brand-voice"]                # exact skill slugs — see below
 delegates_to = ["creative"]             # narrow hand-offs to these desks (omit = anywhere)
 budget_usd_daily = 5.0                  # per-agent daily cap
 
@@ -151,6 +152,33 @@ it declared, plus its own `agents/<id>/` home, which stays writable regardless
 produce and revise its own work. See `src/harness/workspace_tools.rs` for the
 enforcement and why the pre-existing unconfined default is otherwise
 unchanged.
+
+### `skills`
+
+Which of the company's skills this teammate may read, in the same three states
+`tools` uses ([tools.md](tools.md)) and for the same reason: an omitted key has
+to mean *inherit* so every roster written before the key existed keeps working.
+
+| value | means |
+| --- | --- |
+| omitted | inherit — every skill the company has enabled |
+| `[]` | an explicit no-skills scope: no catalogue, no skill read tools |
+| `["brand-voice"]` | narrow to those slugs |
+
+Two differences from `tools`. Entries are **exact slugs**, never globs — a tool
+grant globs over a namespace with real hierarchy, while a slug is a flat
+identifier, so a prefix would silently admit a skill installed after the scope
+was written. And there is no desk level: desks carry a `tools` ceiling and no
+skills, so the resolution is the company's enabled set intersected with this
+list. It is narrow-only either way — a scope can never re-enable a skill the
+company disabled.
+
+The scope is applied **before** the agent's skill tree is written, so a skill
+outside it is never materialized: the catalogue and the three read tools are
+derived from that tree and nothing else, and so cannot disagree with it. A slug
+the company does not have is dropped with a warning naming the agent, rather
+than failing the load, so retiring a skill does not brick a manifest that still
+names it. See [manifest-semantics.md](manifest-semantics.md).
 
 ### `ledgers`
 
@@ -367,87 +395,10 @@ nothing, which is worse than its absence.
 
 ## What a turn is allowed to spend
 
-Two ceilings bound one turn, and they bound different things.
-
-### Tool iterations — 25
-
-A turn may run **25** tool-calling rounds before the runtime pauses it and hands
-the operator a resumable checkpoint instead of an answer.
-
-The number is stated by this crate, not inherited. It used to be inherited: the
-agent builder was never told a cap, so every teammate silently ran on the
-vendored default of ten. Ten is a summariser's budget. A product manager asked
-for a feature spec reads the standards, reads the release checklist, reads the
-nearest prior spec, drafts, and publishes — and spends the ten before delivering
-anything, which is the incident the raise comes from.
-
-Twenty-five is ~2.5x headroom over that shape without the 5x of the runtime's
-"extended" 50. **Cost grows faster than the multiplier**: each iteration re-sends
-a transcript longer than the last one's, so 2.5x the rounds is more than 2.5x the
-spend. That is why the ceiling is the smallest number that covers the observed
-work rather than the largest one that would be safe.
-
-It is a **global** default, deliberately: it reaches every shipped template
-without editing each one. A teammate cannot raise or lower it from its manifest
-today.
-
-**Reaching it is a pause, not a failure.** The runtime stops the tool loop, asks
-the model once more (with tools withheld) for a resumable "Done so far / Next
-steps" checkpoint, and returns that as an ordinary successful reply. There is no
-error to catch and no error to match on, which is precisely why a capped turn
-used to be invisible — the operator read a tidy plan with no deliverable behind
-it and no way to tell the agent had been cut off mid-task. So the harness reads
-the runtime's cap flag while the turn's agent lock is still held and carries it
-out on the turn's outcome, OR'd across every seat turn of the round behind one
-operator message. When any of them paused, the operator gets a **second,
-unauthored bubble** after the reply saying the turn stopped at its step limit,
-that nothing errored, and that replying "continue" asks the agent to pick up
-from there. It is a separate bubble rather than an addition to the reply because
-the reply — and only the reply — is written back to the context store as memory;
-appending would file the platform's notice as something the agent said and
-recall it into later turns. See `src/harness/built_in/mod.rs`
-(`TurnOutcome::hit_iteration_cap`), `src/hive/round.rs` for the fold across a
-round, and `src/harness/built_in/brain.rs` for the notice.
-
-### In-turn spend — armed only for a teammate with a declared daily budget
-
-The company's other two spend controls — the plan-level token ceiling and a
-teammate's `budget_usd_daily` — are both **pre-dispatch**. They decide whether a
-turn may *start*; neither can see inside one. So a turn that begins one cent
-under a cap can finish arbitrarily far over it, and raising the iteration ceiling
-widens that window in proportion.
-
-A running turn is therefore additionally metered by an in-turn brake — openhuman's
-`BudgetStopHook` — an after-call threshold check installed between iterations.
-It records each completed model call, then compares cumulative spend
-(`TurnCost::total_usd()`) against the cap and pauses the turn before the next
-provider call once spend is at or beyond it. The brake is installed **only** for
-a teammate who declares a `budget_usd_daily` cap. Because the check runs after a
-call has already been charged, a crossing call lands on the ledger before the
-next one is prevented — the turn can finish at or slightly above the cap, so the
-worst-case overshoot is bounded by a single model call rather than an entire
-turn ("one call" rather than "one turn, of unknown size").
-
-This mirrors the vendored runtime's own posture rather than inventing one.
-OpenHuman constructs `BudgetStopHook` nowhere — it is an available primitive, not
-an applied policy — and the only hook it installs is `GoalBudgetStopHook`, opt-in
-and tied to a user-declared goal. Its own docs are explicit: *"we never
-hard-stop a user-present turn that isn't actively burning a live budget."* So a
-teammate with no declared budget gets no in-turn brake, and there is deliberately
-no blanket per-turn dollar figure that no operator can see or change (it would
-not be in `company.toml` and not in the console). Four shipped templates do set
-`budget_usd_daily` — three agents in `signals_opportunity_studio` and one in
-`e2e_harness` — so the opt-in path is genuinely exercised, not dead code.
-
-Since a budget halt and an iteration-cap pause are different outcomes, the
-runtime reports them separately: `TurnOutcome::hit_iteration_cap` is read off
-the turn's progress stream (`progress_pump::hit_iteration_cap`), which stays
-`false` for a hook-driven stop — the run paused below the 25-round ceiling, so
-the cap predicate never held. A cap pause means the teammate ran out of rounds
-with work still to do and can be resumed via the "continue" bubble above; a
-budget halt means it ran out of money, returns whatever reply the model produced
-before the hook fired, and gets no such bubble today. Anything that renders one
-to an operator must not label it with the other.
+The 25-round tool-iteration ceiling and the in-turn spend brake moved to
+[agents-turn-limits.md](agents-turn-limits.md) when this file reached the
+500-line cap. What a teammate *is* stays here; what happens when one of its
+turns runs out lives there.
 
 ## `classes`
 
@@ -484,8 +435,7 @@ rename can switch off is not a control.
 | Routing table and exclusions | `src/company/context_routing.rs` |
 | Roster type and constants | `src/company/types.rs` |
 | Manifest wiring and validation | `src/company/manifest.rs` |
-| Iteration cap, stated on every built agent | `src/harness/build.rs` |
-| In-turn spend brake, installed per turn | `src/harness/mod.rs` |
+| Skill scope resolution, shared with the harness | `src/runtime/builder.rs` |
 
 The first three are **always compiled**, though the harness that spends the
 prompt is behind the `openhuman` feature. Composition, clamping and the

@@ -216,6 +216,7 @@ fn an_operator_added_teammate_is_listed_by_name_and_role() {
             description: Some("Write the words.".to_string()),
             provider: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });

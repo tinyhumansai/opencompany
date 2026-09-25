@@ -152,7 +152,7 @@ describe("SkillsView authority", () => {
     // Checked before switching tabs — the Installed panel unmounts once the
     // Registry tab takes its place.
     expect(container.textContent).toContain("SEO audit");
-    expect(container.textContent).toContain("Agents can read this");
+    expect(container.textContent).toContain("Available for your agents to read");
 
     await openRegistryTab();
     expect(

@@ -194,6 +194,7 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
             role: "Head of Support".to_string(),
             description: Some("Answers customer mail and escalates refunds.".to_string()),
             tools: Some(vec!["docs.*".to_string(), "web".to_string()]),
+            skills: None,
             // Both set, so a backend that drops either fails here — the same
             // reason `tools` is a narrowed `Some` here, `None` on the next, and
             // an explicit empty `Some(vec![])` on the third.
@@ -209,6 +210,7 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
             // `None` = inherit the standard company-wide grant. Must rehydrate
             // as `None`, never as `Some(vec![])` (which since #1804 is deny-all).
             tools: None,
+            skills: None,
             // The absent half of the pair: `None` must rehydrate as `None`,
             // never as an empty string pinning the teammate to a nameless
             // harness.
@@ -225,6 +227,7 @@ fn sample_overlay_agents() -> Vec<crate::ports::types::OverlayAgent> {
             // opposite of `None`. Must survive as `Some(vec![])`, never collapse
             // to `None` (which would silently re-grant the whole company belt).
             tools: Some(Vec::new()),
+            skills: None,
             model: None,
             harness: None,
         },
@@ -292,6 +295,10 @@ fn sample_agent_overrides() -> Vec<crate::ports::types::AgentOverride> {
         role: Some("Chief Vibes".to_string()),
         description: Some(String::new()),
         tools: Some(Some(vec!["docs.*".to_string()])),
+        // The scope round-trips in its three-state form for the same reason
+        // `tools` does: an explicit no-skills scope that came back as `None`
+        // would silently turn a deny-all into every enabled skill.
+        skills: Some(Some(vec!["brand-voice".to_string()])),
         instructions: Some("Be exceedingly concise and decisive.".to_string()),
         // A dropped avatar reads as "nobody has chosen", so the teammate's face
         // would silently revert to the hashed default on the next restart — the

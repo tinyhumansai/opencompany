@@ -45,6 +45,7 @@ fn requested_grants_reads_overlay_then_manifest_then_empty() {
         role: "Researcher".to_string(),
         description: None,
         tools: Some(vec!["docs.*".to_string()]),
+        skills: None,
         model: None,
         harness: None,
     });
@@ -56,6 +57,7 @@ fn requested_grants_reads_overlay_then_manifest_then_empty() {
         description: None,
         // `None` = no line of its own → the standard company-wide grant.
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -67,6 +69,7 @@ fn requested_grants_reads_overlay_then_manifest_then_empty() {
         description: None,
         // `Some(vec![])` = an explicit deny-all since #1804, distinct from None.
         tools: Some(Vec::new()),
+        skills: None,
         model: None,
         harness: None,
     });

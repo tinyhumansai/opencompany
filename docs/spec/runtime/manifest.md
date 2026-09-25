@@ -33,6 +33,8 @@ description = "Write ads, pages, and campaign copy."
 # NEW optional per-agent keys:
 tier = "reasoning"                 # cognition tier hint (see glossary)
 tools = ["docs.*", "email.send"]   # tool grant globs
+skills = ["brand-voice"]           # skill slugs this teammate may read;
+                                   # omit for every enabled skill
 delegates_to = ["research"]        # narrow hand-offs to these desks (omit = anywhere)
 budget_usd_daily = 5.0             # per-agent daily spend cap (UTC day)
 prompt = "Write for the reader."   # appended to the generated persona
@@ -147,6 +149,9 @@ approval_ttl_hours = 24            # default 24; how long a parked approval
 
 [place]                            # see company-as-agent/
 discoverable = false               # default false: going public is opt-in
+# `[place].skills` are priced A2A capabilities this company SELLS, served at
+# `GET /a2a/{handle}/skill.md`. Unrelated to the `SKILL.md` bundles an agent
+# reads, which `[[agent]].skills` above scopes — see manifest-semantics.md.
 skills = [
   { id = "seo.audit", price_usd = "25.00", description = "Full SEO audit" },
 ]

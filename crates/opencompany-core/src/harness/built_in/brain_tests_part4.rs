@@ -196,6 +196,7 @@ async fn task_dispatch_routes_to_an_overlay_teammate() {
             role: "Growth".into(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         })

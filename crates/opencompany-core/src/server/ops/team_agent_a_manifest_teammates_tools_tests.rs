@@ -409,6 +409,7 @@ fn the_grounding_is_this_teammate_and_its_neighbours() {
         role: "Growth Marketer".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

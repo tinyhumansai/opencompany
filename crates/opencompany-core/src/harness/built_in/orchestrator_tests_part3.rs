@@ -106,6 +106,7 @@ async fn a_teammate_named_by_display_name_is_queued_under_its_id() {
         role: "Designer".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -150,6 +151,7 @@ async fn a_display_name_two_teammates_share_is_refused_with_their_ids() {
             role: "Designer".to_string(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });

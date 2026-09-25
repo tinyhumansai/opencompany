@@ -207,6 +207,84 @@ pub fn resolve(
     Ok(entries.into_values().collect())
 }
 
+/// One agent's slice of [`resolve`]: the company's effective set narrowed to
+/// the skills that agent's scope admits.
+///
+/// `None` admits every enabled skill, which is what every company had before a
+/// scope could be written, so an unscoped roster materializes exactly what it
+/// did before.
+///
+/// Disabled entries are dropped rather than carried through. [`resolve`] reports
+/// them so the console can render the switch that turns them back on; an agent
+/// has no such switch, and the harness skips them anyway.
+///
+/// The narrowing itself is
+/// [`agent_effective_skills`](crate::runtime::builder::agent_effective_skills),
+/// the same function the agent detail route reports from, so what the console
+/// says a teammate has and what the harness writes for it cannot drift.
+///
+/// A scope entry the company does not have enabled is dropped — retiring a
+/// skill must not brick a manifest that still names it — but never silently:
+/// [`unmet_scope_slugs`] names the agent and the entries in a warning, so a
+/// typo in `company.toml` reads as a typo instead of as a scope that quietly
+/// confers nothing.
+pub fn resolve_for_agent(
+    source_dir: Option<&Path>,
+    registry: &[SkillDoc],
+    deltas: &[SkillState],
+    agent: &str,
+    agent_skills: Option<&[String]>,
+) -> Result<Vec<EffectiveSkill>> {
+    let effective = resolve(source_dir, registry, deltas)?;
+    let enabled: Vec<String> = effective
+        .iter()
+        .filter(|skill| skill.enabled)
+        .map(|skill| skill.slug.clone())
+        .collect();
+    let unmet = unmet_scope_slugs(&enabled, agent_skills);
+    if !unmet.is_empty() {
+        tracing::warn!(
+            "[skills] dropping skill scope entries for agent '{agent}' that this company does \
+             not have enabled: {}",
+            unmet.join(", ")
+        );
+    }
+    let scoped: HashSet<String> =
+        crate::runtime::builder::agent_effective_skills(&enabled, agent_skills)
+            .into_iter()
+            .collect();
+    Ok(effective
+        .into_iter()
+        .filter(|skill| scoped.contains(&skill.slug))
+        .collect())
+}
+
+/// The entries of an agent's skill scope that `company_enabled` does not carry
+/// — exactly what [`resolve_for_agent`] drops, in the order the scope wrote
+/// them and without repeats.
+///
+/// Separate from the warning it feeds so the drop set is assertable rather than
+/// only observable in a log line, and so a reader that wants to *report* the
+/// set has one derivation to share rather than a second one to invent.
+///
+/// `None` is the inherit state: it names nothing, so it drops nothing. An empty
+/// list is a deliberate no-skills scope, which likewise names nothing.
+pub fn unmet_scope_slugs(
+    company_enabled: &[String],
+    agent_skills: Option<&[String]>,
+) -> Vec<String> {
+    let Some(slugs) = agent_skills else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    slugs
+        .iter()
+        .filter(|slug| !company_enabled.iter().any(|have| have == *slug))
+        .filter(|slug| seen.insert(slug.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The document a delta contributes, or `None` when it contributes none.
 fn delta_content(delta: &SkillState, registry: &[SkillDoc]) -> Option<SkillContent> {
     let src = delta.custom_doc.as_deref()?;

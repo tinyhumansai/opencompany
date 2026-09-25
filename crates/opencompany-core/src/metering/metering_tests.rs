@@ -13,6 +13,7 @@ fn roster_uses_role_then_overlay_name() {
             tier: None,
             harness: None,
             tools: None,
+            skills: None,
             delegates_to: vec![],
             context: None,
             budget_usd_daily: None,
@@ -34,6 +35,7 @@ fn roster_uses_role_then_overlay_name() {
             tier: None,
             harness: None,
             tools: None,
+            skills: None,
             delegates_to: vec![],
             context: None,
             budget_usd_daily: None,
@@ -53,6 +55,7 @@ fn roster_uses_role_then_overlay_name() {
         role: "Creative".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     }];

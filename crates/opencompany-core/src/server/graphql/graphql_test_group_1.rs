@@ -375,6 +375,7 @@ async fn team_reports_the_effective_cap_and_its_attribution() {
         role: "Growth".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -462,6 +463,7 @@ async fn team_keeps_zero_explicit_null_and_manifest_only_caps_distinct() {
         role: "Growth".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -472,6 +474,7 @@ async fn team_keeps_zero_explicit_null_and_manifest_only_caps_distinct() {
         role: "Ops".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

@@ -1734,6 +1734,7 @@ export interface AgentDetailDto {
    */
   isOrchestrator: boolean;
   tools: AgentToolsDto;
+  skills: AgentSkillsDto;
   desks: AgentDeskDto[];
   inboxEnabled: boolean;
   /**
@@ -1779,6 +1780,27 @@ export interface AgentToolsDto {
    */
   deskCeilingActive: boolean;
   effective: string[];
+}
+
+/**
+ * An agent's skill scope against the company's enabled set.
+ *
+ * `requested` is three-state exactly like {@link AgentToolsDto.requested}:
+ * `null` **inherits** every enabled skill, `[]` is a deliberate **no-skills**
+ * scope, and a non-empty array **narrows**. A surface that treats `null` and
+ * `[]` alike reports the opposite of the truth for exactly those agents.
+ *
+ * A slug in `requested` but missing from `effective` was asked for and not
+ * granted, because the company does not have it enabled — the same
+ * asked-for-but-dropped shape the tool grant has.
+ */
+export interface AgentSkillsDto {
+  requested: string[] | null;
+  /** The company's enabled set — the ceiling, and what the picker offers. */
+  companyAvailable: string[];
+  effective: string[];
+  /** Whether an operator override sets this scope rather than the manifest. */
+  overridden: boolean;
 }
 
 /** A desk this agent sits on, and whether it leads it. */
@@ -1849,6 +1871,13 @@ export interface EditAgentInput {
    * re-scope a grant the operator did not touch.
    */
   tools?: string[] | null;
+  /**
+   * The teammate's own skill scope, the same four-state wire shape as `tools`:
+   * `undefined` leaves it alone, `null` resets it to every enabled skill, `[]`
+   * is a deliberate no-skills scope, and a non-empty array narrows. Entries are
+   * exact slugs — the host refuses a wildcard.
+   */
+  skills?: string[] | null;
 }
 
 /** One declared or detected harness. */

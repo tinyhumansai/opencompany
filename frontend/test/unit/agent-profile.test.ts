@@ -23,6 +23,7 @@ function agent(over: Partial<AgentDetailDto> = {}): AgentDetailDto {
     editable: ["name", "role", "description"],
     isOrchestrator: false,
     tools: { requested: null, companyAllow: ["workspace.*"], deskAllow: [], deskCeilingActive: false, effective: ["workspace.*"] },
+    skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
     desks: [],
     inboxEnabled: false,
     ...over,
@@ -105,6 +106,7 @@ describe("what the panel says an agent is", () => {
           deskCeilingActive: false,
           effective: ["workspace.*"],
         },
+        skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
       }),
     );
     expect(profile.tools.standardGrant).toBe(false);

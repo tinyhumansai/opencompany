@@ -34,6 +34,7 @@ function detail(over: Partial<AgentDetailDto> = {}): AgentDetailDto {
     editable: ["harness", "model"],
     isOrchestrator: false,
     tools: { requested: null, companyAllow: ["*"], deskAllow: [], deskCeilingActive: false, effective: [] },
+    skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
     desks: [],
     inboxEnabled: false,
     ...over,

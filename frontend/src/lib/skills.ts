@@ -44,17 +44,24 @@ export const CATEGORY_STYLES: Record<SkillCategory, string> = {
  */
 export const SKILLS_READ_ONLY_NOTE =
   "Skills are reference material your agents read — playbooks they follow, not buttons they press. " +
-  "Enabling one puts it in front of every agent; executing a saved automation stays the orchestrator's job.";
+  "Enabling one makes it available to your agents, and each teammate can be scoped to a subset on its own page; " +
+  "executing a saved automation stays the orchestrator's job.";
 
 /**
  * What an installed skill's on/off state means for the company's teammates.
  *
- * Deliberately phrased as reach ("can read it") rather than capability ("can use
- * it"): the switch decides whether a skill is visible to a desk agent, and never
- * whether one can execute it.
+ * Phrased as reach ("available to read") rather than capability ("can use it"):
+ * the switch decides whether a skill is visible to an agent, never whether one
+ * can execute it.
+ *
+ * It does not say *every* agent, because that stopped being true once a
+ * teammate could be scoped to a subset. This page has no roster, so it cannot
+ * name which teammates hold a given skill — the teammate's own page answers
+ * that. Claiming "every agent" here would be false for exactly the companies
+ * that bothered to scope.
  */
 export function skillReachLabel(enabled: boolean): string {
-  return enabled ? "Agents can read this" : "Hidden from agents";
+  return enabled ? "Available for your agents to read" : "Hidden from agents";
 }
 
 /**

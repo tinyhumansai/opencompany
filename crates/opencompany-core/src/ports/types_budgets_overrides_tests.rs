@@ -53,6 +53,7 @@ fn an_overlay_teammate_can_be_capped() {
         role: "Growth".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -274,6 +275,7 @@ fn effective_avatar_answers_for_an_overlay_teammate() {
         role: "Writer".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -490,6 +492,7 @@ fn an_overlay_agent_round_trips_its_provider() {
         role: "r".into(),
         description: None,
         tools: None,
+        skills: None,
         model: Some("test-model-large".to_string()),
         harness: None,
     };

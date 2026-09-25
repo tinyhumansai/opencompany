@@ -13,6 +13,7 @@ pub(super) fn agent(id: &str, tier: Option<&str>) -> ManifestAgent {
         tier: tier.map(str::to_string),
         harness: None,
         tools: None,
+        skills: None,
         delegates_to: Vec::new(),
         context: None,
         budget_usd_daily: None,

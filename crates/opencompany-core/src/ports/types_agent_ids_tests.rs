@@ -95,6 +95,7 @@ fn resolve_teammate_key_takes_an_id_or_a_display_name() {
         role: "Designer".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -141,6 +142,7 @@ fn resolve_teammate_key_never_lets_a_name_shadow_an_id() {
         role: "Growth".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -164,6 +166,7 @@ fn resolve_teammate_key_reports_a_name_two_teammates_answer_to() {
             role: "Designer".into(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });

@@ -100,6 +100,7 @@ fn an_overlay_teammate_resolves() {
         role: "Growth".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -137,6 +138,7 @@ fn an_overlay_member_can_lead_a_manifest_empty_desk() {
         role: "Growth".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -269,6 +271,7 @@ fn an_operator_added_teammate_resolves_by_display_name() {
         role: "Support".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -297,6 +300,7 @@ fn a_display_name_cannot_shadow_a_manifest_id() {
         role: "Support".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -321,6 +325,7 @@ fn two_teammates_sharing_a_display_name_are_refused_not_guessed() {
             role: "Support".into(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });

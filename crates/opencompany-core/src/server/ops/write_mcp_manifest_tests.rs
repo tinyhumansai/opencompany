@@ -230,6 +230,7 @@ async fn mcp_reachability_lists_reaching_agents_including_overlay() {
         role: "Assistant".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     };

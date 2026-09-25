@@ -127,11 +127,12 @@ pub(super) enum AgentSource {
 /// the others, so this is their union. It widens nothing on its own — `tools`,
 /// `model`, `harness` and `provider` stay admin-gated in [`edit_agent`], and
 /// [`EDITABLE_FIELDS_MEMBER`] is unchanged from what #1530 left it.
-const EDITABLE_FIELDS: [&str; 9] = [
+const EDITABLE_FIELDS: [&str; 10] = [
     "name",
     "role",
     "description",
     "tools",
+    "skills",
     "instructions",
     "avatar",
     "model",
@@ -218,6 +219,7 @@ pub(super) struct AgentDetailDto {
     /// off `tier` alone, so an untagged roster's real orchestrator is named.
     is_orchestrator: bool,
     tools: AgentToolsDto,
+    skills: AgentSkillsDto,
     desks: Vec<AgentDeskDto>,
     inbox_enabled: bool,
     /// The face this teammate wears, when somebody has chosen one — the same
@@ -275,6 +277,30 @@ pub(super) struct AgentToolsDto {
     desk_ceiling_active: bool,
     /// What the agent actually holds, after all three levels.
     effective: Vec<String>,
+}
+
+/// An agent's skill scope against the company's enabled set, so the resolution
+/// is legible rather than asserted.
+///
+/// Built **only** through [`agent_skills`], for the reason [`agent_tools`]
+/// gives: two surfaces deriving this independently is how a console ends up
+/// advertising a skill the harness never materializes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AgentSkillsDto {
+    /// The scope the agent asks for, in its three states: `null` = **inherit**
+    /// every enabled skill, `[]` = an **explicit no-skills** scope, `[slugs]` =
+    /// **narrow**. The console renders all three distinctly.
+    requested: Option<Vec<String>>,
+    /// The company's enabled set — the ceiling this scope narrows within, and
+    /// what the picker offers.
+    company_available: Vec<String>,
+    /// What the agent actually holds. A slug in `requested` but missing here was
+    /// asked for and not granted, because the company does not have it enabled.
+    effective: Vec<String>,
+    /// Whether an operator override is currently setting this scope, rather than
+    /// the manifest line. Reported so an override is legible instead of silent.
+    overridden: bool,
 }
 
 /// A desk this agent sits on.
@@ -502,6 +528,51 @@ pub(super) fn agent_tools(record: &CompanyRecord, agent_id: &str) -> AgentToolsD
     }
 }
 
+/// The skill slugs an agent *asks* for, resolved identically for every reader.
+///
+/// Sibling of [`requested_grants`] in shape and in reason: a manifest
+/// teammate's `[[agent]].skills` line with any operator override already
+/// applied, or an overlay teammate's own scope. Returns the field's three-state
+/// value verbatim — `None` inherits, `Some(vec![])` is a deliberate no-skills
+/// scope, `Some(slugs)` narrows.
+pub(super) fn requested_skills(record: &CompanyRecord, agent_id: &str) -> Option<Vec<String>> {
+    if let Some(agent) = record.effective_agent(agent_id) {
+        return agent.skills.clone();
+    }
+    record
+        .overlay_agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .and_then(|agent| agent.skills.clone())
+}
+
+/// One agent's skill scope against `company_enabled`, the company's effective
+/// enabled set.
+///
+/// The narrowing is [`agent_effective_skills`], the same function the harness
+/// materializes from, so the console cannot advertise a skill the agent will not
+/// get. Unlike [`agent_tools`] this takes the ceiling as an argument rather than
+/// reading it off the record: resolving a company's skills is I/O, and keeping
+/// it out of here keeps the projection pure and single.
+pub(super) fn agent_skills(
+    record: &CompanyRecord,
+    agent_id: &str,
+    company_enabled: &[String],
+) -> AgentSkillsDto {
+    let requested = requested_skills(record, agent_id);
+    AgentSkillsDto {
+        effective: crate::runtime::builder::agent_effective_skills(
+            company_enabled,
+            requested.as_deref(),
+        ),
+        requested,
+        company_available: company_enabled.to_vec(),
+        overridden: record
+            .agent_override(agent_id)
+            .is_some_and(|entry| entry.skills.as_ref().is_some_and(Option::is_some)),
+    }
+}
+
 /// The `PATCH` body. Every field is optional, and an absent field is left
 /// alone: this is a patch, not a replacement, so a console that renders only
 /// some of an agent's fields cannot blank the rest by omission.
@@ -549,6 +620,23 @@ pub(super) struct EditAgent {
     /// its workspace folder, budget row, desk memberships and inbox.
     #[serde(default, deserialize_with = "double_option")]
     tools: Option<Option<Vec<String>>>,
+    /// The teammate's skill scope. The same double option `tools` uses, and the
+    /// same four rows:
+    ///
+    /// | body | parses as | means |
+    /// |---|---|---|
+    /// | `{}` | `None` | leave the scope alone |
+    /// | `{"skills": null}` | `Some(None)` | reset to **inherit** every enabled skill |
+    /// | `{"skills": []}` | `Some(Some([]))` | an **explicit no-skills** scope |
+    /// | `{"skills": ["…"]}` | `Some(Some([…]))` | **narrow** to those slugs |
+    ///
+    /// Entries are exact slugs, never globs. A slug the company has not enabled
+    /// is stored and reported as asked-for-but-not-granted rather than refused,
+    /// because the picker renders against a set fetched at page load and a
+    /// concurrent uninstall would otherwise fail an honest save. A slug that is
+    /// not a safe directory name is refused outright — it is a path segment.
+    #[serde(default, deserialize_with = "double_option")]
+    skills: Option<Option<Vec<String>>>,
     /// The teammate's persona instructions (issue #1530). A **double option**,
     /// the same three-state contract as `description`:
     ///
@@ -631,7 +719,32 @@ async fn agent_detail(
         .load(company.id())
         .await?
         .ok_or_else(|| OpenCompanyError::CompanyNotFound(company.id().to_string()))?;
-    detail(&company, &record, &agent_id, is_admin).await
+    let company_skills = company_enabled_skills(&state, &company).await?;
+    detail(&company, &record, &agent_id, is_admin, &company_skills).await
+}
+
+/// The company's **enabled** skill slugs — the ceiling a teammate's scope
+/// narrows within, and what the picker offers.
+///
+/// The same resolution `GET …/skills` reports, filtered to the enabled entries:
+/// that route keeps the disabled rows because they carry the switch that turns
+/// a skill back on, and a teammate has no such switch.
+async fn company_enabled_skills(
+    state: &AppState,
+    company: &ScopedCompany,
+) -> Result<Vec<String>, ApiError> {
+    let mut deltas = company.runtime.skills().list(company.id()).await?;
+    deltas.extend(crate::company::skill_effective::globals_skill_disables(
+        &company.runtime.globals_disable().await?,
+    ));
+    let registry = state.shared_skill_registry()?;
+    Ok(
+        crate::company::skill_effective::resolve(company.runtime.source_dir(), &registry, &deltas)?
+            .into_iter()
+            .filter(|skill| skill.enabled)
+            .map(|skill| skill.slug)
+            .collect(),
+    )
 }
 
 /// `PATCH {scope}/team/{agent_id}` — edit a teammate.
@@ -810,6 +923,7 @@ async fn edit_agent(
     // admin-only in full, so admin-first is self-consistent there. This one is
     // admin-only *per field*, which is what makes the ordering load-bearing.
     if body.tools.is_some()
+        || body.skills.is_some()
         || body.model.is_some()
         || body.harness.is_some()
         || body.provider.is_some()
@@ -827,6 +941,11 @@ async fn edit_agent(
     let tools: Option<Option<Vec<String>>> = body
         .tools
         .map(|maybe_globs| maybe_globs.map(|globs| trimmed_globs(&globs)).transpose())
+        .transpose()
+        .map_err(|e| e.into_response())?;
+    let skills: Option<Option<Vec<String>>> = body
+        .skills
+        .map(|maybe_slugs| maybe_slugs.map(|slugs| trimmed_slugs(&slugs)).transpose())
         .transpose()
         .map_err(|e| e.into_response())?;
     // Present-and-null clears; a blank string clears too — an empty override
@@ -1022,6 +1141,7 @@ async fn edit_agent(
             name,
             role,
             tools,
+            skills,
             ..Default::default()
         };
         // An empty string is the stored form of "cleared" — the write path
@@ -1083,6 +1203,13 @@ async fn edit_agent(
         // route can only ever narrow a teammate within a grant the company made.
         if let Some(tools) = tools {
             agent.tools = tools;
+        }
+        // Stored verbatim in its three-state form, exactly like `tools`. The
+        // company's enabled set is applied at read time by
+        // `agent_effective_skills`, so a slug the company does not have is
+        // surfaced as asked-for-but-not-granted rather than dropped here.
+        if let Some(skills) = skills {
+            agent.skills = skills;
         }
         // Issue #1245's per-agent follow-up: already trimmed/blank-cleared
         // and cross-validated above.
@@ -1183,7 +1310,10 @@ async fn edit_agent(
     // re-resolve rather than assume: an admin editing only a name must still
     // read back `tools` as editable.
     let is_admin = is_admin_actor(&headers, &state, &company, peer).await;
-    detail(&company, &record, &agent_id, is_admin)
+    let company_skills = company_enabled_skills(&state, &company)
+        .await
+        .map_err(|e| e.into_response())?;
+    detail(&company, &record, &agent_id, is_admin, &company_skills)
         .await
         .map_err(|e| e.into_response().into())
 }
@@ -1249,6 +1379,39 @@ fn trimmed_globs(globs: &[String]) -> Result<Vec<String>, ApiError> {
     Ok(out)
 }
 
+/// Trims, drops duplicates and refuses an unsafe entry in a skill scope.
+///
+/// Sibling of [`trimmed_globs`], with one difference that matters: a slug is a
+/// directory name under the agent's materialized tree, so an entry that is not a
+/// safe slug is refused here rather than stored and ignored. An entry that is
+/// well-formed but names a skill the company does not have **is** stored — see
+/// [`EditAgent::skills`].
+fn trimmed_slugs(slugs: &[String]) -> Result<Vec<String>, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let trimmed = slug.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(
+                "a skill scope entry can't be a blank string. Omit `skills` to leave the scope \
+                 as is, send `null` to give this teammate every enabled skill, or send an empty \
+                 list to give it none."
+                    .to_string(),
+            )));
+        }
+        if !crate::company::skill_effective::valid_slug(trimmed) {
+            return Err(ApiError(OpenCompanyError::InvalidRequest(format!(
+                "'{trimmed}' is not a skill slug. Use the slug exactly as the Skills page \
+                 shows it — lowercase letters, digits and hyphens, no wildcards."
+            ))));
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Whether the signed-in caller may administer this company — the question
 /// [`EDITABLE_FIELDS`] keys off, asked without refusing.
 ///
@@ -1274,6 +1437,7 @@ async fn detail(
     record: &CompanyRecord,
     agent_id: &str,
     is_admin: bool,
+    company_skills: &[String],
 ) -> Result<Json<AgentDetailDto>, ApiError> {
     // The manifest row with the operator's stored edits applied — the same
     // resolution `build_roster` performs, so the card and the running teammate
@@ -1362,6 +1526,7 @@ async fn detail(
         provider: declared_provider(record, agent_id),
         is_orchestrator: is_orchestrator(record, agent_id),
         tools: agent_tools(record, agent_id),
+        skills: agent_skills(record, agent_id, company_skills),
         desks: desks_for(record, agent_id),
         inbox_enabled,
         budget_usd_daily: cap,
@@ -2350,6 +2515,9 @@ mod tests_harness_and_model_persist;
 #[cfg(test)]
 #[path = "team_agent_requested_grants_reads_overlay_tests.rs"]
 mod tests_requested_grants_reads_overlay;
+#[cfg(test)]
+#[path = "team_agent_skill_scope_tests.rs"]
+mod tests_skill_scope;
 #[cfg(test)]
 #[path = "team_agent_the_roster_list_carries_tests.rs"]
 mod tests_the_roster_list_carries;

@@ -59,11 +59,23 @@ impl EffectiveSkills {
     /// Materializes the effective skill set for one agent under `workspace_dir`.
     ///
     /// The set itself is resolved by
-    /// [`skill_effective::resolve`](crate::company::skill_effective::resolve),
-    /// which the console's two read paths share — so what an agent gets on disk
-    /// and what the Skills tab reports are the same derivation. This writes the
+    /// [`skill_effective::resolve_for_agent`](crate::company::skill_effective::resolve_for_agent),
+    /// a narrowing of the [`resolve`](crate::company::skill_effective::resolve)
+    /// the console's two read paths share — so what an agent gets on disk and
+    /// what the Skills tab reports are the same derivation. This writes the
     /// enabled entries out; a disabled one is reported by the readers and never
     /// materialized.
+    ///
+    /// `agent` is the teammate's id, carried through so the warning
+    /// `resolve_for_agent` raises over a scope entry the company does not have
+    /// enabled names which teammate's scope it came from.
+    ///
+    /// `agent_skills` is the teammate's own scope, and it is applied **before**
+    /// anything is written. An unlisted skill never reaches this tree, so the
+    /// catalogue and the three read tools — which are derived from the tree and
+    /// nothing else — cannot disagree with it. Trimming the catalogue instead
+    /// would leave `read_skill_resource` able to open a skill the agent does not
+    /// have.
     ///
     /// The `workspace_dir/skills/` tree is rebuilt from scratch on every call so
     /// a rebuild reflects the current deltas (removed skills disappear).
@@ -72,8 +84,11 @@ impl EffectiveSkills {
         source_dir: Option<&Path>,
         registry: &[SkillDoc],
         deltas: &[SkillState],
+        agent: &str,
+        agent_skills: Option<&[String]>,
     ) -> crate::Result<Self> {
-        let effective = skill_effective::resolve(source_dir, registry, deltas)?;
+        let effective =
+            skill_effective::resolve_for_agent(source_dir, registry, deltas, agent, agent_skills)?;
 
         let skills_out = workspace_dir.join("skills");
         if skills_out.exists() {
@@ -232,6 +247,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "skills_scope_tests.rs"]
+mod scope_tests;
 #[cfg(test)]
 #[path = "skills_tests.rs"]
 mod tests;

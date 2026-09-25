@@ -31,6 +31,7 @@ async fn an_overlay_teammate_can_be_capped_from_the_console() {
         role: "Growth Lead".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -362,6 +363,7 @@ fn nothing_that_declares_itself_executable_is_internal_or_grantable() {
         tier: None,
         harness: None,
         tools: None,
+        skills: None,
         delegates_to: Vec::new(),
         context: None,
         budget_usd_daily: None,

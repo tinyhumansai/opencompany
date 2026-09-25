@@ -15,6 +15,7 @@ fn blueprint(dir: &std::path::Path, is_orchestrator: bool) -> AgentBlueprint {
         tier: None,
         harness: None,
         tools: None,
+        skills: None,
         delegates_to: Vec::new(),
         context: None,
         budget_usd_daily: None,

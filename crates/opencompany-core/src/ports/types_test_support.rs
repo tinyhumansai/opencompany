@@ -51,6 +51,7 @@ pub(super) fn add_overlay(record: &mut CompanyRecord, id: &str, name: &str) {
         role: "Worker".into(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

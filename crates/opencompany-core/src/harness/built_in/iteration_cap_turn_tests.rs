@@ -278,6 +278,7 @@ async fn company_agent(
         description: None,
         tier: None,
         tools: None,
+        skills: None,
         delegates_to: Vec::new(),
         context: None,
         harness: None,

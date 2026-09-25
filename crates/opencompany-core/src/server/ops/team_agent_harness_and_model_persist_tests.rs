@@ -579,6 +579,7 @@ async fn editable_names_tools_only_for_an_admin() {
             "role",
             "description",
             "tools",
+            "skills",
             "instructions",
             "avatar",
             "model",

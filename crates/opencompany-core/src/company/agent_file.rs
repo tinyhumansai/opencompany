@@ -114,6 +114,12 @@ struct AgentFile {
     /// and `tools = [globs]` to `Some(globs)` (narrow).
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// Carried verbatim onto [`Agent::skills`](crate::company::Agent::skills),
+    /// whose three states this mirrors: an absent key parses to `None` (every
+    /// enabled skill), `skills = []` to an explicit no-skills scope, and
+    /// `skills = [slugs]` to a narrowing.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
     #[serde(default)]
     delegates_to: Vec<String>,
     #[serde(default)]
@@ -285,6 +291,7 @@ fn parse_agent_file(
         tier: file.tier,
         harness: file.harness,
         tools: file.tools,
+        skills: file.skills,
         delegates_to: file.delegates_to,
         context: file.context,
         budget_usd_daily: file.budget_usd_daily,

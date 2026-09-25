@@ -501,6 +501,7 @@ pub(super) fn belt(grants: &[&str], is_orchestrator: bool, wire_everything: bool
         tier: None,
         harness: None,
         tools: None,
+        skills: None,
         delegates_to: Vec::new(),
         context: None,
         budget_usd_daily: None,

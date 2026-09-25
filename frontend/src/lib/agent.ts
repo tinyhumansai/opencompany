@@ -11,15 +11,15 @@ export type AgentFieldKey = "name" | "role" | "description" | "instructions";
 
 /**
  * Everything the host may report as editable — the form fields above, plus
- * `tools`.
+ * `tools` and `skills`.
  *
- * `tools` is deliberately not an [`AgentFieldKey`]: it is a list of globs
- * rather than a line of prose, it is admin-only where the others are
- * member-open, and it has its own card. Keeping it out of `AGENT_FIELDS` is
- * what stops the shared draft form from rendering it as a text field and
- * echoing it back on every unrelated save.
+ * Neither is an [`AgentFieldKey`]: each is a list rather than a line of prose,
+ * each is admin-only where the others are member-open, and each has its own
+ * card. Keeping them out of `AGENT_FIELDS` is what stops the shared draft form
+ * from rendering one as a text field and echoing it back on every unrelated
+ * save.
  */
-export type AgentEditableKey = AgentFieldKey | "tools";
+export type AgentEditableKey = AgentFieldKey | "tools" | "skills";
 
 export interface AgentFieldSpec {
   key: AgentFieldKey;

@@ -713,6 +713,7 @@ async fn add_member(
         // "inherit" and "narrow"; the deny-all state is reachable by editing the
         // teammate afterwards (`PATCH …/team/{id}` with `tools: []`).
         tools: if tools.is_empty() { None } else { Some(tools) },
+        skills: None,
         model: None,
         harness: None,
     };

@@ -56,6 +56,7 @@ fn teammate(id: &str, tools: Vec<&str>) -> OverlayAgent {
         role: "Growth".to_string(),
         description: None,
         tools: (!tools.is_empty()).then_some(tools),
+        skills: None,
         model: None,
         harness: None,
     }

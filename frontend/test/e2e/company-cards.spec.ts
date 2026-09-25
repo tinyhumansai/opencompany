@@ -154,6 +154,7 @@ async function mockApi(page: Page) {
         editable: ["name", "role", "description"],
         isOrchestrator: false,
         tools: { requested: [], companyAllow: ["web_search"], deskAllow: [], deskCeilingActive: false, effective: ["web_search"] },
+        skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
         desks: [{ id: "research", name: "Research", lead: true }],
         inboxEnabled: false,
       });

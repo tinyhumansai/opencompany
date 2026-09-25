@@ -303,6 +303,7 @@ async function mockApi(page: Page) {
         editable: [],
         isOrchestrator: false,
         tools: { requested: [], companyAllow: [], deskAllow: [], deskCeilingActive: false, effective: [] },
+        skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
         desks: [],
         inboxEnabled: false,
       });

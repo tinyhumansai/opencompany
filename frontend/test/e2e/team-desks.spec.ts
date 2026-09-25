@@ -90,6 +90,7 @@ async function mockApi(page: Page) {
         editable: ["name", "role", "description"],
         isOrchestrator: false,
         tools: { requested: [], companyAllow: [], deskAllow: [], deskCeilingActive: false, effective: [] },
+        skills: { requested: null, companyAvailable: [], effective: [], overridden: false },
         inboxEnabled: false,
       });
     }

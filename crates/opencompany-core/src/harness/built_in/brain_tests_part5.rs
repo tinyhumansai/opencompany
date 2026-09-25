@@ -95,6 +95,7 @@ fn responder_for_gives_the_general_line_to_the_orchestrator_not_a_teammate_calle
             role: "Analyst".into(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         })
@@ -355,6 +356,7 @@ members = ["eng1", "eng2"]
             role: "CTO".to_string(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         }],

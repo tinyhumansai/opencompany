@@ -4106,6 +4106,7 @@ impl Tool for AddAgentTool {
             role: role.clone(),
             description,
             tools: tools.clone(),
+            skills: None,
             model: None,
             harness: None,
         };

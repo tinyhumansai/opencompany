@@ -28,6 +28,7 @@ fn an_upgrade_into_chargebee_preserves_the_pre_upgrade_scope_of_empty_lines() {
             description: None,
             // `None` = inherit (tracks the allow-list) — the state that freezes.
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         },
@@ -38,6 +39,7 @@ fn an_upgrade_into_chargebee_preserves_the_pre_upgrade_scope_of_empty_lines() {
             role: "Assistant".to_string(),
             description: None,
             tools: Some(vec!["docs.*".to_string()]),
+            skills: None,
             model: None,
             harness: None,
         },
@@ -141,6 +143,7 @@ fn an_upgrade_without_a_new_billing_namespace_leaves_empty_lines_tracking() {
         description: None,
         // `None` = inherit / tracks the allow-list.
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     }];

@@ -148,6 +148,7 @@ fn agent_pairs_apply_edits_and_skip_acp_agents() {
         role: "Web search".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: Some("test-model-small".to_string()),
         harness: None,
     }];

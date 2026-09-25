@@ -260,6 +260,7 @@ async fn the_host_states_which_fields_are_editable() {
             "role",
             "description",
             "tools",
+            "skills",
             "instructions",
             "avatar",
             "model",

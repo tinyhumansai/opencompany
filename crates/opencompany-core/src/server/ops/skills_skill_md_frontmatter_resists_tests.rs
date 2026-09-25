@@ -247,6 +247,8 @@ fn the_rest_list_and_the_harness_effective_set_agree() {
         Some(tmp.path()),
         &[],
         &deltas,
+        "agent-under-test",
+        None,
     )
     .expect("materializes");
 

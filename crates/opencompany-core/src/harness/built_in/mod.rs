@@ -5229,6 +5229,11 @@ async fn refresh_oauth_decls(
 /// the roster, and drop every live agent session for a cosmetic change — issue
 /// #1676's review note.
 ///
+/// A skill scope is one of the things the harness reads — it decides which
+/// skills are materialized into the teammate's tree — so a row carrying only a
+/// scope is not avatar-only, and filtering it here would leave the fingerprint
+/// unmoved for the commonest scope edit: one teammate, nothing else changed.
+///
 /// An explicit `Some(vec![])` tool list, `Some("")` instructions and `Some("")`
 /// model/harness (the stored form of "cleared") stay real overrides ("the
 /// company's standard grant" / "cleared" / "the blueprint's model and harness"),
@@ -5238,6 +5243,7 @@ fn is_avatar_only(edit: &crate::ports::types::AgentOverride) -> bool {
         && edit.role.is_none()
         && edit.description.is_none()
         && edit.tools.is_none()
+        && edit.skills.is_none()
         && edit.instructions.is_none()
         && edit.model.is_none()
         && edit.harness.is_none()
@@ -5292,6 +5298,12 @@ fn overlay_fingerprint(
         edit.role.hash(&mut hasher);
         edit.description.hash(&mut hasher);
         edit.tools.hash(&mut hasher);
+        // A skill scope decides which skills are materialized into this
+        // teammate's tree, so it moves the roster the same way a grant edit
+        // does. Without it every other axis is stable on a scope-only change,
+        // the cached roster is reused, and the scope is silently ignored until
+        // the process restarts.
+        edit.skills.hash(&mut hasher);
         // A routing override changes the harness binding the roster must build,
         // so it has to move this fingerprint too — otherwise re-binding one
         // teammate to another model/harness would persist and be silently
@@ -5319,6 +5331,7 @@ fn overlay_fingerprint(
         // order (an operator's own list), length folded in first via the slice
         // length above so `["a","b"]` cannot collide with `["ab"]`.
         agent.tools.hash(&mut hasher);
+        agent.skills.hash(&mut hasher);
         // The overlay's own routing binding (`overlay_agent_to_manifest` carries
         // both straight through), so a model/harness change on an overlay
         // teammate invalidates the cached roster exactly as an edit of a
@@ -6215,6 +6228,10 @@ fn overlay_agent_to_manifest(overlay: &OverlayAgent) -> ManifestAgent {
         // A non-empty list is intersected with `[tools].allow` by that same
         // function below (narrow-only, never a widen).
         tools: overlay.tools.clone(),
+        // The overlay's own skill scope, carried the same way, so a
+        // console-created teammate is scoped exactly as a manifest one is.
+        // `None` is every enabled skill, unchanged from before the field.
+        skills: overlay.skills.clone(),
         // An overlay teammate declares no delegation allowlist, and an empty
         // list is unrestricted (`delegation_tools::reach_is_unrestricted`): it
         // carries the hand-off tools like every roster agent and may reach
@@ -6374,3 +6391,6 @@ mod built_in_tests_part10;
 #[cfg(all(test, feature = "openhuman"))]
 #[path = "mcp_reads_tests.rs"]
 mod mcp_reads_tests;
+#[cfg(test)]
+#[path = "built_in_tests_skill_scope_freshness.rs"]
+mod tests_skill_scope_freshness;

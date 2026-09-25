@@ -679,6 +679,39 @@ export function AgentDetailView({
   }
 
   /**
+   * Save the teammate's skill scope.
+   *
+   * Its own write for the same reason `saveTools` is: the host gates `skills`
+   * on admin where name, role and instructions are member-open, so folding it
+   * into `save()` would 403 an ordinary member edit the moment a stale scope
+   * rode along.
+   */
+  async function saveSkills(slugs: string[] | null) {
+    if (!agent) return;
+    setSaving(true);
+    try {
+      // Three-state on the wire: `null` restores every enabled skill, `[]` is a
+      // deliberate no-skills scope, a non-empty list narrows. Passed through
+      // untouched, because all three are meaningful.
+      const updated = await client.updateAgent(agentId, { skills: slugs }, company);
+      if (displayedAgentIdRef.current !== agentId) return;
+      setAgent(updated);
+      toast.success("Skill scope updated.");
+    } catch (error) {
+      toast.error(
+        error instanceof ApiError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Couldn't save this skill scope.",
+      );
+      throw error;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /**
    * Save the harness binding, the model override, or both (issue #1245's
    * harness-picker follow-up) — one `PATCH`, so the host's cross-field check
    * (a model only means anything on the harness this same save leaves the
@@ -1169,6 +1202,12 @@ export function AgentDetailView({
 
             <PageTabPanel idBase="agent" id="tools" value={tab}>
             <Tools agent={agent} saving={saving} onSave={(globs) => saveTools(globs)} />
+            <Skills
+              key={agent.id}
+              agent={agent}
+              saving={saving}
+              onSave={(slugs) => saveSkills(slugs)}
+            />
             </PageTabPanel>
 
             <PageTabPanel idBase="agent" id="model" value={tab}>
@@ -1504,6 +1543,208 @@ function OpenTasks({ tasks }: { tasks: Task[] | null }) {
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * Which skills this teammate may read, as switches over the company's enabled
+ * set.
+ *
+ * Three states, the same shape the tool grant uses: inheriting (`null`) puts
+ * every enabled skill in front of this teammate, an explicit empty list gives
+ * it none, and a list narrows. There is no row for a skill the company has not
+ * enabled, because scoping to one would confer nothing.
+ *
+ * No desk level: desks carry a tool ceiling and no skills, so the resolution is
+ * the company's enabled set intersected with this list.
+ */
+function Skills({
+  agent,
+  saving,
+  onSave,
+}: {
+  agent: AgentDetailDto;
+  saving: boolean;
+  onSave: (slugs: string[] | null) => Promise<void>;
+}) {
+  const canEdit = isEditable(agent, "skills");
+  const available = agent.skills.companyAvailable;
+  const inherits = agent.skills.requested === null;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<string[]>(agent.skills.requested ?? []);
+  // Whether the operator has touched a switch in this editing session. An
+  // inherited scope renders every switch on, so without this the first switch
+  // turned off would render on again — the stored state still says "inherit".
+  const [touched, setTouched] = useState(false);
+
+  // The teammate on screen can change under this card, and a draft left over
+  // from the previous one would be saved onto the new teammate.
+  useEffect(() => {
+    setDraft(agent.skills.requested ?? []);
+    setEditing(false);
+    setTouched(false);
+  }, [agent.id, agent.skills.requested]);
+
+  const showingInherited = inherits && !touched;
+  const draftSet = new Set(draft);
+  const held = (slug: string) => (showingInherited ? true : draftSet.has(slug));
+  const stored = agent.skills.requested;
+  const unchanged =
+    stored === null
+      ? draft.length === available.length && available.every((slug) => draftSet.has(slug))
+      : stored.length === draft.length && stored.every((slug) => draftSet.has(slug));
+  const dropped = (agent.skills.requested ?? []).filter(
+    (slug) => !agent.skills.effective.includes(slug),
+  );
+
+  return (
+    <Section
+      title="Skills"
+      subtitle={
+        inherits
+          ? "This teammate lists no skills of its own, so it reads every skill the company has enabled."
+          : agent.skills.requested?.length === 0
+            ? "This teammate has been given an explicit empty scope, so it reads no skills at all."
+            : "The skills this teammate asked for, narrowed by what the company has enabled."
+      }
+      action={
+        canEdit && !editing ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setEditing(true)}
+            data-testid="agent-skills-edit"
+          >
+            <Pencil className="size-4" /> Edit
+          </Button>
+        ) : undefined
+      }
+    >
+      {editing && (
+        <div className="grid gap-3" data-testid="agent-skills-editor">
+          {available.length > 0 ? (
+            <div className="divide-y rounded-lg border" data-testid="agent-skills-toggles">
+              {available.map((slug) => (
+                <div key={slug} className="flex items-center justify-between gap-3 px-3 py-2">
+                  <Label
+                    htmlFor={`agent-skill-${slug}`}
+                    className="min-w-0 truncate font-mono text-xs font-normal"
+                  >
+                    {slug}
+                  </Label>
+                  <Switch
+                    id={`agent-skill-${slug}`}
+                    checked={held(slug)}
+                    data-testid={`agent-skill-toggle-${slug}`}
+                    onCheckedChange={(on) => {
+                      // An inherited scope holds every enabled skill, so the
+                      // first switch turned off has to write the rest out
+                      // explicitly — otherwise the save would read as "narrow
+                      // to nothing but this one".
+                      const base = showingInherited ? available : draft;
+                      setDraft(
+                        on
+                          ? [...new Set([...base, slug])]
+                          : base.filter((s) => s !== slug),
+                      );
+                      setTouched(true);
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground" data-testid="agent-skills-none-enabled">
+              The company has no skills enabled, so there is nothing to scope here.
+            </p>
+          )}
+
+          <p className="text-xs text-muted-foreground">
+            A scope only ever takes away — it can never give this teammate a skill the
+            company has disabled.
+          </p>
+
+          {touched && draft.length === 0 && (
+            <p className="text-xs text-status-blocked-text" data-testid="agent-skills-empty-warning">
+              Saving an empty list gives this teammate no skills at all. To put every
+              enabled skill back in front of it, use “Reset to every skill”.
+            </p>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setDraft(agent.skills.requested ?? []);
+                setTouched(false);
+                setEditing(false);
+              }}
+            >
+              Cancel
+            </Button>
+            {!inherits && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={saving}
+                onClick={() => {
+                  void onSave(null).then(
+                    () => setEditing(false),
+                    () => undefined,
+                  );
+                }}
+                data-testid="agent-skills-reset"
+              >
+                Reset to every skill
+              </Button>
+            )}
+            <Button
+              size="sm"
+              disabled={saving || !touched || unchanged}
+              onClick={() => {
+                // An empty draft is a deliberate no-skills scope, not a reset —
+                // that is the separate button above.
+                void onSave(draft).then(
+                  () => setEditing(false),
+                  () => undefined,
+                );
+              }}
+              data-testid="agent-skills-save"
+            >
+              Save
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {agent.skills.effective.length === 0 ? (
+        <p className="text-sm text-muted-foreground" data-testid="agent-skills-empty">
+          {inherits
+            ? "This teammate reads no skills, because the company has none enabled."
+            : agent.skills.requested?.length === 0
+              ? "This teammate reads no skills: it was given an explicit empty scope."
+              : "This teammate reads no skills: the company has none of the skills it asks for enabled."}
+        </p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5" data-testid="agent-skills-effective">
+          {agent.skills.effective.map((slug) => (
+            <span
+              key={slug}
+              className="rounded border px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
+            >
+              {slug}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {dropped.length > 0 && (
+        <p className="mt-2 text-xs text-status-blocked-text" data-testid="agent-skills-dropped">
+          {`The company has not enabled ${dropped.join(", ")}, so it is stored and reads nothing.`}
+        </p>
+      )}
+    </Section>
   );
 }
 

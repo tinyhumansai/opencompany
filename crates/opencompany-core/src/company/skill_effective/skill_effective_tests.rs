@@ -231,3 +231,102 @@ fn a_malformed_company_bundle_fails_the_resolution() {
 
     assert!(resolve(Some(tmp.path()), &[], &[]).is_err());
 }
+
+/// `docs/spec/runtime/manifest-semantics.md` promises that a scope naming a
+/// slug the company does not have is "dropped with a warning rather than
+/// failing the load". The drop was real and the warning was not, so a typo in
+/// `company.toml` narrowed a teammate to nothing and reported nothing anywhere.
+///
+/// Asserted through a capturing subscriber rather than through
+/// [`unmet_scope_slugs`] alone: a test over the helper would still pass with the
+/// `warn!` deleted, and the missing warning is the whole defect.
+#[test]
+fn an_unknown_scope_entry_is_dropped_with_a_warning_naming_the_agent_and_the_slug() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink").extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Writer;
+        fn make_writer(&'a self) -> Self::Writer {
+            Writer(self.0.clone())
+        }
+    }
+
+    let held = global_slugs()
+        .first()
+        .cloned()
+        .expect("the baseline installs at least one skill");
+    let scope = vec![
+        held.clone(),
+        "brand-voise".to_string(),
+        "retired-playbook".to_string(),
+    ];
+
+    let sink = Sink::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let set = resolve_for_agent(None, &[], &[], "copywriter", Some(&scope))
+        .expect("an unknown entry drops rather than failing the load");
+    drop(guard);
+
+    assert_eq!(
+        set.iter()
+            .map(|skill| skill.slug.clone())
+            .collect::<Vec<_>>(),
+        vec![held.clone()],
+        "the two unknown entries confer nothing and the known one survives"
+    );
+
+    let logs = String::from_utf8_lossy(&sink.0.lock().expect("log sink").clone()).to_string();
+    assert!(
+        logs.contains("copywriter"),
+        "a warning that does not name the teammate cannot be traced back to the manifest line \
+         that caused it: {logs:?}"
+    );
+    assert!(
+        logs.contains("brand-voise") && logs.contains("retired-playbook"),
+        "every dropped entry has to be named — the typo is the whole reason to look: {logs:?}"
+    );
+    assert!(
+        !logs.contains(&held),
+        "a slug the teammate actually holds must not be reported as dropped: {logs:?}"
+    );
+}
+
+/// The drop set on its own: scope order kept, repeats collapsed, and both
+/// no-op states (inherit and a deliberate empty scope) naming nothing.
+#[test]
+fn the_drop_set_keeps_scope_order_and_reports_nothing_for_either_no_op_state() {
+    let enabled = vec!["brand-voice".to_string(), "invoicing".to_string()];
+
+    assert_eq!(
+        unmet_scope_slugs(
+            &enabled,
+            Some(&[
+                "gone".to_string(),
+                "brand-voice".to_string(),
+                "gone".to_string(),
+                "missing".to_string()
+            ])
+        ),
+        vec!["gone".to_string(), "missing".to_string()]
+    );
+    assert!(unmet_scope_slugs(&enabled, None).is_empty());
+    assert!(unmet_scope_slugs(&enabled, Some(&[])).is_empty());
+}

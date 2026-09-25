@@ -47,6 +47,7 @@ name = "Morning"
         role: "Researcher".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });
@@ -88,6 +89,7 @@ async fn query_company_lists_a_teammate_under_the_id_delegation_grounds() {
         role: "Designer".to_string(),
         description: None,
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     });

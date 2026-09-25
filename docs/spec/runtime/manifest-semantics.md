@@ -26,6 +26,31 @@ each page under the 500-line cap.
   "inherit" rather than "nothing" — and why, since #1804, an **explicit empty**
   agent `tools` list (`[]`) is a deliberate deny-all rather than an inherit.
 
+  **`skills`** narrows which skills this teammate may read, and spells the same
+  three states as `tools`:
+
+  | value | means |
+  |---|---|
+  | omitted | inherit — every skill the company has enabled |
+  | `[]` | an explicit no-skills scope: no catalogue, no skill read tools |
+  | `["brand-voice"]` | narrow to those slugs |
+
+  Two levels, not three: desks carry a `tools` ceiling but no skills, so the
+  resolution is the company's effective set intersected with this list. It is
+  narrow-only — a scope can never re-enable a skill the company disabled, or one
+  a `[globals].disable` entry turned off.
+
+  Entries are **exact slugs**, not globs. A tool grant globs over a namespace
+  with real hierarchy; a slug is a flat identifier, so a prefix would silently
+  admit a skill installed after the scope was written. A slug the company does
+  not have is dropped with a warning rather than failing the load, so retiring a
+  skill does not brick a manifest that still names it.
+
+  The scope is applied before an agent's skill tree is written, so a skill
+  outside it is never materialized — the catalogue and the three read tools are
+  derived from that tree, and an unlisted skill has nothing for
+  `read_skill_resource` to open.
+
   **`delegates_to`** (issue #176) narrows which **desks** a question from this
   agent may cross to, and follows the same rule as `tools` and `ledgers`:
   **omitted or empty means unrestricted**. On its own desk an agent reaches

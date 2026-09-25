@@ -77,6 +77,7 @@ kind = "built_in"
             role: "Content Writer".into(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         }],

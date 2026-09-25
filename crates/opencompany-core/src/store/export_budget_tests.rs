@@ -216,6 +216,7 @@ async fn operator_overlays_including_desk_order_survive_roundtrip() {
         role: "Design".into(),
         description: Some("Owns the brand".into()),
         tools: None,
+        skills: None,
         model: None,
         harness: None,
     }];

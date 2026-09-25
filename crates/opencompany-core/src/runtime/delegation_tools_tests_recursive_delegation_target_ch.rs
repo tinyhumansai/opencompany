@@ -97,6 +97,7 @@ fn chat_responder_leaves_the_general_line_to_the_caller() {
             role: "Analyst".to_string(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });
@@ -157,6 +158,7 @@ fn a_prefixed_dm_reaches_the_teammate_even_when_a_desk_shares_the_id() {
             role: "Analyst".to_string(),
             description: None,
             tools: None,
+            skills: None,
             model: None,
             harness: None,
         });
