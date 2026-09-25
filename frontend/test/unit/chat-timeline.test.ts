@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ChatOutput } from "@/api/types";
 import { buildTimeline, type Channel } from "@/views/room/model";
 import type { ChatMessage } from "@/lib/chat";
 
@@ -173,7 +174,7 @@ describe("buildTimeline", () => {
    * deliberately opened.
    */
   it("does not promote a carrier that belongs to a later exchange", () => {
-    const outputs = [{ kind: "workspace-node", targetId: "n1", title: "brief.md" }];
+    const outputs: ChatOutput[] = [{ kind: "workspace-node", targetId: "n1", title: "brief.md" }];
     const entries = buildTimeline(
       [
         message({ id: "a", text: "own the pricing launch" }),
