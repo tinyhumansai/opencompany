@@ -5,6 +5,21 @@ These are the **authoring** surfaces — building a graph from a task card,
 drafting one from a description, and grounding either on the tools a company
 can actually reach. The read/edit/run and delivery routes stay in the parent.
 
+## Reading large graphs through the agent tool
+
+`read_workflow({"id":"example"})` returns a complete `workflow` for small graphs.
+Graphs exceeding the tool's graph rendering budget instead return `workflow: null`
+and an exact JSON text `graph_fragment`. Read every zero-based `page`, passing
+page 0's `read_version` on subsequent calls, concatenate the fragments in order,
+and parse the result before editing. `page_count` and `next_page` identify the
+remaining pages; the last page has `next_page: null`.
+
+A missing or stale `read_version` on a later page is refused. Restart at page 0
+if the graph changes; never combine revisions. This snapshot token is separate
+from `version`, which is still supplied as `expected_version` to
+`update_workflow`. Seed graphs support the same read pagination but remain
+uneditable. HTTP workflow routes are unchanged.
+
 ## Building a workflow from a task card (issue #580)
 
 A board card marked `deliverable: "workflow"` does not dispatch to a teammate

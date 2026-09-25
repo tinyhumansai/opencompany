@@ -566,3 +566,68 @@ async fn an_update_can_explicitly_clear_owner_desk_with_blank_string() {
         "an agent explicitly sending a blank ownerDesk must clear the stored desk, not restore it"
     );
 }
+
+#[tokio::test]
+async fn large_workflow_pages_preserve_every_byte_and_reject_mixed_versions() {
+    let fx = Fixture::new();
+    let store: Arc<dyn CompanyStore> = fx.store.clone();
+    let mut spec = graph_args("paged", "Paged", "Worker");
+    let prompt = "Reken café 🧪; behoud alle regels.\n".repeat(700);
+    spec["nodes"][1]["config"] = json!({"prompt":prompt});
+    crate::company::create_company_workflow(
+        &fx.company,
+        Some(fx.source_dir()),
+        &store,
+        None,
+        crate::company::RawWorkflow::try_from(
+            serde_json::from_value::<CreateWorkflowArgs>(spec).unwrap(),
+        )
+        .unwrap(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let tool = ReadWorkflowTool::new(fx.admin());
+    let first = tool.execute(json!({"id":"paged"})).await.unwrap();
+    let payload = data(&first);
+    let count = payload["page_count"].as_u64().unwrap();
+    assert!(count > 1);
+    assert!(
+        payload["workflow"].is_null(),
+        "a fragment is never a complete graph"
+    );
+    let mut assembled = String::new();
+    for page in 0..count {
+        let result = tool
+            .execute(json!({"id":"paged","page":page,"read_version":payload["read_version"]}))
+            .await
+            .unwrap();
+        let value = data(&result);
+        let fragment = value["graph_fragment"].as_str().unwrap();
+        assert!(
+            md(&result).contains(fragment),
+            "the model must receive the actual graph bytes"
+        );
+        assert!(md(&result).len() < TOOL_RESULT_BUDGET_BYTES);
+        assembled.push_str(fragment);
+    }
+    let mut graph: Value = serde_json::from_str(&assembled).unwrap();
+    assert_eq!(graph["nodes"][1]["config"]["prompt"], prompt);
+    graph["name"] = json!("Changed");
+    graph["expected_version"] = payload["version"].clone();
+    let updated = UpdateWorkflowTool::new(fx.admin())
+        .execute(graph)
+        .await
+        .unwrap();
+    assert!(!updated.is_error, "{}", updated.output_for_llm(false));
+    let stale = tool
+        .execute(json!({"id":"paged","page":1,"read_version":payload["read_version"]}))
+        .await
+        .unwrap();
+    assert!(err_text(&stale).contains("stale read_version"));
+    let missing = tool.execute(json!({"id":"paged","page":1})).await.unwrap();
+    assert!(err_text(&missing).contains("read_version"));
+    let invalid = tool.execute(json!({"id":"paged","page":-1})).await.unwrap();
+    assert!(err_text(&invalid).contains("non-negative"));
+}
