@@ -1,0 +1,313 @@
+# Publish this repo's OWN image (the tenant workload) to GitHub Container
+# Registry so boat.dev sandboxes can pull it.
+#
+# boat.dev sandboxes pull the tenant image directly, the way they already pull
+# `cortexdb/cortexdb`. That pull is anonymous: the sandbox holds no GHCR
+# credential, so the package this workflow pushes MUST be made **public** in the
+# repository's package settings (Packages -> opencompany-tenant -> Package
+# settings -> Change visibility -> Public) — or boat.dev must be handed a pull
+# credential — or every pull gets `denied: denied` and the sandbox cannot start.
+# A freshly created GHCR package is private by default; publishing succeeds while
+# pulling silently fails until that flip is done, so it is called out here rather
+# than left to be discovered from a sandbox that will not boot.
+#
+# This is the same image `deploy-staging.yml` builds for private ECR — same
+# Dockerfile, same feature set, same build-args — and the build recipe here is a
+# deliberate copy of that job's. What this workflow does NOT do: it has no AWS,
+# no OIDC role, no kubectl and no SSH. It publishes to GHCR and stops. Staging
+# deployment stays entirely in `deploy-staging.yml`; this is only the registry
+# half that makes the workload pullable outside the private cluster.
+#
+# WHEN THIS RUNS. Not on push-to-main. A push to main is not a release; it is
+# whatever last merged, and publishing `latest` off it would hand boat.dev a
+# build that never went through the release flow. Instead this fires AFTER the
+# production release workflow (`release-production.yml`, `name: Release
+# Production`) finishes, via `workflow_run` — so what lands in GHCR is exactly
+# the tree a release was cut from. `release-production.yml` is left untouched;
+# keying off its completion here is the least-invasive wiring (CTO review on
+# #2490: "run this once a release workflow is completed").
+#
+# `workflow_run` only ever fires from the copy of THIS file on the repository's
+# DEFAULT branch — GitHub ignores `workflow_run` triggers defined on any other
+# branch or in a PR. So this trigger is inert until the PR merges upstream, and
+# once merged it activates on the default-branch copy alone. That is the
+# intended, secure behaviour: no fork or feature branch can arm it.
+#
+# Issue #590. Every `uses:` below is a full commit SHA with the resolved version
+# in a trailing comment — `actions/*` included, no exemptions. The rationale is
+# at the top of `ci.yml`; the `Actions pinned` job there fails this workflow if
+# any `uses:` names a tag instead of a 40-hex SHA. The SHAs shared with
+# `deploy-staging.yml` are copied from it so a Dependabot bump moves both
+# together; re-resolve any hand edit with
+# `gh api repos/<owner>/<action>/commits/<tag> --jq .sha`.
+name: Publish tenant image to GHCR
+
+on:
+  # Fire after a production release completes. The source workflow is matched
+  # by its `name:` (`release-production.yml`'s `name: Release Production`), not
+  # its filename. `types: [completed]` covers every conclusion; the publish job
+  # then gates on `conclusion == 'success'` so a failed or cancelled release
+  # never publishes. Runs from the default-branch copy of this file only — see
+  # the header note above; that is why this activates on merge upstream.
+  workflow_run:
+    workflows: ['Release Production']
+    types: [completed]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege at workflow scope: read only. The one job that pushes to GHCR
+# widens to `packages: write` on its own `permissions:` block, so a token
+# capable of publishing a package never leaks to any other job or to steps that
+# run repository-controlled scripts.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # `packages: write` is scoped to this job alone — see the workflow-level
+    # `permissions:` note above.
+    permissions:
+      contents: read
+      packages: write # push the tenant image to GHCR under this repository's owner
+    # Two ways in, each gated:
+    #   - `workflow_run`: only when the production release it followed actually
+    #     SUCCEEDED. A failed or cancelled release must not publish, and
+    #     `types: [completed]` fires on every conclusion, so the success check
+    #     lives here. The release the run reports is trusted by construction:
+    #     `workflow_run` only fires from the default-branch copy of this file
+    #     (header note), so this can never be armed from a fork or PR.
+    #   - `workflow_dispatch`: a manual re-publish, allowed only when its ref is
+    #     the repository default branch. A dispatch from an arbitrary branch or
+    #     tag would otherwise check that ref out, run its branch-controlled
+    #     workflow/Dockerfile/build scripts, and still hold a `packages: write`
+    #     token plus `SENTRY_AUTH_TOKEN`; the ref guard refuses it before
+    #     checkout.
+    # There is deliberately no `push` and no `release` trigger: push-to-main is
+    # not a release, and a `release` event carries a tag ref a fork/collaborator
+    # can point at any commit, which would defeat this guard.
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+
+    steps:
+      # The commit to build and stamp. A `workflow_run` reports the exact commit
+      # the release was cut from as `github.event.workflow_run.head_sha`;
+      # checking that out (rather than the default branch tip) publishes the
+      # RELEASED tree, not whatever has merged since the release started. A
+      # manual `workflow_dispatch` has no such commit, so it falls back to
+      # `github.sha` (the default-branch tip the guard above already pinned it
+      # to). The value is resolved once here into `$GITHUB_ENV` and every step
+      # that needs it reads `${{ env.BUILD_SHA }}` from a `with:` block — never
+      # `${{ ... }}` interpolated into a `run:` script (GitHub's "understanding
+      # the risk of script injections").
+      - name: Resolve build commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            BUILD_SHA="$RUN_HEAD_SHA"
+          else
+            BUILD_SHA="$FALLBACK_SHA"
+          fi
+          if [ -z "$BUILD_SHA" ]; then
+            echo "::error::could not resolve the commit to build (event=${EVENT_NAME})" >&2
+            exit 1
+          fi
+          echo "BUILD_SHA=${BUILD_SHA}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The released commit for `workflow_run`; the default-branch tip for a
+          # manual dispatch (both resolved into `BUILD_SHA` above).
+          ref: ${{ env.BUILD_SHA }}
+          submodules: false
+
+      # Path-limited on purpose, exactly as `deploy-staging.yml` does it.
+      # `--features openhuman` compiles the vendored openhuman crate and its
+      # nested graph, and cargo must be able to read the manifests behind
+      # [patch.crates-io], so both of these must be present. Recursing from the
+      # repo root instead would also drag in openhuman's desktop-only submodules
+      # (tauri-cef is a heavy CEF checkout) that no server build compiles.
+      #
+      # `vendor/tinyhivemind` is also required even though it is a top-level
+      # submodule, not one nested under `vendor/openhuman`: `tinyhivemind-hive`
+      # is an unconditional path dependency in `Cargo.toml`, so Cargo must read
+      # its manifest to resolve the dependency graph on every build. This job
+      # uses `submodules: false` and fetches everything it needs explicitly, so
+      # it must fetch this one too.
+      - name: Fetch build vendor submodules
+        run: |
+          git submodule update --init vendor/openhuman vendor/tinyhivemind
+          scripts/ci/init-vendored-submodules.sh
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # ${{ github.actor }} + the run's GITHUB_TOKEN authenticate the push to
+      # GHCR. The token's `packages: write` (granted on this job above) is scoped
+      # to this repository's owner, which is exactly where the image is published
+      # below.
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase image path. `github.repository_owner` is the
+      # org/user name and can carry uppercase; lowercasing it here keeps the
+      # image name valid whoever owns the fork.
+      #
+      # Every `github.*` / `steps.*` value this step needs is passed through the
+      # step `env:` block and read as a quoted shell variable — never
+      # interpolated into the script text with `${{ ... }}`. A ref or a
+      # workspace version carrying shell metacharacters is then inert data, not
+      # command source, so a crafted ref or manifest cannot execute on the
+      # runner (GitHub's "understanding the risk of script injections").
+      #
+      # Two tags, both pushed on every run — GHCR tags are MUTABLE by default,
+      # so a name alone is not a guarantee of content:
+      #   - `sha-<commit>`  the released commit (or the dispatched default-branch
+      #                     tip), a convenient commit-scoped reference. Not
+      #                     immutable: deployments that need a fixed artifact
+      #                     should pin by IMAGE DIGEST (the `@sha256:...` the
+      #                     summary step records), which the manager's update
+      #                     path already supports; the `sha-` tag is the
+      #                     human-readable handle onto that build.
+      #   - `latest`        also moved every run. Because both entry paths are
+      #                     now the trusted release flow — a successful
+      #                     `Release Production`, or a deliberate default-branch
+      #                     dispatch — `latest` always points at a released
+      #                     build; there is no push-to-main path left that could
+      #                     move it to an unreleased tree.
+      # `SHA` is the commit resolved into `BUILD_SHA` above, so the `sha-` tag
+      # names the tree actually built.
+      - name: Compute image name and tags
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ env.BUILD_SHA }}
+        run: |
+          set -euo pipefail
+          OWNER_LC=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LC}/opencompany-tenant"
+
+          {
+            echo "${IMAGE}:sha-${SHA}"
+            echo "${IMAGE}:latest"
+          } > /tmp/tags.txt
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<TAGS_EOF'
+            cat /tmp/tags.txt
+            echo 'TAGS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # `deploy-staging.yml` is the SINGLE SOURCE OF TRUTH for the tenant
+      # feature set (its `env.TENANT_FEATURES`). Both workflows build the same
+      # image, so read that value here at build time rather than keeping a
+      # second copy that silently drifts — a feature added there is picked up
+      # here on the next build with no edit to this file. `env` does not cross
+      # workflow files, so this reads the static, trusted, checked-in file with
+      # the shell; no `${{ }}` is interpolated into the run script, so there is
+      # no injection surface (GitHub's "understanding the risk of script
+      # injections"). A change to that list ships on the next production release
+      # (this workflow republishes when `Release Production` completes).
+      #
+      # Prefer `yq` when the runner has it; fall back to a `grep`/`sed` that
+      # captures the single-line value after `TENANT_FEATURES:` and strips a
+      # trailing comment, surrounding quotes and whitespace. Fail loudly on an
+      # empty result so a rename or format change to that env key is caught
+      # here rather than shipping an image with no features.
+      - name: Read tenant FEATURES from deploy-staging (source of truth)
+        id: features
+        run: |
+          set -euo pipefail
+          STAGING='.github/workflows/deploy-staging.yml'
+          if command -v yq >/dev/null 2>&1; then
+            FEATURES=$(yq '.env.TENANT_FEATURES' "$STAGING")
+          else
+            FEATURES=$(grep -m1 -E '^[[:space:]]*TENANT_FEATURES:' "$STAGING" \
+              | sed -E 's/^[[:space:]]*TENANT_FEATURES:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^["'"'"']//; s/["'"'"']$//; s/[[:space:]]+$//')
+          fi
+          if [ -z "${FEATURES}" ] || [ "${FEATURES}" = "null" ]; then
+            echo "::error::could not read env.TENANT_FEATURES from ${STAGING} — the source of truth moved or changed shape" >&2
+            exit 1
+          fi
+          echo "features=${FEATURES}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image to GHCR
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # Build-args copied verbatim from `deploy-staging.yml` so this image is
+          # byte-for-byte the workload staging ships, differing only in registry.
+          #
+          # FEATURES is read from `deploy-staging.yml` at build time by the step
+          # above (its `env.TENANT_FEATURES` is the single source of truth), so
+          # this workflow never carries a second copy of the list to drift out
+          # of step. A change there ships with the next production release, when
+          # this workflow next runs.
+          #
+          # `OPENCOMPANY_BUILD_COMMIT` / `VITE_BUILD_COMMIT`:
+          # `deploy/Dockerfile.dockerignore` excludes `.git` and `GITHUB_SHA`
+          # does not cross into a build context, so the build script has no way to
+          # work out which revision it is compiling — every hosted tenant would
+          # report `unknown` forever. `actions/checkout` checked out
+          # `BUILD_SHA` (the released commit for `workflow_run`, the
+          # default-branch tip for a dispatch), so this names the commit that was
+          # actually built, and both surfaces take the same value so they compute
+          # one `opencompany@<version>+<commit>` release string.
+          #
+          # The `VITE_SENTRY_*` / `SENTRY_*` args and the `sentry_auth_token`
+          # secret are the crash-reporting inputs, all sourced from repository
+          # variables/secrets exactly as `deploy-staging.yml` sources them. They
+          # are optional by construction: unset means an empty build-arg, which
+          # keeps the console silent rather than failing the build — the same "no
+          # DSN, no client" gate every local `npm run build` already takes. This
+          # job deliberately adds no "validate Sentry" gate, so a fork without
+          # those settings still publishes a working image.
+          build-args: |
+            FEATURES=${{ steps.features.outputs.features }}
+            OPENCOMPANY_BUILD_COMMIT=${{ env.BUILD_SHA }}
+            VITE_SENTRY_DSN=${{ vars.OPENCOMPANY_REACT_SENTRY_DSN }}
+            VITE_BUILD_COMMIT=${{ env.BUILD_SHA }}
+            VITE_SENTRY_ENVIRONMENT=${{ vars.OPENCOMPANY_SENTRY_ENVIRONMENT || 'hosted-tenant' }}
+            VITE_SENTRY_TRACES_SAMPLE_RATE=${{ vars.OPENCOMPANY_SENTRY_TRACES_SAMPLE_RATE }}
+            SENTRY_URL=${{ vars.SENTRY_URL }}
+            SENTRY_ORG=${{ vars.SENTRY_ORG }}
+            SENTRY_PROJECT_REACT=${{ vars.SENTRY_PROJECT_REACT }}
+            SENTRY_PROJECT_RUST=${{ vars.SENTRY_PROJECT_RUST }}
+          secrets: |
+            sentry_auth_token=${{ secrets.SENTRY_AUTH_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarize published image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo '## Tenant image published to GHCR'
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo 'Tags:'
+            echo '```'
+            printf '%s\n' "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
