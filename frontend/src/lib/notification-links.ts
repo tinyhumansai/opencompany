@@ -21,14 +21,16 @@ import { renderedChannelIdForContext } from "@/lib/mention-badge";
 /**
  * The hash a row links to, or `null` when nothing in the console is about it.
  *
- * `message` is the only kind that cannot be answered from `subjectId` alone:
- * the id is a chat message id, and the console addresses *channels*, not
- * messages. `context` is the channel the host recorded for exactly this reason
- * ("so a badge lands without the transcript being loaded"), and it is resolved
- * through [`renderedChannelIdForContext`] rather than used raw — the same
- * resolution the mention badge and the shell's thread re-read already share, so
- * a legacy general-chat spelling lands on the rendered main channel here too
- * instead of on a channel id that does not exist (issue #65).
+ * `message` and `workflow`'s `workflow_report` kind are the two that cannot be
+ * answered from `subjectId` alone: a `message` id is a chat message id, and a
+ * `workflow_report`'s `subjectId` is the workflow's own id, neither of which is
+ * a channel — the console addresses *channels*. Both carry the channel in
+ * `context` instead (the DM `report_to_operator` journals the report into),
+ * resolved through [`renderedChannelIdForContext`] rather than used raw — the
+ * same resolution the mention badge and the shell's thread re-read already
+ * share, so a legacy general-chat spelling lands on the rendered main channel
+ * here too instead of on a channel id that does not exist (issue #65). Every
+ * other `workflow` notification still opens the workflows list.
  */
 export function notificationHref(
   notification: NotificationDto,
@@ -54,8 +56,17 @@ export function notificationHref(
       // one. A narrowed queue matching nothing renders "this card is clear",
       // which would be a lie about the row that sent you there.
       return "#/approvals";
-    case "workflow":
+    case "workflow": {
+      if (notification.kind === "workflow_report") {
+        const channel = renderedChannelIdForContext(
+          notification.context,
+          channels.mainChannelId,
+          channels.rendered,
+        );
+        return channel ? `#/chat/${channel}` : null;
+      }
       return "#/workflows";
+    }
     case "message": {
       const channel = renderedChannelIdForContext(
         notification.context,

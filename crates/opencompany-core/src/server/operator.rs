@@ -130,11 +130,6 @@ pub fn router() -> Router<AppState> {
         // Desk member ordering / hierarchy (issue #131): set the operator's
         // explicit member order for a desk. Registered under both scope forms.
         .merge(scoped("/desks/{desk_id}/order", put(set_desk_order)))
-        // The always-present, durable Operator feed — its own surface, not a
-        // desk (issue #1757 rework). Read-only identity lookup: the console
-        // pins it below a divider in the chat rail rather than folding it
-        // into `GET {scope}/desks`.
-        .merge(scoped("/operator-channel", get(operator_channel)))
         // The company → operator attention feed (issue #66): a live SSE stream of
         // the attention-worthy events already on the company's event log, under
         // both scope forms.
@@ -308,65 +303,9 @@ async fn list_desks(scope: ScopedCompany) -> Result<Json<Vec<DeskDto>>, crate::s
             manifest_desks.chain(overlay_desks).collect()
         })
         // A company that failed to load surfaces no desks — the console falls
-        // back to its static default threads (issue #1757 rework: the Operator
-        // feed is its own surface now, fetched through `GET
-        // {scope}/operator-channel` rather than injected here).
+        // back to its static default threads.
         .unwrap_or_default();
     Ok(Json(desks))
-}
-
-/// The identity of the company's always-present, durable Operator feed
-/// (issue #1757 rework). Mirrors `OperatorChannelDto` in
-/// `frontend/src/api/types.ts`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OperatorChannelDto {
-    /// The channel id — the `desk` query param `GET
-    /// {scope}/chat/history?desk=<id>` reads its transcript through.
-    id: String,
-    /// Always "Operator" — the console's pinned-row label.
-    name: String,
-    /// The channel's purpose line, shown under the name in the pinned row.
-    description: String,
-}
-
-/// `GET {scope}/operator-channel` — the identity of the company's dedicated,
-/// durable Operator feed: where "what happened and what needs you" workflow
-/// reports and the owner/no-mailbox fallback land. A pinned surface, not a
-/// desk — the console renders it as its own row below a divider rather than
-/// folding it into `GET {scope}/desks`, and it carries no member or mutation
-/// routes.
-///
-/// `id` resolves through
-/// [`CompanyRecord::operator_feed_channel`](crate::ports::types::CompanyRecord::operator_feed_channel)
-/// — ordinarily [`OPERATOR_CHANNEL`](crate::runtime::OPERATOR_CHANNEL), or
-/// [`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK)
-/// for the one grandfathered company shape where a roster teammate already
-/// owns that id — so this and delivery
-/// (`workflows::delivery::send_to_channel_adapter`) always agree on where the
-/// feed lives. A company with no record yet still gets the default id, so the
-/// console always has a channel to point its history read at — but a store
-/// read failure is propagated as an error rather than silently answered with
-/// the default id: for the grandfathered collision-fallback company, treating
-/// a transient failure as "no record" would label the operator's real
-/// `operator-feed` transcript as `operator` while delivery keeps targeting the
-/// collision-aware address once the store recovers.
-async fn operator_channel(
-    scope: ScopedCompany,
-) -> Result<Json<OperatorChannelDto>, crate::server::Rejection> {
-    let id = scope
-        .runtime
-        .store()
-        .load(scope.id())
-        .await?
-        .map(|record| record.operator_feed_channel().to_string())
-        .unwrap_or_else(|| crate::runtime::OPERATOR_CHANNEL.to_string());
-    Ok(Json(OperatorChannelDto {
-        id,
-        name: "Operator".to_string(),
-        description: "Workflow reports and notifications — what happened and what needs you"
-            .to_string(),
-    }))
 }
 
 /// Whether `desk_id` names the built-in `#general` channel rather than a desk
@@ -2652,7 +2591,8 @@ struct ChatMessage {
     /// The operator's message text.
     #[serde(alias = "message")]
     text: String,
-    /// The desk the message is addressed to. Defaults to the "General" desk.
+    /// The desk the message is addressed to. Omitting it is deprecated; such a
+    /// message lands in the default agent's DM.
     #[serde(default)]
     chat: Option<String>,
     /// The message this one replies to, by its id (issue #364) — a thread reply
@@ -3133,29 +3073,34 @@ async fn run_chat(
             // as the turn-failure notice above: a direct `AgentReply` in the
             // same desk this card would have opened in, so it round-trips
             // through history like any other reply.
-            let notice = CompanyEvent::AgentReply {
-                audience: Vec::new(),
-                episode: None,
-                parent: reply_thread(accepted.thread_root(), accepted.message_seq),
-                chat_id: message
-                    .chat
-                    .clone()
-                    .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
-                agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
-                text: "This should have opened a task card, but the card could not be saved. \
-                       Nothing else was lost — send the message again, or open the card by hand."
-                    .to_string(),
-                steps: Vec::new(),
-                task_id: None,
-                outputs: Vec::new(),
-                mentions: Vec::new(),
-                mention_depth: 0,
-            };
-            if let Err(journal_err) = runtime.events().append(runtime.id(), notice).await {
-                tracing::warn!(
-                    error = %journal_err,
-                    "failed to journal the card-open failure notice itself"
-                );
+            match addressed_or_default_dm(&runtime, message.chat.as_deref()).await {
+                Some(chat_id) => {
+                    let notice = CompanyEvent::AgentReply {
+                        audience: Vec::new(),
+                        episode: None,
+                        parent: reply_thread(accepted.thread_root(), accepted.message_seq),
+                        chat_id,
+                        agent_id: crate::ports::SYSTEM_AUTHOR.to_string(),
+                        text: "This should have opened a task card, but the card could not be \
+                               saved. Nothing else was lost — send the message again, or open \
+                               the card by hand."
+                            .to_string(),
+                        steps: Vec::new(),
+                        task_id: None,
+                        outputs: Vec::new(),
+                        mentions: Vec::new(),
+                        mention_depth: 0,
+                    };
+                    if let Err(journal_err) = runtime.events().append(runtime.id(), notice).await {
+                        tracing::warn!(
+                            error = %journal_err,
+                            "failed to journal the card-open failure notice itself"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    "no conversation to post the card-open failure notice in: the roster is empty"
+                ),
             }
         }
     }
@@ -3172,6 +3117,21 @@ async fn run_chat(
         )
         .await?;
     Ok((report, feedback_note))
+}
+
+/// The conversation a message addressed, else the default agent's DM. `None`
+/// only when the message named none and the roster is empty (or unreadable).
+pub(crate) async fn addressed_or_default_dm(
+    runtime: &CompanyRuntime,
+    chat: Option<&str>,
+) -> Option<String> {
+    if let Some(chat) = chat {
+        return Some(chat.to_string());
+    }
+    runtime.default_agent_dm().await.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "could not read the roster for the default agent's DM");
+        None
+    })
 }
 
 /// What accepting a chat turn produced, before any of the turn's work runs
@@ -3794,14 +3754,24 @@ async fn chat_and_emit(
     state: &AppState,
     id: &CompanyId,
     runtime: Arc<CompanyRuntime>,
-    message: ChatMessage,
+    mut message: ChatMessage,
     by: Option<Actor>,
 ) -> Result<ChatOk, ApiError> {
-    // The default desk for an unaddressed message.
-    let desk = message
-        .chat
-        .clone()
-        .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string());
+    let desk = match message.chat.clone() {
+        Some(chat) => chat,
+        None => {
+            let desk = addressed_or_default_dm(&runtime, None)
+                .await
+                .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string());
+            tracing::warn!(
+                company = %id,
+                chat = %desk,
+                "[chat] a message with no `chat` is deprecated; routed to the default agent's DM"
+            );
+            message.chat = Some(desk.clone());
+            desk
+        }
+    };
     // Issue #1757: the Operator channel is a **read-only** aggregation surface —
     // a "what happened" feed of workflow reports, not a conversation. Refuse a
     // send addressed to it rather than journaling an `OperatorMessage` under the

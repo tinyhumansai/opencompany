@@ -1,7 +1,6 @@
 import type { Step } from "react-joyride";
 
 import type { View } from "@/components/app-shell";
-import { MAIN_THREAD_ID } from "@/lib/chat";
 
 /**
  * One stop on the guided tour: a spotlight target plus the console view it
@@ -13,16 +12,12 @@ import { MAIN_THREAD_ID } from "@/lib/chat";
  * spotlight never waits on a code-split chunk. Only the chat composer anchors to
  * content, and Chat is not lazy.
  *
- * A content anchor has to be **addressed**, not just navigated to: a stop that
- * names only its view inherits whatever sub-page was last open there, and a
- * content anchor the remembered sub-page does not render is skipped in silence.
- * Both chat composer stops therefore carry an explicit `sub`. That matters more
- * since #1984, which stopped rendering a composer at all on the read-only
- * Operator feed — with Room remembering the last channel, an operator whose last
- * visit was `#Operator` would otherwise have had BOTH composer stops skip, and
- * a seven-stop tour would have silently taught five.
+ * The two chat composer stops name no channel: a bare `#/chat` opens the
+ * channel the operator was last reading, else the first one in the rail, and
+ * every channel the rail offers renders a composer. Only the archived
+ * `#general` line is read-only, and a bare `#/chat` does not restore onto it.
  *
- * Each nav stop therefore has to name a row that EXISTS. The anchor is
+ * Each nav stop has to name a row that EXISTS. The anchor is
  * `nav-<view>`, not `nav-<label>`, because the two are deliberately allowed to
  * differ — the `chat` view's row says "Room", the `workflows` view's says
  * "Flows" — and an anchor should not move when a word does. What it must track
@@ -64,25 +59,7 @@ export const TOUR: TourStop[] = [
     body: "Four places: the Room you talk in, your Company, what it's Connected to, and the Automations it repeats. Open one and what's inside it appears underneath.",
   },
   {
-    // `sub` is not optional here, and neither composer stop below may drop it.
-    //
-    // A bare `setView("chat")` restores whichever channel the operator was last
-    // on — `app-shell`'s `lastSubByViewRef`, and `RoomView`'s own
-    // `readLastChannel` for a cold start. That can be the read-only `#Operator`
-    // feed, which renders no composer at all since PR #1984. The stop would then
-    // wait out `targetWaitTimeout` and be **skipped** — silently, because a
-    // missing anchor degrades rather than errors (see `waitForTarget`), so the
-    // tour would simply teach less and say nothing about it. The last stop below
-    // is "You're all set", so the tour would end by vanishing.
-    //
-    // `main` is the built-in company-wide channel, present in every company from
-    // first boot (issue #1743) and always writable. A blueprint that
-    // grandfathers a desk onto that line renders it under the desk's own id
-    // instead; `RoomView` folds every General spelling onto whichever channel
-    // actually holds the line (`generalChannelId`), so this address resolves
-    // either way rather than raising issue #370's unknown-channel notice.
     view: "chat",
-    sub: MAIN_THREAD_ID,
     target: '[data-tour="chat-composer"]',
     placement: "top",
     title: "Talk to your company",
@@ -120,9 +97,7 @@ export const TOUR: TourStop[] = [
     body: "Plug in the tools your company already uses — Gmail, Slack, Notion — so your agents can act for real.",
   },
   {
-    // Addressed, for the reason the first composer stop above gives at length.
     view: "chat",
-    sub: MAIN_THREAD_ID,
     target: '[data-tour="chat-composer"]',
     placement: "top",
     title: "You're all set",

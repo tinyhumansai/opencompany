@@ -34,7 +34,7 @@ describe("a live frame's thread key", () => {
 
   it("resolves a General alias whatever casing the caller addressed", () => {
     // The host echoes the caller's spelling; all of them are the same line, and
-    // the console armed its maps at the built-in channel's id.
+    // the console armed its maps at the archive's id.
     for (const spelling of ["", "main", "General", "general"]) {
       expect(liveFrameThreadKey(LOADED, spelling)).toBe(MAIN_THREAD_ID);
     }
@@ -59,7 +59,7 @@ describe("a live frame's thread key", () => {
   it("honours a blueprint desk that owns the General line", () => {
     // A company declaring `[[group_chat]] id = "general"` keeps its own desk,
     // and the map is the only thing that knows. Resolution must defer to it
-    // rather than assume the built-in channel.
+    // rather than assume the archive.
     const blueprint = { ...LOADED, [MAIN_THREAD_ID]: "growth" };
     expect(liveFrameThreadKey(blueprint, "General")).toBe("growth");
   });

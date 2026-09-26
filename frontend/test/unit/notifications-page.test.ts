@@ -210,6 +210,38 @@ describe("where a row sends you", () => {
     );
   });
 
+  it("opens an ordinary workflow row on the workflows list", () => {
+    expect(
+      notificationHref(
+        row({ kind: "mention", subjectKind: "workflow", subjectId: "wf1", context: "desk-ops" }),
+        CHANNELS,
+      ),
+    ).toBe("#/workflows");
+  });
+
+  it("opens a workflow-report row on the report's DM, not the workflows list", () => {
+    // `report_to_operator` journals the report into the responsible agent's
+    // DM and files a `workflow_report` notification with that DM as
+    // `context` — the general `workflow` case ignores `context` entirely, so
+    // this row needs its own branch or it opens a list with no report in it.
+    const dm = "dm:product_manager";
+    expect(
+      notificationHref(
+        row({ kind: "workflow_report", subjectKind: "workflow", subjectId: "wf1", context: dm }),
+        { rendered: new Set([dm]), mainChannelId: "desk-design" },
+      ),
+    ).toBe(`#/chat/${dm}`);
+  });
+
+  it("renders a workflow-report row inert if it names no DM", () => {
+    expect(
+      notificationHref(
+        row({ kind: "workflow_report", subjectKind: "workflow", subjectId: "wf1", context: undefined }),
+        CHANNELS,
+      ),
+    ).toBeNull();
+  });
+
   it("resolves a message row through the channel the host recorded", () => {
     expect(notificationHref(row({ context: "desk-ops", subjectId: "412" }), CHANNELS)).toBe(
       "#/chat/desk-ops?m=h412",

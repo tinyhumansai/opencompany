@@ -641,14 +641,9 @@ pub enum DeliveryReason {
     /// The channel adapter refused the message. As with mail, the adapter's own
     /// reason stays in `detail`.
     ChannelRefused,
-    /// The operator feed's collision fallback
-    /// ([`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK))
-    /// is itself shadowed by a second grandfathered desk name, so there is no
-    /// address left to journal this report to that would not land it in that
-    /// desk's own transcript — see
-    /// [`CompanyRecord::operator_feed_channel_fallback_shadowed`](crate::ports::types::CompanyRecord::operator_feed_channel_fallback_shadowed)
-    /// (issue #1781 review). Refused rather than delivered, unlike the primary
-    /// collision.
+    /// The retired Operator feed's collision fallback was itself shadowed by a
+    /// desk name, so the report was refused. No longer produced; kept so rows
+    /// recorded with it still parse.
     ChannelCollisionShadowed,
     /// The destination kind is not one this runtime knows how to deliver to
     /// (unreachable through `parse_workflow`, which rejects unknown kinds).

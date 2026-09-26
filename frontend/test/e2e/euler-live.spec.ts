@@ -17,7 +17,7 @@ import {
   transcript,
   type Card,
 } from "./euler";
-import { dispatch, openMainLine, say, silenceTour } from "./orchestration";
+import { dispatch, openOrchestratorDm, say, silenceTour } from "./orchestration";
 
 /**
  * **The whole company, against a problem that has a right answer.**
@@ -138,7 +138,7 @@ async function waitQuiet(
   approved: string[],
   budgetMs = 30 * 60_000,
 ): Promise<void> {
-  await openMainLine(page);
+  await openOrchestratorDm(page);
   const deadline = Date.now() + budgetMs;
   // One settled reading is not enough: a turn that has just ended has not yet
   // drained its delegations, so the board is momentarily quiet in the middle of
@@ -179,7 +179,7 @@ test("the lab takes a Project Euler problem and returns the published answer", a
   const approved: string[] = [];
 
   await silenceTour(page);
-  await openMainLine(page);
+  await openOrchestratorDm(page);
 
   // ── 1. The problem, as an operator would state it ──────────────────────
   // The statement is handed over in full and the *method* is left entirely to
@@ -264,7 +264,7 @@ test("the lab takes a Project Euler problem and returns the published answer", a
 
     // Not finished. Ask the way an operator would — for the state of things,
     // not for a particular tool — and let the company decide what to do next.
-    await openMainLine(page);
+    await openOrchestratorDm(page);
     await say(
       page,
       "Where does this stand? If the answer is not yet checked, please carry on: " +
@@ -277,7 +277,7 @@ test("the lab takes a Project Euler problem and returns the published answer", a
   // A final, explicit ask so the verdict reads on a deliberate statement rather
   // than on a number that happened to appear mid-working. Cheap, and it is what
   // makes a failure message quotable.
-  await openMainLine(page);
+  await openOrchestratorDm(page);
   await say(
     page,
     `What is the final answer to Project Euler Problem ${problem.id}? ` +
@@ -315,7 +315,7 @@ test("the lab takes a Project Euler problem and returns the published answer", a
 
   expect(
     final,
-    "the lab never answered the final question — the last message in the main line is " +
+    "the lab never answered the final question — the last message in the orchestrator DM is " +
       "the operator's own",
   ).toBeTruthy();
 

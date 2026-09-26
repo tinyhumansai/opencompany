@@ -163,6 +163,23 @@ pub fn dm_key(chat: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
+/// The console's DM channel key for the teammate `agent`: `dm:<agent>`.
+pub fn dm_channel(agent: &str) -> String {
+    format!("{DM_PREFIX}{agent}")
+}
+
+/// The thread a turn answers in: `chat` when it names one, else `agent`'s DM.
+pub fn chat_or_dm(chat: Option<&str>, agent: &str) -> String {
+    chat.map_or_else(|| dm_channel(agent), str::to_string)
+}
+
+/// The DM channel of the company's default agent — the orchestrator, else the
+/// first teammate on the roster — which is where a message, reply or notice
+/// that names no conversation lands. `None` on an empty roster.
+pub fn default_agent_dm(record: &CompanyRecord) -> Option<String> {
+    crate::company::orchestrator_id(&record.effective_agents()).map(dm_channel)
+}
+
 /// Resolves `assignee` against `record`'s full roster.
 ///
 /// Resolution order, and the order matters: **desks first**, mirroring

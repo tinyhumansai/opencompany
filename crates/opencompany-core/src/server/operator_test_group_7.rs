@@ -134,6 +134,7 @@ async fn a_detached_turn_still_journals_its_question_and_its_answer() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home, "running").await;
+    let dm = default_dm(&state).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
@@ -159,7 +160,7 @@ async fn a_detached_turn_still_journals_its_question_and_its_answer() {
     // than for a handle this route deliberately does not hold.
     let mut history = Vec::new();
     for _ in 0..100 {
-        history = get_history(&app, &cookie, "").await;
+        history = get_history(&app, &cookie, &dm).await;
         if history
             .iter()
             .any(|m| m["text"].as_str() == Some("You said: detached hello"))
@@ -220,6 +221,7 @@ async fn thread_replies_survive_a_history_reload() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home, "running").await;
+    let dm = default_dm(&state).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
@@ -239,7 +241,7 @@ async fn thread_replies_survive_a_history_reload() {
         "the answer is its own journal line, not the root's"
     );
 
-    let history = get_history(&app, &cookie, "").await;
+    let history = get_history(&app, &cookie, &dm).await;
     let parented: Vec<(&str, Option<&str>)> = history
         .iter()
         .map(|m| (m["text"].as_str().unwrap(), m["parentId"].as_str()))
@@ -297,6 +299,7 @@ async fn reactions_persist_are_attributed_and_are_idempotent() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home, "running").await;
+    let dm = default_dm(&state).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
@@ -313,7 +316,7 @@ async fn reactions_persist_are_attributed_and_are_idempotent() {
         StatusCode::NO_CONTENT
     );
 
-    let history = get_history(&app, &cookie, "").await;
+    let history = get_history(&app, &cookie, &dm).await;
     let reacted = history
         .iter()
         .find(|m| m["id"].as_str() == Some(target.as_str()))
@@ -332,7 +335,7 @@ async fn reactions_persist_are_attributed_and_are_idempotent() {
         post_reaction(&app, &cookie, &target, "👍", false).await,
         StatusCode::NO_CONTENT
     );
-    let history = get_history(&app, &cookie, "").await;
+    let history = get_history(&app, &cookie, &dm).await;
     let cleared = history
         .iter()
         .find(|m| m["id"].as_str() == Some(target.as_str()))
@@ -482,6 +485,7 @@ async fn a_message_in_one_channel_is_absent_from_another() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_manifest(&home, desk_manifest()).await;
+    let dm = default_dm(&state).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
@@ -498,7 +502,7 @@ async fn a_message_in_one_channel_is_absent_from_another() {
         .iter()
         .map(|m| m["text"].as_str().unwrap().to_string())
         .collect();
-    let general = get_history(&app, &cookie, "").await;
+    let general = get_history(&app, &cookie, &dm).await;
     let general_texts: Vec<&str> = general
         .iter()
         .map(|m| m["text"].as_str().unwrap())

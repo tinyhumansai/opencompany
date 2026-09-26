@@ -8,17 +8,9 @@
 //! `OperatorMessage` events through the HTTP chat route, not through this
 //! stream, so `inbound` is an empty stream for now.
 //!
-//! The *delivery* side is backed by [`DurableOperatorChannel`] (issue #1757).
-//! A workflow `owner` report on a company with no mailbox used to dead-end on
-//! the in-memory buffer — which has no durable reader, so the one human who
-//! could act on it never saw it. The durable adapter instead journals the
-//! report onto its own `operator` chat line through the same event-log
-//! mechanism [`DeskChannel`] uses, so it survives a restart and is rendered by
-//! the console's standing **Operator channel** — a first-class, always-present
-//! system desk the desk list enumerates alongside the real desks. It carries the
-//! `operator` channel id but is wired only into the workflow-delivery adapter
-//! set, never into the interactive runtime channels — so it can never
-//! double-journal an interactive reply.
+//! A workflow report addressed to the operator does not go through this
+//! adapter: `workflows::delivery` journals it into the responsible agent's DM
+//! and files a notification.
 
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -32,9 +24,9 @@ use crate::ports::types::{CompanyEvent, CompanyId, EventSeq, InboundMessage, Out
 
 /// The `agent_id` a workflow-delivered report is journaled under, so the
 /// console (and any other reader) can tell a workflow report apart from an
-/// agent's own reply. Shared by [`DeskChannel`] and [`DurableOperatorChannel`]
-/// so every workflow bubble names the same author whichever surface it lands
-/// on.
+/// agent's own reply. Shared by [`DeskChannel`] and the operator reports
+/// `workflows::delivery` journals, so every workflow bubble names the same
+/// author whichever surface it lands on.
 ///
 /// Hyphenated on purpose, the same way
 /// [`CONFINED_AGENT_ID`](crate::ports::CONFINED_AGENT_ID) is: `agent_slug`
@@ -218,110 +210,6 @@ impl std::fmt::Debug for OperatorChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OperatorChannel")
             .field("sent", &self.sent().len())
-            .finish()
-    }
-}
-
-/// The **durable** operator delivery channel (issue #1757).
-///
-/// Carries the [`OPERATOR_CHANNEL`] id, but unlike [`OperatorChannel`] it does
-/// not buffer in memory — it appends the report to the company's event log as an
-/// `AgentReply` on the **dedicated operator line** (`chat_id == OPERATOR_CHANNEL`,
-/// NOT the General/main line). That is the same durable write path [`DeskChannel`]
-/// uses, so a report survives a restart; and because it lands on its own
-/// `operator` chat id, the console renders it in the standing **Operator channel**
-/// — a first-class, always-present system desk the desk list enumerates
-/// alongside the real desks (see `server::operator::list_desks`). It is the
-/// aggregating "what happened" surface for workflow-run reports and the
-/// owner/no-mailbox fallback.
-///
-/// Authored under [`WORKFLOW_REPLY_AUTHOR`], and the report text carries a source
-/// header ([`operator_report`](crate::workflows::delivery)), so a workflow report
-/// is distinguishable at a glance from any other message.
-///
-/// Wired **only** into the workflow-delivery adapter set (see the runtime
-/// builder), never into the interactive runtime channels the cycle's
-/// `route_response` sends to — so an interactive reply that already journals
-/// itself can never be double-recorded here.
-#[derive(Clone)]
-pub struct DurableOperatorChannel {
-    company: CompanyId,
-    events: Arc<dyn EventLog>,
-}
-
-impl DurableOperatorChannel {
-    /// Creates a durable operator channel for `company`, journaling through
-    /// `events`.
-    pub fn new(company: CompanyId, events: Arc<dyn EventLog>) -> Self {
-        Self { company, events }
-    }
-}
-
-#[async_trait]
-impl ChannelAdapter for DurableOperatorChannel {
-    fn channel_id(&self) -> &str {
-        OPERATOR_CHANNEL
-    }
-
-    fn inbound(&self) -> BoxStream<'static, InboundMessage> {
-        Box::pin(stream::empty())
-    }
-
-    async fn send(&self, msg: OutboundMessage) -> Result<()> {
-        self.events
-            .append(
-                &self.company,
-                CompanyEvent::AgentReply {
-                    audience: Vec::new(),
-                    episode: None,
-                    // The dedicated operator line, normally `OPERATOR_CHANNEL`
-                    // itself — `owns("operator","operator",…)` matches it (it is
-                    // NOT folded into General — see
-                    // `server::chat_history::is_general_chat`), so the console's
-                    // standing Operator channel renders exactly these reports and
-                    // nothing else.
-                    //
-                    // The caller (`workflows::delivery::send_to_channel_adapter`)
-                    // sets `msg.channel` to
-                    // `CompanyRecord::operator_feed_channel()`'s result, not
-                    // always the literal `OPERATOR_CHANNEL`: a company whose
-                    // roster already grandfathers a **teammate** at that literal
-                    // id resolves to `OPERATOR_CHANNEL_COLLISION_FALLBACK`
-                    // instead, so a report can never land on the same address as
-                    // that teammate's own DM (issue #1781 review).
-                    chat_id: msg.channel,
-                    // Ordinarily `WORKFLOW_REPLY_AUTHOR`. The owner-fallback
-                    // report overrides this to `OWNER_FALLBACK_REPORT_AUTHOR`
-                    // via `msg.agent` so the read path can restrict exactly
-                    // those rows to admins (issue #1781 review, Codex P1) —
-                    // every other producer leaves `agent` unset and gets the
-                    // ordinary author, unchanged.
-                    agent_id: msg
-                        .agent
-                        .unwrap_or_else(|| WORKFLOW_REPLY_AUTHOR.to_string()),
-                    text: msg.text,
-                    steps: msg.steps,
-                    outputs: msg.outputs,
-                    task_id: msg.task_id,
-                    parent: msg
-                        .reply_to
-                        .and_then(|reply| reply.chat_id.parse::<u64>().ok())
-                        .map(EventSeq::new),
-                    // A workflow report addresses the thread it posts into, not a
-                    // person in it — nothing to resolve an `@name` against.
-                    mentions: Vec::new(),
-                    mention_depth: 0,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for DurableOperatorChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableOperatorChannel")
-            .field("company", &self.company)
             .finish()
     }
 }

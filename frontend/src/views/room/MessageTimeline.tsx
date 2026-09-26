@@ -548,12 +548,12 @@ function ChannelIntro({
           offering "add an agent here" over a channel that turns out to be full
           of conversation reads as data loss.
 
-          Not on the read-only Operator feed (`channel.system`, the same
+          Not on a read-only channel (`channel.system`, the same
           predicate `RoomView` derives `readOnly` from). Neither opening exists
           there: "Give the team a brief" prefills a composer that channel does
           not render, and "Add people" opens a members pane `RoomView` gates
           off on the same flag — so both were controls offering an action that
-          could not happen, under a notice saying there is nothing to reply to
+          could not happen, under a notice saying nothing can be posted
           here. */}
       {empty && !loading && channel.kind === "channel" && !channel.system && (
         <ActionCards onStartBrief={onStartBrief} onAddPeople={onAddPeople} />

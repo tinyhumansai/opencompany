@@ -12,23 +12,17 @@ import { isGeneralChannel } from "@/lib/chat";
 export { GENERAL_CHANNEL, isGeneralChannel } from "@/lib/chat";
 
 /**
- * Does this desk answer to the company-wide line?
+ * Does this desk answer to the legacy company-wide line?
  *
  * Id **or** display name, mirroring the host's `resolve_desk_id`, which matches
  * a desk by either — so a blueprint declaring `id = "ops", name = "General"`
- * routes the built-in line at that desk exactly as one declaring
- * `id = "general"` does. An id-only test rendered it as a second `#general` row
- * beside the built-in channel while the host answered from the desk, which is
- * the same duplicate this predicate exists to prevent.
+ * owns the line exactly as one declaring `id = "general"` does, and a General
+ * spelling in a deep link opens that desk rather than the read-only archive.
  *
- * **A blueprint desk only.** `resolve_desk_id` searches the manifest desks and
- * then the operator-created overlay ones, and it declines the overlay half for
- * a General key outright — so an overlay desk *named* `General` answers only to
- * its own id and does not have the line. It is projected under that id like any
- * other desk (`GET .../desks`), and letting its name claim the line here would
- * take `#general` off the rail in a company where the host still answers it as
- * the orchestrator. `overlayCreated` is the host's own word for the
- * distinction, carried through {@link Desk} for exactly this.
+ * **A blueprint desk only.** `resolve_desk_id` declines the operator-created
+ * overlay half for a General key, so an overlay desk *named* `General` answers
+ * only to its own id and does not have the line. `overlayCreated` is the host's
+ * own word for the distinction, carried through {@link Desk} for exactly this.
  *
  * The host reserves both spellings against newly created desks; a manifest can
  * still declare either, and that is the grandfathered case.
@@ -88,18 +82,9 @@ export interface Desk {
 /**
  * A few focused desks, for a host that exposes none of its own.
  *
- * **No `#general` row.** It used to carry one — `id: "main"` — back when the
- * company-wide line existed only here. Since issue #1743 the rail projects
- * `#general` from the roster instead ({@link buildChannels}), so a row here
- * would be a second one sitting beside it.
- *
- * Removing it is not just de-duplication. While it existed, `isGeneralChannel`
- * was true of a row in this fabricated set *and* of a desk a blueprint really
- * declared, and nothing downstream could tell the two apart — which is exactly
- * how a `[[group_chat]] id = "general"` came out as two channels folding onto
- * one transcript, and a `[[group_chat]] id = "main"` came out hidden while the
- * host still routed to its lead. Console-side desk fabrication being
- * indistinguishable from a real desk is the same shape as issue #370.
+ * **No `#general` row.** A fabricated General desk would be indistinguishable
+ * from one a blueprint really declared, and {@link deskClaimsGeneralChannel}
+ * would then hand it the legacy line — the same shape as issue #370.
  */
 export function defaultDesks(): Desk[] {
   return [

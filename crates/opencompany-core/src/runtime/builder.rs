@@ -3572,40 +3572,17 @@ impl RuntimeBuilder {
                                     // before their first sign-in mints a user
                                     // record. `None` off the hosted serve path.
                                     bootstrap_admin: self.bootstrap_admin.clone(),
-                                    // Swap the *interactive* operator adapter for
-                                    // the DURABLE one (issue #1757). The in-memory
-                                    // operator is a response surface with no
-                                    // durable reader, so it is dropped by
-                                    // **identity** (its `operator` id) and the
-                                    // journal-backed `DurableOperatorChannel` is
-                                    // pushed under the same id in its place — so a
-                                    // report to `operator` (an `owner` fallback or
-                                    // an explicit `channel` target) lands durably
-                                    // in the standing Operator channel. The durable
-                                    // one is added ONLY here, never to the
-                                    // interactive `channels` above, so it can never
-                                    // double-journal a `route_response` reply. The
-                                    // result is exactly the picker set
-                                    // (`deliverable_channel_ids`) by membership —
-                                    // the #981 equality invariant, now with
-                                    // `operator` on both sides.
-                                    channels: {
-                                        let mut delivery_channels: Vec<Arc<dyn ChannelAdapter>> =
-                                            channels
-                                                .iter()
-                                                .filter(|channel| {
-                                                    channel.channel_id() != OPERATOR_CHANNEL
-                                                })
-                                                .cloned()
-                                                .collect();
-                                        delivery_channels.push(Arc::new(
-                                            crate::runtime::channel::DurableOperatorChannel::new(
-                                                id.clone(),
-                                                events.clone(),
-                                            ),
-                                        ));
-                                        delivery_channels
-                                    },
+                                    // The interactive operator adapter is a
+                                    // response surface with no durable reader,
+                                    // so it is dropped by identity; a report
+                                    // addressed to the operator is journaled by
+                                    // `workflows::delivery` itself.
+                                    channels: channels
+                                        .iter()
+                                        .filter(|channel| channel.channel_id() != OPERATOR_CHANNEL)
+                                        .cloned()
+                                        .collect(),
+                                    notifications: Some(ops.notifications.clone()),
                                     // Issue #227: the same gate and journal the
                                     // runtime gets below — one approvals queue,
                                     // so a report parked by a workflow lands in

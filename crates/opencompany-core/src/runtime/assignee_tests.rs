@@ -375,3 +375,34 @@ fn a_desk_assignment_is_not_relinked_to_its_lead() {
         "a teammate assignment is already canonical and stays linked"
     );
 }
+
+#[test]
+fn the_default_agent_dm_is_the_orchestrators_dm() {
+    assert_eq!(default_agent_dm(&acme()).as_deref(), Some("dm:ceo"));
+
+    let tagged = record(
+        r#"
+[company]
+name = "Acme"
+
+[[agent]]
+id = "engineer"
+role = "Engineer"
+
+[[agent]]
+id = "boss"
+role = "Chief Executive"
+tier = "orchestrator"
+"#,
+    );
+    assert_eq!(default_agent_dm(&tagged).as_deref(), Some("dm:boss"));
+
+    let empty = record("[company]\nname = \"Acme\"\n");
+    assert_eq!(default_agent_dm(&empty), None);
+}
+
+#[test]
+fn a_turn_with_no_thread_answers_in_the_agents_dm() {
+    assert_eq!(chat_or_dm(Some("eng"), "engineer"), "eng");
+    assert_eq!(chat_or_dm(None, "engineer"), "dm:engineer");
+}

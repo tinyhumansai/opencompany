@@ -204,11 +204,8 @@ test("#369 a DM reads as two people, not as the whole company", async ({ page })
 
 test("#369 a host with no desks surface still shows the whole roster", async ({ page }) => {
   await mockApi(page, () => "404");
-  // `strategy`, not `general` (issue #1743): `#general` is no longer one of the
-  // static fallback desks — it is derived from the roster and every teammate is
-  // in it, which is what the test below this one pins. `strategy` is still a
-  // fallback desk with `members` absent, so it is the fixture this test is
-  // actually about: membership *unknown*, as distinct from membership empty.
+  // `strategy` is a fallback desk with `members` absent, so it is the fixture
+  // this test is about: membership *unknown*, as distinct from membership empty.
   await openChannel(page, "strategy");
 
   // The fallback desks have no membership to scope to, so this is unchanged
@@ -220,19 +217,17 @@ test("#369 a host with no desks surface still shows the whole roster", async ({ 
   await expect(pane(page).locator("ul").first().locator("li")).toHaveCount(17);
 });
 
-test("#1743 #general is everyone, even with no desks surface", async ({ page }) => {
-  // The other half of the case above, and the reason it had to move off
-  // `general`. `#general` is not a desk and never comes from `/desks` — it is
-  // built from the roster this render was handed — so its membership is known
-  // even when `/desks` 404s, and it is the whole company by construction.
+test("the #general archive opens read-only, even with no desks surface", async ({ page }) => {
+  // `#general` is not a desk and never comes from `/desks`, so an explicit
+  // deep link still resolves when `/desks` 404s — as the read-only archive of
+  // the old company-wide line, with no composer and no members pane.
   await mockApi(page, () => "404");
-  await openChannel(page, "general");
+  await page.goto("/#/chat/general");
 
-  await expect(membersToggle(page)).toHaveText(/17/);
-  await openPane(page);
-  await expect(pane(page)).toContainText("17 in this channel · 17 in the company");
-  await expect(pane(page).getByRole("heading", { name: "In this channel" })).toBeVisible();
-  await expect(pane(page).locator("ul").first().locator("li")).toHaveCount(17);
+  await expect(page.getByText("nothing can be posted here")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByPlaceholder(/^Message /)).toHaveCount(0);
+  await expect(membersToggle(page)).toHaveCount(0);
+  await expect(page.getByText("isn't a channel here")).toHaveCount(0);
 });
 
 test("#370 a deep link never flashes a channel the company doesn't have", async ({ page }) => {
@@ -275,9 +270,7 @@ test("#370 an unknown channel opens the first one and says so", async ({ page })
   // (issue #934), and an unqualified `getByRole("status")` matches both.
   const notice = page.getByRole("status").filter({ hasText: /isn't a channel here/ });
   await expect(notice).toContainText("#does-not-exist");
-  // General remains directly addressable for legacy history, but is no longer
-  // offered as the default destination (#2368). The notice names the first
-  // offered desk the operator actually landed in.
+  // The notice names the first offered desk the operator actually landed in.
   await expect(notice).toContainText("#engineering");
   // The hash is left alone deliberately — rewriting it needs replace-semantics
   // the shell does not thread through yet, and a push would fight the back
@@ -354,9 +347,6 @@ test("#485 a DM has no desk to manage", async ({ page }) => {
 
 test("#485 a fallback desk offers no link to a desk the host doesn't have", async ({ page }) => {
   await mockApi(page, () => "404");
-  // `strategy`, not `general`, for the same reason as the #369 case above:
-  // since issue #1743 `#general` is derived from the roster rather than being
-  // one of the static fallback desks, so it is no longer an example of one.
   await openChannel(page, "strategy");
   await openPane(page);
 

@@ -56,7 +56,6 @@ function dmFor(m: TeamMember): Channel {
     {
       [`dm:${m.id}`]: [{ id: "message", from: "you", text: "Hello", at: 1 }],
     },
-    true,
   ).find((s) => s.id === "dms");
   expect(dms?.channels).toHaveLength(1);
   return dms!.channels[0];
@@ -74,14 +73,10 @@ function channelFor(over: { channel: string; blurb: string }): Channel {
       },
     ],
     {},
-    true,
   );
   const channels = sections.find((s) => s.id === "channels")!.channels;
-  // The built-in `#general` channel is always first (issue #1743); this helper
-  // is about the desk channel after it.
-  expect(channels).toHaveLength(2);
-  expect(channels[0].id).toBe("main");
-  return channels[1];
+  expect(channels).toHaveLength(1);
+  return channels[0];
 }
 
 /** The roster shape the sample company actually produces: a role, no name. */

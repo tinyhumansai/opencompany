@@ -161,12 +161,12 @@ pub(super) async fn until(label: &str, mut f: impl AsyncFnMut() -> bool) {
 }
 
 /// The operator messages `chat/history` currently shows for the main desk.
-pub(super) async fn history_texts(app: &axum::Router) -> Vec<String> {
+pub(super) async fn history_texts(app: &axum::Router, desk: &str) -> Vec<String> {
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/company/chat/history")
+                .uri(format!("/api/v1/company/chat/history?desk={desk}"))
                 .header("cookie", crate::server::test_support::fixed_cookie("acme"))
                 .body(Body::empty())
                 .unwrap(),
@@ -445,6 +445,33 @@ pub(super) async fn multi_park_company_run(
     let _ = rt_slot.set(runtime.clone());
     let app = router(state);
 
+    if chat.is_none() && run_id.is_some() {
+        runtime
+            .run_cycle(vec![CompanyEvent::OperatorMessage {
+                text: "do it".to_string(),
+                by: None,
+                chat: None,
+                parent: None,
+                deliverable: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+            }])
+            .await
+            .expect("the parking cycle runs");
+        let approvals: Vec<_> = runtime
+            .pending_approvals()
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(approvals.len(), parks, "the turn parked {parks} sign-offs");
+        return MultiParkCompany {
+            app,
+            runtime,
+            approvals,
+            decisions,
+            cycles,
+        };
+    }
     let body = match chat {
         Some(chat) => serde_json::json!({ "text": "do it", "chat": chat }),
         None => serde_json::json!({ "text": "do it" }),

@@ -7,12 +7,9 @@ use super::*;
 /// must have the **same membership** — an author must never be offered a
 /// target the runner refuses, nor be refused a target the picker offers.
 ///
-/// #981 broke it by excluding `operator` from one side only; my earlier #1757
-/// cut broke it the other way (operator in delivery, not the picker). Now
-/// `operator` is a first-class durable channel on **both** sides, so the two
-/// sets match by membership again. Order differs by construction — the picker
-/// reads the interactive runtime channels (operator first), delivery swaps in
-/// the durable operator last — so this compares as sets, not sequences.
+/// `operator` is offered by the picker and accepted by delivery without an
+/// adapter (`workflows::delivery` reports it to the operator itself), so the
+/// delivery side is its wired adapters plus `operator`. Compared as sets.
 ///
 /// Needs the harness arm, because that is the only site that wires
 /// `WorkflowDeliveryDeps` at all.
@@ -70,7 +67,15 @@ async fn the_picker_set_and_the_delivery_deps_have_the_same_membership() {
         .channels
         .iter()
         .map(|channel| channel.channel_id().to_string())
+        .chain(std::iter::once(OPERATOR_CHANNEL.to_string()))
         .collect();
+    assert!(
+        delivery
+            .channels
+            .iter()
+            .all(|channel| channel.channel_id() != OPERATOR_CHANNEL),
+        "no adapter answers for `operator`; delivery reports it itself"
+    );
 
     // Same membership on both sides, order-independent.
     let picker = runtime.deliverable_channel_ids();

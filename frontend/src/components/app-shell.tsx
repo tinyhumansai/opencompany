@@ -131,7 +131,6 @@ import { ConsoleProvider } from "@/lib/console-context";
 import { fromDto, type TeamMember } from "@/lib/team";
 import { agentDmThreads, defaultThreads, threadsFromDesks } from "@/lib/threads";
 import { drainReReadQueue, type PendingReRead } from "@/lib/re-read-queue";
-import { fetchWithOneRetry } from "@/lib/fetch-with-retry";
 import { Overview } from "@/views/Overview";
 import { CompanyView } from "@/views/company/CompanyView";
 import { ManageListsView } from "@/views/company/ManageListsView";
@@ -149,7 +148,6 @@ import {
   runningCrossingRows,
   HISTORY_UNSTARTED,
   firstChannel,
-  isOperatorChannelDto,
   type DecidedApproval,
   type HistoryStatus,
 } from "@/views/room/model";
@@ -382,20 +380,9 @@ function connectErrorMessage(code: string, provider: string | null): string {
  */
 function channelMap(desks: Desk[], members: TeamMember[]): Record<string, string> {
   const map: Record<string, string> = {};
-  // Every spelling the host folds the company-wide line under (issue #1743).
-  //
-  // The main line used to be seeded with the first desk's id instead: with no
-  // `#general` channel to land in, it was parked on whichever desk sorted
-  // first, so it would still be somewhere the operator could find it. That is
-  // now actively wrong — an unaddressed message and its reply were rendered in
-  // `#engineering`, complete with an unread badge, while the host's own
-  // history for that desk was empty.
-  //
-  // Resolved through `channelIdForThread` rather than answered here, so there
-  // is one rule and not two: a blueprint desk grandfathered under a General id
-  // owns the line in its own company, and `buildChannels` renders no built-in
-  // channel beside it — pointing these spellings at a `main` nothing renders
-  // parks live frames and their unread badges where they cannot be opened.
+  // Every spelling the host folds the archived company-wide line under,
+  // resolved through `channelIdForThread` so a blueprint desk that claims a
+  // General id owns it in its own company.
   for (const spelling of ["", MAIN_THREAD_ID, "General", GENERAL_CHANNEL]) {
     const channelId = channelIdForThread(spelling, desks, members);
     if (channelId) map[spelling] = channelId;
@@ -1303,31 +1290,10 @@ export function AppShell({
       );
     };
 
-    Promise.all([
-      client.listDesks(company).catch(() => null),
-      // The always-present Operator feed's identity (issue #1757 rework) —
-      // fetched alongside desks, not derived from them, since it is its own
-      // surface now. `null` on any failure (offline, or a host that predates
-      // the route) rather than sinking the whole pass: a company can still
-      // rehydrate its real desks/DMs without the pinned Operator row.
-      //
-      // One retry (issue #1781 review, Codex P2): `RoomView` fetches this
-      // same identity independently for rendering the pinned row, so a
-      // single dropped request here — while `RoomView`'s own, later call
-      // succeeds — used to render the row but permanently omit its id from
-      // this pass's rehydration targets and five-second polling, since this
-      // pass had already given up. A bounded retry closes the common
-      // transient case without turning the fetch into an open-ended one; see
-      // `fetchWithOneRetry`'s doc for why it is extracted rather than inline.
-      fetchWithOneRetry(() => client.getOperatorChannel(company)),
-    ])
-      .then(async ([desks, operatorChannelRaw]) => {
-        // See `isOperatorChannelDto`'s doc comment — a client stub that
-        // resolves every unlisted method to `[]` would otherwise satisfy the
-        // `Promise.all` type and reach the field reads below.
-        const operatorChannel = isOperatorChannelDto(operatorChannelRaw)
-          ? operatorChannelRaw
-          : null;
+    client
+      .listDesks(company)
+      .catch(() => null)
+      .then(async (desks) => {
         if (cancelled || requestCompany !== company) return;
         // Issue #151 §3.3: desks first, then one DM thread per roster teammate.
         // The roster is fetched separately and tolerated as optional — a host
@@ -1353,43 +1319,14 @@ export function AppShell({
         // #1934) — derived from the roster this effect already read, so it costs
         // no extra request and is scoped to the company the effect ran for.
         setAgentNames(Object.fromEntries(roster.map((m) => [m.id, m.name])));
-        // Keep the addressing this loop resolves, not just its side effect.
-        //
-        // The Operator feed's id is folded in here too (issue #1781 review,
-        // Codex P2): `channelMap` only knows desks and roster teammates, so
-        // without this the map a **live** SSE frame is resolved through
-        // (`channelForThread(chatChannelByThread, event.chatId)`, a few
-        // hundred lines below) missed the Operator channel entirely and
-        // dropped the frame — `renderAgentReply` returns on the very next
-        // line when the lookup misses. The five-second history poll still
-        // recovered it eventually, because the `channels` rehydration-target
-        // list a little further down already carries this same id→id pair;
-        // this closes the live-event gap the poll was quietly papering over.
-        setChatChannelByThread({
-          ...channelMap(chatDesks, roster),
-          ...(operatorChannel ? { [operatorChannel.id]: operatorChannel.id } : {}),
-        });
-        // Keep unaddressed system lines in the same offered channel a bare
-        // Room route opens. The built-in General line remains addressable for
-        // legacy history, but the #2368 experiment no longer offers it in the
-        // rail, so resolving MAIN_THREAD_ID here would file a decision in a
-        // hidden transcript.
+        setChatChannelByThread(channelMap(chatDesks, roster));
+        // Unaddressed system lines go to the channel a bare Room route opens,
+        // not to the archived General line nobody is offered.
         setFirstDeskChannelId(firstChannel(buildChannels(roster, chatDesks))?.id ?? null);
-        // Fold the Operator feed's id into the same rehydration pass, keyed on
-        // its own id both as channel and thread (its channel id *is* its
-        // thread id — `chat/history?desk=<id>` reads it through the ordinary
-        // path). Without this, `RoomView`'s pinned row would sit on a channel
-        // id `historyReady` never sees a status for until `discovered` alone
-        // resolves it, and `transcripts[operatorChannel.id]` would never fill
-        // in — the spinner-forever failure mode this pass exists to avoid.
-        const threadIds = [
-          ...resolved.map((t) => t.id),
-          ...(operatorChannel ? [operatorChannel.id] : []),
-        ];
+        const threadIds = resolved.map((t) => t.id);
         const channels = [
-          // `#general` is not in the desk list (it is not a desk), so its
-          // history has to be named here or nothing would rehydrate it on
-          // reload — the one channel every company has would come back empty.
+          // The archived `#general` line is not a desk, so its history is
+          // named here or its read-only view would come back empty.
           {
             channelId: channelIdForThread(MAIN_THREAD_ID, chatDesks, roster) ?? MAIN_THREAD_ID,
             threadId: MAIN_THREAD_ID,
@@ -1417,9 +1354,6 @@ export function AppShell({
             // reload (issue #1743).
             threadId: dmThreadId(m),
           })),
-          ...(operatorChannel
-            ? [{ channelId: operatorChannel.id, threadId: operatorChannel.id }]
-            : []),
         ];
         const rehydrateAll = () => rehydrateTargets(threadIds, channels);
         // SSE remains the fast path. This catches a persisted channel message
@@ -1432,8 +1366,8 @@ export function AppShell({
         setHydration((h) => ({ ...h, discovered: true }));
       })
       .catch(() => {
-        // Last-resort safety net: `listDesks`/`getOperatorChannel` already
-        // degrade to `null` on their own failure above, so this only fires on
+        // Last-resort safety net: `listDesks` already degrades to `null` on
+        // its own failure above, so this only fires on
         // something unexpected inside the `.then` (e.g. a state setter
         // throwing) — keep the static default threads so the console still
         // renders something rather than getting stuck.
@@ -1446,8 +1380,8 @@ export function AppShell({
         setFirstDeskChannelId(firstChannel(buildChannels([], fallbackDesks))?.id ?? null);
         const threadIds = defaultThreads().map((t) => t.id);
         const channels = [
-          // `#general` is not a desk here either — same reason the success
-          // path above names it explicitly. Without this entry `mainThread()`
+          // The `#general` archive is not a desk here either — same reason the
+          // success path above names it explicitly. Without this entry `mainThread()`
           // is still in `threadIds` (via `defaultThreads()`) but has no
           // channel to rehydrate history through.
           { channelId: MAIN_THREAD_ID, threadId: MAIN_THREAD_ID },

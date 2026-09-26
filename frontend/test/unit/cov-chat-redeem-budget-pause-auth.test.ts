@@ -39,8 +39,6 @@ function clientAs(role: "admin" | "member"): OpenCompanyClient {
     },
     listDesks: () => Promise.resolve([DESK_DTO]),
     listTeam: () => Promise.resolve([MEMBER_DTO]),
-    getOperatorChannel: () =>
-      Promise.resolve({ id: "operator", name: "Operator", description: "Automation reports and notifications" }),
     redeemBudgetPause: vi.fn(async () => ({})),
   };
   return new Proxy(named, {

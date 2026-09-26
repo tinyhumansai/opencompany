@@ -21,27 +21,18 @@ import {
   directMessageChannels,
   directMessageForId,
   dmThreadId,
+  legacyGeneralChannel,
   memberForThread,
 } from "@/views/room/model";
 
 /**
- * The built-in `#general` channel (issue #1743).
+ * The legacy `#general` line.
  *
- * The defect it closes is narrow and easy to miss: `#general` existed only in
- * `defaultDesks()`, the **fallback** set used when the host exposes no desks at
- * all. So the moment a company had real desks — which is every shipped company
- * — the company-wide line vanished from the rail, and there was nowhere to
- * address everyone.
- *
- * Three properties are pinned here, and each is a requirement rather than a
- * rendering detail:
- *
- * 1. it is present whatever the host's desk list says, including when that list
- *    is long and real;
- * 2. its membership is the roster, derived on every render, with nothing
- *    written anywhere — so a teammate added a moment ago is in it;
- * 3. it is not a desk, and carries no desk affordance, because it never reaches
- *    the surfaces that offer them.
+ * The company-wide channel is gone from the rail: a message that names no chat
+ * goes to the default agent's DM. Its history is still served, so an explicit
+ * deep link opens it as a read-only archive, and every General spelling the
+ * host journals still resolves to the one place that renders it — the archive,
+ * or a blueprint desk that claims the line.
  */
 
 function member(
@@ -81,42 +72,28 @@ const DESKS: Desk[] = [
   },
 ];
 
-// `showGeneral: true` throughout this file, because this file is ABOUT the
-// built-in channel: that a desk claiming the spelling replaces it, where it
-// sorts, what it is called. The default is off (#2368) and is asserted once, at
-// the bottom, which is the only fact the default carries.
 function channels(members: TeamMember[], desks: Desk[]) {
-  return buildChannels(members, desks, {}, true).find(
+  return buildChannels(members, desks, {}).find(
     (s) => s.id === "channels",
   )!.channels;
 }
 
-describe("the built-in #general channel", () => {
-  it("is the first channel in a company that has real desks", () => {
-    const rail = channels(ROSTER, DESKS);
-    expect(rail.map((c) => c.name)).toEqual([
-      GENERAL_CHANNEL,
+describe("the rail offers no company-wide channel", () => {
+  it("lists only the company's desks", () => {
+    expect(channels(ROSTER, DESKS).map((c) => c.id)).toEqual([
       "engineering",
       "growth",
     ]);
-    expect(rail[0].kind).toBe("channel");
   });
 
-  it("replaces the static fallback's main row rather than sitting beside it", () => {
-    const rail = channels(ROSTER, defaultDesks());
-    expect(rail.filter((c) => c.name === GENERAL_CHANNEL)).toHaveLength(1);
-    // And the one that survived is the derived channel, not the members-less
-    // fallback row.
-    expect(rail[0].memberIds).toEqual(["ceo", "eng"]);
+  it("is empty on a company with no desks at all", () => {
+    expect(channels(ROSTER, [])).toEqual([]);
   });
 
-  it("steps aside for a blueprint desk that authored the id `general`", () => {
+  it("keeps a blueprint desk that authored the id `general`", () => {
     // The host grandfathers this: `is_general_channel` is guarded on
     // `!record.desk_exists`, so such a desk keeps its lead and its writes and
-    // `responder_for` routes to that lead. Adding the built-in one beside it
-    // put two `#general` rows in the rail folding onto one transcript — the
-    // host's `is_general_chat` treats `main` and `general` as one conversation
-    // — while a send could pick either responder.
+    // `responder_for` routes to that lead.
     const authored: Desk[] = [
       {
         id: "general",
@@ -136,11 +113,6 @@ describe("the built-in #general channel", () => {
   });
 
   it("keeps a blueprint desk that authored the id `main` instead of hiding it", () => {
-    // The reverse failure: this desk was filtered out of the rail, so the
-    // built-in channel took the slot and named the orchestrator as who answers
-    // — while the host still routed `main` to this desk's lead, because
-    // `responder_for` checks desks first. The UI both hid a real desk and
-    // misstated the responder.
     const authored: Desk[] = [
       {
         id: "main",
@@ -156,19 +128,14 @@ describe("the built-in #general channel", () => {
     expect(rail.map((c) => c.id)).toEqual(["main", "engineering", "growth"]);
     expect(rail[0].voice).toBe("Front office");
     expect(rail[0].memberIds).toEqual(["eng"]);
-    // Not the derived channel's claim about who picks up an unmentioned message.
     expect(rail[0].purpose).toBe("The line");
   });
 
-  it("steps aside for a blueprint desk whose display *name* is General", () => {
+  it("keeps a blueprint desk whose display *name* is General", () => {
     // The host matches a desk key by id **or** case-insensitive name
     // (`resolve_desk_id`), and reserves both spellings against newly created
     // desks — so `[[group_chat]] id = "ops", name = "General"` is a real,
-    // grandfathered case. An id-only test rendered the built-in channel *and*
-    // this desk, whose own `#` name is also `general`: two rows, one host
-    // conversation. It is not cosmetic either — `everyone_desk` folds the
-    // console's `main` to `General`, `resolve_desk_id("General")` then selects
-    // `ops`, and `@everyone` on the line scopes to that desk's members.
+    // grandfathered case.
     const namedGeneral: Desk[] = [
       {
         id: "ops",
@@ -192,7 +159,7 @@ describe("the built-in #general channel", () => {
     }
   });
 
-  it("does not step aside for a desk merely named after something else", () => {
+  it("does not treat a desk merely named after something else as the line", () => {
     // The guard is the four spellings the host folds, not a fuzzy match: a
     // desk called `Generals` or `Main Street` claims nothing.
     const nearby: Desk[] = [
@@ -212,7 +179,7 @@ describe("the built-in #general channel", () => {
       },
     ];
     const rail = channels(ROSTER, nearby);
-    expect(rail.map((c) => c.id)).toEqual([MAIN_THREAD_ID, "ops", "street"]);
+    expect(rail.map((c) => c.id)).toEqual(["ops", "street"]);
     expect(channelIdForThread("main", nearby, ROSTER)).toBe(MAIN_THREAD_ID);
   });
 
@@ -222,77 +189,42 @@ describe("the built-in #general channel", () => {
     expect(defaultDesks().some((d) => isGeneralChannel(d.id))).toBe(false);
   });
 
-  it("is present on a company with no desks at all", () => {
-    expect(channels(ROSTER, [])[0].name).toBe(GENERAL_CHANNEL);
+  it("is absent from the desk list every desk affordance is built from", () => {
+    expect(DESKS.some((d) => isGeneralChannel(d.id))).toBe(false);
+  });
+});
+
+describe("the legacy #general archive", () => {
+  it("is a read-only channel on the main thread", () => {
+    const archive = legacyGeneralChannel(ROSTER);
+    expect(archive.id).toBe(MAIN_THREAD_ID);
+    expect(archive.name).toBe(GENERAL_CHANNEL);
+    expect(archive.kind).toBe("channel");
+    expect(archive.system).toBe(true);
   });
 
   it("holds the whole roster, derived — an agent added later is in it", () => {
-    const before = channels(ROSTER, DESKS)[0];
+    const before = legacyGeneralChannel(ROSTER);
     expect(channelMembers(before, ROSTER)!.map((m) => m.id)).toEqual([
       "ceo",
       "eng",
     ]);
-
     const grown = [
       ...ROSTER,
       member({ id: "designer", name: "Cass", role: "Designer" }),
     ];
-    const after = channels(grown, DESKS)[0];
+    const after = legacyGeneralChannel(grown);
     expect(channelMembers(after, grown)!.map((m) => m.id)).toEqual([
       "ceo",
       "eng",
       "designer",
     ]);
-
-    // Nothing about the desk list changed to make that true.
-    expect(DESKS.map((d) => d.members)).toEqual([["eng"], ["ceo"]]);
-  });
-
-  it("names the orchestrator as who picks up an unmentioned message", () => {
-    expect(channels(ROSTER, DESKS)[0].purpose).toBe(
-      "Everyone's here. Ada picks up anything you don't @-mention.",
-    );
-  });
-
-  it("makes no claim about who answers when the host does not say", () => {
-    const silent = ROSTER.map((m) => ({ ...m, isOrchestrator: undefined }));
-    expect(channels(silent, DESKS)[0].purpose).toBe(
-      "Everyone's here — the whole company on one line",
-    );
   });
 
   it("carries no overlay membership, so no surface can offer a remove", () => {
-    // `overlayMembers` is what the console reads to decide a member is
-    // removable. A desk row has it; the built-in channel has no such concept —
-    // the `Channel` shape it produces carries only ids.
-    const general = channels(ROSTER, DESKS)[0];
-    expect(Object.keys(general).sort()).toEqual(
-      ["id", "kind", "memberIds", "name", "purpose", "voice"].sort(),
+    expect(Object.keys(legacyGeneralChannel(ROSTER)).sort()).toEqual(
+      ["id", "kind", "memberIds", "name", "purpose", "system"].sort(),
     );
-  });
-
-  it("is absent from the desk list every desk affordance is built from", () => {
-    // The host does not list it under `GET .../desks`, so the org chart, the
-    // assignee picker and the desk counts never see it. This asserts the
-    // console does not put it back: `buildChannels` composes it for the rail
-    // and returns a `Channel`, never a `Desk`.
-    expect(DESKS.some((d) => isGeneralChannel(d.id))).toBe(false);
-  });
-  /**
-   * The default is OFF (#2368).
-   *
-   * Every other test in this file passes `showGeneral: true`, because they are
-   * about what the built-in channel does when it exists. This is the one that
-   * is about the default, and it has to exist separately: a flag asserted only
-   * by the absence of assertions is a flag nobody notices flipping back.
-   */
-  it("is not offered by default — a conversation that cannot deliberate is not a channel", () => {
-    const built = buildChannels(ROSTER, DESKS, {})
-      .find((s) => s.id === "channels")!
-      .channels.map((c) => c.id);
-
-    expect(built).not.toContain(MAIN_THREAD_ID);
-    expect(built).toEqual(["engineering", "growth"]);
   });
 });
 
@@ -492,10 +424,8 @@ describe("resolving a host thread to the general channel", () => {
   });
 
   it("sends every other spelling to that desk too, since nothing else renders the line", () => {
-    // `buildChannels` adds no built-in channel beside a grandfathered desk, so
-    // answering `main` here would name a channel that does not exist — and a
-    // live frame, an unread badge or an approval link addressed to it would
-    // land in a bucket the operator cannot open.
+    // A grandfathered desk owns the line, so answering `main` here would name
+    // an archive that is never opened in that company.
     const authored: Desk[] = [
       {
         id: "general",
@@ -592,20 +522,20 @@ describe("isGeneralChannel", () => {
 
 /**
  * The two desk affordances `RoomView` derives from a channel, and why neither
- * may reach the built-in one.
+ * may reach the archive.
  *
  * A full `RoomView` render needs the whole client and every hook, so this uses
  * the source-contract idiom `chat-rail-focus.test.ts` established for exactly
  * that case: pin the wiring the behaviour rests on. The behaviour itself is
  * verified in a browser — see the PR.
  *
- * Both gates matter because `#general` is the one channel that carries
- * `memberIds` **without** being a desk. Every previous non-desk channel (a DM,
+ * Both gates matter because the `#general` archive is the one channel that
+ * carries `memberIds` **without** being a desk. Every previous non-desk channel (a DM,
  * a static fallback desk) was excluded by having no `memberIds` at all, so both
  * tests read as "has membership ⇒ is a desk" — an inference that is true of
  * every channel except this one.
  */
-describe("RoomView offers no desk affordance on the built-in channel", () => {
+describe("RoomView offers no desk affordance on the #general archive", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const chatView = readFileSync(
     resolve(here, "../../src/views/RoomView.tsx"),
@@ -617,7 +547,7 @@ describe("RoomView offers no desk affordance on the built-in channel", () => {
 
   it("decides by the desk list, not by the id's spelling", () => {
     // Both affordances hang off this one predicate. Asking the desk list is
-    // what makes the built-in channel excluded for the right reason — and what
+    // what makes the archive excluded for the right reason — and what
     // keeps a blueprint desk that authored a General id from being hidden with
     // it, since the host grandfathers that desk and the org chart holds it.
     expect(source).toContain(
@@ -830,25 +760,7 @@ describe("the shell resolves every thread-to-channel lookup through channelForTh
     expect(shell).not.toContain("chatChannelByThreadRef.current[threadId]");
   });
 
-  /**
-   * PR #1781 review (Codex P2, comment 3878664647): `channelMap` only knows
-   * desks and roster teammates, so `setChatChannelByThread(channelMap(...))`
-   * alone never taught `chatChannelByThread` the Operator channel's own
-   * id → id pair. `channelForThread(chatChannelByThread, event.chatId)`
-   * (pinned above) then missed on `event.chatId === operatorChannel.id` and
-   * `renderAgentReply` returned without rendering the live SSE frame — the
-   * Operator transcript and its unread state only caught up on the
-   * five-second history poll, whose own `channels` rehydration-target list
-   * (a few lines further down) already carried this id and was masking the
-   * gap. Folding the id into the state map itself, not just the poll
-   * targets, is what closes it for the live path too.
-   */
-  it("folds the Operator channel's id into chatChannelByThread, not just the poll targets", () => {
-    expect(shell).toContain(
-      "...(operatorChannel ? { [operatorChannel.id]: operatorChannel.id } : {})",
-    );
-    expect(shell).not.toContain(
-      "setChatChannelByThread(channelMap(chatDesks, roster));",
-    );
+  it("maps threads to channels from desks and the roster alone", () => {
+    expect(shell).toContain("setChatChannelByThread(channelMap(chatDesks, roster));");
   });
 });

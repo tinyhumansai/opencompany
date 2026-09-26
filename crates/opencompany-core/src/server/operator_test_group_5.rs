@@ -55,9 +55,7 @@ async fn remove_desk_member_prunes_the_order_entry() {
 async fn desks_route_returns_the_company_desks() {
     // The default test manifest defines no group chats, so the route
     // answers 200 with an empty list — the console falls back to its
-    // static default threads. The Operator feed is a separate surface
-    // (issue #1757 rework), fetched through `GET
-    // {scope}/operator-channel`, and no longer folded into this list.
+    // static default threads.
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home, "running").await;
@@ -80,28 +78,28 @@ async fn desks_route_returns_the_company_desks() {
     assert!(desks.is_empty(), "{desks:?}");
 }
 
-/// Issue #1757 rework: `GET {scope}/operator-channel` returns the
-/// dedicated feed's identity — never folded into `list_desks` any more —
-/// and `list_desks` carries zero operator logic: the real desks are all
-/// it returns.
+/// The Operator feed's identity route is gone, and `list_desks` carries
+/// only real desks.
 #[tokio::test]
-async fn operator_channel_route_returns_the_feed_identity_and_is_absent_from_desks() {
+async fn the_operator_feed_route_is_gone() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_manifest(&home, desk_manifest()).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
-    let channel = get_operator_channel(&app, &cookie).await;
-    assert_eq!(channel["id"], "operator");
-    assert_eq!(channel["name"], "Operator");
-    assert!(
-        channel["description"]
-            .as_str()
-            .unwrap()
-            .contains("what happened"),
-        "{channel}"
-    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/company/operator-channel")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let desks = get_desks(&app, &cookie).await;
     assert!(
@@ -114,12 +112,10 @@ async fn operator_channel_route_returns_the_feed_identity_and_is_absent_from_des
     );
 }
 
-/// Issue #1757 rework: the always-present Operator feed is its own
-/// surface — `GET {scope}/operator-channel` names it, `list_desks` never
-/// does — and posting to it is still refused (it is a read-only report
-/// feed).
+/// `list_desks` never names the legacy Operator feed, and posting to its
+/// chat id is still refused so its archived reports stay a read-only log.
 #[tokio::test]
-async fn the_operator_channel_is_a_separate_surface_and_stays_read_only() {
+async fn the_legacy_operator_feed_stays_read_only() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_manifest(&home, desk_manifest()).await;
@@ -130,10 +126,6 @@ async fn the_operator_channel_is_a_separate_surface_and_stays_read_only() {
     let desks = desks.as_array().unwrap();
     let ids: Vec<&str> = desks.iter().map(|d| d["id"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["studio"], "list_desks carries only real desks");
-
-    let channel = get_operator_channel(&app, &cookie).await;
-    assert_eq!(channel["id"], "operator");
-    assert_eq!(channel["name"], "Operator");
 
     // A send addressed to it is refused (read-only), never journaled.
     let response = app
@@ -213,63 +205,6 @@ async fn a_failing_store_load_is_not_collapsed_into_the_read_only_refusal() {
     assert!(
         !body.contains("read-only"),
         "a store outage must not be misreported as the ordinary read-only refusal: {body}"
-    );
-}
-
-/// CodeRabbit review (PR #1781, P2): `operator_channel` used to fold a
-/// `store().load()` failure into "no record" via `.ok().flatten()`, and
-/// answer the default `operator` id anyway. For an upgraded company whose
-/// grandfathered `operator` teammate requires the `operator-feed`
-/// collision address, that silently mislabels the teammate's `operator`
-/// transcript as the system feed while a transient outage lasts — and the
-/// console would show it as healthy the whole time. This proves the fix:
-/// a real load failure now propagates as an error instead of defaulting.
-///
-/// Corrupts `company.toml` on disk after the app is built (rather than
-/// mocking `CompanyStore`) to exercise the real `FsCompanyStore::load`
-/// error path — same technique as
-/// `a_failing_store_load_is_not_collapsed_into_the_read_only_refusal`
-/// above.
-#[tokio::test]
-async fn operator_channel_propagates_a_store_load_failure_instead_of_defaulting() {
-    let home_dir = home();
-    let home = home_dir.path().to_path_buf();
-    let state = state_with_manifest(&home, desk_manifest()).await;
-    let app = router(state);
-    let cookie = crate::server::test_support::fixed_cookie("acme");
-
-    // Baseline: before any corruption, the route answers the default id.
-    let channel = get_operator_channel(&app, &cookie).await;
-    assert_eq!(channel["id"], "operator");
-
-    // Corrupt the on-disk manifest so the next `store().load()` fails
-    // instead of returning `Some(record)` or `None`.
-    let toml_path = crate::store::Bundle::new(&home, &CompanyId::new("acme")).company_toml();
-    tokio::fs::write(&toml_path, b"not valid toml [[[")
-        .await
-        .expect("corrupt company.toml");
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/company/operator-channel")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a store load failure must propagate as itself, not the default operator id"
-    );
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_ne!(
-        body["id"], "operator",
-        "a store outage must not be silently answered as the healthy default channel: {body}"
     );
 }
 
@@ -540,16 +475,10 @@ async fn a_manifest_agent_predating_the_reserved_operator_id_stays_dm_able() {
     );
 }
 
-/// Issue #1757 rework, the read side of the grandfather case the test
-/// above covers on the write side: a company whose roster names a
-/// teammate `operator` (no desk of the same id) must have `GET
-/// {scope}/operator-channel` answer at the disjoint collision-fallback
-/// id, not the literal `operator` one — a direct post to the visible
-/// read-only feed and the teammate's own DM must stay distinguishable
-/// (`chat_id == "operator"` for the DM, the fallback id for the feed) —
-/// and that fallback id must itself stay refused as read-only.
+/// A company whose roster names a teammate `operator` keeps the legacy
+/// feed's collision-fallback address refused as read-only.
 #[tokio::test]
-async fn the_operator_channel_diverts_off_a_grandfathered_teammates_operator_line() {
+async fn a_grandfathered_operator_teammates_fallback_address_stays_read_only() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let legacy_manifest: CompanyManifest = toml::from_str(
@@ -559,24 +488,8 @@ async fn the_operator_channel_diverts_off_a_grandfathered_teammates_operator_lin
     )
     .unwrap();
     let state = state_with_manifest(&home, legacy_manifest).await;
-    let app = router(state.clone());
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
-    let channel = get_operator_channel(&app, &cookie).await;
-    assert_eq!(
-        channel["id"],
-        crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK,
-        "the feed must not claim the literal `operator` id once a \
-         teammate already holds it: {channel:?}"
-    );
-
-    // list_desks carries no operator logic at all, so it is untouched by
-    // this collision either way — nothing to assert there but its
-    // absence of the teammate, which the DM test above already covers.
-
-    // The disjoint fallback id is unmintable and system-only: a direct post
-    // to it must stay refused exactly like the literal `operator` id is,
-    // even though nothing minted it as a desk.
     let app = router(state);
     let response = app
         .oneshot(
@@ -600,19 +513,9 @@ async fn the_operator_channel_diverts_off_a_grandfathered_teammates_operator_lin
     );
 }
 
-/// PR #1781 review (CodeRabbit): the same divert as the test above, for
-/// the *other* grandfather shape — a real **desk** already owning
-/// `operator` (see `a_manifest_desk_predating_the_reserved_operator_id_stays_writable`
-/// for the write side of this same fixture). Left undiverted, `GET
-/// {scope}/operator-channel` and `GET {scope}/desks` would answer the
-/// same id for two different things: the console appends the pinned
-/// Operator row *after* the desk section (`operatorSection`,
-/// `frontend/src/views/ChatView.tsx`), so `findChannel` — first-section-match
-/// — would resolve the pinned row to the desk, and every workflow report
-/// would journal onto the desk's own transcript instead of a
-/// distinguishable feed.
+/// A grandfathered desk at the literal `operator` id keeps its own id.
 #[tokio::test]
-async fn the_operator_channel_diverts_off_a_grandfathered_desks_own_operator_line() {
+async fn a_grandfathered_operator_desk_keeps_its_own_id() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let legacy_manifest: CompanyManifest = toml::from_str(
@@ -631,15 +534,5 @@ async fn the_operator_channel_diverts_off_a_grandfathered_desks_own_operator_lin
     assert_eq!(
         desks[0]["id"], "operator",
         "the desk itself must keep its own literal id: {desks:?}"
-    );
-
-    let channel = get_operator_channel(&app, &cookie).await;
-    assert_eq!(
-        channel["id"],
-        crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK,
-        "the pinned Operator row must not claim the literal `operator` id \
-         once a desk already holds it — otherwise the console shows two \
-         rows sharing one id and `findChannel` always resolves the pinned \
-         row to the desk: {channel:?}"
     );
 }

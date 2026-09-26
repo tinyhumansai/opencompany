@@ -113,3 +113,36 @@ async fn disconnect_closes_every_session_on_the_connection_at_once() {
         "the connection must not survive its own disconnect"
     );
 }
+
+#[tokio::test]
+async fn a_session_opened_without_a_chat_is_bound_to_the_default_agents_dm() {
+    let home = tempfile::Builder::new()
+        .prefix("oc-acp-default-chat-")
+        .tempdir()
+        .expect("tempdir");
+    let state = acp_state(home.path()).await;
+    let company = CompanyId::new("acme");
+    let admin = seed_user(&state, &company, "u-admin", "Admin Person").await;
+    let auth = admin_auth(&company, admin, "hash");
+    let params = json!({
+        "_meta": {
+            "opencompany": { "company": "acme" },
+            "opencompany/connectionId": "conn-default-chat",
+        }
+    });
+
+    let opened = open_session(&state, &auth, &params)
+        .await
+        .expect("the session opens");
+    let id = opened["sessionId"].as_str().expect("a session id");
+    let session = state
+        .acp_sessions()
+        .get(
+            "conn-default-chat",
+            &owner(&auth),
+            id,
+            crate::ports::now_millis(),
+        )
+        .expect("the session is registered");
+    assert_eq!(session.chat, "dm:product_manager");
+}

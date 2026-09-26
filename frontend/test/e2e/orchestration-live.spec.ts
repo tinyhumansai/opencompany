@@ -7,7 +7,7 @@ import {
   column,
   dispatch,
   openBoard,
-  openMainLine,
+  openOrchestratorDm,
   say,
   silenceTour,
   waitForTurn,
@@ -130,7 +130,7 @@ test("a real model takes a goal, gives it to its team, and closes it out", async
   // Specific about the *outcome* (cards on the board, owned by teammates) and
   // silent about the mechanism, because which tool to reach for is exactly the
   // decision under test.
-  await openMainLine(page);
+  await openOrchestratorDm(page);
   await say(
     page,
     "Our workspace has a Standards note. I want a short \"How we write\" one-pager " +
@@ -252,7 +252,7 @@ test("a real model takes a goal, gives it to its team, and closes it out", async
   // asserted it would be measuring the model's diligence rather than the
   // company's plumbing.
   for (const card of reviewable) {
-    await openMainLine(page);
+    await openOrchestratorDm(page);
     await say(
       page,
       `The work on card ${card.id} ("${card.title}") is back and it looks good to ` +

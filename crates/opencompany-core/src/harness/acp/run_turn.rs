@@ -371,19 +371,14 @@ impl AcpRunTurn {
 
     /// The live-stream context for a **chat** turn.
     ///
-    /// Falls back to the default desk when the caller addressed none, so the
-    /// live rows land on the same thread the durable reply does — byte for
-    /// byte the rule `built_in`'s `LiveStream::On` applies, because a frame
-    /// routed to a different thread than its reply is worse than no frame.
+    /// Falls back to the answering agent's DM when the caller addressed no
+    /// thread — the same rule `built_in`'s `LiveStream::On` applies.
     fn chat_ctx(company: &CompanyId, agent_id: &str, chat: ChatTarget<'_>) -> TurnStreamCtx {
         TurnStreamCtx {
             company: company.clone(),
             agent_id: agent_id.to_string(),
             route: LiveRoute::Chat {
-                chat_id: chat
-                    .chat_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
+                chat_id: crate::runtime::assignee::chat_or_dm(chat.chat_id, agent_id),
             },
             // Takes the whole `ChatTarget` rather than the id alone, so this
             // cannot go on answering with `None` while the caller holds the

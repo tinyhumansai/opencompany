@@ -67,8 +67,7 @@ describe("buildChannels", () => {
       deskFromDto(desk({ id: "eng", name: "Engineering" })),
       deskFromDto(desk({ id: "launch", name: "Launch", responder: "auto" })),
     ]);
-    // Selected by id, not by index: since issue #1743 the rail leads with the
-    // built-in `#general` row, which is not a desk and shifts every position.
+    // Selected by id, not by index, so the assertions do not depend on rail order.
     const byId = (id: string) => channels.channels.find((c) => c.id === id)!;
     const eng = byId("eng");
     const launch = byId("launch");

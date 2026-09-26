@@ -254,6 +254,7 @@ async fn a_queued_message_is_in_the_transcript_before_its_turn_runs() {
         Some(brain),
     )
     .await;
+    let dm = default_dm(&state).await;
     let app = router(state);
 
     // Turn one takes the lock and stops inside the brain.
@@ -272,7 +273,7 @@ async fn a_queued_message_is_in_the_transcript_before_its_turn_runs() {
     until(
         "the queued message never reached the transcript",
         async || {
-            history_texts(&app)
+            history_texts(&app, &dm)
                 .await
                 .iter()
                 .any(|t| t == "the second question")
@@ -282,7 +283,7 @@ async fn a_queued_message_is_in_the_transcript_before_its_turn_runs() {
 
     // …and it is there while its turn is provably not finished: no answer
     // has been journaled for either message.
-    let texts = history_texts(&app).await;
+    let texts = history_texts(&app, &dm).await;
     assert!(
         texts.contains(&"the first question".to_string()),
         "the running turn's own message is missing: {texts:?}"

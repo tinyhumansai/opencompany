@@ -56,13 +56,11 @@ async fn owner_ignores_suspended_admins_and_members() {
     assert_eq!(h.mail.sent()[0].1.to, "ada@acme.test");
 }
 
-/// With no mailbox wired, `owner` falls back to the DURABLE operator channel
-/// (issue #1757): a genuine, journal-backed delivery — not the discard-on-an-
-/// in-memory-buffer failure it used to report. The report lands in the event
-/// log on the dedicated Operator line, and the interactive buffer is
-/// untouched.
+/// With no mailbox wired, `owner` falls back to the operator: the report is
+/// journaled into the responsible agent's DM and the company's admins are
+/// notified. The interactive buffer is untouched.
 #[tokio::test]
-async fn owner_falls_back_to_the_durable_operator_channel_without_mail() {
+async fn owner_falls_back_to_a_dm_and_an_admin_notification_without_mail() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::new(dir.path(), false, true);
     h.add_admin("u1", "ada@acme.test").await;
@@ -79,33 +77,87 @@ async fn owner_falls_back_to_the_durable_operator_channel_without_mail() {
 
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(reports[0].status, DeliveryStatus::Sent, "{reports:?}");
-    assert_eq!(reports[0].target.as_deref(), Some(OPERATOR_CHANNEL));
+    assert_eq!(reports[0].target.as_deref(), Some("dm:workflow"));
     assert!(reports[0].detail.contains("no mailbox"), "{reports:?}");
     assert_eq!(reports[0].reason, DeliveryReason::OwnerFellBackNoMailbox);
-    // The interactive in-memory buffer is never a delivery surface.
     assert!(h.channel.sent().is_empty());
-    // The report is durable: an `AgentReply` landed on the dedicated
-    // Operator line — never the General desk — carrying the workflow's
-    // subject header so it reads as a workflow report, not an agent's own
-    // reply.
-    let landed = h.operator_reports().await;
+
+    let landed = h.operator_report_authors().await;
     assert_eq!(landed.len(), 1, "the report must be journaled: {landed:?}");
-    assert!(landed[0].contains("Q3 is up 12%."), "{landed:?}");
-    assert!(landed[0].contains("Report flow"), "{landed:?}");
+    let (chat_id, author, text) = &landed[0];
+    assert_eq!(chat_id, "dm:workflow");
+    assert_eq!(author, crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR);
+    assert!(text.contains("Q3 is up 12%."), "{landed:?}");
+    assert!(text.contains("Report flow"), "{landed:?}");
+
+    let notes = h.notifications_for("u1").await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, "workflow_report");
+    assert_eq!(notes[0].subject.id, "report_flow");
+    assert_eq!(notes[0].context.as_deref(), Some("dm:workflow"));
+    assert_eq!(notes[0].audience, Some(vec!["u1".to_string()]));
+    assert!(
+        h.notifications_for("someone-else").await.is_empty(),
+        "an owner report's notification is for the admins only"
+    );
 }
 
-/// Issue #1781 review (Codex P1): the `owner`-with-no-mailbox fallback must
-/// journal under a distinct author from an ordinary operator-channel report,
-/// so the read path (`server::chat_history::history_for_desk`) can restrict
-/// exactly this row to administrators — the same audience the sibling email
-/// branch already enforces (`owner_recipients` filters to active admins).
-///
-/// Proven against a **contrasting pair** in the same test rather than just
-/// asserting the fallback's author: an explicit `channel` destination
-/// naming `operator` is a workflow author's deliberate choice, general
-/// audience, and must keep the ordinary `WORKFLOW_REPLY_AUTHOR` — this is
-/// what shows the fallback's marker is additive, not a wholesale change to
-/// every operator-channel report.
+/// The DM is the responsible agent's: the lead of the workflow's owning
+/// desk, else the orchestrator.
+#[tokio::test]
+async fn an_operator_report_lands_in_the_responsible_agents_dm() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new(dir.path(), false, true);
+
+    let mut staffed = record(&[]);
+    staffed.manifest = toml::from_str(
+        r#"
+[company]
+name = "Acme"
+
+[policy]
+mode = "full"
+
+[[agent]]
+id = "ceo"
+role = "Chief Executive"
+
+[[agent]]
+id = "analyst"
+role = "Analyst"
+
+[[group_chat]]
+id = "research"
+name = "Research"
+members = ["analyst"]
+"#,
+    )
+    .expect("valid manifest");
+
+    let unowned = graph("channel", Some(OPERATOR_CHANNEL));
+    let mut owned = unowned.clone();
+    owned.owner_desk = Some("research".to_string());
+
+    for (flow, run) in [(&unowned, "run-1"), (&owned, "run-2")] {
+        let reports =
+            deliver_outputs(Some(&h.deps), &staffed, flow, run, &reached_output(), &[]).await;
+        assert_eq!(reports[0].status, DeliveryStatus::Sent, "{reports:?}");
+    }
+
+    let landed: Vec<String> = h
+        .operator_report_authors()
+        .await
+        .into_iter()
+        .map(|(chat_id, _, _)| chat_id)
+        .collect();
+    assert_eq!(landed, vec!["dm:ceo", "dm:analyst"]);
+}
+
+/// The `owner` fallback journals under a distinct author from an ordinary
+/// report to the operator, so the read path can restrict exactly that row to
+/// administrators. An explicit `channel: operator` destination is a workflow
+/// author's deliberate choice with a general audience, and keeps the ordinary
+/// `WORKFLOW_REPLY_AUTHOR` and a company-wide notification.
 #[tokio::test]
 async fn owner_fallback_report_is_authored_distinctly_from_an_ordinary_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -121,7 +173,7 @@ async fn owner_fallback_report_is_authored_distinctly_from_an_ordinary_one() {
         &[],
     )
     .await;
-    deliver_outputs(
+    let reports = deliver_outputs(
         Some(&h.deps),
         &record(&[]),
         &graph("channel", Some(OPERATOR_CHANNEL)),
@@ -130,207 +182,35 @@ async fn owner_fallback_report_is_authored_distinctly_from_an_ordinary_one() {
         &[],
     )
     .await;
+    assert_eq!(reports[0].status, DeliveryStatus::Sent, "{reports:?}");
+    assert_eq!(reports[0].target.as_deref(), Some(OPERATOR_CHANNEL));
 
     let authors = h.operator_report_authors().await;
     assert_eq!(authors.len(), 2, "{authors:?}");
     assert!(
         authors
             .iter()
-            .any(|(agent_id, _)| agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR),
+            .any(|(_, agent_id, _)| agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR),
         "the owner fallback must be marked distinctly: {authors:?}"
     );
     assert!(
         authors
             .iter()
-            .any(|(agent_id, _)| agent_id == crate::runtime::channel::WORKFLOW_REPLY_AUTHOR),
-        "an explicit `channel: operator` destination must keep the ordinary \
-         author — the marker is additive, not a wholesale change: {authors:?}"
+            .any(|(_, agent_id, _)| agent_id == crate::runtime::channel::WORKFLOW_REPLY_AUTHOR),
+        "an explicit `channel: operator` destination keeps the ordinary author: {authors:?}"
     );
-}
-
-/// Issue #1781 review (CodeRabbit Major + Codex P2): a company whose roster
-/// already grandfathers a **teammate** at the literal id `operator` (no desk
-/// of the same id — see `CompanyRecord::operator_feed_channel`) must not
-/// have the durable Operator system feed land on that same address. Proven
-/// for **both** report shapes that can reach the operator channel — the
-/// `owner` fallback and an explicit `channel: operator` destination — since
-/// review found the collision on the desk-list/read side, not the write
-/// guard, and either shape re-opens it if only one were fixed.
-///
-/// Pre-fix, both reports journaled at `chat_id == OPERATOR_CHANNEL`
-/// (`"operator"`) — exactly the address `ChatView` addresses that teammate's
-/// own DM by (issue #364). This test's whole point is that the two lines
-/// now diverge.
-#[tokio::test]
-async fn a_report_diverts_off_a_grandfathered_teammates_own_operator_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::new(dir.path(), false, true);
-    h.add_admin("u1", "ada@acme.test").await;
-
-    let mut collided = record(&[]);
-    collided.manifest = toml::from_str(
-        r#"
-[company]
-name = "Acme"
-
-[policy]
-mode = "full"
-
-[[agent]]
-id = "operator"
-role = "Chief of Staff"
-"#,
-    )
-    .expect("valid manifest with a grandfathered `operator` teammate");
-    assert!(
-        collided.is_roster_agent(OPERATOR_CHANNEL) && !collided.desk_exists(OPERATOR_CHANNEL),
-        "fixture must actually be in the collision state this test exercises"
-    );
-
-    deliver_outputs(
-        Some(&h.deps),
-        &collided,
-        &graph("owner", None),
-        "run-1",
-        &reached_output(),
-        &[],
-    )
-    .await;
-    deliver_outputs(
-        Some(&h.deps),
-        &collided,
-        &graph("channel", Some(OPERATOR_CHANNEL)),
-        "run-2",
-        &reached_output(),
-        &[],
-    )
-    .await;
-
-    let landed = h
-        .events
-        .read_from(
-            &h.company,
-            crate::ports::types::EventSeq::new(0),
-            usize::MAX,
-        )
-        .await
-        .expect("journal readable")
-        .into_iter()
-        .filter_map(|s| match s.event {
-            CompanyEvent::AgentReply { chat_id, .. } => Some(chat_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(landed.len(), 2, "{landed:?}");
-    assert!(
-        landed
-            .iter()
-            .all(|chat_id| chat_id == crate::runtime::OPERATOR_CHANNEL_COLLISION_FALLBACK),
-        "every report bound for the system feed must land off the \
-         grandfathered teammate's own `operator` line, not on it: {landed:?}"
-    );
-    assert!(
-        landed.iter().all(|chat_id| chat_id != OPERATOR_CHANNEL),
-        "the literal `operator` line must stay untouched by the durable \
-         feed — that is the teammate's own DM address: {landed:?}"
-    );
-}
-
-/// Issue #1781 review (fresh P2 on `operator_feed_channel_fallback_shadowed`
-/// itself): the residual double collision that predicate detects must not
-/// merely be logged while the report ships anyway. Reuses this fixture's
-/// manifest shape from `CompanyRecord`'s own
-/// `operator_feed_channel_fallback_shadowed_detects_a_double_collision` test
-/// (`ports::types`) — one grandfathered desk named "Operator" (shadowing the
-/// primary address) and a second, different desk named "operator-feed"
-/// (shadowing the collision fallback) — and proves the delivery layer
-/// refuses the send rather than journaling into that second desk's own
-/// transcript while still reporting `Sent`.
-#[tokio::test]
-async fn a_double_collision_refuses_delivery_instead_of_misrouting() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = Harness::new(dir.path(), false, true);
-
-    let mut collided = record(&[]);
-    collided.manifest = toml::from_str(
-        r#"
-[company]
-name = "Acme"
-
-[policy]
-mode = "full"
-
-[[group_chat]]
-id = "legacy_ops"
-name = "Operator"
-members = []
-
-[[group_chat]]
-id = "ops2"
-name = "operator-feed"
-members = []
-"#,
-    )
-    .expect("valid manifest with a double grandfathered collision");
-    assert!(
-        collided.operator_feed_channel_fallback_shadowed(),
-        "fixture must actually be in the double-collision state this test \
-         exercises, or it proves nothing"
-    );
-
-    let reports = deliver_outputs(
-        Some(&h.deps),
-        &collided,
-        &graph("channel", Some(OPERATOR_CHANNEL)),
-        "run-1",
-        &reached_output(),
-        &[],
-    )
-    .await;
-
-    assert_eq!(reports.len(), 1, "{reports:?}");
+    let for_anyone = h.notifications_for("someone-else").await;
     assert_eq!(
-        reports[0].status,
-        DeliveryStatus::Failed,
-        "a shadowed fallback must be reported as a failed delivery, never \
-         `Sent` — a `Sent` row here is exactly the silent misroute this test \
-         guards against: {reports:?}"
-    );
-    assert_eq!(
-        reports[0].reason,
-        DeliveryReason::ChannelCollisionShadowed,
-        "{reports:?}"
-    );
-
-    let landed = h
-        .events
-        .read_from(
-            &h.company,
-            crate::ports::types::EventSeq::new(0),
-            usize::MAX,
-        )
-        .await
-        .expect("journal readable")
-        .into_iter()
-        .filter_map(|s| match s.event {
-            CompanyEvent::AgentReply { chat_id, .. } => Some(chat_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        landed.is_empty(),
-        "a refused delivery must not append anything to the event log — in \
-         particular nothing must land on \"operator-feed\", the second \
-         desk's own transcript: {landed:?}"
+        for_anyone.len(),
+        1,
+        "only the explicit report is company-wide: {for_anyone:?}"
     );
 }
 
-/// A company with a mailbox but no admin address also delivers durably to the
-/// operator channel rather than failing — the report still reaches the one
-/// human who could act on it.
+/// A company with a mailbox but no admin address also reports to the
+/// operator rather than failing.
 #[tokio::test]
-async fn owner_falls_back_to_the_durable_operator_channel_when_no_admin_has_an_address() {
+async fn owner_falls_back_to_the_operator_when_no_admin_has_an_address() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::new(dir.path(), true, true);
 
@@ -357,13 +237,12 @@ async fn owner_falls_back_to_the_durable_operator_channel_when_no_admin_has_an_a
     assert_eq!(landed.len(), 1, "the report must be journaled: {landed:?}");
 }
 
-/// Both fallbacks unavailable: no mail, no operator channel wired at all
-/// (a misconfigured build). Still a row — `failed`, naming the gap — never
-/// silence.
+/// No mail, and the report cannot be journaled either: still a row —
+/// `failed`, naming the gap — never silence.
 #[tokio::test]
-async fn owner_with_neither_mail_nor_a_channel_reports_failure() {
+async fn owner_with_neither_mail_nor_a_journal_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let h = Harness::new(dir.path(), false, false);
+    let h = Harness::new(dir.path(), false, false).with_failing_events();
 
     let reports = deliver_outputs(
         Some(&h.deps),
@@ -377,6 +256,7 @@ async fn owner_with_neither_mail_nor_a_channel_reports_failure() {
 
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(reports[0].status, DeliveryStatus::Failed);
+    assert_eq!(reports[0].reason, DeliveryReason::OwnerFallbackFailed);
     assert!(reports[0].detail.contains("operator"), "{reports:?}");
 }
 
@@ -512,7 +392,6 @@ async fn owner_does_not_email_a_suspended_bootstrap_admin() {
         h.channel.sent().is_empty(),
         "the interactive operator buffer is not delivery"
     );
-    // The report still lands, durably, on the operator channel.
     assert_eq!(h.operator_reports().await.len(), 1);
 }
 

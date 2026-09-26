@@ -146,8 +146,8 @@ interface Props {
    * `RoomView` renders one channel composer for every channel: React reconciles
    * it as the same instance across a channel switch, which is why a draft has
    * always survived walking to another channel and back. Gating that element on
-   * `!readOnly` quietly took that away — opening `#Operator` for a moment, with
-   * an unsent message in `#general`, unmounted the composer and emptied it
+   * `!readOnly` quietly took that away — opening a read-only channel for a
+   * moment, with an unsent message elsewhere, unmounted the composer and emptied it
    * (codex review on PR #1984). The old disabled-composer rendering was
    * accidentally load-bearing.
    *

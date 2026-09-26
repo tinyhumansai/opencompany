@@ -55,7 +55,6 @@ import {
   type BudgetPauseMarker,
   type InboxDto,
   type InboxMessageDto,
-  type OperatorChannelDto,
   type PageManifestDto,
   type ProvisioningInfo,
   type ResolveReceipt,
@@ -718,11 +717,6 @@ export class OpenCompanyClient {
    */
   listDesks(company?: string | null): Promise<DeskDto[]> {
     return this.request<DeskDto[]>("GET", `${this.scope(company)}/desks`);
-  }
-
-  /** The identity of the company's durable, read-only Operator feed. */
-  getOperatorChannel(company?: string | null): Promise<OperatorChannelDto> {
-    return this.request<OperatorChannelDto>("GET", `${this.scope(company)}/operator-channel`);
   }
 
   /**

@@ -11,7 +11,7 @@ import {
   markers,
   openBoard,
   openCard,
-  openMainLine,
+  openOrchestratorDm,
   say,
   settledMarkerCount,
   silenceTour,
@@ -116,7 +116,7 @@ test("a goal becomes delegated cards, the team works them, and review closes the
   // One sentence, in the one place an operator says anything. The plan riding
   // on it is the orchestrator's decision, scripted: two cards, one per
   // teammate, each with the brief it should carry.
-  await openMainLine(page);
+  await openOrchestratorDm(page);
   const goal =
     `Ship a short market digest this week: find what is being said and write it up. ` +
     plan(
@@ -160,7 +160,7 @@ test("a goal becomes delegated cards, the team works them, and review closes the
   // The markers this thread already holds, counted **here** — on the transcript
   // this test has been watching all along, rather than after a fresh navigation
   // that would have to be waited on again. The suite shares one data root, so a
-  // marker an earlier test left in the main line is legitimately in it, and a
+  // marker an earlier test left in the orchestrator DM is legitimately in it, and a
   // baseline taken before a hydration has landed reads zero for a thread that
   // holds three.
   const markersBefore = await settledMarkerCount(page);
@@ -212,7 +212,7 @@ test("a goal becomes delegated cards, the team works them, and review closes the
   // the run *stopped*, and here is where it landed (issue #377). Counted rather
   // than addressed by card, because this surface renders a marker as a plain
   // system pill — see `markers` in `./orchestration`.
-  await openMainLine(page);
+  await openOrchestratorDm(page);
   await expect
     .poll(() => markers(page).count(), {
       message: "the two settled cards did not mark the thread they were raised in",

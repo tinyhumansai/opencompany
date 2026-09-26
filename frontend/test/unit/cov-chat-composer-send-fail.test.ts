@@ -30,8 +30,6 @@ function clientAs(chat: () => Promise<never>): OpenCompanyClient {
   const named: Record<string, unknown> = {
     scopeFor: () => "/api/v1/companies/acme",
     listDesks: () => Promise.resolve([DESK_DTO]),
-    getOperatorChannel: () =>
-      Promise.resolve({ id: "operator", name: "Operator", description: "Automation reports and notifications" }),
     chat: vi.fn(chat),
   };
   return new Proxy(named, {

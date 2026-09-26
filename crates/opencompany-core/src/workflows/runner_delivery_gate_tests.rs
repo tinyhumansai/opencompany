@@ -272,6 +272,7 @@ async fn a_run_delivers_its_output_report_through_the_runner() {
         users: Arc::new(FsOps::new(dir.path())),
         bootstrap_admin: None,
         channels: vec![Arc::new(channel.clone())],
+        notifications: None,
         // This case delivers to a channel, which never parks.
         parking: None,
         events: Arc::new(crate::store::FsEventLog::new(dir.path())),

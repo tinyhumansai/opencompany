@@ -11,58 +11,11 @@ import { fromHistory, mergeHistoryInOrder, type ChatMessage } from "@/lib/chat";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appShell = readFileSync(resolve(here, "../../src/components/app-shell.tsx"), "utf8");
-const chatView = readFileSync(resolve(here, "../../src/views/RoomView.tsx"), "utf8");
 
 describe("chat channel history polling", () => {
   it("wires each resolved channel fan-out to a disposable 5s visible-tab poll", () => {
     expect(appShell.match(/startVisiblePolling\(rehydrateAll, 5000\)/g)).toHaveLength(2);
     expect(appShell).toContain("disposeRehydratePolling?.();");
-  });
-
-  /**
-   * Issue #1781 review (Codex P2): `RoomView` fetches the Operator channel's
-   * identity independently of this hydration pass, for rendering its pinned
-   * row. A single dropped request here — while `RoomView`'s own, later call
-   * succeeds — used to render the row but permanently omit its id from the
-   * rehydration targets and this 5s poll, since this pass had already given
-   * up on it. `fetchWithOneRetry` closes the common transient case.
-   */
-  it("retries the Operator channel fetch instead of giving up on the first miss", () => {
-    expect(appShell).toContain(
-      "fetchWithOneRetry(() => client.getOperatorChannel(company))",
-    );
-    expect(appShell).not.toContain("client.getOperatorChannel(company).catch(() => null)");
-  });
-
-  /**
-   * PR #1781 review (Codex P2, comment 3878524727): `RoomView`'s own
-   * render-side lookup of the same identity had the twin gap — a single
-   * dropped request there, while `app-shell.tsx`'s independent, now-retried
-   * lookup succeeded, left history hydrating with `operator` stuck `null`
-   * until the client/company changed or the page reloaded. Same wrapper,
-   * same fix, source-wiring-pinned the same way the shell's call site above
-   * is (no render harness for either component in this repo).
-   */
-  it("RoomView also retries the Operator channel fetch instead of giving up on the first miss", () => {
-    expect(chatView).toContain("fetchWithOneRetry(() => client.getOperatorChannel(company))");
-    expect(chatView).not.toContain("client.getOperatorChannel(company)\n      .then(");
-  });
-
-  /**
-   * PR #1781 review (Codex, comment 3878749061): the `.then` callback checked
-   * `isOperatorChannelDto(dto)` but had no `else` — a 2xx response that is not
-   * `OperatorChannelDto`-shaped (schema drift, not a fetch failure) was
-   * silently indistinguishable from the ordinary offline/older-host miss.
-   * Source-wiring-pinned the same way the retry above is (no render harness
-   * for this component in this repo): the mismatched-shape arm must be
-   * logged, and only the `dto !== null` (i.e. not the already-collapsed
-   * fetch-failure) case must log.
-   */
-  it("RoomView logs a mismatched Operator channel shape instead of dropping it silently", () => {
-    expect(chatView).toContain(
-      'console.debug("[RoomView] getOperatorChannel returned an unexpected shape", dto)',
-    );
-    expect(chatView).toContain("} else if (dto !== null) {");
   });
 
   // The polling merge is `mergeHistoryInOrder` — the same reconstruction rule

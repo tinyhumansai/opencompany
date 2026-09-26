@@ -180,8 +180,6 @@ async fn create_desk_persists_and_appears_in_list() {
     assert_eq!(body["members"][1], "ceo");
 
     // The list now carries the manifest desk and the created overlay desk.
-    // The Operator feed is its own surface (issue #1757 rework) — it is
-    // fetched through `GET {scope}/operator-channel`, not injected here.
     let desks = get_desks(&app, &cookie).await;
     let arr = desks.as_array().unwrap();
     assert_eq!(arr.len(), 2, "{arr:?}");

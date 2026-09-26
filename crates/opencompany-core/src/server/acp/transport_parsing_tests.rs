@@ -11,10 +11,13 @@ fn target_requires_an_explicit_company() {
 }
 
 #[test]
-fn target_defaults_to_general() {
+fn target_leaves_an_omitted_chat_unset() {
     let (_, chat, _) =
         target(&json!({ "_meta": { "opencompany": { "company": "acme" } } })).unwrap();
-    assert_eq!(chat, crate::server::ops::language::DEFAULT_DESK);
+    assert_eq!(chat, None);
+    let (_, chat, _) =
+        target(&json!({ "_meta": { "opencompany": { "company": "acme", "chat": "" } } })).unwrap();
+    assert_eq!(chat, None);
 }
 
 #[test]

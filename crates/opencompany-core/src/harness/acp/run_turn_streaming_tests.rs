@@ -80,9 +80,7 @@ async fn a_chat_turn_streams_its_execution_state_onto_the_watching_thread() {
 }
 
 #[tokio::test]
-async fn an_unaddressed_chat_turn_streams_onto_the_default_desk() {
-    // Where the durable reply lands is where the live rows must land: an
-    // API client that omits `chat` still gets a coherent timeline.
+async fn an_unaddressed_chat_turn_streams_onto_the_answering_agents_dm() {
     let company = CompanyId::new("acme-live-default");
     let mut bus = crate::turn_stream::subscribe(&company);
 
@@ -97,10 +95,7 @@ async fn an_unaddressed_chat_turn_streams_onto_the_default_desk() {
 
     let frames = drain_live(&mut bus).await;
     assert_eq!(frames.len(), 1);
-    assert_eq!(
-        frames[0].chat_id.as_deref(),
-        Some(crate::server::ops::language::DEFAULT_DESK)
-    );
+    assert_eq!(frames[0].chat_id.as_deref(), Some("dm:ceo"));
 }
 
 #[tokio::test]

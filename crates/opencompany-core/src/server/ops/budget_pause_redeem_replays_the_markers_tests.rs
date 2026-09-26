@@ -37,7 +37,15 @@ async fn state_with_brain(
     company: &str,
     brain: Arc<dyn crate::ports::brain::Brain>,
 ) -> AppState {
-    let m = manifest();
+    state_with_brain_on(home, company, brain, manifest()).await
+}
+
+async fn state_with_brain_on(
+    home: &std::path::Path,
+    company: &str,
+    brain: Arc<dyn crate::ports::brain::Brain>,
+    m: CompanyManifest,
+) -> AppState {
     let store = FsCompanyStore::new(home.to_path_buf());
     let id = CompanyId::new(company);
     store
@@ -719,3 +727,53 @@ async fn omitting_the_id_query_param_redeems_unconditionally() {
 /// A brain whose `run_cycle` always refuses — the redispatch never
 /// completes successfully.
 pub(super) struct FailingRedispatchBrain;
+
+#[tokio::test]
+async fn redeeming_an_unaddressed_pause_answers_in_the_default_agents_dm() {
+    let home = home();
+    let company = "acme-redeem-unaddressed";
+    let replying = Arc::new(ReplyingBrain::default());
+    let roster: CompanyManifest = toml::from_str(
+        "[company]\nname = \"Acme\"\n[policy]\nmode = \"full\"\n\
+         [[agent]]\nid = \"ceo\"\nrole = \"Chief Executive\"\n",
+    )
+    .unwrap();
+    let state = state_with_brain_on(home.path(), company, replying.clone(), roster).await;
+    let id = CompanyId::new(company);
+    let runtime = state.registry().get(&id).expect("company is registered");
+
+    budget_pauses_for(&id).park(
+        "ceo",
+        None,
+        "ship the API",
+        "paused",
+        1_000,
+        RedeemContext::default(),
+    );
+
+    let (status, _resp, raw) = send(
+        &state,
+        company,
+        "POST",
+        "/api/v1/company/agents/ceo/budget-pause/redeem",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raw}");
+
+    let events = runtime
+        .events()
+        .read_from(&id, crate::ports::EventSeq::new(0), 100)
+        .await
+        .unwrap();
+    let asked = events.iter().find_map(|e| match &e.event {
+        CompanyEvent::OperatorMessage { chat, .. } => Some(chat.clone()),
+        _ => None,
+    });
+    assert_eq!(asked, Some(Some("dm:ceo".to_string())));
+    match replying.last.lock().unwrap().clone() {
+        Some(CompanyEvent::OperatorMessage { chat, .. }) => {
+            assert_eq!(chat.as_deref(), Some("dm:ceo"), "the turn runs in the DM")
+        }
+        other => panic!("expected the redispatched OperatorMessage, got {other:?}"),
+    }
+}

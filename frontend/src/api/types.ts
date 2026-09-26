@@ -452,23 +452,6 @@ export type EpisodeCompletionReason =
   | "membership_changed";
 
 /**
- * `GET {scope}/operator-channel` — the identity of the company's
- * always-present, durable Operator feed (issue #1757 rework): a read-only
- * "what happened" feed aggregating workflow-run reports and the owner/
- * no-mailbox fallback. Its own surface, not a desk — the console pins it
- * below a divider in the chat rail instead of folding it into `GET
- * {scope}/desks`. Mirrors `OperatorChannelDto` in `src/server/operator.rs`.
- */
-export interface OperatorChannelDto {
-  /** The channel id — the `desk` query param `chat/history` reads through. */
-  id: string;
-  /** Always "Operator" — the console's pinned-row label. */
-  name: string;
-  /** The channel's purpose line, shown under the name in the pinned row. */
-  description: string;
-}
-
-/**
  * Body for `POST {scope}/desks` — create a desk. `name` is required; `id` is
  * derived from the name when omitted; `members` are optional roster teammate
  * ids (the first becomes the lead).

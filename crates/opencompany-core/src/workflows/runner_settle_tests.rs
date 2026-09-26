@@ -22,6 +22,7 @@ fn deps_with_parking_over(
         users: Arc::new(crate::store::FsOps::new(dir)),
         bootstrap_admin: None,
         channels: Vec::new(),
+        notifications: None,
         parking: Some(super::super::delivery::DeliveryParking {
             approvals: gate,
             journal,

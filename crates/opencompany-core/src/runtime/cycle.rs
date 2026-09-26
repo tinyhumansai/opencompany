@@ -946,13 +946,9 @@ impl<'a> CycleRunner<'a> {
                 // Cheap exit before touching either store: no operator message,
                 // so no briefing has anywhere to land.
                 //
-                // Every operator message counts, addressed or not. `chat: None`
-                // is not "unaddressed" — `chat_and_emit` routes it to the
-                // General desk and every reader of the journal folds it there
-                // (`is_general_chat`), so requiring `Some` silently withheld
-                // both briefings from exactly the turns a bare REST or ACP
-                // caller sends: "did that ship?" answered blind, in the one
-                // conversation the console itself defaults to (codex on #1972).
+                // Every operator message counts, addressed or not: a message
+                // with no chat lands in the default agent's DM, so requiring
+                // `Some` would withhold both briefings from it.
                 && events
                     .iter()
                     .any(|e| matches!(e, CompanyEvent::OperatorMessage { .. }))

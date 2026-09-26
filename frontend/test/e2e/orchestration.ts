@@ -18,22 +18,6 @@ import { expect, type Locator, type Page } from "@playwright/test";
 /** The single-company alias the host answers on. */
 export const SCOPE = "/api/v1/company";
 
-/**
- * The main line's thread id, as both the console and the host spell it.
- *
- * It is **not** a channel in the `#/chat/<id>` workspace, and that is the trap
- * this constant exists to document: that view builds its channels from the
- * company's real desks (issue #368 deliberately removed the `"main"` literal
- * from it), so `#/chat/main` resolves to no channel and falls back to the first
- * desk — whose lead is an ordinary teammate with no delegation tools. A goal
- * sent there is answered politely and delegates nothing, which reads as the
- * orchestrator having ignored it.
- *
- * Room preserves the legacy `general` spelling as an explicit address for
- * this hidden channel, which is where {@link openMainLine} goes.
- */
-export const MAIN_LINE = "main";
-
 /** The board, now that it is the `tasks` ledger rather than a screen of its own. */
 export const BOARD = "/#/company/work/tasks";
 
@@ -60,19 +44,20 @@ export async function silenceTour(page: Page) {
 }
 
 /**
- * Opens the company's main line — the channel the orchestrator answers on.
+ * Opens the orchestrator's DM — where the operator hands the company a goal.
  *
- * Use the explicit legacy `#/chat/general` deep link rather than bare `#/chat`: the #2368
- * experiment makes a bare route open the first offered desk, whose lead is an
- * ordinary teammate without the orchestrator-only lifecycle tools. General is
- * hidden from the rail but remains resolvable by this address so old history
- * and orchestration coverage can still reach the company-wide line.
+ * Not a bare `#/chat`: that opens the first offered desk, whose lead is an
+ * ordinary teammate without the orchestrator-only lifecycle tools. The
+ * orchestrator is read off the host's own roster rule (`isOrchestrator`).
  */
-export async function openMainLine(page: Page) {
-  await openChannel(page, "general");
-  await expect(
-    page.getByRole("complementary").first().getByRole("button", { name: "general" }),
-  ).toHaveCount(0);
+export async function openOrchestratorDm(page: Page) {
+  const response = await page.request.get(`${SCOPE}/team`);
+  expect(response.ok(), `reading the team failed: ${response.status()}`).toBeTruthy();
+  const body = await response.json();
+  const members = (body.members ?? body.team ?? body) as { id: string; isOrchestrator?: boolean }[];
+  const orchestrator = members.find((member) => member.isOrchestrator);
+  expect(orchestrator, "the company has no orchestrator to hand a goal to").toBeTruthy();
+  await openChannel(page, `dm:${orchestrator!.id}`);
 }
 
 /** Opens one desk channel by id in the chat workspace, and waits for the view. */
@@ -88,7 +73,7 @@ export async function say(page: Page, text: string) {
 }
 
 /**
- * Every dispatch marker in the open main line.
+ * Every dispatch marker in the open conversation.
  *
  * Matched as **text**, not as a link: this asserts *that* a card settled and
  * where it landed, which is all these specs are about. Room renders the marker

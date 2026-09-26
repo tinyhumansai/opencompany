@@ -617,6 +617,7 @@ async fn chat_response_carries_durable_message_ids() {
     let home_dir = home();
     let home = home_dir.path().to_path_buf();
     let state = state_with_company(&home, "running").await;
+    let dm = default_dm(&state).await;
     let app = router(state);
     let cookie = crate::server::test_support::fixed_cookie("acme");
 
@@ -627,7 +628,7 @@ async fn chat_response_carries_durable_message_ids() {
         .expect("reply message id");
     assert_ne!(mine, reply, "the two halves are separate journal lines");
 
-    let history = get_history(&app, &cookie, "").await;
+    let history = get_history(&app, &cookie, &dm).await;
     let ids: Vec<&str> = history.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&mine), "own id absent from history: {ids:?}");
     assert!(

@@ -89,23 +89,6 @@ pub(super) async fn put_desk_order(
         .status()
 }
 
-pub(super) async fn get_operator_channel(app: &axum::Router, cookie: &str) -> serde_json::Value {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/company/operator-channel")
-                .header("cookie", cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    serde_json::from_slice(&bytes).unwrap()
-}
-
 /// Everything one agent said and heard, for a company with one reply in it.
 ///
 /// Fetched through the router so the assertion is about the wire, not about
@@ -175,6 +158,16 @@ pub(super) async fn post_chat(app: &Router, cookie: &str, body: &str) -> serde_j
     assert_eq!(response.status(), StatusCode::OK, "chat POST failed");
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// The default agent's DM — where a message with no `chat` lands.
+pub(super) async fn default_dm(state: &AppState) -> String {
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    runtime
+        .default_agent_dm()
+        .await
+        .unwrap()
+        .expect("the company has a default agent")
 }
 
 /// Reads a desk's history. `desk` empty reads the default General thread.

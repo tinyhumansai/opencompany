@@ -5792,12 +5792,6 @@ impl CompanyRecord {
     /// resolve to that desk's own transcript instead of the system feed
     /// (issue #1781 review, CodeRabbit P2 follow-up).
     ///
-    /// Diverting to [`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK) does not itself
-    /// re-check whether *that* address is free — see
-    /// [`operator_feed_channel_fallback_shadowed`](Self::operator_feed_channel_fallback_shadowed)
-    /// for the residual double-collision this leaves and why it is logged
-    /// rather than resolved here.
-    ///
     /// The **desk** half of the collision needs the identical stay-put
     /// treatment `is_retired` gives the agent half, for the identical reason:
     /// `desk_exists`/`resolve_desk_id` are live checks, so `delete_desk`
@@ -5823,37 +5817,6 @@ impl CompanyRecord {
         } else {
             crate::runtime::channel::OPERATOR_CHANNEL
         }
-    }
-
-    /// Whether [`operator_feed_channel`](Self::operator_feed_channel) has
-    /// diverted to [`OPERATOR_CHANNEL_COLLISION_FALLBACK`](crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK) ("operator-feed")
-    /// and that address is *itself* shadowed by a second grandfathered desk
-    /// name (issue #1781 review, CodeRabbit P2 follow-up to `316bc9229`).
-    ///
-    /// `resolve_desk_id`'s name match makes this theoretically reachable: a
-    /// manifest desk cannot claim the fallback by **id** (`is_valid_desk_id`
-    /// rejects the hyphen, so nothing can ever mint it — see the constant's
-    /// own doc), but a *different* desk's display **name** can, the same way
-    /// a desk named `Operator` shadows the primary address above. `316bc9229`
-    /// and `16dcce235` already close every creation path going forward — a
-    /// manifest authored through `opencompany check`/`from_path`, or an
-    /// overlay desk created through `POST .../desks`, can never be named
-    /// "operator-feed" again — so this can only happen to a manifest edited
-    /// outside those paths (hand-authored `company.toml` on disk) and loaded
-    /// through [`CompanyManifest::from_path_for_reload`], the same
-    /// grandfathering that makes the *primary* collision reachable at all.
-    ///
-    /// There is no third, similarly collision-proof address to divert to —
-    /// picking one would only shrink this residual gap, not close it, the
-    /// same way the fallback itself does not fully close the primary's. This
-    /// predicate exists so the delivery layer can at least log the double
-    /// collision instead of misrouting a report with no trace: see its call
-    /// site in `workflows::delivery::send_to_channel_adapter`.
-    pub fn operator_feed_channel_fallback_shadowed(&self) -> bool {
-        self.operator_feed_channel() == crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK
-            && self
-                .resolve_desk_id(crate::runtime::channel::OPERATOR_CHANNEL_COLLISION_FALLBACK)
-                .is_some()
     }
 
     /// Mints the roster id for a teammate about to be added under

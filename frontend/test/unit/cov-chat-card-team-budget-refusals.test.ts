@@ -46,7 +46,6 @@ vi.mock("sonner", () => ({
 }));
 
 const DESK_DTO = { id: "main", name: "main", description: "The main channel", members: [] as string[] };
-const OPERATOR_DTO = { id: "operator", name: "Operator", description: "Automation reports" };
 const MEMBER_DTO = { id: "m1", name: "Ada", role: "engineer" };
 
 interface Overrides {
@@ -66,7 +65,6 @@ function clientAs(overrides: Overrides): OpenCompanyClient {
     listDesks: () => Promise.resolve([DESK_DTO]),
     listTeam: () => Promise.resolve([MEMBER_DTO]),
     mentionables: () => Promise.resolve([]),
-    getOperatorChannel: () => Promise.resolve(OPERATOR_DTO),
     capabilityStatus: () => Promise.resolve({ cognition: null }),
     del: vi.fn(overrides.del ?? (() => Promise.resolve())),
     getBudgetPause: vi.fn(() => Promise.resolve(null)),

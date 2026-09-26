@@ -23,8 +23,8 @@ export const PER_GROUP_LIMIT = 6;
  * remember instead.
  *
  * The action says which of the two things Enter will do, because in a fused
- * palette both are reachable from the same row: `#general` goes there, and
- * `#general box` searches inside it. Inferring that from the shape of what you
+ * palette both are reachable from the same row: `#engineering` goes there, and
+ * `#engineering box` searches inside it. Inferring that from the shape of what you
  * typed is not something an operator should have to do.
  */
 export function channelResults(desks: readonly Desk[], query: SearchQuery): SearchResult[] {

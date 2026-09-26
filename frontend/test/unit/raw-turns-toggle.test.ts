@@ -238,9 +238,8 @@ describe("the raw-turns toggle in a DM", () => {
   });
 
   /**
-   * Only in a DM. A `#channel` has several agents and the Operator feed has
-   * none, so "the raw turns" would have to pick one for you — which is worse
-   * than not offering it. Same rule the member pane follows for that feed.
+   * Only in a DM. A `#channel` has several agents, so "the raw turns" would
+   * have to pick one for you — which is worse than not offering it.
    */
   it("is offered only where exactly one teammate is on the other end", () => {
     expect(room).toContain(

@@ -11,6 +11,18 @@ use super::write_test_support::*;
 use crate::ports::types::CompanyId;
 use crate::server::router;
 
+/// The history route for the default agent's DM, where a message with no
+/// `chat` lands.
+async fn default_history_uri(state: &crate::AppState) -> String {
+    let runtime = state.registry().get(&CompanyId::new("acme")).unwrap();
+    let dm = runtime
+        .default_agent_dm()
+        .await
+        .unwrap()
+        .expect("the company has a default agent");
+    format!("/api/v1/company/chat/history?desk={dm}")
+}
+
 /// A browser may send a full path as the filename; the route stores under the
 /// last segment only, named by the workspace rule — the same sanitizer the
 /// workspace upload applies, so no client string reaches a filesystem path.
@@ -118,7 +130,7 @@ async fn chat_message_with_attachment_journals_and_hydrates() {
 
     // The reload: the operator's own message comes back with the attachment,
     // and every field is the store's.
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     let mine = history
         .as_array()
@@ -259,7 +271,7 @@ async fn chat_message_rejects_foreign_node() {
 
     // And nothing was journaled: the refusal is before the append, so the
     // transcript does not hold a message pointing at a file this company lacks.
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         history
@@ -289,7 +301,7 @@ async fn chat_message_rejects_too_many_attachments() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         history
@@ -327,7 +339,7 @@ async fn chat_message_deduplicates_a_repeated_attachment_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     let mine = history
         .as_array()
@@ -384,7 +396,7 @@ async fn chat_message_attaches_a_note_uploaded_to_the_workspace() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     let mine = history
         .as_array()
@@ -438,7 +450,7 @@ async fn chat_message_attaches_a_note_already_in_the_workspace() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (status, history) = send(&state, "GET", "/api/v1/company/chat/history", None).await;
+    let (status, history) = send(&state, "GET", &default_history_uri(&state).await, None).await;
     assert_eq!(status, StatusCode::OK);
     let mine = history
         .as_array()

@@ -27,7 +27,7 @@ export const MAIN_THREAD_ID = "main";
 export const GENERAL_CHANNEL = "general";
 
 /**
- * Does this id name the built-in `#general` channel?
+ * Does this id name the legacy `#general` line?
  *
  * Mirrors the host's `is_general_chat` (`src/server/chat_history.rs`), which
  * has folded four spellings into one conversation since issue #65: the empty
@@ -106,8 +106,8 @@ export function generalAwareChannel(
  * The host folds the company-wide line under whatever casing the caller
  * addressed and echoes that spelling back, so an API client posting to
  * `General` has its frames emitted under `General` while the console armed
- * these maps at the built-in channel's id — `MAIN_THREAD_ID`, since
- * `generalChannel` is `{ id: MAIN_THREAD_ID, name: GENERAL_CHANNEL }`. Rows
+ * these maps at the archive's id — `MAIN_THREAD_ID`, since
+ * `legacyGeneralChannel` is `{ id: MAIN_THREAD_ID, name: GENERAL_CHANNEL }`. Rows
  * written under a spelling no reader looks at are rows the operator never sees
  * (issue #1743).
  *
@@ -125,7 +125,7 @@ export function generalAwareChannel(
  * arriving before the desks landed keyed `General`, its `tool_result` after
  * keyed `main`, and since a result whose call is not in its bucket is dropped,
  * the call row stayed `running` for good in a bucket nothing renders (CodeRabbit
- * on #2068). `MAIN_THREAD_ID` is the built-in General channel's own id, so it is
+ * on #2068). `MAIN_THREAD_ID` is the General archive's own id, so it is
  * both the stable answer and the one the map itself returns for an ordinary
  * company — the two agree, and the transition stops mattering.
  */

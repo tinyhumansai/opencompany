@@ -6,46 +6,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TeamMember } from "@/lib/team";
 import { ThreadPanel } from "@/views/room/ThreadPanel";
-import { operatorChannelFrom } from "@/views/room/model";
+import { legacyGeneralChannel } from "@/views/room/model";
 
 /**
- * Issue #1757 follow-up (codex + CodeRabbit review on the Operator channel
- * PR). The main composer already disables on `readOnly` — `Boolean(channel?.
- * system)` — but `ThreadPanel` renders its own composer and used to disable
- * it only while `sending`. Opening a durable Operator report as a thread and
- * replying there reached `onSend` (and would have reached `client.chat`)
- * before the server's read-only guard finally refused it, after the operator
- * had already written and submitted the reply.
+ * `ThreadPanel` renders its own composer, so a read-only channel — the
+ * `#general` archive — has to take it away there too, or an archived message
+ * could be opened as a thread and replied to.
  *
- * Issue #1757 rework: the Operator channel is its own surface now (`GET
- * {scope}/operator-channel`), not an entry `list_desks` returns, so the
- * fixture channel is built through `operatorChannelFrom` — the same
- * projection `RoomView` uses — rather than a hand-rolled literal.
- *
- * # The read-only answer changed: no composer, not a disabled one
- *
- * The first fix left the composer on screen and disabled, with the
- * placeholder "This channel is read-only". That still reads as a claim that
- * replying is a thing you do here — a textarea, an `@` button, a paperclip, a
- * formatting toggle and a Send button, under a notice that has just said
- * there is nothing to reply to. The panel now renders the notice and **no
- * composer at all**.
- *
- * So these assert absence, not disabledness: no textarea, no Send button, no
- * mention/attach/formatting controls, and a notice in their place. The
- * "never reaches `onSend`" pins that carried the old fix are subsumed — there
- * is no control left to click or press Enter in — and the writable cases
- * below are what keeps this from being satisfiable by a panel that renders
- * nothing at all.
+ * The read-only answer is no composer, not a disabled one: a disabled textarea,
+ * `@` button, paperclip and Send are still a claim that replying is a thing
+ * you do here. So these assert absence, and the writable cases below keep this
+ * from being satisfiable by a panel that renders nothing at all.
  */
 
-const CHANNEL = operatorChannelFrom({
-  id: "operator",
-  name: "Operator",
-  description: "Automation reports and notifications",
-});
-
 const MEMBERS: TeamMember[] = [];
+const CHANNEL = legacyGeneralChannel(MEMBERS);
 
 let container: HTMLDivElement;
 let root: Root;
@@ -70,7 +45,7 @@ async function render(readOnly: boolean | undefined) {
       createElement(ThreadPanel, {
         channel: CHANNEL,
         members: MEMBERS,
-        parent: { id: "p", from: "company", text: "nightly report", at: 0 },
+        parent: { id: "p", from: "company", text: "archived update", at: 0 },
         replies: [],
         sending: false,
         readOnly,
@@ -98,7 +73,7 @@ async function type(text: string) {
   });
 }
 
-describe("thread composer on a read-only channel (issue #1757)", () => {
+describe("thread composer on a read-only channel", () => {
   it("renders no composer at all for a read-only channel", async () => {
     await render(true);
 
@@ -124,7 +99,7 @@ describe("thread composer on a read-only channel (issue #1757)", () => {
     const notice = container.querySelector('[data-testid="thread-read-only-notice"]');
     expect(notice).not.toBeNull();
     expect(notice?.getAttribute("role")).toBe("status");
-    expect(notice?.textContent).toContain("There is nothing to reply to here");
+    expect(notice?.textContent).toContain("nothing can be posted here");
     // It is the last thing in the panel: the composer is not below it, hidden
     // or otherwise. `lastElementChild` fails the moment one is rendered again.
     expect(container.querySelector("aside")?.lastElementChild).toBe(notice);

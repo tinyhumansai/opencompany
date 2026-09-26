@@ -70,8 +70,8 @@ function clientWith(
     scopeFor: () => "/api/v1/company",
     // ONE desk, where the empty answer below used to do.
     //
-    // The console no longer offers `#general` as somewhere to type (#2368), so
-    // a company with no desks renders no channel — and this view's banner hangs
+    // There is no company-wide channel, so a company with no desks renders
+    // no channel — and this view's banner hangs
     // off the open channel, which made every assertion here read `null` for a
     // reason that has nothing to do with cognition. A desk is also the state
     // this test means: a company someone is actually talking to.
@@ -385,9 +385,8 @@ describe("the chat cognition banner", () => {
     const named: Record<string, unknown> = {
       capabilityStatus,
       scopeFor: () => "/api/v1/company",
-      // One desk, for the reason `clientWith` has one: with `#general` no
-      // longer offered, a company with no desks renders no channel and the
-      // banner has nothing to hang off (#2368).
+      // One desk, for the reason `clientWith` has one: a company with no desks
+      // renders no channel and the banner has nothing to hang off.
       listDesks: () =>
         Promise.resolve([
           {

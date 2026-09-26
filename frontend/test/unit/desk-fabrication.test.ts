@@ -64,17 +64,17 @@ describe("a company with no desks (empty /desks answer)", () => {
     ]);
   });
 
-  it("builds a rail of #general and nothing beside it", () => {
-    const channels = buildChannels(NO_MEMBERS, [], {}, true).flatMap(
+  it("builds an empty rail", () => {
+    const channels = buildChannels(NO_MEMBERS, [], {}).flatMap(
       (section) => section.channels,
     );
 
-    expect(channels.map((c) => c.id)).toEqual([MAIN_THREAD_ID]);
+    expect(channels).toEqual([]);
   });
 
-  it("keeps #general resolvable for an approval raised on the main line", () => {
-    // The empty list is an answer, so the one channel every company has can be
-    // named. While `[]` also meant "the read failed" this label was withheld.
+  it("keeps the #general archive resolvable for an approval raised on the main line", () => {
+    // The empty list is an answer, so the archived line can be named. While
+    // `[]` also meant "the read failed" this label was withheld.
     const approval = {
       id: "a1",
       kind: "runtime.unlabelled_effect",

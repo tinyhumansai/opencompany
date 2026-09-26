@@ -4518,13 +4518,11 @@ impl HarnessPool {
             deps.events.clone(),
         )?;
 
-        let stream_ctx = Some(crate::turn_stream::TurnStreamCtx {
+        let stream_ctx = chat_id.map(|chat_id| crate::turn_stream::TurnStreamCtx {
             company: company.clone(),
             agent_id: confine::CONFINED_AGENT_ID.to_string(),
             route: crate::turn_stream::LiveRoute::Chat {
-                chat_id: chat_id
-                    .map(str::to_string)
-                    .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
+                chat_id: chat_id.to_string(),
             },
             // A copilot turn is addressed by `chat_id` alone — this entry point
             // takes no `ChatTarget` — so its frames key by thread, as every
@@ -4818,13 +4816,10 @@ impl HarnessPool {
                 // The chat/desk thread this turn answers — the same id journaled
                 // as `AgentReply.chat_id`, so the console keys the live timeline
                 // on it and concurrent turns on different threads never
-                // cross-attribute. Falls back to the default desk to match the
-                // durable reply when the caller addressed no desk (e.g. an API
-                // client that omits `chat`).
+                // cross-attribute. A turn that names no thread streams into the
+                // answering agent's DM.
                 route: crate::turn_stream::LiveRoute::Chat {
-                    chat_id: chat_id
-                        .map(str::to_string)
-                        .unwrap_or_else(|| crate::server::ops::language::DEFAULT_DESK.to_string()),
+                    chat_id: crate::runtime::assignee::chat_or_dm(chat_id, agent_id),
                 },
                 // The operator message this turn answers, read off the
                 // `ChatTarget` the caller already passes. Nothing new is

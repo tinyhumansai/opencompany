@@ -786,11 +786,9 @@ interface WiredChannelsResponse {
  * output node's `channel` destination may name (issue #813): its desk chats and
  * its enabled OpenHuman-provider manifest channels.
  *
- * **`operator` is always one of them** (issue #1757). It was excluded per
- * issue #981, back when the in-memory `operator` adapter had no durable reader
- * and workflow delivery refused it by name; the built-in Operator channel is
- * now a durable, journal-backed delivery target present on every running
- * company, so the host serves it here like any other real channel.
+ * **`operator` is always one of them.** Delivering to it files a
+ * notification and posts the report in the DM of the agent responsible for the
+ * workflow; there is no Operator feed to read it in.
  *
  * The console reads this to offer a picker instead of a free-text box that only
  * fails at delivery with `ChannelNotWired`. An empty list has two causes and the

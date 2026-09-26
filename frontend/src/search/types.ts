@@ -50,7 +50,7 @@ export interface SearchResult {
   /**
    * What activating it will do, said plainly on the row.
    *
-   * Load-bearing in a fused palette: `#general` navigates and `#general box`
+   * Load-bearing in a fused palette: `#engineering` navigates and `#engineering box`
    * searches, and the operator should not have to infer which from the shape
    * of what they typed.
    */

@@ -2,7 +2,7 @@ use super::tests_owner_setup::{Harness, graph, graph_without_destination, reache
 use super::*;
 
 use crate::company::parse_workflow;
-use crate::runtime::channel::{DeskChannel, OPERATOR_CHANNEL};
+use crate::runtime::channel::DeskChannel;
 
 /// A channel the deployment never wired cannot be conjured by a graph. The
 /// failure names what IS wired, so the fix is obvious from the run result.
@@ -23,16 +23,18 @@ async fn channel_that_is_not_wired_fails_with_the_wired_list() {
 
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(reports[0].status, DeliveryStatus::Failed);
-    // The unwired failure now speaks in the same sentence the console's
-    // picker pre-flight shows (issue #981), naming what IS wired — which,
-    // since #1757, includes the durable `operator` channel this Harness wires.
+    // The unwired failure speaks in the same sentence the console's picker
+    // pre-flight shows (issue #981), naming what IS wired — nothing, here.
     assert!(
         reports[0]
             .detail
             .contains("is not an automation delivery channel"),
         "{reports:?}"
     );
-    assert!(reports[0].detail.contains(OPERATOR_CHANNEL), "{reports:?}");
+    assert!(
+        reports[0].detail.contains("no durable channels"),
+        "{reports:?}"
+    );
     // The two channel failures are classified apart: "you named a channel
     // that does not exist" and "the channel said no" want different fixes,
     // and the log line only ever sees this half.
@@ -444,7 +446,7 @@ async fn a_failed_delivery_journals_nothing() {
     let reports = deliver_outputs(
         Some(&h.deps),
         &record(&[]),
-        &graph("channel", Some("operator")),
+        &graph("channel", Some("telegram")),
         "run-1",
         &reached_output(),
         &[],

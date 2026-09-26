@@ -63,23 +63,21 @@ function railRow(page: Page, channelName: string): Locator {
   return page.getByRole("complementary").first().getByRole("button", { name: channelName });
 }
 
-test("does not offer the built-in general channel by default", async ({ page }) => {
+test("offers no company-wide channel in the rail", async ({ page }) => {
   await openChannel(page, ENGINEERING.id);
 
-  // `#general` remains resolvable for legacy history, but the console no
-  // longer offers it as a channel to open or compose into.
   await expect(railRow(page, ENGINEERING.channel)).toBeVisible();
   await expect(railRow(page, "general")).toHaveCount(0);
 });
 
-test("resolves the hidden general channel from its legacy deep link", async ({ page }) => {
+test("opens the #general archive read-only from its legacy deep link", async ({ page }) => {
   await openChannel(page, ENGINEERING.id);
   await expect(railRow(page, "general")).toHaveCount(0);
 
-  await openChannel(page, "general");
+  await page.goto("/#/chat/general");
   await expect(page).toHaveURL(/#\/chat\/general(?:[/?]|$)/);
-  await expect(page.getByRole("main")).toBeVisible();
-  await expect(page.getByPlaceholder(/^Message /)).toBeVisible();
+  await expect(page.getByText("nothing can be posted here")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByPlaceholder(/^Message /)).toHaveCount(0);
   await expect(railRow(page, "general")).toHaveCount(0);
 });
 

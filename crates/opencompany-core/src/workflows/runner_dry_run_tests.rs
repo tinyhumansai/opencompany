@@ -327,6 +327,7 @@ async fn t4_dry_run_delivers_nothing_and_journals_nothing() {
         users: Arc::new(FsOps::new(dir.path())),
         bootstrap_admin: None,
         channels: vec![Arc::new(channel.clone())],
+        notifications: None,
         parking: None,
         events: events.clone(),
     });
@@ -387,6 +388,7 @@ async fn t5_the_same_graph_run_for_real_dispatches_and_journals() {
         users: Arc::new(FsOps::new(dir.path())),
         bootstrap_admin: None,
         channels: vec![Arc::new(channel.clone())],
+        notifications: None,
         parking: None,
         events: events.clone(),
     });

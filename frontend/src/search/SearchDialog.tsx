@@ -12,8 +12,8 @@
 // whole query because you wanted to widen it is the thing that makes people
 // stop using a palette.
 //
-// **Enter says what it will do before it does it.** `#general` navigates and
-// `#general box` searches inside it, and the active row spells out which —
+// **Enter says what it will do before it does it.** `#engineering` navigates and
+// `#engineering box` searches inside it, and the active row spells out which —
 // see `SearchResult.action`.
 
 import { useEffect, useMemo, useRef, useState } from "react";

@@ -8,7 +8,7 @@ use crate::policy::ManifestApprovalGate;
 use crate::ports::UserRecord;
 use crate::ports::types::CompanyId;
 use crate::ports::types::SecretValue;
-use crate::runtime::channel::{DurableOperatorChannel, OperatorChannel};
+use crate::runtime::channel::OperatorChannel;
 use crate::server::ops::mailer::{MailSender, RecordingMailSender};
 use crate::server::ops::smtp::{SmtpCredentials, SmtpSecurity};
 use crate::store::{FsInboxStore, FsOps};
@@ -189,19 +189,11 @@ impl Harness {
         // side must actually land on disk and read back, so the delivered
         // ledger is exercised end to end rather than against a double.
         let events: Arc<dyn EventLog> = Arc::new(crate::store::FsEventLog::new(dir));
-        // The delivery adapter set the production builder wires (issue #1757):
-        // the DURABLE operator channel, journaling into the event log, is the
-        // owner/no-mailbox fallback's landing spot. `with_channel = false`
-        // wires nothing, so the fallback has no operator adapter and reports a
-        // failure row — the misconfigured-build case.
-        let channels: Vec<Arc<dyn ChannelAdapter>> = if with_channel {
-            vec![Arc::new(DurableOperatorChannel::new(
-                CompanyId::new("acme"),
-                events.clone(),
-            ))]
-        } else {
-            Vec::new()
-        };
+        // `with_channel` wires the operator notification store; the report
+        // itself always lands in the responsible agent's DM.
+        let notifications: Option<Arc<dyn crate::ports::notifications::NotificationStore>> =
+            with_channel
+                .then(|| users.clone() as Arc<dyn crate::ports::notifications::NotificationStore>);
         Self {
             deps: WorkflowDeliveryDeps {
                 events: events.clone(),
@@ -212,7 +204,8 @@ impl Harness {
                 inbox: inbox.clone(),
                 users: users.clone(),
                 bootstrap_admin: None,
-                channels,
+                channels: Vec::new(),
+                notifications,
                 parking: None,
             },
             mail,
@@ -392,12 +385,18 @@ admins = [{list}]
             .collect()
     }
 
-    /// The text of every workflow report the durable operator channel
-    /// journaled (issue #1757): `AgentReply`s authored by `workflow` on the
-    /// dedicated `operator` line the standing Operator channel renders. This
-    /// is what proves the owner/no-mailbox fallback is a real, readable
-    /// delivery rather than a discard on the in-memory buffer.
+    /// The text of every workflow report journaled into a DM: `AgentReply`s
+    /// authored as a workflow report or an owner-fallback report.
     pub(super) async fn operator_reports(&self) -> Vec<String> {
+        self.operator_report_authors()
+            .await
+            .into_iter()
+            .map(|(_, _, text)| text)
+            .collect()
+    }
+
+    /// Every report journaled into a DM, as `(chat_id, agent_id, text)`.
+    pub(super) async fn operator_report_authors(&self) -> Vec<(String, String, String)> {
         self.events
             .read_from(
                 &self.company,
@@ -413,48 +412,29 @@ admins = [{list}]
                     agent_id,
                     text,
                     ..
-                } if chat_id == crate::runtime::channel::OPERATOR_CHANNEL
-                    // `WORKFLOW_REPLY_AUTHOR` covers an explicit `channel`
-                    // destination's report; `OWNER_FALLBACK_REPORT_AUTHOR`
-                    // covers the `owner`-with-no-mailbox fallback (issue
-                    // #1781 review, Codex P1) — both are still genuine,
-                    // durable operator-channel reports, just gated
-                    // differently on read. A test that cares which one
-                    // landed reads `agent_id` itself via
-                    // `operator_report_authors`.
+                } if chat_id.starts_with(crate::runtime::assignee::DM_PREFIX)
                     && (agent_id == crate::runtime::channel::WORKFLOW_REPLY_AUTHOR
                         || agent_id == crate::runtime::OWNER_FALLBACK_REPORT_AUTHOR) =>
                 {
-                    Some(text)
+                    Some((chat_id, agent_id, text))
                 }
                 _ => None,
             })
             .collect()
     }
 
-    /// Every operator-channel `AgentReply`'s `(agent_id, text)` pair, for a
-    /// test that needs to tell an owner-fallback report apart from an
-    /// ordinary one rather than just counting them (issue #1781 review,
-    /// Codex P1).
-    pub(super) async fn operator_report_authors(&self) -> Vec<(String, String)> {
-        self.events
-            .read_from(
-                &self.company,
-                crate::ports::types::EventSeq::new(0),
-                usize::MAX,
-            )
+    /// Every notification `user` can see.
+    pub(super) async fn notifications_for(
+        &self,
+        user: &str,
+    ) -> Vec<crate::ports::notifications::Notification> {
+        use crate::ports::notifications::NotificationStore;
+        self.users
+            .list(&self.company, user)
             .await
-            .expect("journal readable")
+            .expect("notifications readable")
             .into_iter()
-            .filter_map(|s| match s.event {
-                CompanyEvent::AgentReply {
-                    chat_id,
-                    agent_id,
-                    text,
-                    ..
-                } if chat_id == crate::runtime::channel::OPERATOR_CHANNEL => Some((agent_id, text)),
-                _ => None,
-            })
+            .map(|view| view.notification)
             .collect()
     }
 

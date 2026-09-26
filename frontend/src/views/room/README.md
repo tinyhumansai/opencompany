@@ -22,14 +22,15 @@ start an otherwise absent DM.
 - A DM is `dm:<teammate-id>` — e.g. `#/chat/dm:designer` for a host roster
   agent, or `#/chat/dm:member-product-manager-1f3k` for a teammate this console
   invented.
-- `#general` is always first, in every company, and is **not** a desk — see
-  below.
+- There is no company-wide channel. A message that names no chat goes to the
+  default agent's DM; the old `#general` line survives only as a read-only
+  archive — see below.
 - A host with no `.../desks` route falls back to `#strategy`, `#creative`,
   `#front-desk` (`lib/desks.ts`) under it.
 
 Nothing resolves until `/desks` has answered — the view holds a loading state
 rather than resolving against the fallback desks and swapping under you, which
-is what made every deep link flash `#general` (issue #370). An id that doesn't
+is what made every deep link flash a fabricated channel (issue #370). An id that doesn't
 resolve *after* they land opens the first channel and says so in a notice above
 the timeline, so the URL and the content never disagree silently. A `/desks`
 failure that isn't "this host has none" (404 or an empty list) is a retryable
@@ -45,108 +46,35 @@ Ids minted before #364 were `dm:<slug-of-name>-<hash>`. `resolveDmChannelId`
 still resolves those for one release so a saved link lands, but nothing is ever
 addressed or stored under one.
 
-## `#general` — the one channel that is not a desk (#1743)
+## `#general` — the read-only archive
 
-Every other channel here is a desk. `#general` is the company-wide line, and it
-is composed by `buildChannels` rather than read from `GET .../desks`, because
-the host deliberately does not list it there.
+The company-wide line is gone from the rail: `buildChannels` lists desks and
+DMs only, and an unaddressed message lands in the default agent's DM. The host
+still serves the old General history, so an explicit `#/chat/main` (or any
+General spelling) opens `legacyGeneralChannel` — a `system` channel with no
+composer, no reaction toolbar, no members pane and no empty-state cards. It is
+never offered in the rail, and a bare `#/chat` does not restore onto it.
 
-That absence is the design, not an omission. A desk has a lead
-(`members[0]`) and a hierarchy (`PUT .../desks/{id}/order`); "everyone" has
-neither. Keeping it out of the desk list is what stops every desk-shaped
-surface — the org chart, the assignee picker, the desk counts — from offering
-it a lead, a seat, a rename or a delete, without any of them needing to know it
-exists. Two affordances in this view derive from a channel and had to be told
-about it explicitly, because it is the first channel to carry `memberIds`
-*without* being a desk:
+**The four spellings still fold.** The host journals the line under `""`,
+`main`, `General` and `general` (`isGeneralChannel`, mirroring
+`is_general_chat`), so `channelIdForThread`, the shell's thread → channel map
+and the rehydration targets all resolve every spelling to the one place that
+renders it, and old approvals raised there still link to it.
 
-- **no lead badge.** Its `memberIds` are the roster in roster order, so `[0]` is
-  whoever is listed first. Badging them "lead" would state a rank nothing
-  confers.
-- **no "Manage on the org chart" link.** It would open `#/company/main` on a
-  desk that does not exist. The rule `api/setup.ts:58` states — do not render a
-  control that will be refused — makes absence the honest state, so there is no
-  link and no disabled one either.
+**Unless a blueprint desk claims the line.** A manifest `[[group_chat]]` with a
+General id — or a General display name, since `resolve_desk_id` matches either
+(`deskClaimsGeneralChannel`) — is grandfathered by the host: that desk keeps its
+lead, its writes and its routing. It is an ordinary writable desk in the rail,
+and `generalChannelId` sends every General spelling to it instead of the
+archive. Operator-created overlay desks never claim the line.
 
-The host enforces the same thing from its side rather than trusting this:
-`DELETE`, the two membership writes and the order write are all refused with a
-`409` and a sentence, and a desk cannot be created with an id that would shadow
-the channel. See `docs/spec/runtime/api.md`.
+**A teammate whose id is a General spelling keeps its DM under `dm:<id>`.** The
+bare key folds onto the line, so `dmThreadId` addresses that one DM prefixed,
+and `channelIdForThread` resolves desk, then the General fold, then the roster.
 
-**Unless a blueprint already declared one.** The host grandfathers a company
-whose manifest names a `[[group_chat]]` with a General id — `is_general_channel`
-is guarded on the *manifest*, so that desk keeps its lead, its writes and its
-routing, and `responder_for` answers there as it always did. Only the manifest:
-an operator-created overlay desk that took one of those ids before they were
-reserved is refused every desk write, is not listed by `GET .../desks`, and —
-since `CompanyRecord::resolve_desk_id` declines to search the overlay list for a
-General key at all — no longer *routes* under one either, so it never reaches
-this rail and the built-in channel owns the line. `buildChannels`
-follows the same rule: the built-in channel is added **only when no desk claims
-a General spelling**, and no desk is ever filtered out of the rail. The two
-affordances above are decided by whether the desk list holds the active id
-(`activeIsDesk`), not by how the id is spelled, so a grandfathered desk keeps
-its lead badge and its org-chart link while `#general` proper still has neither.
-
-**A claim is by id *or* by display name**, because the host's own
-`resolve_desk_id` matches either — `deskClaimsGeneralChannel` in `lib/desks.ts`
-is that predicate, and `generalChannelId` and `buildChannels` both ask it so
-there is one answer to "which desk owns the line". A blueprint declaring
-`id = "ops", name = "General"` is as grandfathered as one declaring
-`id = "general"`: `deskFromDto` slugs that name into `channel: "general"`, so an
-id-only test rendered the built-in channel beside a desk row spelled the same
-way, over one host conversation. It is not cosmetic either — `everyone_desk`
-folds the console's `main` to `General` and `resolve_desk_id("General")` then
-selects `ops`, so `@everyone` on the built-in row would have expanded to that
-desk's members while the row beside it routed by `ops`.
-
-**A General spelling in the address bar opens the line too.** The host folds
-four spellings into one conversation (`isGeneralChannel`, mirroring
-`is_general_chat`), and every consumer of a live frame already applies that
-fold; routing was the one place that did not, so which of `#/chat/main` and
-`#/chat/general` worked depended on how the company happened to be declared.
-`RoomView` now falls back to `generalChannelId` for a General-spelled segment
-that names no channel outright — exact ids are still asked first, so a real desk
-whose id *is* a General spelling still wins its own channel and nothing that
-already resolved is rerouted. The guided tour's two composer stops depend on
-this: they address `#/chat/main` explicitly so they cannot inherit the read-only
-Operator feed, which renders no composer for their spotlight to anchor on.
-
-**A teammate whose id is a General spelling does not take the line with it.**
-`mint_agent_id` reserves `main` and `General`, but a manifest can still declare
-one, and `GET chat/history?desk=main` answers with the folded General
-conversation rather than that teammate's transcript — the fold is a fact about
-the address, not about who was addressed. So the bare key is the company's line
-(`responder_for` answers it as the orchestrator) and the teammate keeps its DM
-under `dm:<id>`. `channelIdForThread` mirrors that order — desk, then the
-General fold, then the roster — and `app-shell.tsx` resolves each DM's
-rehydration target through it, so a DM is only ever hydrated from a thread id
-that belongs to it.
-
-This is also why `defaultDesks()` no longer carries a `main` row. While it did,
-a console-invented desk and a blueprint-declared one were indistinguishable
-here, and the rail got the grandfathered case wrong in both directions at once:
-a manifest `id = "general"` rendered as two channels folding onto one
-transcript, and a manifest `id = "main"` was hidden while the host still routed
-to its lead. Console-side desk fabrication reading as a real desk is the same
-shape as issue #370.
-
-**Its membership is derived on every render** — the roster this view already
-holds, in roster order. Nothing records who is in `#general`, so a teammate
-added a minute ago is in it with no write anywhere and the two cannot drift.
-The host derives the same set the same way when it expands `@everyone` here.
-
-**Its thread id is `main`**, which is what this console has always addressed the
-company's main line as, and what the host folds `""`, `General` and `general`
-onto (`chat_history::is_general_chat`). So the transcript, the unread counts,
-the mention badges and the remembered-channel key are the ones that already
-existed — nothing was re-keyed, and no history moved.
-
-**An unmentioned message is answered by the orchestrator**, one turn, exactly as
-the main line always was; the purpose line under the title says so by name when
-`GET .../team` reports `isOrchestrator`, and says nothing about it when the host
-does not answer that. `@`-mentioning somebody overrides it here as it does in a
-desk channel.
+**Desk affordances follow the desk list.** The lead badge and the "Manage on the
+org chart" link are gated on `activeIsDesk` — whether `GET .../desks` holds the
+active id — so the archive gets neither, and a grandfathered desk keeps both.
 
 ## What is real and what is console-local
 
@@ -185,14 +113,11 @@ loss.
 
 ### A read-only channel offers no new reaction (#1986)
 
-Issue #1986 was opened as a product question — is reacting to a read-only feed
-of workflow reports legitimate acknowledgement, or the same defect that #1757
-and #1984 fixed for the members pane and the composer? The operator's ruling is
-**no**. Reacting writes into the company's transcript exactly as sending does,
+Reacting writes into the company's transcript exactly as sending does,
 and the host authorizes it through the very same gate (`chat_actor`,
 `src/server/operator.rs`, whose own doc says reacting "can be neither easier nor
-harder than saying something"), so a surface that states *there is nothing to
-reply to here* must not offer it either.
+harder than saying something"), so a surface that states *nothing can be
+posted here* must not offer it either.
 
 `MessageTimeline` reads `channel.system` — the flag `RoomView` derives its own
 `readOnly` from, and the one the channel intro already gates on — and
@@ -204,21 +129,16 @@ buttons mounted leaves them reachable by pointer, by keyboard focus and by a
 screen reader.
 
 Reactions **already** on such a line still render, disabled, with a tooltip
-saying why. One somebody left is content and this feed is the only record of
-it; hiding it would lose information rather than withdraw an offer. Only the
+saying why. One somebody left is content and this channel is the only record
+of it; hiding it would lose information rather than withdraw an offer. Only the
 ability to add or toggle one goes. The way into a thread stays too — an
-Operator report is still worth reading the replies under, and what may be
+archived message is still worth reading the replies under, and what may be
 *written* in one is `ThreadPanel`'s question, answered there.
 
-**This one is UX, not enforcement.** A *send* is refused server-side by
-`CompanyRuntime::ensure_desk_writable` (#1757), which is why the composer's
-gate is defence in depth. The reaction route is not: `POST
-{scope}/chat/messages/{seq}/reactions` is addressed by sequence number, never
-resolves the target's channel, and runs no read-only check at all — so a
-reaction on an Operator report is still accepted (`204`) from anyone who can
-issue the request. `reactions_refuse_a_target_that_is_an_admin_only_report` in
-`src/server/operator.rs` asserts exactly that in its admin branch. Closing it
-is a host change and is not part of #1986.
+**This one is UX, not enforcement.** The reaction route
+(`POST {scope}/chat/messages/{seq}/reactions`) is addressed by sequence number
+and runs no read-only check, so a reaction on an archived row is still accepted
+from anyone who can issue the request.
 
 ## Empty, or not answered yet
 
@@ -261,9 +181,8 @@ other end.
 
 The fallback desks in `lib/desks.ts` carry no membership — there is none to
 carry — so a channel built from them falls back to the whole roster, and the
-pane renders one plain list. `#general` is the exception in the other
-direction: it states the whole roster as its membership, derived, rather than
-declining to answer (see above). The rest of the company is always one section
+pane renders one plain list. The `#general` archive states the whole roster as
+its membership, derived, but offers no pane. The rest of the company is always one section
 below, so adding a teammate or opening somebody's DM never needs a different
 surface.
 
@@ -285,8 +204,8 @@ ghosts are visible. Keep the two behaviours as they are; the divergence is what
 makes the split coherent rather than arbitrary.
 
 The link is offered only for a **host-backed desk channel**. A DM is not a desk,
-a fallback desk names one the host does not have, and `#general` is not a desk
-at all (#1743) — the chart would open on nothing in all three cases, so none of
+a fallback desk names one the host does not have, and the `#general` archive is
+not a desk at all — the chart would open on nothing in all three cases, so none of
 them gets a link. The test is `activeIsDesk`: whether the desk list holds the
 active id. Asked of the list rather than of the id's spelling, so a blueprint
 desk grandfathered under a General id — which the host does list and the chart
@@ -302,7 +221,7 @@ chart's desk level, since no desk can name a parent desk. See
 
 | | |
 |---|---|
-| `channels.ts` | What a channel is: desks, DMs, `#general`, the Operator feed, and the id grammar. Pure. |
+| `channels.ts` | What a channel is: desks, DMs, the `#general` archive, and the id grammar. Pure. |
 | `timeline.ts` | Senders, hydration, grouping, the timeline items (messages, approvals, rounds, completion markers), reactions. Pure. |
 | `review.ts` | A card's lifecycle inside a conversation: the settle pill a verdict hangs off, and the budget-pause markers. Pure. |
 | `model.ts` | A barrel re-exporting the three above, so one import address still reaches all of it. Declares nothing. |

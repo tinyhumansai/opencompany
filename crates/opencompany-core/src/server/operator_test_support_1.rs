@@ -153,6 +153,112 @@ impl crate::ports::runs::RunStore for FailingRunStore {
     }
 }
 
+/// A [`CompanyStore`](crate::ports::CompanyStore) whose `load` can be told to
+/// fail a fixed number of times before going back to answering from its real
+/// backing store — a transient roster-read outage rather than a permanently
+/// dead store.
+pub(super) struct SometimesFailingCompanyStore {
+    inner: FsCompanyStore,
+    remaining_load_failures: std::sync::atomic::AtomicUsize,
+}
+
+impl SometimesFailingCompanyStore {
+    pub(super) fn new(inner: FsCompanyStore) -> Self {
+        Self {
+            inner,
+            remaining_load_failures: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn fail_next_loads(&self, count: usize) {
+        self.remaining_load_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ports::CompanyStore for SometimesFailingCompanyStore {
+    async fn load(&self, id: &CompanyId) -> crate::Result<Option<CompanyRecord>> {
+        let remaining = self
+            .remaining_load_failures
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if remaining > 0 {
+            self.remaining_load_failures
+                .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err(OpenCompanyError::InvalidRequest(
+                "company store offline".to_string(),
+            ));
+        }
+        self.inner.load(id).await
+    }
+    async fn save(&self, record: &CompanyRecord) -> crate::Result<()> {
+        self.inner.save(record).await
+    }
+    async fn list(&self) -> crate::Result<Vec<crate::ports::types::CompanySummary>> {
+        self.inner.list().await
+    }
+    async fn append_ledger(
+        &self,
+        id: &CompanyId,
+        entry: crate::ports::types::LedgerEntry,
+    ) -> crate::Result<()> {
+        self.inner.append_ledger(id, entry).await
+    }
+}
+
+/// [`state_with_roster`], with the company store swapped for a
+/// [`SometimesFailingCompanyStore`] the caller can arm after the runtime has
+/// booted — the fixture for a roster read failing mid-request rather than at
+/// boot.
+pub(super) async fn state_with_roster_and_failing_store(
+    home: &std::path::Path,
+) -> (AppState, Arc<SometimesFailingCompanyStore>) {
+    let seed_store = FsCompanyStore::new(home.to_path_buf());
+    let id = CompanyId::new("acme");
+    use crate::ports::CompanyStore;
+    seed_store
+        .save(&CompanyRecord {
+            overlay_desk_hive: Vec::new(),
+            overlay_retired_agents: Vec::new(),
+            overlay_agent_edits: Vec::new(),
+            id: id.clone(),
+            manifest: roster_manifest(),
+            ledger: Vec::new(),
+            lifecycle: "running".to_string(),
+            overlay_agents: Vec::new(),
+            overlay_desk_members: Vec::new(),
+            overlay_desk_order: Vec::new(),
+            overlay_desks: Vec::new(),
+            overlay_workflows: Vec::new(),
+            overlay_budgets: Vec::new(),
+            overlay_policy: None,
+            overlay_tool_grants: None,
+            overlay_desk_tools: Default::default(),
+            disabled_workflows: Vec::new(),
+            template_provenance: None,
+            setup: None,
+            name_confirmed: false,
+            activation_completed_at: None,
+            created_at_millis: None,
+        })
+        .await
+        .unwrap();
+
+    let failing_store = Arc::new(SometimesFailingCompanyStore::new(FsCompanyStore::new(
+        home.to_path_buf(),
+    )));
+    let runtime = RuntimeBuilder::new(home.to_path_buf(), roster_manifest())
+        .with_id(id.clone())
+        .with_store(failing_store.clone())
+        .build()
+        .await
+        .unwrap();
+    let state = AppState::new(AppConfig::default());
+    state.registry().insert(id, Arc::new(runtime));
+    crate::server::test_support::seed_fixed_admin(&state, "acme").await;
+    (state, failing_store)
+}
+
 /// [`state_with_company`] with the run store swapped for one that refuses
 /// every verb — the setup for the rowless-turn tests.
 pub(super) async fn state_with_failing_runs(home: &std::path::Path) -> AppState {

@@ -1,5 +1,4 @@
 use super::*;
-use crate::server::ops::language::DEFAULT_DESK;
 
 /// The shared refusal sentence names what IS deliverable, and says so
 /// plainly when the answer is nothing — a desk-less company is a legitimate
@@ -114,109 +113,6 @@ async fn a_desk_send_fails_when_the_journal_refuses_it() {
             channel: "engineering".into(),
             agent: None,
             text: "the weekly digest".into(),
-            steps: Vec::new(),
-            reply_to: None,
-            mentions: Vec::new(),
-        })
-        .await;
-    assert!(result.is_err(), "an unwritable journal must fail the send");
-}
-
-/// An [`EventLog`] that records every appended event, for asserting what a
-/// channel journals.
-#[derive(Default)]
-struct RecordingEventLog {
-    events: StdMutex<Vec<CompanyEvent>>,
-}
-
-#[async_trait]
-impl EventLog for RecordingEventLog {
-    async fn append(&self, _company: &CompanyId, event: CompanyEvent) -> Result<EventSeq> {
-        let mut events = self.events.lock().expect("recording log poisoned");
-        events.push(event);
-        Ok(EventSeq::new(events.len() as u64))
-    }
-
-    async fn read_from(
-        &self,
-        _company: &CompanyId,
-        _seq: EventSeq,
-        _limit: usize,
-    ) -> Result<Vec<crate::ports::types::StoredEvent>> {
-        Ok(Vec::new())
-    }
-
-    fn subscribe(
-        &self,
-        _company: &CompanyId,
-    ) -> BoxStream<'static, crate::ports::events::EventStreamItem> {
-        Box::pin(stream::empty())
-    }
-}
-
-/// The durable operator channel carries the `operator` id and journals its
-/// report onto that dedicated Operator line — never the General desk,
-/// authored by `workflow-report` — so the owner/no-mailbox fallback lands
-/// somewhere the console renders and survives a restart, and reads as a
-/// workflow report rather than an agent's own reply (issue #1757).
-#[tokio::test]
-async fn the_durable_operator_channel_journals_to_the_operator_line() {
-    let log = Arc::new(RecordingEventLog::default());
-    let channel = DurableOperatorChannel::new(CompanyId::new("acme"), log.clone());
-    assert_eq!(channel.channel_id(), OPERATOR_CHANNEL);
-
-    channel
-        .send(OutboundMessage {
-            message_id: None,
-            task_id: None,
-            outputs: Vec::new(),
-            channel: OPERATOR_CHANNEL.into(),
-            agent: None,
-            text: "[Acme] Weekly digest — Owner summary\n\nQ3 is up 12%.".into(),
-            steps: Vec::new(),
-            reply_to: None,
-            mentions: Vec::new(),
-        })
-        .await
-        .expect("a durable operator send journals rather than buffering");
-
-    let events = log.events.lock().expect("recording log poisoned");
-    assert_eq!(events.len(), 1, "the report must be journaled");
-    match &events[0] {
-        CompanyEvent::AgentReply {
-            chat_id,
-            agent_id,
-            text,
-            ..
-        } => {
-            assert_eq!(
-                chat_id, OPERATOR_CHANNEL,
-                "lands on the dedicated operator line, not General"
-            );
-            assert_ne!(chat_id, DEFAULT_DESK, "must NOT fold into the main line");
-            assert_eq!(agent_id, WORKFLOW_REPLY_AUTHOR, "authored by the workflow");
-            assert!(text.contains("Q3 is up 12%."), "{text}");
-            assert!(text.contains("Weekly digest"), "carries its subject header");
-        }
-        other => panic!("expected an AgentReply, got {other:?}"),
-    }
-}
-
-/// A durable operator send is a real write, so a journal that refuses it is a
-/// failed delivery — the same fail-loud contract [`DeskChannel`] holds. This
-/// is what lets the owner fallback report `Failed` on a broken journal instead
-/// of a silent discard.
-#[tokio::test]
-async fn a_durable_operator_send_fails_when_the_journal_refuses_it() {
-    let channel = DurableOperatorChannel::new(CompanyId::new("acme"), Arc::new(FailingEventLog));
-    let result = channel
-        .send(OutboundMessage {
-            message_id: None,
-            task_id: None,
-            outputs: Vec::new(),
-            channel: OPERATOR_CHANNEL.into(),
-            agent: None,
-            text: "the owner report".into(),
             steps: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),

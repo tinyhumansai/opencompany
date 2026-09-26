@@ -9,6 +9,7 @@ import { MessageTimeline } from "@/views/room/MessageTimeline";
 import {
   buildTimeline,
   buildTimelineItems,
+  legacyGeneralChannel,
   QUICK_REACTIONS,
   type Channel,
 } from "@/views/room/model";
@@ -16,12 +17,10 @@ import {
 /**
  * Issue #1986 — a read-only channel must not offer a new reaction.
  *
- * The operator's ruling on the product question the issue was opened to
- * settle: reactions are **not** allowed on the read-only Operator feed. It is
- * the same class of defect #1757 and #1984 already fixed for the members pane
- * and the composer — the channel states "there is nothing to reply to here",
- * and the UI then offers an interaction — and the hover toolbar's five quick
- * reactions were the last interactive affordance left on that surface.
+ * Reactions are **not** allowed on a read-only channel (the `#general`
+ * archive). The channel states "nothing can be posted here", so the UI must
+ * not then offer an interaction — and the hover toolbar's five quick reactions
+ * were the last interactive affordance left on that surface.
  *
  * **Hover is not what these tests have to simulate, and that is not a gap in
  * them.** The action bar is in the DOM unconditionally and revealed by CSS
@@ -37,22 +36,16 @@ import {
  * What must survive, and is asserted here rather than left to inference:
  *
  * - **Reactions already left still render.** A reaction is content, and this
- *   feed is the only record of it; hiding one would lose information rather
+ *   channel is the only record of it; hiding one would lose information rather
  *   than withdraw an offer. It renders disabled, with a tooltip saying why.
- * - **The way into a thread stays.** An Operator report is still worth reading
+ * - **The way into a thread stays.** An archived message is still worth reading
  *   the replies under. What may be *written* there is `ThreadPanel`'s question
  *   (#1757, #1984) and is out of this issue's scope — so a regression that
  *   swept the whole action bar away would be caught here.
  */
 
-/** The read-only Operator feed: `system` is the flag `RoomView` gates on. */
-const OPERATOR: Channel = {
-  id: "operator",
-  name: "Operator",
-  kind: "channel",
-  purpose: "Automation reports and notifications",
-  system: true,
-};
+/** The read-only `#general` archive: `system` is the flag `RoomView` gates on. */
+const ARCHIVE: Channel = legacyGeneralChannel([]);
 
 /** An ordinary, writable channel — the control for every assertion below. */
 const ENGINEERING: Channel = {
@@ -140,8 +133,8 @@ function reactionChipButtons(): HTMLButtonElement[] {
 }
 
 describe("the hover reaction toolbar on a read-only channel (#1986)", () => {
-  it("is not rendered at all on the Operator feed", () => {
-    render(OPERATOR, [report()]);
+  it("is not rendered at all on the archive", () => {
+    render(ARCHIVE, [report()]);
     expect(quickReactions()).toHaveLength(0);
     // Absent, not merely hidden: nothing in the row may carry a quick
     // reaction's accessible name, however it is styled.
@@ -155,24 +148,24 @@ describe("the hover reaction toolbar on a read-only channel (#1986)", () => {
     );
   });
 
-  it("keeps the way into a thread on the Operator feed", () => {
+  it("keeps the way into a thread on the archive", () => {
     // Scope guard. Reading the replies under a report is not reacting to it,
     // and #1986 is reactions only — a change that swept the whole action bar
     // away would satisfy the first test and be wrong.
-    render(OPERATOR, [report()]);
+    render(ARCHIVE, [report()]);
     expect(container.querySelector('button[aria-label="Reply in thread"]')).not.toBeNull();
   });
 });
 
 describe("reactions that are already there (#1986)", () => {
   it("still render on a read-only line, and say why they no longer toggle", () => {
-    render(OPERATOR, [report({ reactions: [{ emoji: "👍", by: "Mithil", mine: false }] })]);
+    render(ARCHIVE, [report({ reactions: [{ emoji: "👍", by: "Mithil", mine: false }] })]);
     const chips = reactionChipButtons();
     expect(chips).toHaveLength(1);
     expect(chips[0].textContent).toContain("👍");
     expect(chips[0].disabled).toBe(true);
     expect(chips[0].title).toBe(
-      "This channel is a read-only feed — reactions cannot be added here.",
+      "This channel is read-only — reactions cannot be added here.",
     );
   });
 
@@ -189,7 +182,7 @@ describe("reactions that are already there (#1986)", () => {
     // is the more specific fact and the one that would still be true in a
     // writable channel, so it must win — a read-only tooltip here would tell
     // an operator the wrong thing about why the chip is dead.
-    render(OPERATOR, [
+    render(ARCHIVE, [
       report({ id: "local-7", reactions: [{ emoji: "👍", by: "Mithil", mine: false }] }),
     ]);
     const chips = reactionChipButtons();

@@ -812,21 +812,12 @@ export function approvalThreadLink(
   const desk = known.find((candidate) => candidate.id === channelId);
   if (desk) return { channelId, label: `#${desk.channel}` };
 
-  // The built-in `#general` channel (issue #1743), which is deliberately in no
-  // desk list — so the scan above can never name it, and an approval raised on
-  // the company's main line resolved to a channel and then failed to find a
-  // label, leaving "Origin unavailable" on the one channel every company has.
-  // After the desk scan, deliberately: a blueprint desk that authored one of
-  // the General ids keeps its own name, exactly as `channelIdForThread` keeps
-  // it its own thread.
-  //
-  // Guarded on the topology being *known* rather than on the list being
-  // non-empty. A failed read must not be guessed at — `RoomView` surfaces the
-  // error and renders no rail, so a link into it would land nowhere — but a
-  // company that genuinely declares no desks still has `#general`, and that is
-  // the one channel every company has. While an empty answer was overwritten
-  // with `defaultDesks()` the two cases were the same value, and reading the
-  // length was the only test available; now the failure says `null`.
+  // The `#general` archive is in no desk list, so the scan above can never
+  // name it; an approval raised on the old main line still links to the
+  // archive. After the desk scan, so a blueprint desk that authored one of the
+  // General ids keeps its own name. Guarded on the topology being *known*: a
+  // failed read (`null`) must not be guessed at, since `RoomView` then renders
+  // no rail for a link to land in.
   if (channelId === MAIN_THREAD_ID && desks !== null) {
     return { channelId, label: `#${GENERAL_CHANNEL}` };
   }
@@ -899,7 +890,7 @@ export function useApprovalThreadLinks(
     void Promise.all([
       // The host's answer, taken as given — the same rule RoomView and
       // AppShell now follow. An empty list is a company with no desks, and an
-      // approval raised on its `main` thread still resolves to `#general`. It
+      // approval raised on its `main` thread still resolves to the archive. It
       // used to be swapped for `defaultDesks()`, which resolved approvals to
       // fabricated channels the rail no longer shows.
       //

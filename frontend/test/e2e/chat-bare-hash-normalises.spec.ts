@@ -16,7 +16,7 @@ import { expect, test } from "@playwright/test";
  * The wrong one is that a bare `#/chat` — where the magic-link landing route
  * puts you, because `useHashView` canonicalises the *view* and knows nothing
  * about chat's channels — left the open channel as the value of an expression
- * over `members`, `desks`, `transcripts` and `operator`. Each lands
+ * over `members`, `desks` and `transcripts`. Each lands
  * asynchronously, so any re-derivation could answer differently from the
  * channel the founder was shown, and `send` addresses whatever that expression
  * currently names.

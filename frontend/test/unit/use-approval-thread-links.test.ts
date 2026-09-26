@@ -100,12 +100,9 @@ describe("useApprovalThreadLinks", () => {
     expect(lastLinks?.has("a1")).toBe(false);
   });
 
-  it("links an approval raised on the main line to #general on a real company", async () => {
-    // The built-in `#general` is in no desk list, so the desk scan cannot name
-    // it — and this is the ordinary case, not an edge one: every company with
-    // real desks reached it. `channelIdForThread` resolved `main` to a channel
-    // and the label lookup then found nothing, so the card read "Origin
-    // unavailable" for the one channel every company has.
+  it("links an approval raised on the old main line to the #general archive", async () => {
+    // The `#general` archive is in no desk list, so the desk scan cannot name
+    // it; without the explicit arm the card read "Origin unavailable".
     const client = fakeClient();
     await render(client, [approval("a1", "main")]);
 
@@ -138,8 +135,7 @@ describe("useApprovalThreadLinks", () => {
 
   it("falls back to the default desks when /desks comes back empty", async () => {
     // A company with no declared `[[group_chat]]` entries gets `[]` from
-    // /desks, yet RoomView and AppShell still show the default desks, and
-    // `#general` above them. An approval raised on the main line must resolve
+    // /desks. An approval raised on the old main line must still resolve
     // here too, or its "Asked in" link would silently disappear — and this is
     // the case that tells an empty *response* apart from a failed read below.
     const client = {
