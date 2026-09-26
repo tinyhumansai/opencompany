@@ -19,7 +19,7 @@ event vocabulary those traits carry moved to [`events.md`](events.md)
 | Port | Contract | Seam |
 | --- | --- | --- |
 | `Brain`, `CycleHost` | [ports-cognition.md](ports-cognition.md#brain) | cognition: the cycle the kernel never reimplements |
-| `ChannelAdapter` | [ports-cognition.md](ports-cognition.md#channeladapter) | inbound/outbound conversation surfaces, and the `TurnStep` activity trace on a bubble |
+| `ChannelAdapter` | [ports-cognition.md](ports-cognition.md#channeladapter) | outbound conversation surfaces, and the `TurnStep` activity trace on a bubble |
 | `CompanyStore` | [ports-state.md](ports-state.md#companystore) | charter, roster, ledger, approval queue, operator overlays |
 | `EventLog` | [ports-state.md](ports-state.md#eventlog) | the append-only journal (its vocabulary: [events.md](events.md)) |
 | `MemoryStore` | [ports-state.md](ports-state.md#memorystore) | compressed cycle traces and task results |
