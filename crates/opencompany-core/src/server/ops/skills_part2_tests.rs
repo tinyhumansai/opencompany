@@ -1,12 +1,13 @@
 use super::*;
 
 /// HTTP-level coverage of the two path-slug handlers. A slug that fails
-/// `valid_slug` must be rejected with `400` **before** any write, so the
+/// `validate_slug` must be rejected with `400` **before** any write, so the
 /// effective skill set is untouched; a valid slug succeeds and lands.
 ///
 /// `..` and `a/b` cannot be carried as a single path segment (a `/` splits
 /// them, and `..` is normalized away by the router), so their rejection is
-/// pinned in [`valid_slug_rejects_traversal_separator_and_case`]. `A` is a
+/// pinned in [`validate_slug_rejects_traversal_separator_case_and_length`].
+/// `A` is a
 /// single segment the router will pass through, so it is the shape we drive
 /// through the handlers to prove the `400` and the no-mutation guarantee.
 mod http {
@@ -16,10 +17,11 @@ mod http {
     use tower::ServiceExt;
 
     use crate::company::CompanyManifest;
+    use crate::company::skill_validate::{MAX_SLUG_CHARS, validate_slug};
     use crate::ports::CompanyStore;
     use crate::ports::types::{CompanyId, CompanyRecord};
     use crate::runtime::RuntimeBuilder;
-    use crate::server::ops::skills::{MAX_SKILL_DOC_BYTES, valid_slug, write_lock};
+    use crate::server::ops::skills::{MAX_SKILL_DOC_BYTES, write_lock};
     use crate::server::router;
     use crate::server::test_support::{
         fixed_cookie, member_cookie, seed_fixed_admin, seed_fixed_member,
@@ -439,12 +441,12 @@ mod http {
     /// Authoring derives the slug from the display name, so the name is the
     /// untrusted input that decides a store key and a `skills/<slug>/`
     /// directory name. Whatever `create_custom` accepts must therefore
-    /// derive a slug the slug-bearing routes accept: an id `valid_slug`
+    /// derive a slug the slug-bearing routes accept: an id `validate_slug`
     /// refuses is a skill nobody can toggle or uninstall afterwards, and a
     /// path segment nothing else in the product will honour.
     ///
     /// Asserted end to end — the derived id is fed straight back to
-    /// `PUT …/skills/{slug}`, the route that does apply `valid_slug`.
+    /// `PUT …/skills/{slug}`, the route that does apply `validate_slug`.
     #[tokio::test]
     async fn an_authored_slug_is_always_one_the_slug_routes_accept() {
         let home = tempfile::tempdir().unwrap();
@@ -471,7 +473,7 @@ mod http {
 
             let slug = resp["id"].as_str().expect("an id").to_string();
             assert!(
-                valid_slug(&slug),
+                validate_slug(&slug).is_ok(),
                 "{name:?} derived {slug:?}, which the slug routes refuse"
             );
 
@@ -520,5 +522,94 @@ mod http {
         .await
         .expect("the refused write left the company write lock held");
         assert_eq!(next.0, StatusCode::OK, "{}", next.2);
+    }
+
+    /// Authoring never writes over a slug that is already resolving.
+    ///
+    /// A slug is a store key, and the store's `set` replaces whatever holds it.
+    /// Two authored skills can arrive at one slug — the display names differ
+    /// only past the truncation point, or contain no alphanumerics at all and
+    /// both fall back to `skill` — and before this, the second write silently
+    /// destroyed the first: one row left, holding the second name and body,
+    /// with `200` on both requests and nothing naming the loss.
+    #[tokio::test]
+    async fn an_authored_skill_never_writes_over_a_slug_already_in_use() {
+        let home = tempfile::tempdir().unwrap();
+        let state = state_with_company(home.path()).await;
+
+        let author = async |name: &str, description: &str| {
+            let body = serde_json::json!({"name": name, "description": description}).to_string();
+            let (status, resp, raw) =
+                send(&state, "POST", "/api/v1/company/skills", Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "authoring {name:?}: {raw}");
+            resp["id"].as_str().expect("an id").to_string()
+        };
+
+        let first = author("Alpha", "The first one, which must survive.").await;
+        let second = author("Alpha", "The second one, which must not replace it.").await;
+        assert_ne!(first, second, "a taken slug must not be handed out twice");
+
+        let (_, list, raw) = send(&state, "GET", "/api/v1/company/skills", None).await;
+        let rows = list.as_array().expect("a list");
+        let find = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is gone from the list: {raw}"))
+        };
+        assert_eq!(
+            find(&first)["description"],
+            "The first one, which must survive.",
+            "the first skill's document was replaced: {raw}"
+        );
+        assert_eq!(
+            find(&second)["description"],
+            "The second one, which must not replace it."
+        );
+        // Both display names are kept verbatim — only the slug was made unique.
+        assert_eq!(find(&first)["name"], "Alpha");
+        assert_eq!(find(&second)["name"], "Alpha");
+    }
+
+    /// The two ways distinct names reach one slug, each getting its own.
+    ///
+    /// Truncation: the names differ only past `MAX_SLUG_CHARS`. Fallback: the
+    /// names carry no alphanumerics, so both slugify to `skill`. Both are
+    /// reachable with names an operator can type, which is why neither is
+    /// refused — the slug is made unique instead of the name rejected.
+    #[tokio::test]
+    async fn names_that_collide_only_after_slugification_each_get_a_slug() {
+        let home = tempfile::tempdir().unwrap();
+        let state = state_with_company(home.path()).await;
+
+        let author = async |name: &str| {
+            let body =
+                serde_json::json!({"name": name, "description": "a description"}).to_string();
+            let (status, resp, raw) =
+                send(&state, "POST", "/api/v1/company/skills", Some(&body)).await;
+            assert_eq!(status, StatusCode::OK, "authoring {name:?}: {raw}");
+            resp["id"].as_str().expect("an id").to_string()
+        };
+
+        let long = "a".repeat(MAX_SLUG_CHARS);
+        let truncating = [
+            author(&format!("{long}one")).await,
+            author(&format!("{long}two")).await,
+        ];
+        assert_ne!(truncating[0], truncating[1], "truncated names collided");
+
+        let falling_back = [author("!!!").await, author("  ---  ").await];
+        assert_eq!(falling_back[0], "skill");
+        assert_ne!(
+            falling_back[1], "skill",
+            "both names fell back onto one slug"
+        );
+
+        // Every derived slug still has to be one the slug-bearing routes accept.
+        for slug in truncating.iter().chain(falling_back.iter()) {
+            assert!(
+                validate_slug(slug).is_ok(),
+                "{slug:?} is not a routable slug"
+            );
+        }
     }
 }

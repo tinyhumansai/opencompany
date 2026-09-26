@@ -256,7 +256,7 @@ pub fn load_dir_skills(dir: &Path) -> Result<Vec<SkillDoc>> {
 ///
 /// Returns `None` when the document does not open with a `---` fence line or
 /// has no matching closing fence.
-fn split_frontmatter(src: &str) -> Option<(&str, &str)> {
+pub(super) fn split_frontmatter(src: &str) -> Option<(&str, &str)> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let after_open = strip_fence_line(src)?;
 
