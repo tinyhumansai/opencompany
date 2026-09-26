@@ -85,6 +85,31 @@ let root: Root;
 let added: Array<Record<string, unknown>>;
 let patched: Array<{ id: string; patch: Record<string, unknown> }>;
 
+/**
+ * jsdom ships no `matchMedia`, and the mascot avatar swatch this dialog's
+ * picker now renders (`AvatarPicker`'s flavour grid,
+ * `rendering-strategy.md`'s "12th tile") pulls in `@rive-app/react-canvas`,
+ * whose own `useDevicePixelRatio` reaches for `matchMedia` unguarded — so
+ * without this the dialog fails to mount at all. Same stub as
+ * `chat-cognition-banner.test.ts` / `working-indicator.test.ts`.
+ */
+function stubMatchMedia() {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+      onchange: null,
+    }),
+  });
+}
+
 function fakeClient(): OpenCompanyClient {
   return {
     scopeFor: (company: string | null) => `/api/v1/${company ?? "company"}`,
@@ -103,6 +128,7 @@ function fakeClient(): OpenCompanyClient {
 }
 
 beforeEach(() => {
+  stubMatchMedia();
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);

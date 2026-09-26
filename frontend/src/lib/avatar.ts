@@ -37,6 +37,132 @@ export const TINY_FLAVOURS = [
 
 export type TinyFlavour = (typeof TINY_FLAVOURS)[number];
 
+/**
+ * The animated mascots shipped in `public/avatars/mascot-<kind>.riv`.
+ *
+ * **Must stay in step with `MASCOT_KINDS` in `src/company/avatar.rs`**, the
+ * same reason `TINY_FLAVOURS` must. A list of one on purpose even though v1
+ * ships a single kind — the same closed shape as the tiny flavours, so a
+ * second colorway or character later is an addition to this list, not a
+ * grammar change. See `docs/spec/runtime/avatars.md` for why this form is
+ * curated (a `.riv` file is a programmable, document-like format, not a
+ * raster image) rather than user-uploadable like `blob:`.
+ */
+export const MASCOT_KINDS = ["animated"] as const;
+
+export type MascotKind = (typeof MASCOT_KINDS)[number];
+
+/**
+ * Whether a `mascot:animated` wearer's live canvas plays at all.
+ *
+ * **Must stay in step with `MASCOT_MODES` in `src/company/mascot.rs`.**
+ * `"static"` freezes on the chosen costume's resting frame with no hover or
+ * "replying" reactivity wired up at all — not merely visually still, the
+ * handlers themselves are never attached, since a mode is a fact about
+ * behaviour. `"animated"` is the live canvas already shipped: reactive to
+ * hover, landing on the chosen costume as its baseline. `"animated"` is the
+ * file's own default, so a teammate with no chosen mode renders exactly as
+ * every `mascot:animated` wearer already did before this override existed.
+ */
+export const MASCOT_MODES = ["animated", "static"] as const;
+
+export type MascotMode = (typeof MASCOT_MODES)[number];
+
+/**
+ * The nine costumes a `mascot:animated` wearer may land on, by id — a
+ * `mascotAnimationNumber` value, driving which of the file's states its
+ * canvas shows in both display modes.
+ *
+ * **Must stay in step with `MASCOT_COSTUMES` in `src/company/mascot.rs`**,
+ * the same contract {@link MASCOT_KINDS} and {@link TINY_FLAVOURS} already
+ * keep. Named and numbered from what was actually watched play — cycling
+ * `mascotAnimationNumber` 1–13 against a running instance of the file and
+ * screenshotting each landing frame — not from the `.riv` file's own typo'd
+ * internal clip names (`cap`/`hadband`/`hadphone`/`habibi`/`cardboard
+ * mask`/`glass1`-`glass4`). Number `4` is deliberately excluded: it renders a
+ * different resting frame depending on which costume the state machine was
+ * previously on, so it is not a stable, addressable costume the way the
+ * other nine are. See `crate::company::mascot` (Rust) for the full account.
+ */
+export const MASCOT_COSTUMES = [
+  { id: "cap", label: "Cap", number: 1 },
+  { id: "headphones", label: "Headphones", number: 2 },
+  { id: "headband", label: "Headband", number: 3 },
+  { id: "glass1", label: "Round goggles", number: 5 },
+  { id: "habibi", label: "Keffiyeh", number: 6 },
+  { id: "cardboard_mask", label: "Cardboard mask", number: 7 },
+  { id: "glass2", label: "Round glasses", number: 8 },
+  { id: "glass3", label: "Cat-eye sunglasses", number: 9 },
+  { id: "glass4", label: "Rectangle sunglasses", number: 10 },
+] as const;
+
+export type MascotCostume = (typeof MASCOT_COSTUMES)[number]["id"];
+
+/** The mascot's own default costume — the file's resting frame. */
+export const DEFAULT_MASCOT_COSTUME: MascotCostume = "cap";
+
+/** The `mascotAnimationNumber` for a costume id, or the default's when unset/unrecognised. */
+export function mascotCostumeNumber(costume: string | undefined): number {
+  const match = MASCOT_COSTUMES.find((c) => c.id === costume);
+  return match ? match.number : MASCOT_COSTUMES[0].number;
+}
+
+/**
+ * The six curated skin-color (body) swatches, by id, paired with a hex.
+ *
+ * **Must stay in step with `MASCOT_SKIN_COLORS`/`MASCOT_SKIN_COLOR_HEXES` in
+ * `src/company/mascot.rs`.** Independent of {@link MASCOT_HAND_COLORS} — the
+ * mascot's `skinColor` and `handColor` are two separate `.riv` ViewModel
+ * properties. Curated rather than an open picker for the reason the Rust
+ * module docs give: `skinColor` is the character's literal body color, and
+ * which hues read as on-model is a call for whoever looks at it rendered.
+ * `"default"` is the file's own shipped color, first so a teammate with no
+ * chosen skin color renders unchanged.
+ */
+export const MASCOT_SKIN_COLORS = [
+  { id: "default", hex: "#F7D145" },
+  { id: "peach", hex: "#F5B88A" },
+  { id: "mint", hex: "#A8E6C1" },
+  { id: "sky", hex: "#9CCDF0" },
+  { id: "lavender", hex: "#C9B6E4" },
+  { id: "coral", hex: "#F08A8A" },
+] as const;
+
+export type MascotSkinColor = (typeof MASCOT_SKIN_COLORS)[number]["id"];
+
+/**
+ * The six curated hand/accent-color swatches, by id, paired with a hex.
+ *
+ * **Must stay in step with `MASCOT_HAND_COLORS`/`MASCOT_HAND_COLOR_HEXES` in
+ * `src/company/mascot.rs`.** `"default"` is the file's own shipped color.
+ */
+export const MASCOT_HAND_COLORS = [
+  { id: "default", hex: "#B4900B" },
+  { id: "charcoal", hex: "#3A3A3A" },
+  { id: "teal", hex: "#2F8F86" },
+  { id: "rose", hex: "#D86A8C" },
+  { id: "plum", hex: "#7A4F8C" },
+  { id: "forest", hex: "#3F7A45" },
+] as const;
+
+export type MascotHandColor = (typeof MASCOT_HAND_COLORS)[number]["id"];
+
+/** `"#RRGGBB"` → `[r, g, b]`, for `useViewModelInstanceColor`'s `setRgb`. */
+export function hexToRgb(hex: string): [number, number, number] {
+  const n = parseInt(hex.replace("#", ""), 16);
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+
+/** The hex for a skin-color id, or the default's when unset/unrecognised. */
+export function mascotSkinColorHex(color: string | undefined): string {
+  return (MASCOT_SKIN_COLORS.find((c) => c.id === color) ?? MASCOT_SKIN_COLORS[0]).hex;
+}
+
+/** The hex for a hand-color id, or the default's when unset/unrecognised. */
+export function mascotHandColorHex(color: string | undefined): string {
+  return (MASCOT_HAND_COLORS.find((c) => c.id === color) ?? MASCOT_HAND_COLORS[0]).hex;
+}
+
 /** The image types an uploaded avatar may be — the `accept` a file input wants. */
 export const AVATAR_ACCEPT = "image/png,image/jpeg,image/webp,image/gif";
 
@@ -85,6 +211,24 @@ export function tinySrc(flavour: string): string {
   return `/avatars/blob-${flavour}.webp`;
 }
 
+/**
+ * Where an animated mascot's `.riv` file lives on disk.
+ *
+ * Not consulted by {@link staticAvatarSrc} — a `.riv` needs a canvas and a
+ * runtime, not an `<img src=…>`, so `MascotAvatar` is the only reader of
+ * this. It exists here (rather than only inside that component) so the
+ * frontend/Rust cross-check test can assert every shipped kind has a file
+ * behind it, the same way it already does for {@link tinySrc}.
+ */
+export function mascotSrc(kind: string): string {
+  return `/avatars/mascot-${kind}.riv`;
+}
+
+/** Whether an avatar reference names an animated mascot. */
+export function isMascotRef(ref: string): boolean {
+  return ref.trim().startsWith("mascot:");
+}
+
 /** The workspace node id a `blob:` reference names, or `null` for any other form. */
 export function blobNodeId(ref: string): string | null {
   const trimmed = ref.trim();
@@ -103,10 +247,18 @@ export function blobNodeId(ref: string): string | null {
 export function staticAvatarSrc(ref: string): string | null {
   const trimmed = ref.trim();
   if (trimmed.startsWith("tiny:")) return tinySrc(trimmed.slice("tiny:".length));
-  // An unrecognised reference is drawn as nothing rather than as itself. The
-  // host refuses to store anything but the two forms, so this can only be
-  // version skew — and putting an unknown string into a `src=` is the one thing
-  // the closed grammar exists to prevent.
+  // `mascot:` is a legitimate, host-accepted form — deliberately not resolved
+  // here. A `.riv` needs a canvas and a runtime, not a static `src=`, so every
+  // mass-render surface (facepiles, the org chart, thread rows...) keeps
+  // drawing the tone tile underneath exactly as it does for an unresolved
+  // reference, and only the hero surfaces that explicitly opt in mount a live
+  // `MascotAvatar` instead of reading this function at all. See
+  // `docs/issue/mascot-profile-avatar/rendering-strategy.md`.
+  //
+  // Anything else is drawn as nothing rather than as itself. The host
+  // refuses to store anything but the three forms, so an unrecognised string
+  // here can only be version skew — and putting an unknown one into a `src=`
+  // is the one thing the closed grammar exists to prevent.
   return null;
 }
 

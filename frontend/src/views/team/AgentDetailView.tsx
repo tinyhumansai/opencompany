@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ChevronRight,
   Cpu,
@@ -91,8 +91,18 @@ import type { DefaultChoice, Provider } from "@/inference/types";
 import { FieldCopilot } from "@/views/team/FieldCopilot";
 import { consoleHref } from "@/lib/console-paths";
 import { fetchBoardColumns } from "@/lib/board-columns";
-import { avatarRef } from "@/lib/avatar";
+import { avatarRef, isMascotRef } from "@/lib/avatar";
 import { AvatarPicker } from "@/components/avatar-picker";
+
+/**
+ * The Rive runtime + the mascot asset are ~1.8 MB combined and load only for
+ * the rare teammate wearing `mascot:animated` — code-split the same way
+ * `agent-profile-sheet.tsx` and `avatar-picker.tsx` already do, so no other
+ * agent's page pays anything for it.
+ */
+const LazyMascotAvatar = lazy(() =>
+  import("@/components/mascot-avatar").then((m) => ({ default: m.MascotAvatar })),
+);
 import { usd } from "@/lib/money";
 import { roleSubtitle, toneFor } from "@/lib/team";
 import { workloadByAssignee, type Workload } from "@/lib/team-workload";
@@ -554,6 +564,36 @@ export function AgentDetailView({
       toast.error(
         error instanceof Error ? error.message : "Couldn't change this agent's icon.",
       );
+    } finally {
+      setAvatarSaving(false);
+    }
+  }
+
+  /**
+   * Saves one mascot appearance field — mode, costume, skin color or hand
+   * color — the same one-click-is-the-save pattern as {@link saveAvatar} and
+   * for the same reason: a toggle or a swatch is a visual choice, not a form
+   * field waiting on a submit button.
+   *
+   * A separate `PATCH` per field from `saveAvatar` rather than bundled into
+   * it — the picker lets an operator try each independently of (and, for the
+   * mascot tile itself, before) changing `avatar`, so each is its own save
+   * rather than a combined one that would send fields the operator never
+   * touched. `noun` is only for the error toast.
+   */
+  async function saveMascotField(
+    field: "mascotMode" | "mascotCostume" | "mascotSkinColor" | "mascotHandColor",
+    noun: string,
+    value: string | undefined,
+  ) {
+    if (!agent) return;
+    setAvatarSaving(true);
+    try {
+      const updated = await client.updateAgent(agentId, { [field]: value ?? null }, company);
+      if (displayedAgentIdRef.current !== agentId) return;
+      setAgent(updated);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : `Couldn't change this agent's ${noun}.`);
     } finally {
       setAvatarSaving(false);
     }
@@ -1276,6 +1316,14 @@ export function AgentDetailView({
           setAvatarOpen(false);
           void saveAvatar(avatar);
         }}
+        onPickMascotMode={(mode) => void saveMascotField("mascotMode", "animation mode", mode)}
+        onPickMascotCostume={(costume) => void saveMascotField("mascotCostume", "costume", costume)}
+        onPickMascotSkinColor={(color) =>
+          void saveMascotField("mascotSkinColor", "skin color", color)
+        }
+        onPickMascotHandColor={(color) =>
+          void saveMascotField("mascotHandColor", "hand color", color)
+        }
       />
       {/* Round-2 review, P2-5: confirms before Save actually clears an
           existing pin back to the company default — see `saveHarnessAndModel`'s
@@ -1316,6 +1364,91 @@ export function AgentDetailView({
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * The 56px face at the top of the page an agent *is* — the live mascot for a
+ * teammate who chose `mascot:animated`, the ordinary static tile for everyone
+ * else. Mirrors `agent-profile-sheet.tsx`'s `AgentAvatar`: same reasoning
+ * (issue found live 2026-09-26 — an operator picked the mascot in the Icon
+ * dialog, then found this header — the first, most obvious place to look
+ * after picking an icon — still showing plain initials, because only the
+ * profile-sheet hero had been wired to `MascotAvatar`), same `Suspense`
+ * fallback shaped like the tile underneath so the header does not jump size
+ * while the mascot's chunk loads.
+ */
+function IdentityAvatar({
+  name,
+  tone,
+  avatar,
+  mascotMode,
+  mascotCostume,
+  mascotSkinColor,
+  mascotHandColor,
+}: {
+  name: string;
+  tone: string;
+  avatar: string;
+  mascotMode?: string;
+  mascotCostume?: string;
+  mascotSkinColor?: string;
+  mascotHandColor?: string;
+}) {
+  // Only the mascot branch needs this — a static tile has no state to track,
+  // and hooks cannot sit behind the early return below.
+  const [hovering, setHovering] = useState(false);
+  if (isMascotRef(avatar)) {
+    // Static means static: the hover handlers are never attached, not merely
+    // fed a state `MascotAvatar` then ignores — see its own module docs.
+    if ((mascotMode ?? "animated") === "static") {
+      return (
+        // The `Skeleton` sits behind, not just in the `Suspense` fallback: see
+        // `agent-profile-sheet.tsx`'s matching `AgentAvatar` for why — the
+        // same gap, the same fix, found live against this exact header
+        // (2026-09-26).
+        <div className="relative size-14">
+          <Skeleton className="absolute inset-0 rounded-xl" />
+          <Suspense fallback={null}>
+            <LazyMascotAvatar
+              mode="static"
+              costume={mascotCostume}
+              skinColor={mascotSkinColor}
+              handColor={mascotHandColor}
+              className="absolute inset-0"
+              data-testid="agent-avatar"
+            />
+          </Suspense>
+        </div>
+      );
+    }
+    return (
+      <span onMouseEnter={() => setHovering(true)} onMouseLeave={() => setHovering(false)}>
+        <div className="relative size-14">
+          <Skeleton className="absolute inset-0 rounded-xl" />
+          <Suspense fallback={null}>
+            <LazyMascotAvatar
+              mode="animated"
+              state={hovering ? "hover" : "idle"}
+              costume={mascotCostume}
+              skinColor={mascotSkinColor}
+              handColor={mascotHandColor}
+              className="absolute inset-0"
+              data-testid="agent-avatar"
+            />
+          </Suspense>
+        </div>
+      </span>
+    );
+  }
+  return (
+    <TeammateAvatar
+      name={name}
+      tone={tone}
+      avatar={avatar}
+      className="size-14 rounded-xl text-base"
+      data-testid="agent-avatar"
+    />
   );
 }
 
@@ -1370,21 +1503,25 @@ function Identity({
             className="rounded-xl ring-2 ring-transparent transition-colors hover:ring-primary focus-visible:ring-primary focus-visible:outline-none disabled:cursor-wait"
             data-testid="agent-avatar-pick"
           >
-            <TeammateAvatar
+            <IdentityAvatar
               name={display}
               tone={tone}
               avatar={avatar}
-              className="size-14 rounded-xl text-base"
-              data-testid="agent-avatar"
+              mascotMode={agent.mascotMode}
+              mascotCostume={agent.mascotCostume}
+              mascotSkinColor={agent.mascotSkinColor}
+              mascotHandColor={agent.mascotHandColor}
             />
           </button>
         ) : (
-          <TeammateAvatar
+          <IdentityAvatar
             name={display}
             tone={tone}
             avatar={avatar}
-            className="size-14 rounded-xl text-base"
-            data-testid="agent-avatar"
+            mascotMode={agent.mascotMode}
+            mascotCostume={agent.mascotCostume}
+            mascotSkinColor={agent.mascotSkinColor}
+            mascotHandColor={agent.mascotHandColor}
           />
         )}
         <div className="min-w-0 flex-1 space-y-2">
@@ -2377,6 +2514,10 @@ function AvatarDialog({
   busy,
   onOpenChange,
   onPick,
+  onPickMascotMode,
+  onPickMascotCostume,
+  onPickMascotSkinColor,
+  onPickMascotHandColor,
 }: {
   client: OpenCompanyClient;
   company: string | null;
@@ -2385,6 +2526,10 @@ function AvatarDialog({
   busy: boolean;
   onOpenChange: (open: boolean) => void;
   onPick: (avatar: string | undefined) => void;
+  onPickMascotMode: (mode: string | undefined) => void;
+  onPickMascotCostume: (costume: string | undefined) => void;
+  onPickMascotSkinColor: (color: string | undefined) => void;
+  onPickMascotHandColor: (color: string | undefined) => void;
 }) {
   const name = agent?.name?.trim() || agent?.role || "this agent";
   return (
@@ -2407,6 +2552,14 @@ function AvatarDialog({
             tone={toneFor(agent.id || name)}
             disabled={busy}
             onChange={onPick}
+            mascotMode={agent.mascotMode}
+            mascotCostume={agent.mascotCostume}
+            mascotSkinColor={agent.mascotSkinColor}
+            mascotHandColor={agent.mascotHandColor}
+            onChangeMascotMode={onPickMascotMode}
+            onChangeMascotCostume={onPickMascotCostume}
+            onChangeMascotSkinColor={onPickMascotSkinColor}
+            onChangeMascotHandColor={onPickMascotHandColor}
           />
         )}
       </DialogContent>

@@ -1,5 +1,7 @@
 import {
   createContext,
+  lazy,
+  Suspense,
   useContext,
   useEffect,
   useMemo,
@@ -22,7 +24,108 @@ import {
 } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { agentHref, agentProfile } from "@/lib/agent-profile";
+import { isMascotRef } from "@/lib/avatar";
 import { cn } from "@/lib/utils";
+
+/**
+ * The Rive runtime + the mascot asset are ~1.8 MB combined and load only for
+ * the rare teammate wearing `mascot:animated` — code-split the same way this
+ * codebase already isolates `recharts`/`@xyflow/react`/`react-joyride`, so
+ * every other profile sheet pays nothing for it.
+ */
+const LazyMascotAvatar = lazy(() =>
+  import("@/components/mascot-avatar").then((m) => ({ default: m.MascotAvatar })),
+);
+
+/**
+ * The profile sheet's header face: the live mascot for a teammate who chose
+ * it, the ordinary static tile for everyone else.
+ *
+ * `TeammateAvatar` already falls back to the tone tile while an image loads,
+ * so the `Suspense` fallback here matches that same tile-shaped `Skeleton`
+ * rather than a generic spinner — the header must not jump size while the
+ * mascot's chunk is in flight.
+ */
+function AgentAvatar({
+  name,
+  tone,
+  avatar,
+  mascotMode,
+  mascotCostume,
+  mascotSkinColor,
+  mascotHandColor,
+}: {
+  name: string;
+  tone: string;
+  avatar: string;
+  mascotMode?: string;
+  mascotCostume?: string;
+  mascotSkinColor?: string;
+  mascotHandColor?: string;
+}) {
+  // Only the mascot branch needs this — a static tile has no state to track,
+  // and hooks cannot sit behind the early return below, so it is declared
+  // unconditionally like `AvatarTile`'s own hook in `teammate-avatar.tsx`.
+  const [hovering, setHovering] = useState(false);
+  if (isMascotRef(avatar)) {
+    // Static means static: the handlers that make the header react to a
+    // pointer are never attached in the first place, not merely fed a state
+    // `MascotAvatar` then ignores — see that component's own module docs.
+    if ((mascotMode ?? "animated") === "static") {
+      return (
+        // The `Skeleton` sits behind, not just in the `Suspense` fallback:
+        // `MascotAvatar` stays transparent past the chunk load, through its
+        // own `.riv` fetch (~1.7 MB, a further second or two), so a fallback
+        // that only covers the chunk would still hand off to a blank header
+        // for that whole gap — which is exactly what read as broken (issue
+        // found live 2026-09-26, "no loading indicator").
+        <div className="relative size-12">
+          <Skeleton className="absolute inset-0 rounded-xl" />
+          <Suspense fallback={null}>
+            <LazyMascotAvatar
+              mode="static"
+              costume={mascotCostume}
+              skinColor={mascotSkinColor}
+              handColor={mascotHandColor}
+              className="absolute inset-0"
+              data-testid="agent-profile-avatar"
+            />
+          </Suspense>
+        </div>
+      );
+    }
+    return (
+      <span
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => setHovering(false)}
+      >
+        <div className="relative size-12">
+          <Skeleton className="absolute inset-0 rounded-xl" />
+          <Suspense fallback={null}>
+            <LazyMascotAvatar
+              mode="animated"
+              state={hovering ? "hover" : "idle"}
+              costume={mascotCostume}
+              skinColor={mascotSkinColor}
+              handColor={mascotHandColor}
+              className="absolute inset-0"
+              data-testid="agent-profile-avatar"
+            />
+          </Suspense>
+        </div>
+      </span>
+    );
+  }
+  return (
+    <TeammateAvatar
+      name={name}
+      tone={tone}
+      avatar={avatar}
+      className="size-12 rounded-xl text-sm"
+      data-testid="agent-profile-avatar"
+    />
+  );
+}
 
 /** What a click on a teammate's face can do, from anywhere under the provider. */
 interface AgentProfileApi {
@@ -227,12 +330,14 @@ function ProfileBody({ agent }: { agent: AgentDetailDto }) {
     <>
       <SheetHeader className="gap-3 pr-10">
         <div className="flex items-start gap-3">
-          <TeammateAvatar
+          <AgentAvatar
             name={profile.display}
             tone={profile.tone}
             avatar={profile.avatar}
-            className="size-12 rounded-xl text-sm"
-            data-testid="agent-profile-avatar"
+            mascotMode={agent.mascotMode}
+            mascotCostume={agent.mascotCostume}
+            mascotSkinColor={agent.mascotSkinColor}
+            mascotHandColor={agent.mascotHandColor}
           />
           <div className="min-w-0 flex-1">
             <SheetTitle className="truncate text-lg" data-testid="agent-profile-name">

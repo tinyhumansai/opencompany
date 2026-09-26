@@ -32,11 +32,31 @@ fn accepts_a_node_reference() {
     );
 }
 
+#[test]
+fn accepts_every_shipped_mascot_kind() {
+    for kind in MASCOT_KINDS {
+        let stored = normalize(&format!("mascot:{kind}")).expect("a shipped mascot kind");
+        assert_eq!(parse(&stored).unwrap(), AvatarRef::Mascot(kind));
+    }
+}
+
+#[test]
+fn refuses_a_mascot_kind_with_no_file() {
+    // Same rule as `refuses_a_flavour_with_no_file`: an unshipped kind would
+    // render as a broken canvas on every surface that draws a face.
+    let err = parse("mascot:bogus").unwrap_err().to_string();
+    assert!(err.contains("bogus"), "{err}");
+    assert!(
+        err.contains("animated"),
+        "the refusal must list what to pick: {err}"
+    );
+}
+
 /// The security rule this module exists for: a URL is not an avatar. Each of
 /// these is rendered into an `src=` on every surface that draws a face, so a
 /// stored one is an instruction the console obeys for whoever wrote it.
 #[test]
-fn refuses_anything_that_is_not_one_of_the_two_forms() {
+fn refuses_anything_that_is_not_one_of_the_three_forms() {
     for hostile in [
         "https://tracker.example/beacon.gif",
         "javascript:alert(1)",
@@ -59,11 +79,16 @@ fn refuses_anything_that_is_not_one_of_the_two_forms() {
 #[test]
 fn refuses_an_unbounded_string() {
     assert!(parse(&format!("tiny:{}", "a".repeat(MAX_LEN))).is_err());
+    assert!(parse(&format!("mascot:{}", "a".repeat(MAX_LEN))).is_err());
 }
 
 #[test]
 fn trims_on_the_way_in() {
     assert_eq!(normalize("  tiny:teal \n").unwrap(), "tiny:teal");
+    assert_eq!(
+        normalize("  mascot:animated \n").unwrap(),
+        "mascot:animated"
+    );
 }
 
 #[test]

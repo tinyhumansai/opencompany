@@ -46,7 +46,33 @@ function paneProps(overrides: Record<string, unknown> = {}) {
 let container: HTMLDivElement;
 let root: Root;
 
+/**
+ * jsdom ships no `matchMedia`, and the mascot avatar swatch the avatar
+ * picker now renders (`AvatarPicker`'s flavour grid,
+ * `rendering-strategy.md`'s "12th tile") pulls in `@rive-app/react-canvas`,
+ * whose own `useDevicePixelRatio` reaches for `matchMedia` unguarded — so
+ * any dialog reaching that picker fails to mount without this. Same stub as
+ * `chat-cognition-banner.test.ts` / `working-indicator.test.ts`.
+ */
+function stubMatchMedia() {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+      onchange: null,
+    }),
+  });
+}
+
 beforeEach(() => {
+  stubMatchMedia();
   (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);

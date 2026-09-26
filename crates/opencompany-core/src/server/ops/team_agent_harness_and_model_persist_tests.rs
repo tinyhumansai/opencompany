@@ -581,6 +581,10 @@ async fn editable_names_tools_only_for_an_admin() {
             "tools",
             "instructions",
             "avatar",
+            "mascotMode",
+            "mascotCostume",
+            "mascotSkinColor",
+            "mascotHandColor",
             "model",
             "harness",
             "provider"
@@ -598,10 +602,21 @@ async fn editable_names_tools_only_for_an_admin() {
     .await;
     assert_eq!(
         strings(&as_member["editable"]),
-        vec!["name", "role", "description", "instructions", "avatar"],
-        "a member is not offered a field they cannot save — but a face is not \
-         one of those: picking a colleague's icon is no privilege boundary, \
-         and `tools`, `model` and `harness` stay admin-gated: {as_member}"
+        vec![
+            "name",
+            "role",
+            "description",
+            "instructions",
+            "avatar",
+            "mascotMode",
+            "mascotCostume",
+            "mascotSkinColor",
+            "mascotHandColor"
+        ],
+        "a member is not offered a field they cannot save — but a face (and its \
+         mascot mode/costume/colors) is not one of those: picking a colleague's \
+         icon is no privilege boundary, and `tools`, `model` and `harness` stay \
+         admin-gated: {as_member}"
     );
 }
 

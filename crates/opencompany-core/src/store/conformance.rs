@@ -302,6 +302,15 @@ fn sample_agent_overrides() -> Vec<crate::ports::types::AgentOverride> {
         // value here or the new ones are covered by nothing.
         model: Some("claude-opus-4-5".to_string()),
         harness: Some("laptop".to_string()),
+        // Same reasoning as `avatar` above, for the four fields that widened
+        // it (issue mascot-profile-avatar, the mode/costume/color slice): a
+        // dropped one reads as "the file's own default", so a store that
+        // drops it would silently change what the teammate's face looks like
+        // on the next restart.
+        mascot_mode: Some("static".to_string()),
+        mascot_costume: Some("glass2".to_string()),
+        mascot_skin_color: Some("mint".to_string()),
+        mascot_hand_color: Some("teal".to_string()),
     }]
 }
 

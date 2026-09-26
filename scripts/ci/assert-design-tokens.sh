@@ -98,11 +98,28 @@ if [ -n "$hits" ]; then
 fi
 
 # ---- 4. raw hex ----------------------------------------------------------
-# connections.ts is the one allowed file: eleven third-party provider brand
+# connections.ts is one allowed file: eleven third-party provider brand
 # colours, which identify someone else and are correct as literals. The field
 # itself documents why.
+#
+# avatar.ts's `MASCOT_SKIN_COLORS`/`MASCOT_HAND_COLORS` are the other: these
+# are not a Tailwind class, and the literals themselves live only in this one
+# file — every other file reads a swatch's `hex` field as a JS value, so this
+# check never sees a hex literal outside avatar.ts to begin with. Most of
+# those reads (`mascot-avatar.tsx`'s `setHandColor`/`setSkinColor`, via
+# `hexToRgb`) are `[r,g,b]` values written straight into the mascot's Rive
+# canvas ViewModel — the same non-theming, identifies-a-specific-thing
+# category as a brand colour, and canvas paint that `index.css` custom
+# properties cannot reach without a read at draw time nothing here does. A
+# swatch button in `avatar-picker.tsx` also paints one via `style=`, which
+# *is* an ordinary CSS use — but it is still one curated, reviewed set of six
+# per property, the same posture as the ten shipped `tiny:` tone tiles
+# (`TeammateAvatar`'s own hash-to-hue, also exempt from this rule by being a
+# runtime value rather than a literal), not a color chosen ad hoc per call
+# site.
 hits=$(grep -rn '#[0-9a-fA-F]\{6\}' "$SRC" "${INCLUDES[@]}" 2>/dev/null \
   | grep -v '^frontend/src/lib/connections.ts:' \
+  | grep -v '^frontend/src/lib/avatar.ts:' \
   | strip_comments || true)
 if [ -n "$hits" ]; then
   report "raw hex colour" \

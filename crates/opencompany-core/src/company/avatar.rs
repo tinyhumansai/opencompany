@@ -8,17 +8,18 @@
 //!
 //! ## The grammar
 //!
-//! An avatar reference is one short string in exactly one of two forms:
+//! An avatar reference is one short string in exactly one of three forms:
 //!
 //! | Form | Means |
 //! |---|---|
 //! | `tiny:<flavour>` | one of the [shipped mascots](TINY_FLAVOURS) — a flavour of tiny |
 //! | `blob:<nodeId>` | a custom image the operator uploaded, held as a binary workspace node |
+//! | `mascot:<kind>` | one of the [shipped animated mascots](MASCOT_KINDS) — a curated Rive character, never uploaded |
 //!
-//! Absent (`None`) is a third state and the default: *nobody has chosen*, so the
-//! console keeps hashing. It is deliberately distinct from either stored form,
-//! because "reset to the default face" has to be expressible and neither
-//! `tiny:` nor an empty string can express it.
+//! Absent (`None`) is a fourth state and the default: *nobody has chosen*, so the
+//! console keeps hashing. It is deliberately distinct from every stored form,
+//! because "reset to the default face" has to be expressible and none of the
+//! stored forms nor an empty string can express it.
 //!
 //! ## Why the grammar is closed
 //!
@@ -31,8 +32,15 @@
 //! reports who looked at the roster and when, and either survives in the record
 //! long after the person who set it lost their account.
 //!
-//! Both stored forms name something *this host already holds*, so rendering one
-//! reaches nothing the viewer's session did not already reach.
+//! Every stored form names something *this host already holds*, so rendering one
+//! reaches nothing the viewer's session did not already reach. `mascot:` is
+//! curated for the same reason `blob:` is validated against its referent rather
+//! than trusted by shape: a `.riv` file is a programmable, document-like format
+//! with its own runtime, not a raster image `sniff_image` can validate by
+//! signature and dimensions — the same class of thing SVG is refused for below.
+//! Accepting one as an arbitrary upload would reopen exactly that risk, so a
+//! mascot kind is a closed enum naming a file shipped with the console, the same
+//! posture as `tiny:`, never something a member's bytes could become.
 //!
 //! ## Animation
 //!
@@ -71,6 +79,15 @@ pub const TINY_FLAVOURS: [&str; 11] = [
     "violet",
 ];
 
+/// The animated mascots shipped with the console, one Rive file per kind.
+///
+/// **Must stay in step with `frontend/public/avatars/mascot-<kind>.riv` and
+/// with `MASCOT_KINDS` in `frontend/src/lib/avatar.ts`.** A list of one on
+/// purpose even though v1 ships a single kind (`"animated"`): the same closed,
+/// validated-membership shape `TINY_FLAVOURS` uses, so a second colorway or a
+/// second character later is an addition to this list, not a grammar change.
+pub const MASCOT_KINDS: [&str; 1] = ["animated"];
+
 /// The longest an avatar reference may be.
 ///
 /// Both forms are a short prefix plus an identifier the host itself minted, so
@@ -95,6 +112,8 @@ pub enum AvatarRef<'a> {
     Tiny(&'a str),
     /// A custom image, by the id of the binary workspace node holding its bytes.
     Blob(&'a str),
+    /// One of the [shipped animated mascots](MASCOT_KINDS), by kind name.
+    Mascot(&'a str),
 }
 
 /// The image types an uploaded avatar may be.
@@ -686,9 +705,9 @@ pub fn check_image_dimensions(bytes: &[u8]) -> Result<()> {
 
 /// Parses a stored or submitted avatar reference.
 ///
-/// Returns [`OpenCompanyError::InvalidRequest`] naming both accepted forms,
-/// because the commonest way to get this wrong is to send a URL and the error
-/// has to say what to send instead.
+/// Returns [`OpenCompanyError::InvalidRequest`] naming all three accepted
+/// forms, because the commonest way to get this wrong is to send a URL and
+/// the error has to say what to send instead.
 pub fn parse(value: &str) -> Result<AvatarRef<'_>> {
     let value = value.trim();
     if value.len() > MAX_LEN {
@@ -709,6 +728,16 @@ pub fn parse(value: &str) -> Result<AvatarRef<'_>> {
             Ok(AvatarRef::Blob(node))
         } else {
             Err(refusal())
+        };
+    }
+    if let Some(kind) = value.strip_prefix("mascot:") {
+        return if MASCOT_KINDS.contains(&kind) {
+            Ok(AvatarRef::Mascot(kind))
+        } else {
+            Err(OpenCompanyError::InvalidRequest(format!(
+                "\"{kind}\" isn't one of the animated mascots. Pick one of: {}.",
+                MASCOT_KINDS.join(", ")
+            )))
         };
     }
     Err(refusal())
@@ -742,9 +771,10 @@ fn is_node_id(node: &str) -> bool {
 
 fn refusal() -> OpenCompanyError {
     OpenCompanyError::InvalidRequest(format!(
-        "an avatar must be \"tiny:<flavour>\" (one of: {}) or \"blob:<nodeId>\" for an uploaded \
-         image. A URL can't be stored as an avatar.",
-        TINY_FLAVOURS.join(", ")
+        "an avatar must be \"tiny:<flavour>\" (one of: {}), \"mascot:<kind>\" (one of: {}), or \
+         \"blob:<nodeId>\" for an uploaded image. A URL can't be stored as an avatar.",
+        TINY_FLAVOURS.join(", "),
+        MASCOT_KINDS.join(", ")
     ))
 }
 

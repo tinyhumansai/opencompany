@@ -35,6 +35,7 @@
     "@base-ui/react": "^1.6.0",
     "@fontsource-variable/geist": "^5.2.9",
     "@fontsource-variable/geist-mono": "^5.3.0",
+    "@rive-app/react-canvas": "^4.35.0",
     "@sentry/react": "^10.38.0",
     "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.3.2",

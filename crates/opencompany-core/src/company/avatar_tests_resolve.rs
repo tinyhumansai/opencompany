@@ -209,6 +209,18 @@ async fn resolve_refuses_a_missing_referent() {
     assert!(err.contains("isn't here any more"), "{err}");
 }
 
+/// `Mascot`, like `Tiny`, is resolved with no workspace lookup at all —
+/// `resolve`'s early return passes any non-`Blob` variant straight through.
+/// An empty `ScriptedStore` (every method `unreachable!`) proves it: reaching
+/// any store method here would panic the test.
+#[tokio::test]
+async fn resolve_passes_a_mascot_reference_through_untouched() {
+    let store = ScriptedStore::new();
+    let company = crate::ports::types::CompanyId::new("e2e");
+    let stored = resolve(&store, &company, "mascot:animated").await.unwrap();
+    assert_eq!(stored, "mascot:animated");
+}
+
 /// The store's own byte count is refused before any payload is buffered.
 #[tokio::test]
 async fn resolve_refuses_a_referent_the_store_counts_over_the_ceiling() {
