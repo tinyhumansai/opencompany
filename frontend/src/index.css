@@ -63,6 +63,43 @@
     --brand-800: oklch(0.369 0.1496 285.32); /* #3C2A89 */
     --brand-900: oklch(0.2957 0.1142 286.51); /* #2B1E62 */
 
+    /* Signature — the graph's and the charts' own violet, held apart from
+       `--brand-*` on purpose (issue #2493). Both start equal to
+       `--brand-500`/`--brand-400`, but an operator's accent-preset choice
+       overrides `--brand-*` and must never reach here: the knowledge graph's
+       "AI agents" colour and chart slot 1 are identity, not interaction, and
+       stay this one violet regardless of preset. */
+    --signature-500: oklch(0.5649 0.2236 285.51); /* #7153F0 */
+    --signature-400: oklch(0.6614 0.1769 289.73); /* #937BF6 */
+
+    /* Canvas/chrome tint — the opposite decoupling from `--signature-*` above.
+       That pair holds a value apart from an operator's accent choice; these
+       four hold values `--background`/`--chrome` (below) resolve through
+       specifically so an accent choice CAN reach them, without also reaching
+       `--surface-dark-2` (which still backs `--muted` directly) the way
+       overriding that primitive itself would (issue #2493 follow-on,
+       `theme-system-decision-addendum.md`). Values below are today's authored
+       `--surface-light-bg`/`--surface-dark-bg`/`--surface-light-chrome`/
+       `--surface-dark-2`, unchanged — the operator's chosen accent hue
+       overrides only these four, at their existing lightness and chroma, so
+       selecting the shipped default reproduces today's pixels exactly. */
+    --canvas-tint-light: oklch(0.9776 0.0066 286.28);
+    --canvas-tint-dark: oklch(0.1395 0.0048 262.8);
+    --chrome-tint-light: oklch(0.9427 0.012 286.17);
+    --chrome-tint-dark: oklch(0.1865 0.0044 264.46);
+
+    /* Accent tint — the same decoupling, for `--accent` (the menu-row/
+       list-item/settings-rail hover-active tint, `--accent` below and dark
+       mode's `--sidebar-accent`). `--accent` was always meant to read as
+       brand-tinted, but was wired straight to `--surface-light-active`/
+       `--surface-dark-active` — fixed primitives, so it silently never
+       followed an accent choice while `--primary`/`--ring` did (bug, not
+       scope: `theme-system-decision-addendum-2.md`). Values below are those
+       primitives' own today, unchanged, so the shipped default still
+       reproduces today's pixels exactly. */
+    --accent-tint-light: oklch(0.942 0.0256 293.15);
+    --accent-tint-dark: oklch(0.2396 0.019 284.87);
+
     /*
      * Surfaces — the six-rung ladder, stated per theme.
      *
@@ -191,7 +228,7 @@
     /* Surfaces, from furthest back to closest to the operator. The canvas
        is a hair off white and cards are pure white, so a card lifts off the
        page by lightness alone — before any shadow is applied. */
-    --background: var(--surface-light-bg);
+    --background: var(--canvas-tint-light);
     --foreground: var(--ink-light-primary);
     --card: var(--surface-light-1);
     --card-foreground: var(--ink-light-primary);
@@ -228,8 +265,12 @@
        nav. Brand-tinted, but the *text* on it stays neutral — 40 call
        sites pair `bg-accent` with `text-accent-foreground`, and indigo
        text on every hover would make the console strobe. The one place
-       brand ink is allowed is the active sidebar row, below. */
-    --accent: var(--surface-light-active);
+       brand ink is allowed is the active sidebar row, below.
+
+       Resolves through `--accent-tint-light`, not `--surface-light-active`
+       directly, so an accent choice can reach it the same way it reaches
+       `--background`/`--chrome` above (`theme-system-decision-addendum-2.md`). */
+    --accent: var(--accent-tint-light);
     --accent-foreground: var(--ink-light-primary);
 
     --destructive: var(--red-text);
@@ -243,7 +284,7 @@
        column and the frame around the card are the same continuous surface.
        Tinting them separately is what puts the seam back. See
        `components/content-surface.tsx`. */
-    --chrome: var(--surface-light-chrome);
+    --chrome: var(--chrome-tint-light);
     --chrome-border: var(--surface-light-4);
     /* Focus is branded. It is the most-seen interactive signal in the app
        and it was grey. */
@@ -317,11 +358,13 @@
      */
     --highlight: oklch(0.9 0.16 100 / 55%);
 
-    /* Charts. Brand leads slot 1, then the sequence walks the hue circle
-       so neighbouring series never collide. Ordered by how often a series
-       count occurs: the two-series case gets indigo/cyan, which are also
-       the pair that survives the most common colour-vision deficiencies. */
-    --chart-1: var(--brand-500);
+    /* Charts. Slot 1 is the product's signature violet — fixed, not the
+       operator's brand accent (issue #2493) — then the sequence walks the
+       hue circle so neighbouring series never collide. Ordered by how often
+       a series count occurs: the two-series case gets indigo/cyan, which are
+       also the pair that survives the most common colour-vision
+       deficiencies. */
+    --chart-1: var(--signature-500);
     --chart-2: var(--cyan-mark);
     --chart-3: var(--green-mark);
     --chart-4: var(--amber-mark);
@@ -447,7 +490,7 @@
        direction as light mode. The canvas is near-black, and each layer
        above it is a measured step up — never a translucent white wash,
        which tints unpredictably over whatever it lands on. */
-    --background: var(--surface-dark-bg);
+    --background: var(--canvas-tint-dark);
     --foreground: var(--ink-dark-primary);
     --card: var(--surface-dark-1);
     --card-foreground: var(--ink-dark-primary);
@@ -463,7 +506,7 @@
 
     /* Brand-500 is too dense to read as ink on near-black; 400 is the
        working accent in dark mode. Filled brand buttons keep 500 with
-       white text, which measures 4.70:1 in both themes. */
+       white text, which measures 5.00:1 in both themes. */
     --primary: var(--brand-400);
     --primary-foreground: var(--surface-dark-bg);
     --secondary: var(--surface-dark-active);
@@ -479,7 +522,9 @@
     --ink-hint: var(--ink-dark-hint);
     --ink-muted: var(--ink-dark-muted);
 
-    --accent: var(--surface-dark-active);
+    /* `--accent-tint-dark`, not `--surface-dark-active` directly — see the
+       light-mode comment above. */
+    --accent: var(--accent-tint-dark);
     --accent-foreground: var(--ink-dark-primary);
 
     --destructive: var(--red-bright);
@@ -500,7 +545,7 @@
        for why the direction inverts here. The hairline takes the active rung
        rather than rung 4: rung 4 is only 1.04:1 against this ground, and a
        card edge nobody can see is the seam problem in reverse. */
-    --chrome: var(--surface-dark-2);
+    --chrome: var(--chrome-tint-dark);
     --chrome-border: var(--surface-dark-active);
 
     --status-idle: var(--ink-dark-muted);
@@ -529,7 +574,7 @@
     --status-failed-text: var(--red-bright);
     --status-failed-soft: color-mix(in oklab, var(--red-bright) 16%, transparent);
 
-    --chart-1: var(--brand-400);
+    --chart-1: var(--signature-400);
     --chart-2: var(--cyan-bright);
     --chart-3: var(--green-bright);
     --chart-4: var(--amber-bright);
@@ -552,7 +597,11 @@
     --sidebar-foreground: var(--ink-dark-primary);
     --sidebar-primary: var(--brand-400);
     --sidebar-primary-foreground: var(--surface-dark-bg);
-    --sidebar-accent: var(--surface-dark-active);
+    /* Same primitive `--accent` above resolves through in dark mode — reuse
+       it rather than a second computation (`theme-system-decision-addendum-2.md`).
+       Light mode's `--sidebar-accent` already correctly uses `--brand-100`,
+       untouched. */
+    --sidebar-accent: var(--accent-tint-dark);
     --sidebar-accent-foreground: var(--brand-300);
     --sidebar-border: var(--surface-dark-4);
     --sidebar-ring: var(--brand-400);
@@ -808,7 +857,7 @@
  * ========================================================================== */
 
 :root {
-    --kg-accent: var(--brand-500);
+    --kg-accent: var(--signature-500);
     --kg-ok: var(--status-done);
     --kg-warn: var(--status-blocked);
     /* The two brain hues stay deliberately outside the status vocabulary:
@@ -829,7 +878,7 @@
 }
 
 .dark {
-    --kg-accent: var(--brand-400);
+    --kg-accent: var(--signature-400);
     --kg-ok: var(--status-done);
     --kg-warn: var(--status-blocked);
     --kg-brain-1: var(--pink-bright);
@@ -1247,4 +1296,224 @@
             }
         }
     }
+}
+
+/* ============================================================================
+ * ACCENT PRESETS (issue #2493)
+ *
+ * An operator's chosen interaction hue, independent of light/dark mode. Full
+ * design in `docs/issues/accent-theme-presets/architecture.md`; this section
+ * is its §2–3 in code.
+ *
+ * ## What a preset overrides, and why only this
+ *
+ * Each block below re-declares the ten `--brand-{50..900}` primitives and
+ * nothing else. Every semantic token built on the ramp — `--primary`,
+ * `--ring`, `--sidebar-primary(-foreground)`, `--sidebar-accent(-foreground)`,
+ * `--shadow-brand`, `--glow-brand-card`, the `bg-brand-*` utilities — is
+ * therefore re-derived in both themes for free, because the *choice of step*
+ * (500 in light, 400 in dark, 700/300 for active-nav ink) already lives one
+ * layer up, in `:root` and `.dark`, and is never repeated here.
+ *
+ * `--signature-500`/`--signature-400` are deliberately absent from every
+ * block: chart slot 1 and the knowledge graph's "AI agents" colour are
+ * identity, not interaction, and Phase 1 of this issue moved them off
+ * `--brand-*` for exactly this reason (see the primitives block near the top
+ * of this file). A preset here can never reach them.
+ *
+ * ## Selector shape, and why it must stay this way
+ *
+ * `[data-accent-preset="…"]`, not `:root[data-accent-preset="…"]`. The bare
+ * attribute selector matches *any* element, which is what lets a picker
+ * swatch carry its own `data-accent-preset` and render its own colour
+ * (`accent-preset-picker.tsx`) — `:root[…]` would only ever match `<html>`.
+ * Its specificity, (0,1,0), ties with both `:root` and `.dark`, so it wins on
+ * **source order** alone: this section must stay the last thing in the file.
+ * `accent-presets-shape.test.ts` pins that.
+ *
+ * ## The specificity trap (roadblocks.md R2)
+ *
+ * `.dark` and `[data-accent-preset="x"]` are the same specificity, so on
+ * `<html class="dark" data-accent-preset="x">` the preset block wins the tie
+ * by sitting later in the file — including over `.dark`'s own
+ * `--primary-foreground`. A preset block may therefore set ONLY the ten ramp
+ * primitives unqualified. A preset that also needs a `-foreground` override
+ * (none of the seven below do; white already clears 4.5:1 on every one's 500)
+ * must split it into a `:not(.dark)` / `.dark` qualified pair, never bare —
+ * `accent-presets-shape.test.ts` enforces both rules.
+ *
+ * ## Where the numbers come from
+ *
+ * Generated, not eyeballed: each ramp holds the brand ramp's own lightness
+ * cadence and hue-drift shape (the rule already stated where `--brand-*` is
+ * declared), retargeted to a new hue and chroma at the 500 step, then
+ * verified — gamut and all five contrast pairs from
+ * `docs/design-system/color.md`'s table — before being written here.
+ * `accent-presets-contrast.test.ts` re-verifies the same five pairs on every
+ * CI run, so a hand-edit here cannot silently regress one.
+ * ========================================================================== */
+
+[data-accent-preset="violet"] {
+    /* Deliberately identical to :root's own ramp — the current default, named
+       so it stays choosable if a future brand decision ever moves the default
+       away from violet (open-questions.md Q1). Also load-bearing for a second
+       reason: the "Default" preset has no block of its own (selecting it
+       means "remove the attribute", not "apply one named default"), so
+       accent-preset-picker.tsx paints ITS swatch with this block too. Keeping
+       the two identical is what makes that correct;
+       accent-presets-shape.test.ts pins the equality. */
+    --brand-50: oklch(0.9522 0.0230 295.71); /* #f0ecfd */
+    --brand-100: oklch(0.9124 0.0427 295.48); /* #e4ddfc */
+    --brand-200: oklch(0.8410 0.0794 294.74); /* #cec1fa */
+    --brand-300: oklch(0.7488 0.1287 292.75); /* #b09df8 */
+    --brand-400: oklch(0.6614 0.1769 289.73); /* #937bf6 */
+    --brand-500: oklch(0.5649 0.2236 285.51); /* #7153f0 */
+    --brand-600: oklch(0.5141 0.2088 284.97); /* #6247d7 */
+    --brand-700: oklch(0.4453 0.1828 284.88); /* #5038b2 */
+    --brand-800: oklch(0.3690 0.1496 285.32); /* #3c2a89 */
+    --brand-900: oklch(0.2957 0.1142 286.51); /* #2b1e62 */
+}
+
+/* white/500 4.97 · 500/canvas 4.65 · 400/dark-canvas 6.04 · 700/100 6.07 · 300/dark-active 7.08 */
+[data-accent-preset="indigo"] {
+    --brand-50: oklch(0.9439 0.0237 278.20); /* #e8ebfd */
+    --brand-100: oklch(0.9045 0.0439 277.97); /* #d8ddfd */
+    --brand-200: oklch(0.8337 0.0817 277.23); /* #bbc4fe */
+    --brand-300: oklch(0.7423 0.1324 275.24); /* #94a4fe */
+    --brand-400: oklch(0.6557 0.1820 272.22); /* #6c84fe */
+    --brand-500: oklch(0.5600 0.2300 268.00); /* #3d60f8 */
+    --brand-600: oklch(0.5096 0.2148 267.46); /* #3253de */
+    --brand-700: oklch(0.4414 0.1880 267.37); /* #2743b8 */
+    --brand-800: oklch(0.3658 0.1539 267.81); /* #1d328e */
+    --brand-900: oklch(0.2931 0.1175 269.00); /* #162365 */
+}
+
+/* white/500 4.92 · 500/canvas 4.61 · 400/dark-canvas 5.98 · 700/100 5.79 · 300/dark-active 6.88 */
+[data-accent-preset="blue"] {
+    --brand-50: oklch(0.9271 0.0175 265.20); /* #e1e7f3 */
+    --brand-100: oklch(0.8883 0.0325 264.97); /* #d0daf0 */
+    --brand-200: oklch(0.8188 0.0604 264.23); /* #b0c4ec */
+    --brand-300: oklch(0.7290 0.0978 262.24); /* #86a8e5 */
+    --brand-400: oklch(0.6440 0.1345 259.22); /* #5a8dde */
+    --brand-500: oklch(0.5500 0.1700 255.00); /* #1570d1 */
+    --brand-600: oklch(0.5005 0.1587 254.46); /* #0662bb */
+    --brand-700: oklch(0.4336 0.1390 254.37); /* #014f9a */
+    --brand-800: oklch(0.3593 0.1137 254.81); /* #043c76 */
+    --brand-900: oklch(0.2879 0.0868 256.00); /* #072a55 */
+}
+
+/* white/500 4.84 · 500/canvas 4.54 · 400/dark-canvas 5.89 · 700/100 5.46 · 300/dark-active 6.69 */
+[data-accent-preset="teal"] {
+    --brand-50: oklch(0.9102 0.0087 205.20); /* #dbe3e4 */
+    --brand-100: oklch(0.8722 0.0162 204.97); /* #c9d8da */
+    --brand-200: oklch(0.8039 0.0302 204.23); /* #a9c5c8 */
+    --brand-300: oklch(0.7158 0.0489 202.24); /* #7fadb0 */
+    --brand-400: oklch(0.6322 0.0672 199.22); /* #559699 */
+    --brand-500: oklch(0.5400 0.0850 195.00); /* #1c7e7e */
+    --brand-600: oklch(0.4914 0.0794 194.46); /* #126f6e */
+    --brand-700: oklch(0.4257 0.0695 194.37); /* #0b5a5a */
+    --brand-800: oklch(0.3527 0.0569 194.81); /* #084444 */
+    --brand-900: oklch(0.2827 0.0434 196.00); /* #073030 */
+}
+
+/* white/500 4.83 · 500/canvas 4.52 · 400/dark-canvas 5.99 · 700/100 5.45 · 300/dark-active 6.74 */
+[data-accent-preset="green"] {
+    --brand-50: oklch(0.9102 0.0123 155.20); /* #dbe4de */
+    --brand-100: oklch(0.8722 0.0229 154.97); /* #cadace */
+    --brand-200: oklch(0.8039 0.0426 154.23); /* #abc8b3 */
+    --brand-300: oklch(0.7158 0.0691 152.24); /* #83b08e */
+    --brand-400: oklch(0.6322 0.0949 149.22); /* #5f9a6a */
+    --brand-500: oklch(0.5400 0.1200 145.00); /* #3b8040 */
+    --brand-600: oklch(0.4914 0.1121 144.46); /* #327135 */
+    --brand-700: oklch(0.4257 0.0981 144.37); /* #275c29 */
+    --brand-800: oklch(0.3527 0.0803 144.81); /* #1c461f */
+    --brand-900: oklch(0.2827 0.0613 146.00); /* #123116 */
+}
+
+/* white/500 4.86 · 500/canvas 4.55 · 400/dark-canvas 6.13 · 700/100 6.03 · 300/dark-active 7.08.
+   Reads as a deep amber/rust rather than a bright one: R11 measured white text
+   on a bright amber-500 at 3.19:1, so clearing 4.5 costs saturation at this
+   lightness. The alternative — a dark foreground override — was rejected here
+   per §2's preference for a darker 500 over a dark foreground. */
+[data-accent-preset="amber"] {
+    --brand-50: oklch(0.9439 0.0134 65.20); /* #f3ebe3 */
+    --brand-100: oklch(0.9045 0.0248 64.97); /* #ecddcf */
+    --brand-200: oklch(0.8337 0.0462 64.23); /* #dec3aa */
+    --brand-300: oklch(0.7423 0.0748 62.24); /* #cea17b */
+    --brand-400: oklch(0.6557 0.1028 59.22); /* #bf814d */
+    --brand-500: oklch(0.5600 0.1300 55.00); /* #ad5c15 */
+    --brand-600: oklch(0.5096 0.1214 54.46); /* #994f0d */
+    --brand-700: oklch(0.4414 0.1063 54.37); /* #7e4007 */
+    --brand-800: oklch(0.3658 0.0870 54.81); /* #603005 */
+    --brand-900: oklch(0.2931 0.0664 56.00); /* #442204 */
+}
+
+/* white/500 4.92 · 500/canvas 4.61 · 400/dark-canvas 6.17 · 700/100 6.33 · 300/dark-active 7.24.
+   Chroma held back from the search optimum at this hue: the 50 step alone
+   left sRGB gamut above ~C 0.19, so 500's chroma is capped at 0.185 to keep
+   every step in the same gamut the rest of this file requires. */
+[data-accent-preset="rose"] {
+    --brand-50: oklch(0.9608 0.0190 25.20); /* #ffeeec */
+    --brand-100: oklch(0.9206 0.0353 24.97); /* #fcdcd9 */
+    --brand-200: oklch(0.8486 0.0657 24.23); /* #f6bdb8 */
+    --brand-300: oklch(0.7556 0.1065 22.24); /* #ec9491 */
+    --brand-400: oklch(0.6674 0.1464 19.22); /* #e06b70 */
+    --brand-500: oklch(0.5700 0.1850 15.00); /* #cd3753 */
+    --brand-600: oklch(0.5187 0.1728 14.46); /* #b62d48 */
+    --brand-700: oklch(0.4493 0.1512 14.37); /* #96223a */
+    --brand-800: oklch(0.3723 0.1238 14.81); /* #73192b */
+    --brand-900: oklch(0.2984 0.0945 16.00); /* #53121d */
+}
+
+/* white/500 4.88 · 500/canvas 4.57 · 400/dark-canvas 6.00 · 700/100 5.68 · 300/dark-active 6.86.
+   Chroma zero at every step — the one preset with no hue at all, for the
+   monochrome look requested alongside this feature from the start. Every
+   other preset holds violet's lightness cadence and scales chroma to its own
+   hue's gamut; this one holds the cadence and scales chroma to zero instead,
+   which is why its L values are the violet ramp's own values scaled by a
+   single factor (0.9737) rather than independently searched — there is no
+   chroma to trade against lightness here, so the shape carries over exactly
+   and only the overall level needed adjusting to clear 500/canvas. */
+[data-accent-preset="graphite"] {
+    --brand-50: oklch(0.9277 0 0); /* #e7e7e7 */
+    --brand-100: oklch(0.8889 0 0); /* #dadada */
+    --brand-200: oklch(0.8193 0 0); /* #c4c4c4 */
+    --brand-300: oklch(0.7295 0 0); /* #a7a7a7 */
+    --brand-400: oklch(0.6444 0 0); /* #8d8d8d */
+    --brand-500: oklch(0.5504 0 0); /* #717171 */
+    --brand-600: oklch(0.5009 0 0); /* #636363 */
+    --brand-700: oklch(0.4338 0 0); /* #515151 */
+    --brand-800: oklch(0.3595 0 0); /* #3d3d3d */
+    --brand-900: oklch(0.2881 0 0); /* #2b2b2b */
+}
+
+/* white/500 16.48 · 500/canvas 15.43 · 400/dark-canvas 5.04 · 700/100 14.72 ·
+   300/dark-active 5.11. Chroma zero at every step, like Graphite, but
+   anchored much darker (500 ≈ #1f1f1f) to read as near-black rather than
+   mid-gray.
+   Unlike Graphite, this ramp does NOT hold the shared step-lightness cadence
+   `accent-ramp.ts` derives from violet: doing so is provably incompatible
+   with a near-black 500. `c400OnDarkCanvas` and `c300OnDarkActiveRung`
+   (`accent-contrast.ts`) are checked against fixed near-black anchors
+   (`--surface-dark-bg` L 0.1395, `--surface-dark-active` L 0.2396), which
+   forces step 400 to at least L≈0.571 and step 300 to at least L≈0.618
+   regardless of how dark 500 is — verified by binary-searching those two
+   pairs in isolation, and by sweeping violet's cadence at every scale factor,
+   which only clears all five pairs for L500 in ≈0.489–0.552 and never below
+   it (both checked against this exact contrast implementation, not
+   eyeballed). So 50–400 are held light enough to clear those floors with
+   margin, and 500–900 compress toward black on their own independent,
+   still-decreasing run instead of scaling with them. A second, deliberate
+   exception to "hold the cadence" alongside Graphite's chroma-zero one. */
+[data-accent-preset="onyx"] {
+    --brand-50: oklch(0.9400 0 0); /* #ebebeb */
+    --brand-100: oklch(0.9000 0 0); /* #dedede */
+    --brand-200: oklch(0.8000 0 0); /* #bebebe */
+    --brand-300: oklch(0.6500 0 0); /* #8f8f8f */
+    --brand-400: oklch(0.6000 0 0); /* #808080 */
+    --brand-500: oklch(0.2400 0 0); /* #1f1f1f */
+    --brand-600: oklch(0.1900 0 0); /* #141414 */
+    --brand-700: oklch(0.1450 0 0); /* #0a0a0a */
+    --brand-800: oklch(0.1050 0 0); /* #040404 */
+    --brand-900: oklch(0.0700 0 0); /* #010101 */
 }

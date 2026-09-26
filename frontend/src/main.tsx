@@ -7,6 +7,7 @@ import { App } from "./App";
 import { CrashFallback } from "@/components/crash-fallback";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
+import { applyStoredAccentPreset } from "@/lib/accent-presets";
 import { purgeStoredSmtpPasswords } from "@/lib/domain";
 import { installExternalLinkOpener } from "@/lib/external-links";
 import { startScrollActivity } from "@/lib/scroll-activity";
@@ -94,5 +95,14 @@ installExternalLinkOpener();
 // Settings again, and the credential has to be gone either way. A no-op on any
 // browser that never stored one.
 purgeStoredSmtpPasswords();
+
+// Synchronous, and before `mount()`, so the chosen accent preset is already on
+// `<html>` for React's first commit — see `accent-presets.ts` for why this
+// cannot be an inline `<script>` (client-rendered scripts are inert) or a
+// `next-themes`-style trick (this SPA has no server render for that trick to
+// run during). `next-themes` itself still applies `.dark` from an effect, one
+// commit later — a pre-existing flash this call does not fix (issue #2493,
+// `docs/issues/accent-theme-presets/open-questions.md` Q8).
+applyStoredAccentPreset();
 
 mount();

@@ -44,6 +44,15 @@ mode this structure exists to prevent.
 approximate with a near-miss and do not inline a raw value. Naming the need is
 the work.
 
+**One deliberate, narrow exception:** the accent-preset picker's own swatches
+(`components/accent-preset-picker.tsx`, issue #2493) paint with `bg-brand-500`
+— layer 1 — rather than `bg-primary`. `--primary` resolves against whichever
+preset `<html>` currently carries, so a swatch styled with it would show the
+*page's* preset instead of its own. This is the only call site permitted to
+reach into layer 1, and it is why: see
+[`../issues/accent-theme-presets/roadblocks.md`](../issues/accent-theme-presets/roadblocks.md)
+R4.
+
 ---
 
 ## Anti-patterns, and what to do instead

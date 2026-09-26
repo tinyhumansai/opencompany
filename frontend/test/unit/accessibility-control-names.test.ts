@@ -31,4 +31,17 @@ describe("operator control names (issue #1395)", () => {
 
     expect(composer).toContain("aria-label={placeholder}");
   });
+
+  it("names the accent preset picker (issue #2493)", () => {
+    // `role="radiogroup"` / `role="radio"` and `aria-checked` come from the
+    // `@base-ui/react` primitives at runtime rather than appearing literally in
+    // source, so they are not grepped here — `test/e2e/accent-preset.spec.ts`
+    // E3/E4 verify the live semantics with `getByRole("radio", { name })`
+    // instead. This checks the one thing that IS source text: the group's name
+    // and each swatch's visible label, so colour is never the only cue.
+    const picker = read("components/accent-preset-picker.tsx");
+
+    expect(picker).toContain('aria-label="Accent preset"');
+    expect(picker).toContain("{preset.label}");
+  });
 });

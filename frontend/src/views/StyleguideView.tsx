@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, XAxis } from "recharts";
 import {
   AlertTriangle,
@@ -112,6 +112,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { AccentPresetPicker } from "@/components/accent-preset-picker";
+import { ACCENT_PRESETS } from "@/lib/accent-presets";
 import { withHostParam } from "@/hooks/use-host-route";
 import { cn } from "@/lib/utils";
 import { STYLEGUIDE_COMPONENTS } from "@/views/styleguide-components";
@@ -234,7 +236,13 @@ function useResolved(vars: string[]) {
     const next: Record<string, string> = {};
     for (const v of vars) next[v] = style.getPropertyValue(v).trim();
     setValues(next);
-    // Re-read when the theme class flips, so dark values are shown in dark.
+    // Re-read when the theme class flips, so dark values are shown in dark —
+    // and, since issue #2493, when the accent preset changes: the Brand ramp
+    // swatches above read `--brand-*` off `document.documentElement`, which is
+    // exactly what `AccentPresetPicker` (also on this page) changes by setting
+    // `data-accent-preset`. Without watching that attribute too, picking a
+    // preset here repaints the swatch fills but leaves the printed values
+    // showing the previous preset's ramp.
     const observer = new MutationObserver(() => {
       const s = getComputedStyle(document.documentElement);
       const n: Record<string, string> = {};
@@ -243,7 +251,7 @@ function useResolved(vars: string[]) {
     });
     observer.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ["class"],
+      attributeFilter: ["class", "data-accent-preset"],
     });
     return () => observer.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -348,7 +356,7 @@ function ColorSection() {
   return (
     <Section
       title="Color"
-      hint="Brand violet is the only hue the product owns. It marks interaction and identity — never status."
+      hint="The brand ramp marks interaction — never status. Violet is its default; since issue #2493 an operator may choose a different accent preset (below) without changing what the ramp is for."
     >
       <div>
         <h3 className="mb-2 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -370,6 +378,8 @@ function ColorSection() {
           steps up to 400, because 500 is too dense to read as ink on near-black.
         </p>
       </div>
+
+      <AccentPresetsSection />
 
       <div>
         <h3 className="mb-2 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -444,6 +454,83 @@ function ColorSection() {
         </p>
       </div>
     </Section>
+  );
+}
+
+/**
+ * The curated accent presets, each rendered against its own colour rather
+ * than the page's currently-selected one.
+ *
+ * `useResolved` above reads `getComputedStyle(document.documentElement)` — the
+ * live page — which is exactly wrong here: a preset's own swatch has to show
+ * *its* `--brand-500`, resolved on an element carrying *its own*
+ * `data-accent-preset`, the same rule `accent-preset-picker.tsx` follows
+ * (`roadblocks.md` R4). So each row gets its own ref and its own
+ * `getComputedStyle` read, scoped to that row's element.
+ */
+function AccentPresetsSection() {
+  return (
+    <div>
+      <h3 className="mb-2 text-2xs font-medium tracking-wide text-muted-foreground uppercase">
+        Accent presets
+      </h3>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {ACCENT_PRESETS.filter((p) => p.id !== "default").map((preset) => (
+          <PresetRampRow key={preset.id} presetId={preset.id} label={preset.label} />
+        ))}
+      </div>
+      <p className="mt-2 text-2xs text-muted-foreground">
+        One interaction hue at a time, chosen in Settings → Appearance. Chart
+        slot 1 and the knowledge graph's "AI agents" mark never follow a
+        preset — see `--signature-500`/`--signature-400` above.
+      </p>
+      <div className="mt-3">
+        <AccentPresetPicker />
+      </div>
+    </div>
+  );
+}
+
+function PresetRampRow({ presetId, label }: { presetId: string; label: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [values, setValues] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const style = getComputedStyle(el);
+    const next: Record<string, string> = {};
+    for (const s of BRAND_STEPS) next[String(s.step)] = style.getPropertyValue(`--brand-${s.step}`).trim();
+    setValues(next);
+    // Re-read when the theme class flips: dark mode does not change which
+    // ramp a preset declares, but it is cheap insurance against a future
+    // preset that does add a `.dark`-qualified override.
+    const observer = new MutationObserver(() => {
+      const s = getComputedStyle(el);
+      const n: Record<string, string> = {};
+      for (const step of BRAND_STEPS) n[String(step.step)] = s.getPropertyValue(`--brand-${step.step}`).trim();
+      setValues(n);
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div ref={ref} data-accent-preset={presetId} className="rounded-lg border border-border p-2">
+      <div className="flex gap-1">
+        {[500, 400].map((step) => (
+          <div
+            key={step}
+            className="h-8 flex-1 rounded"
+            style={{ background: values[String(step)] || undefined }}
+          />
+        ))}
+      </div>
+      <span className="mt-1.5 block text-2xs font-medium">{label}</span>
+      <span className="block font-mono text-3xs text-muted-foreground">
+        {values["500"] || `--brand-500`}
+      </span>
+    </div>
   );
 }
 

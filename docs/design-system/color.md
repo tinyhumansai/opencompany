@@ -57,6 +57,72 @@ is too dense to read as ink on near-black.
 
 ---
 
+## Accent presets (issue #2493)
+
+Since issue #2493, `--brand-*` is an operator's choice rather than a fixed
+ramp: Settings → Appearance offers a curated set of presets, each overriding
+the ten primitives above and nothing else. Every semantic token built on the
+ramp (`--primary`, `--ring`, `--sidebar-primary`, …) is re-derived for both
+themes automatically — see
+[`../issues/accent-theme-presets/architecture.md`](../issues/accent-theme-presets/architecture.md)
+§2 for why only the ramp, never a semantic token, is what a preset may touch.
+
+**What never follows a preset:** status colours, identity tones, chart slots
+2–5, and — since Phase 1 of #2493 — chart slot 1 and the knowledge graph's
+"AI agents" mark, both pinned to a new fixed primitive,
+`--signature-500`/`--signature-400`, so a chart or a shared graph reads the
+same on every operator's screen regardless of their personal accent. See
+"Charts" and "The knowledge graph" below.
+
+Every preset is measured against the same five pairs the default ramp meets,
+enforced by `frontend/test/unit/accent-presets-contrast.test.ts` rather than
+by eye:
+
+| Preset | white / 500 | 500 / light canvas | 400 / dark canvas | 700 / 100 | 300 / dark active rung |
+| --- | --- | --- | --- | --- | --- |
+| Violet (default) | 5.00 | 4.68 | 6.08 | 6.29 | 7.10 |
+| Indigo | 4.97 | 4.65 | 6.04 | 6.07 | 7.08 |
+| Blue | 4.92 | 4.61 | 5.98 | 5.79 | 6.88 |
+| Teal | 4.84 | 4.54 | 5.89 | 5.46 | 6.69 |
+| Green | 4.83 | 4.52 | 5.99 | 5.45 | 6.74 |
+| Amber | 4.86 | 4.55 | 6.13 | 6.03 | 7.08 |
+| Rose | 4.92 | 4.61 | 6.17 | 6.33 | 7.24 |
+| Graphite | 4.88 | 4.57 | 6.00 | 5.68 | 6.86 |
+| Onyx | 16.48 | 15.43 | 5.04 | 14.72 | 5.11 |
+
+All nine clear 4.5:1. None is asserted against `--accent` or `--chrome` — the
+default ramp already misses both (4.20:1, 4.22:1; a pre-existing gap this
+feature does not widen, tracked separately from issue #2493).
+
+**Graphite is the one exception to "hold the hue-drift shape":** chroma zero
+at every step, for the premium monochrome look asked for alongside this
+feature from the start. Its lightness cadence is still the brand ramp's own
+shape (scaled by a single factor so 500 clears 500/light-canvas), because a
+neutral ramp needs no hue to trade chroma against — see its comment in
+`index.css` for the exact derivation.
+
+**Onyx is a second, deeper exception — chroma zero AND a broken cadence:**
+anchored near-black (500 ≈ `oklch(0.24 0 0)`, `#1f1f1f`) rather than
+Graphite's mid-gray. Holding the shared lightness cadence at that anchor is
+not just undesirable here, it is provably impossible: `c400OnDarkCanvas` and
+`c300OnDarkActiveRung` are checked against fixed near-black anchors
+(`--surface-dark-bg`, `--surface-dark-active`), which floors step 400 at
+L≈0.571 and step 300 at L≈0.618 no matter how dark 500 is — scaling
+Graphite's whole cadence down only keeps every pair clearing for L500 in
+≈0.489–0.552, never lower. Onyx therefore holds 50–400 lifted above those
+floors (with margin) and lets 500–900 compress toward black on an
+independent, still-monotonically-decreasing run instead — see its comment in
+`index.css` for the derivation and the binary-searched floors.
+
+**Authoring a new preset:** tune in oklch, hold the brand ramp's own lightness
+cadence and hue-drift shape (stated where `--brand-*` is declared in
+`index.css`) rather than inventing a new one, and let the contrast test — not
+review — decide whether it ships. Prefer a darker 500 over a `-foreground`
+override when white text fails; none of the nine above needed one. An id, once
+shipped, is never renamed (an operator's stored choice names it).
+
+---
+
 ## Neutrals
 
 Cool-tinted at ~286°, chroma 0.001–0.03. See
@@ -304,10 +370,12 @@ renamed — they name a slot, not a colour. A desk keyed `amber` resolves to
 | `--chart-4` | `#BF7200` amber | `#FFC53D` |
 | `--chart-5` | `#E93D82` pink | `#FF6BA6` |
 
-Brand leads slot 1; the sequence then walks the hue circle so neighbouring
-series never collide. The ordering is chosen so the *two-series* case — by far
-the most common — gets violet and cyan, the pair that survives the most common
-colour-vision deficiencies.
+Slot 1 is the product's signature violet (`--signature-500`/`--signature-400`,
+`index.css`) — fixed, and independent of `--brand-*` since issue #2493, so an
+operator's chosen accent preset never recolours a chart. The sequence
+then walks the hue circle so neighbouring series never collide. The ordering
+is chosen so the *two-series* case — by far the most common — gets violet and
+cyan, the pair that survives the most common colour-vision deficiencies.
 
 Chart colours are marks, not text. Axis labels and legends use
 `--muted-foreground`, never the series colour.
@@ -327,6 +395,11 @@ outside `.oc-kg` may use those names.
 `--kg-brain-1` / `--kg-brain-2` stay deliberately outside the status
 vocabulary: they identify *which store* a node came from, and colouring them
 with status hues would imply a health they do not carry.
+
+`--kg-accent` (the "AI agents" mark) points at `--signature-500`/
+`--signature-400`, not `--brand-*`, since issue #2493 — it identifies the
+company's own teammates, not an interactive element, so it holds the one
+signature violet regardless of an operator's chosen accent preset.
 
 ---
 

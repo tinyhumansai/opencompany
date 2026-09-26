@@ -116,7 +116,7 @@ export const SETTINGS_PAGES = [
     id: "appearance",
     label: "Appearance",
     icon: Palette,
-    hint: "Light, dark, or follow the system",
+    hint: "Theme and accent",
     group: "console",
   },
   // Brain is NOT here: it has its own nav row (`#/brain`). It was the one page

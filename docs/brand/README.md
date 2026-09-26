@@ -87,19 +87,27 @@ never assume gender for a named agent or a person.
 
 Full values, ramps and measured contrast: [`design-system/color.md`](../design-system/color.md).
 
-### The one hue we own
+### The interaction hue
 
-**Violet `#7153F0`.** It means *interactive or ours*: buttons, links, focus
-rings, the active nav row, the leading chart series, the logo. Nothing else.
+**The brand ramp.** It means *interactive*: buttons, links, focus rings, the
+active nav row. Nothing else. Its default is **violet `#7153F0`** — a
+cool-warm hybrid, deliberately carrying more warmth than a generic indigo such
+as `#6366F1` — and since issue #2493 an operator may choose a different
+curated preset in Settings → Appearance without changing what the ramp is
+*for*.
 
-A cool-warm hybrid, deliberately carrying more warmth than a generic indigo
-such as `#6366F1`.
+What stays fixed regardless of that choice is the product's own identity: the
+logo, chart slot 1, and the knowledge graph's "AI agents" mark all hold one
+signature violet (`--signature-500`/`--signature-400`) — they identify the
+product and its own teammates, not something the operator interacts with, so
+personal taste does not reach them. See
+[`../design-system/color.md`](../design-system/color.md#accent-presets-issue-2493).
 
-The discipline that makes it work is what the brand hue is **forbidden** from
-doing:
+The discipline that makes any of this work is what the interaction hue is
+**forbidden** from doing, whichever preset is active:
 
-- It is never a status. A run is not violet.
-- It is not a background wash. There are no violet gradients, no glows, no
+- It is never a status. A run is not violet, or indigo, or rose.
+- It is not a background wash. There are no accent gradients, no glows, no
   tinted hero panels.
 - It is not used to make something look important. Hierarchy comes from size,
   weight and position first.
