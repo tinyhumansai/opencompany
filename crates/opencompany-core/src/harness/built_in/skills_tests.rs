@@ -70,6 +70,7 @@ fn library_doc(slug: &str) -> SkillDoc {
         category: Some("Research".to_string()),
         version: Some("1.0.0".to_string()),
         body: "\n# Competitor Scan\n\n## Steps\n\n1. Pick.\n\n## Output\n\nA table.\n".to_string(),
+        extra_frontmatter: Vec::new(),
     }
 }
 

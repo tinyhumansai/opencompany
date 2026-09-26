@@ -429,7 +429,11 @@ hmac = "0.12"
 pdf-extract = { version = "0.12", optional = true }
 calamine = { version = "0.36", optional = true }
 quick-xml = { version = "0.41", optional = true }
-zip = { version = "7", default-features = false, features = ["deflate"], optional = true }
+# Not optional: the console's skill upload accepts a `.zip`/`.skill` archive
+# in every build, so gating the reader behind a feature would make that route
+# silently refuse a valid archive on a build that merely omitted OOXML text
+# extraction.
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 sha2 = "0.10"
 getrandom = "0.4"
@@ -611,7 +615,7 @@ default = ["oauth", "platform-jwt", "documents", "tinymemory"]
 # "remember this file" from the operator's side, and a build that reads a
 # dropped PDF but cannot fetch a URL would be a distinction nobody asked for.
 # It is already in the default set via `oauth`, so this adds nothing there.
-documents = ["dep:pdf-extract", "dep:calamine", "dep:quick-xml", "dep:zip", "dep:reqwest"]
+documents = ["dep:pdf-extract", "dep:calamine", "dep:quick-xml", "dep:reqwest"]
 
 tiny = ["tinyagents-harness", "tinyinference"]
 # WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent

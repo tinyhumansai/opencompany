@@ -163,6 +163,7 @@ fn render_collapses_newlines_so_a_value_cannot_inject_frontmatter() {
         category: None,
         version: None,
         body: "body\n".to_string(),
+        extra_frontmatter: Vec::new(),
     };
     let parsed = parse_skill_md("evil", &render_skill_md(&doc)).expect("stays parseable");
     assert_eq!(parsed.name, "Evil --- description: hijacked");

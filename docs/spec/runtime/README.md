@@ -137,6 +137,8 @@ Supporting docs:
     route by route
     - [api-team-drafting.md](api-team-drafting.md) — the two draft routes behind
       the teammate copilot, and why a model may write into a persona at all
+    - [api-skill-authoring.md](api-skill-authoring.md) — the skill upload and
+      draft routes, and why an archive's extras are refused rather than dropped
     - [api-tool-grants.md](api-tool-grants.md) — the three tool-grant routes
       that widen `[tools].allow` from a connect page, and when a grant takes
       effect

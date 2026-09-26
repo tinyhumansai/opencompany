@@ -29,6 +29,13 @@ pub struct SkillDoc {
     pub version: Option<String>,
     /// The Markdown body after the frontmatter, preserved verbatim.
     pub body: String,
+    /// Frontmatter lines this parser does not recognise, verbatim.
+    ///
+    /// The parser ignores an unknown key, but an uploaded document is stored
+    /// and materialized as its own source, so whatever those lines say is what
+    /// the agent reads. Keeping them means the scan can see the whole of what
+    /// will be stored rather than only the keys this struct names.
+    pub extra_frontmatter: Vec<String>,
 }
 
 /// Parses one SKILL.md document for the given `slug` (its directory name).
@@ -46,6 +53,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
             message: "missing a `---` frontmatter block at the top of the file.".to_string(),
         })?;
 
+    let mut extra_frontmatter = Vec::new();
     let mut name = None;
     let mut description = None;
     let mut category = None;
@@ -56,6 +64,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
+            extra_frontmatter.push(line.to_string());
             continue;
         };
         let value = value.trim().to_string();
@@ -64,7 +73,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
             "description" => description = Some(value),
             "category" => category = Some(value),
             "version" => version = Some(value),
-            _ => {}
+            _ => extra_frontmatter.push(line.to_string()),
         }
     }
 
@@ -98,6 +107,7 @@ pub fn parse_skill_md(slug: &str, src: &str) -> Result<SkillDoc> {
         category: category.filter(|value| !value.is_empty()),
         version: version.filter(|value| !value.is_empty()),
         body: body.to_string(),
+        extra_frontmatter,
     })
 }
 
@@ -256,7 +266,7 @@ pub fn load_dir_skills(dir: &Path) -> Result<Vec<SkillDoc>> {
 ///
 /// Returns `None` when the document does not open with a `---` fence line or
 /// has no matching closing fence.
-fn split_frontmatter(src: &str) -> Option<(&str, &str)> {
+pub(super) fn split_frontmatter(src: &str) -> Option<(&str, &str)> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let after_open = strip_fence_line(src)?;
 

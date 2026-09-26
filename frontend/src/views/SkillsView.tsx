@@ -9,6 +9,7 @@ import {
   Search,
   Sparkles,
   Trash2,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -22,7 +23,11 @@ import {
   uninstallSkill,
   type RegistrySkill,
   type Skill,
+  type SkillUploadRow,
 } from "@/api/skills";
+import { getInferenceStatus } from "@/api/inference";
+import { DraftSkillDialog } from "@/views/skills/DraftSkillDialog";
+import { UploadSkillDialog } from "@/views/skills/UploadSkillDialog";
 import type { OpenCompanyClient } from "@/api/client";
 import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -55,6 +60,10 @@ import { cn } from "@/lib/utils";
 import {
   CATEGORY_STYLES,
   registryEmptyLabel,
+  SKILL_DESCRIPTION_HINT,
+  SKILL_DESCRIPTION_MAX_CHARS,
+  SKILL_DESCRIPTION_PLACEHOLDER,
+  skillDescriptionCount,
   SKILLS_READ_ONLY_NOTE,
   type SkillCategory,
   skillReachLabel,
@@ -103,6 +112,14 @@ export function SkillsView({ client, company }: Props) {
   const [registryLoading, setRegistryLoading] = useState(true);
   const [registryError, setRegistryError] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [draftOpen, setDraftOpen] = useState(false);
+  // Whether this host can draft at all. `undefined` is "it did not say" — an
+  // older host omits the field — and is read as unknown rather than as `false`,
+  // exactly as the Add-teammate dialog reads it. Only an explicit `false` hides
+  // the control, because that is the one answer that means the route could only
+  // ever return `no_model`.
+  const [canDraft, setCanDraft] = useState<boolean | undefined>(undefined);
   const [query, setQuery] = useState("");
   // A generation token so a response from a previous company scope (or after
   // unmount) can't overwrite the current one.
@@ -112,6 +129,8 @@ export function SkillsView({ client, company }: Props) {
   // enabled control, so this defaults closed the way `HostingView` does.
   const [canManage, setCanManage] = useState(false);
   const [authorityScope, setAuthorityScope] = useState({ client, company });
+  // Bumped on a scope change; keys the authoring dialogs so they remount.
+  const [scopeGen, setScopeGen] = useState(0);
 
   // Closed *during* the render that first sees a new scope, not in the effect
   // that follows it. An effect runs after commit, so the frame carrying the new
@@ -125,6 +144,10 @@ export function SkillsView({ client, company }: Props) {
     setAuthorityScope({ client, company });
     setCanManage(false);
     setAddOpen(false);
+    setUploadOpen(false);
+    setDraftOpen(false);
+    setCanDraft(undefined);
+    setScopeGen((g) => g + 1);
   }
 
   useEffect(() => {
@@ -152,6 +175,39 @@ export function SkillsView({ client, company }: Props) {
       live = false;
     };
   }, [client, company]);
+
+  // Whether to offer drafting at all. A host with no drafter can only answer
+  // `no_model`, and a control that answers nothing else is worse than no
+  // control. A failed read leaves it unknown, which keeps the button — the
+  // route's own refusal is then what says so, rather than a network blip
+  // removing a working feature.
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const status = await getInferenceStatus(client, company);
+        if (live) setCanDraft(status.designsProfiles);
+      } catch {
+        if (live) setCanDraft(undefined);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [client, company]);
+
+  // Rows an upload (or a saved draft) stored, folded into the list without a
+  // re-read: the host returns the stored skill, so refetching would only be a
+  // second chance to disagree with what it just said.
+  const takeUploaded = useCallback((rows: SkillUploadRow[]) => {
+    const stored = rows.flatMap((row) => (row.skill ? [row.skill as Skill] : []));
+    if (stored.length === 0) return;
+    setSkills((all) => [
+      ...stored,
+      ...all.filter((skill) => !stored.some((one) => one.id === skill.id)),
+    ]);
+    toast.success(stored.length === 1 ? `Added ${stored[0].name}.` : `Added ${stored.length} skills.`);
+  }, []);
 
   const refresh = useCallback(async () => {
     const mine = ++gen.current;
@@ -257,9 +313,23 @@ export function SkillsView({ client, company }: Props) {
         }
         actions={
           canManage ? (
-            <Button onClick={() => setAddOpen(true)}>
-              <Plus className="size-4" /> Add skill
-            </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" onClick={() => setUploadOpen(true)}>
+                <Upload className="size-4" /> Upload
+              </Button>
+              {canDraft !== false && (
+                <Button
+                  variant="outline"
+                  data-testid="skills-draft-trigger"
+                  onClick={() => setDraftOpen(true)}
+                >
+                  <Sparkles className="size-4" /> Draft with a teammate
+                </Button>
+              )}
+              <Button onClick={() => setAddOpen(true)}>
+                <Plus className="size-4" /> Add skill
+              </Button>
+            </div>
           ) : undefined
         }
         tabs={
@@ -384,6 +454,22 @@ export function SkillsView({ client, company }: Props) {
           setAddOpen(false);
           toast.success(`Added ${saved.name}.`);
         }}
+      />
+      <UploadSkillDialog
+        key={`upload-${scopeGen}`}
+        client={client}
+        company={company}
+        open={uploadOpen}
+        onOpenChange={setUploadOpen}
+        onUploaded={takeUploaded}
+      />
+      <DraftSkillDialog
+        key={`draft-${scopeGen}`}
+        client={client}
+        company={company}
+        open={draftOpen}
+        onOpenChange={setDraftOpen}
+        onSaved={takeUploaded}
       />
     </div>
   );
@@ -519,6 +605,8 @@ function AddSkillDialog({
   const [category, setCategory] = useState<SkillCategory>("Marketing");
   const [body, setBody] = useState("");
   const [busy, setBusy] = useState(false);
+  const described = skillDescriptionCount(description);
+  const tooLong = described > SKILL_DESCRIPTION_MAX_CHARS;
 
   function reset() {
     setName("");
@@ -528,8 +616,10 @@ function AddSkillDialog({
   }
 
   async function submit() {
-    // The host rejects a blank description, so gate on both here.
+    // The host rejects a blank description and one past the limit, so gate on
+    // all three here rather than spending a round trip to be told.
     if (!name.trim() || !description.trim()) return;
+    if (skillDescriptionCount(description) > SKILL_DESCRIPTION_MAX_CHARS) return;
     setBusy(true);
     try {
       await onAdd({ name, description, category, body });
@@ -583,7 +673,24 @@ function AddSkillDialog({
           </Select>
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="skill-desc">What it does</Label>
+          <div className="flex items-baseline justify-between gap-2">
+            <Label htmlFor="skill-desc">What it does, and when to use it</Label>
+            {/* Live, and against the host's own limit rather than a second copy
+                of the number: a counter the host disagrees with either stops the
+                operator short of a description that would have been accepted, or
+                reads green while the save is refused. */}
+            <span
+              data-testid="skill-desc-count"
+              className={cn(
+                "text-xs tabular-nums",
+                described > SKILL_DESCRIPTION_MAX_CHARS
+                  ? "text-destructive"
+                  : "text-muted-foreground",
+              )}
+            >
+              {described} / {SKILL_DESCRIPTION_MAX_CHARS}
+            </span>
+          </div>
           {/* One line, and an `Input` so it can only be one: the host collapses
               newlines out of this field, and it is what an agent reads when
               deciding whether to open the skill at all. */}
@@ -591,8 +698,12 @@ function AddSkillDialog({
             id="skill-desc"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="One line on when to use it and what it delivers."
+            placeholder={SKILL_DESCRIPTION_PLACEHOLDER}
+            aria-describedby="skill-desc-hint"
           />
+          <p id="skill-desc-hint" data-testid="skill-desc-hint" className="text-xs text-muted-foreground">
+            {SKILL_DESCRIPTION_HINT}
+          </p>
         </div>
         <div className="grid gap-2">
           <Label htmlFor="skill-body">Playbook</Label>
@@ -610,7 +721,10 @@ function AddSkillDialog({
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
             Cancel
           </Button>
-          <Button disabled={!name.trim() || !description.trim() || busy} onClick={() => void submit()}>
+          <Button
+            disabled={!name.trim() || !description.trim() || tooLong || busy}
+            onClick={() => void submit()}
+          >
             {busy && <Loader2 className="mr-1.5 size-4 animate-spin" />}
             Add skill
           </Button>

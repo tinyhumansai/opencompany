@@ -148,6 +148,27 @@ impl ProfileDrafter {
         self.model.telemetry_model()
     }
 
+    /// The model this drafter dispatches on.
+    ///
+    /// Exposed for [`skill_draft`](super::skill_draft), which is a different
+    /// prompt over the same drafter rather than a second wiring of the
+    /// provider — the console offers it from `designsProfiles`, which is this
+    /// drafter's own presence.
+    pub(crate) fn model(&self) -> &Arc<dyn HarnessModel> {
+        &self.model
+    }
+
+    /// The model name this drafter puts on a request. See [`Self::model`].
+    pub(crate) fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    /// Reads what a response cost, including the provider's own charged
+    /// amount when it reports one. See [`Self::model`].
+    pub(crate) fn usage_of(&self, response: &ModelResponse) -> TokenUsage {
+        usage_from(response)
+    }
+
     /// Drafts `field` for `subject`.
     ///
     /// **Infallible by design**, like the roster pass: there is no failure a
