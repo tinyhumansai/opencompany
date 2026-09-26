@@ -208,3 +208,35 @@ fn with_composio_the_connected_integrations_brief_stays_runtime_deferred() {
         entry.reason
     );
 }
+
+/// The server-family brief must describe a missing `mcp` feature as the
+/// compile-time absence it is, not as a section waiting on live server state.
+///
+/// Same shape as the Composio test above, and for the same reason: the call site
+/// that appends this brief is `#[cfg(feature = "mcp")]`, so a binary without it
+/// can never include the section whatever the company has configured.
+#[test]
+#[cfg(all(feature = "openhuman", not(feature = "mcp")))]
+fn without_mcp_the_server_family_brief_names_the_missing_feature() {
+    let manifest = manifest(
+        "[company]\nname = \"Acme\"\n\n[[agent]]\nid = \"pm\"\nrole = \"Product Manager\"\n",
+    );
+    let dumped = dump(&manifest);
+    let entry = dumped[0]
+        .deferred
+        .iter()
+        .find(|d| d.title == "MCP server-family brief")
+        .expect("always reported, so the dump never looks complete while missing a section");
+    assert!(
+        entry.reason.contains("--features mcp"),
+        "a binary without `mcp` wires neither dispatch tool, so the reason must name the \
+         missing feature: {}",
+        entry.reason
+    );
+    assert!(
+        !entry.reason.contains("live server"),
+        "must not describe this as runtime-deferred when an `mcp`-less binary can never \
+         include it: {}",
+        entry.reason
+    );
+}

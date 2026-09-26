@@ -403,7 +403,24 @@ fn harness_sections(
 
     deferred.push(Deferred {
         title: "MCP capability brief".to_string(),
-        reason: "appended only when this agent is granted an enabled MCP server, which needs a configured registry".to_string(),
+        reason: "appended only when this agent is granted an enabled MCP server or an explicit `mcp_registry` install, which needs a configured registry".to_string(),
+    });
+
+    // The server-family brief: one line per reachable server naming the dispatch
+    // tool that addresses it. Its rows are the live declared set reconciled
+    // against the directory installs, so a manifest alone cannot know them.
+    // Split on the feature for the reason PR #1780 gave for the Composio brief
+    // above — the call site is `#[cfg(feature = "mcp")]`, so in a binary without
+    // it the section is a compile-time absence, not a runtime-deferred one.
+    #[cfg(feature = "mcp")]
+    deferred.push(Deferred {
+        title: "MCP server-family brief".to_string(),
+        reason: "appended only when a dispatch tool is wired; it names each reachable server and the tool that addresses it, which needs the live server and install state".to_string(),
+    });
+    #[cfg(not(feature = "mcp"))]
+    deferred.push(Deferred {
+        title: "MCP server-family brief".to_string(),
+        reason: "this binary was built without `--features mcp`, so neither MCP dispatch tool is wired and there is no family to name; rebuild with `--features openhuman,mcp` to see it".to_string(),
     });
 
     // Issue #1759: the connected-integration grounding + Composio-routing brief.

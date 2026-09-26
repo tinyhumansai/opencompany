@@ -75,6 +75,18 @@ pub mod ledger_file;
 pub mod ledgers;
 mod manifest;
 pub mod mcp;
+/// The one rule that decides whether two MCP records name the same server,
+/// shared by the console's server list and the agent prompt that tells a model
+/// which dispatch tool reaches which server.
+pub(crate) mod mcp_endpoint;
+/// Which of an agent's two MCP dispatch tools reaches which connected server,
+/// rendered for its system prompt. Ungated: the prompt is composed from company
+/// data, and the rule is worth testing without a harness build.
+// The only caller is the prompt builder, which needs `openhuman` to exist and
+// `mcp` to be wired. The renderer stays ungated regardless so its tests run in
+// the default lane rather than only in the `mcp` lane's filter (issue #770).
+#[cfg_attr(not(all(feature = "openhuman", feature = "mcp")), allow(dead_code))]
+pub(crate) mod mcp_families;
 /// The bundle's MCP declaration file: `companies/<name>/mcp.json`. A vertical
 /// ships the tool servers its work needs the way it already ships its ledgers,
 /// rather than starting with an empty tool surface somebody has to fill in by

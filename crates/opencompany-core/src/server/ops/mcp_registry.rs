@@ -49,6 +49,7 @@ use axum::routing::{delete, get, post, put};
 use crate::AppState;
 use crate::company::McpServer;
 use crate::company::mcp::{McpHealth, McpSource};
+use crate::company::mcp_endpoint::normalize_endpoint;
 use crate::server::ops::mcp::{McpServerDto, RosterAgentDto};
 use crate::server::ops::scoped;
 
@@ -125,56 +126,6 @@ pub(super) struct RegistryInstall {
 // ---------------------------------------------------------------------------
 // Endpoint reconciliation — always compiled
 // ---------------------------------------------------------------------------
-
-/// Normalises an MCP endpoint to the identity two lists are compared on:
-/// lowercased scheme and host, default port dropped, query and fragment
-/// stripped, trailing slash dropped.
-///
-/// **The query string must go.** A List A server can carry its credential as a
-/// query parameter (the BrowserBase style — see
-/// [`AuthMaterial::QueryParam`](crate::company::mcp::AuthMaterial::QueryParam)),
-/// so `…/mcp?token=abc` and `…/mcp` are the same server reached two ways. A
-/// comparison that kept the query would never match them and the operator would
-/// get the duplicate row this whole rule exists to prevent — with two
-/// credentials and two health badges disagreeing about one server.
-///
-/// Returns `None` for a blank endpoint, which is what a stdio install has: no
-/// address means nothing to reconcile *on*, not "reconciles with everything".
-pub(super) fn normalize_endpoint(endpoint: &str) -> Option<String> {
-    let raw = endpoint.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let (scheme, rest) = match raw.split_once("://") {
-        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
-        // Not a URL we can decompose. Compare it case-insensitively as a whole
-        // rather than guessing at a shape — a wrong split would merge two
-        // unrelated rows, which is worse than leaving a duplicate.
-        None => return Some(raw.to_ascii_lowercase()),
-    };
-    // `?` and `#` cannot legally appear in an authority, so cutting them off the
-    // whole remainder first is safe and handles `https://host?q` too.
-    let cut = rest.find(['?', '#']).unwrap_or(rest.len());
-    let rest = &rest[..cut];
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    let mut authority = authority.to_ascii_lowercase();
-    for (default_scheme, port) in [("http", ":80"), ("https", ":443")] {
-        if scheme == default_scheme
-            && let Some(host) = authority.strip_suffix(port)
-        {
-            authority = host.to_string();
-            break;
-        }
-    }
-    let path = path.trim_end_matches('/');
-    if authority.is_empty() && path.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{authority}{path}"))
-}
 
 /// A display slug for a registry row, derived from its qualified name.
 ///

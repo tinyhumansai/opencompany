@@ -139,9 +139,11 @@ pub(crate) fn grants_cover_server(grants: &[String], name: &str) -> bool {
 /// with [`agent_effective_grants`](crate::runtime::builder::agent_effective_grants)
 /// first, never the raw per-agent `tools`.
 ///
-/// Gated with the harness: every caller is behind `feature = "openhuman"`,
-/// unlike [`grants_cover_server`], which `server/ops/mcp.rs` also reads.
-#[cfg(feature = "openhuman")]
+/// Ungated, like [`grants_cover_server`]: the call path that enforces it ships
+/// with the harness, but the agent prompt that tells a model which install it
+/// may address is composed without one, and both have to answer this question
+/// the same way.
+#[cfg_attr(not(feature = "openhuman"), allow(dead_code))]
 pub(crate) fn grants_cover_registry_server(grants: &[String], server_id: &str) -> bool {
     let want = format!("mcp_registry.{server_id}");
     // Only a grant rooted at this namespace reaches it. The catch-all `*` never

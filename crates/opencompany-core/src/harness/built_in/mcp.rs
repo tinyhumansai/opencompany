@@ -130,11 +130,32 @@ pub fn granted_policies(
 
 /// A persona brief appended when an agent is granted MCP tools: a stale-memory
 /// mitigation directing the agent to answer capability questions from a **live**
-/// `mcp_list_servers` / `mcp_list_tools` call, never from memory (the effective
-/// server set can change between turns — the MCP-freshness path). The root fix
-/// for stale answers lives in the Memory cell; this is the mitigation.
-pub fn capability_brief() -> String {
-    " When you are asked what tools, integrations, or MCP servers you have — or whether you can do something that would use one — ALWAYS call `mcp_list_servers` (and `mcp_list_tools` for a specific server) to check what is available right now. Never answer such questions from memory: your available servers and tools can change between turns.".to_string()
+/// enumeration call, never from memory (the effective server set can change
+/// between turns — the MCP-freshness path). The root fix for stale answers lives
+/// in the Memory cell; this is the mitigation.
+///
+/// The two families enumerate through different tools, so the brief names only
+/// the ones the agent was actually wired: an agent holding a directory install
+/// and no declared server has no `mcp_list_servers` to call, and naming it would
+/// send the model at a tool it cannot see. Empty when neither family is wired.
+pub fn capability_brief(declared: bool, registry: bool) -> String {
+    let enumerate = match (declared, registry) {
+        (true, true) => {
+            "`mcp_list_servers` and `mcp_registry_installed_list` (and `mcp_list_tools` or \
+             `mcp_registry_list_tools` for a specific server)"
+        }
+        (true, false) => "`mcp_list_servers` (and `mcp_list_tools` for a specific server)",
+        (false, true) => {
+            "`mcp_registry_installed_list` (and `mcp_registry_list_tools` for a specific server)"
+        }
+        (false, false) => return String::new(),
+    };
+    format!(
+        " When you are asked what tools, integrations, or MCP servers you have — or whether you \
+         can do something that would use one — ALWAYS call {enumerate} to check what is available \
+         right now. Never answer such questions from memory: your available servers and tools can \
+         change between turns."
+    )
 }
 
 /// The company's granted MCP servers, rendered as [`openhuman_embed::McpServer`]

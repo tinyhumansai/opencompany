@@ -691,3 +691,45 @@ fn get_on_a_store_that_fails_to_read_reports_store_error() {
         "a failing store read must surface as Store, got: {error:?}"
     );
 }
+
+/// The declared family enumerates through `mcp_list_servers`.
+#[test]
+fn a_declared_only_agent_is_pointed_at_the_declared_enumeration_tools() {
+    let brief = capability_brief(true, false);
+    assert!(brief.contains("mcp_list_servers"), "{brief}");
+    assert!(
+        !brief.contains("mcp_registry_installed_list"),
+        "it holds no registry tool, so naming one sends it at a tool it cannot see: {brief}"
+    );
+}
+
+/// The registry family enumerates through different tools, and an agent holding
+/// only that family used to be told nothing at all.
+#[test]
+fn a_registry_only_agent_is_pointed_at_the_registry_enumeration_tools() {
+    let brief = capability_brief(false, true);
+    assert!(
+        !brief.is_empty(),
+        "a registry-only agent still gets the brief"
+    );
+    assert!(brief.contains("mcp_registry_installed_list"), "{brief}");
+    assert!(brief.contains("mcp_registry_list_tools"), "{brief}");
+    assert!(
+        !brief.contains("mcp_list_servers"),
+        "`mcp_list_servers` is not on this agent's belt: {brief}"
+    );
+}
+
+/// Both families wired names both enumeration paths.
+#[test]
+fn an_agent_holding_both_families_is_pointed_at_both() {
+    let brief = capability_brief(true, true);
+    assert!(brief.contains("mcp_list_servers"), "{brief}");
+    assert!(brief.contains("mcp_registry_installed_list"), "{brief}");
+}
+
+/// No MCP family wired means no brief, rather than one naming nothing.
+#[test]
+fn an_agent_with_no_mcp_family_gets_no_capability_brief() {
+    assert_eq!(capability_brief(false, false), "");
+}
