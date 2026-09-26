@@ -128,13 +128,31 @@ pub fn granted_policies(
     )
 }
 
-/// A persona brief appended when an agent is granted MCP tools: a stale-memory
-/// mitigation directing the agent to answer capability questions from a **live**
-/// `mcp_list_servers` / `mcp_list_tools` call, never from memory (the effective
-/// server set can change between turns — the MCP-freshness path). The root fix
-/// for stale answers lives in the Memory cell; this is the mitigation.
-pub fn capability_brief() -> String {
-    " When you are asked what tools, integrations, or MCP servers you have — or whether you can do something that would use one — ALWAYS call `mcp_list_servers` (and `mcp_list_tools` for a specific server) to check what is available right now. Never answer such questions from memory: your available servers and tools can change between turns.".to_string()
+/// The names of the enabled servers `grants` reach — the same narrowing
+/// [`registry_for_agent`] applies, with nothing but the names.
+pub fn granted_server_names(decls: &[McpServerDecl], grants: &[String]) -> Vec<String> {
+    decls
+        .iter()
+        .filter(|decl| decl.enabled && grants_cover_server(grants, &decl.name))
+        .map(|decl| decl.name.clone())
+        .collect()
+}
+
+/// A persona brief appended when an agent is granted MCP servers: names the
+/// servers it may reach and directs it to answer capability questions from a
+/// **live** `mcp_list_tools` call on one of them, never from memory.
+///
+/// Carries server names only. Endpoints and credentials never reach the
+/// persona, and there is no server-listing tool to recover them from.
+pub fn capability_brief(servers: &[String]) -> String {
+    let named = servers
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        " Your connected MCP servers: {named}. When you are asked what tools or integrations you have — or whether you can do something that would use one — ALWAYS call `mcp_list_tools` with the server's name to check what it offers right now. Never answer such questions from memory: a server's tools can change between turns."
+    )
 }
 
 /// The company's granted MCP servers, rendered as [`openhuman_embed::McpServer`]
@@ -147,11 +165,10 @@ pub fn capability_brief() -> String {
 /// "the company agents run on the embedded OpenHuman runtime, whose tool set
 /// is its own (plus MCP servers) — there is no seam for a `Tool` this crate
 /// built" for a company AGENT (as opposed to an in-process auxiliary pass).
-/// [`OcMcpCallTool`] / [`OcMcpListServersTool`] / upstream's
-/// `McpListToolsTool` are exactly such tools — pushed onto
+/// [`OcMcpCallTool`] and upstream's `McpListToolsTool` are exactly such
+/// tools — pushed onto
 /// [`AgentBlueprint::tools`](crate::harness::built_in::build::AgentBlueprint::tools)
-/// under the reserved names `mcp_call_tool` / `mcp_list_servers` /
-/// `mcp_list_tools` so the OLD native-dispatch builder (`tool_dispatcher.rs`,
+/// under the reserved names `mcp_call_tool` / `mcp_list_tools` so the OLD native-dispatch builder (`tool_dispatcher.rs`,
 /// removed when the runtime moved to the hosted pipeline) would run OC's
 /// decorator instead of OpenHuman's own implementation of those names.
 ///
@@ -169,12 +186,12 @@ pub fn capability_brief() -> String {
 /// "call repeatedly to add several") is meant to be used, alongside the
 /// `opencompany` attachment.
 ///
-/// **Known gap left open by this fix**: OpenHuman's own `mcp_call_tool` /
-/// `mcp_list_servers` do not scrub credentials the way `OcMcpCallTool`'s
-/// `handle_failure` and `OcMcpListServersTool` do (see this module's security
-/// note above) — a transport failure or a `mcp_list_servers` call can now
-/// surface a configured bearer/token verbatim to the agent for a
-/// directly-attached company server. Restoring that hardening needs a real
+/// **Known gap left open by this fix**: OpenHuman's own `mcp_call_tool` does
+/// not scrub credentials the way `OcMcpCallTool`'s `handle_failure` does (see
+/// this module's security note above) — a transport failure can surface a
+/// configured bearer/token verbatim to the agent for a directly-attached
+/// company server. `mcp_list_servers` is kept out of every company agent's
+/// tool scope for the same reason. Restoring that hardening needs a real
 /// seam into the hosted pipeline (a job for hive-desks Phase 4), not a
 /// band-aid here; it is called out rather than silently reintroduced.
 pub fn embed_servers_for_agent(
@@ -527,7 +544,7 @@ impl Tool for OcMcpCallTool {
             "properties": {
                 "server": {
                     "type": "string",
-                    "description": "Registered MCP server name from `mcp_list_servers`."
+                    "description": "Registered MCP server name, from the granted servers named in your persona brief."
                 },
                 "tool": {
                     "type": "string",

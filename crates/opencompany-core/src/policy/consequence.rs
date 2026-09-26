@@ -668,13 +668,13 @@ const DECLARED: &[Declared] = &[
     d("describe_skill", EffectGroup::Other, Reach::Nothing),
     d("read_skill_resource", EffectGroup::Other, Reach::Nothing),
     // ---- MCP ---------------------------------------------------------------
-    // The agent persona *instructs* every agent to call `mcp_list_servers` (and
-    // `mcp_list_tools` for a specific server) rather than answer a capability
-    // question from memory, so parking them made the guidance that exists to
-    // prevent stale answers cost an operator approval to follow (issue #443).
+    // The agent persona *instructs* every agent to call `mcp_list_tools` on a
+    // named server rather than answer a capability question from memory, so
+    // parking it made the guidance that exists to prevent stale answers cost
+    // an operator approval to follow (issue #443).
     //
-    // `mcp_list_servers` and `mcp_registry_list_tools` read process-local
-    // registration state, credentials already redacted. `mcp_list_tools` is
+    // `mcp_registry_list_tools` reads process-local registration state,
+    // credentials already redacted. `mcp_list_tools` is
     // NOT local — it is a `tools/list` round trip to the operator-configured
     // server. It is `Nothing` all the same: it changes nothing there or here
     // and is billed for nothing, and a desk that cannot ask a server what it
@@ -683,7 +683,6 @@ const DECLARED: &[Declared] = &[
     //
     // Calling *through* a server is a consequence and stays per-call: it can
     // perform any effect the third-party server advertises.
-    d("mcp_list_servers", EffectGroup::Other, Reach::Nothing),
     d("mcp_list_tools", EffectGroup::Other, Reach::Nothing),
     d(
         "mcp_registry_list_tools",

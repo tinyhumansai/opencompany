@@ -2,7 +2,7 @@
 
 Issue #50. Each company can expose remote **MCP tool servers** to its agents.
 An agent granted a server reaches it through the generic bridge tools
-(`mcp_list_servers`, `mcp_list_tools`, `mcp_call_tool`), reusing OpenHuman's
+(`mcp_list_tools`, `mcp_call_tool`), reusing OpenHuman's
 `mcp_client` registry, its HTTP transport, and its prompt-injection safety
 filter over remote tool metadata.
 
@@ -53,10 +53,10 @@ key `mcp/{name}/auth`. It is **write-only** over the API: set via the `token`
 field on add/update, stored in the secret store, and **never** returned. The
 read shape carries only an `authConfigured` boolean.
 
-The agent-facing surface is redacted too: `OcMcpListServersTool`
-([`harness::mcp`](../../src/harness/mcp.rs)) replaces OpenHuman's own
-`mcp_list_servers` (which serializes bearer tokens into agent-visible output)
-with a drop-in that emits the same shape minus any credential. A regression
+The agent-facing surface is redacted too: no company agent's tool scope names
+`mcp_list_servers`, because OpenHuman's own implementation serializes each
+server's credentials into agent-visible output. The persona brief names the
+agent's granted servers instead — names only, no endpoint or auth. A regression
 test drives `mcp_call_tool` against an in-process MCP server and asserts the
 bearer reaches the *server* over the wire but never appears in any `ToolResult`.
 
@@ -85,11 +85,11 @@ classified for audit, but policy-generated HITL is disabled.
 needs sign-off calls `request_approval` explicitly before invoking it.
 `readonly` remains a hard denial.
 
-`mcp_list_servers` and `mcp_list_tools` do not require approval. They read
-local registration state with credentials already redacted and reach nothing.
-This matters more than one saved prompt: the persona brief appended to every
-MCP-granted agent *instructs* it to answer capability questions from a live
-`mcp_list_servers` call rather than from memory. These reads must remain
+`mcp_list_tools` does not require approval. It changes nothing and is billed
+for nothing. This matters more than one saved prompt: the persona brief
+appended to every MCP-granted agent *instructs* it to answer capability
+questions from a live `mcp_list_tools` call on a named server rather than from
+memory. These reads must remain
 uninterrupted so the guidance that prevents stale answers is usable on an
 agent's first move.
 

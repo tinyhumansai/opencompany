@@ -429,11 +429,7 @@ fn web_search_is_still_a_priced_call() {
 async fn listing_mcp_servers_and_tools_runs_without_asking() {
     in_cycle(async {
         let p = policy("supervised", &[], None);
-        for tool in [
-            "mcp_list_servers",
-            "mcp_list_tools",
-            "mcp_registry_list_tools",
-        ] {
+        for tool in ["mcp_list_tools", "mcp_registry_list_tools"] {
             assert_eq!(
                 p.check(&request(tool, serde_json::json!({}))).await,
                 ToolPolicyDecision::Allow,

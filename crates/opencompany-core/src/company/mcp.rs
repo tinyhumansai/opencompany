@@ -743,6 +743,11 @@ pub fn validate_servers(servers: &[McpServer]) -> Vec<String> {
     problems
 }
 
+/// Server names a company may not declare: the runtime merges servers by
+/// name, last write wins, so a company server under one of these would stand
+/// in for OpenCompany's own MCP server or OpenHuman's docs server.
+pub const RESERVED_SERVER_NAMES: &[&str] = &["opencompany", "gitbooks"];
+
 /// Validates a single server declaration under a caller-supplied `label`.
 pub fn validate_one(label: &str, server: &McpServer) -> Vec<String> {
     let mut problems = Vec::new();
@@ -751,6 +756,13 @@ pub fn validate_one(label: &str, server: &McpServer) -> Vec<String> {
 
     if name.is_empty() {
         problems.push(format!("{label} is missing a `name`."));
+    } else if let Some(reserved) = RESERVED_SERVER_NAMES
+        .iter()
+        .find(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        problems.push(format!(
+            "{label} uses the name `{reserved}`, which is reserved for a server OpenCompany runs itself — choose another name."
+        ));
     }
 
     if server

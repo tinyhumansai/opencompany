@@ -115,8 +115,8 @@ use crate::harness::built_in::provider::HarnessModel;
 use crate::harness::file_tool_outputs::WritePromotion;
 #[cfg(feature = "mcp")]
 use crate::harness::mcp::{
-    OcMcpCallTool, OcMcpListServersTool, OcMcpRegistryInstalledListTool, OcMcpRegistryScopedTool,
-    capability_brief, granted_policies, granted_secrets, registry_for_agent,
+    OcMcpCallTool, OcMcpRegistryInstalledListTool, OcMcpRegistryScopedTool, capability_brief,
+    granted_policies, granted_secrets, granted_server_names, registry_for_agent,
 };
 use crate::harness::orchestrator;
 use crate::harness::policy::ApprovalPolicy;
@@ -1111,11 +1111,10 @@ pub fn build_agent_with_model(
     }
 
     // MCP bridge (issue #50): if this agent is granted any enabled MCP server
-    // (via its `mcp:*` tool grants), give it the three bridge tools over a
-    // registry scoped to just those servers. The registry reuses OpenHuman's
-    // HTTP transport + injection-safety filter. The credential-redacting
-    // `OcMcpListServersTool` replaces upstream's list-servers tool (which would
-    // serialize bearer tokens into agent-visible output). `mcp_call_tool` takes
+    // (via its `mcp:*` tool grants), give it the bridge tools over a registry
+    // scoped to just those servers. The registry reuses OpenHuman's HTTP
+    // transport + injection-safety filter. No server-listing tool is wired:
+    // OpenHuman's own serializes each server's credentials. `mcp_call_tool` takes
     // a permissive OpenHuman `SecurityPolicy` (Supervised — allows `Act`);
     // OpenCompany's own `ApprovalPolicy` tool policy below stays the real
     // per-call gate.
@@ -1124,7 +1123,7 @@ pub fn build_agent_with_model(
         // Reaches the model natively: `agent_spec_for` attaches each of these
         // to the `AgentSpec` via `AgentSpec::mcp`, alongside the internal
         // `opencompany` server, so OpenHuman's own `mcp_call_tool` /
-        // `mcp_list_servers` / `mcp_list_tools` — the only implementations of
+        // `mcp_list_tools` — the only implementations of
         // those names that actually run for a company agent now — can reach
         // this company's own registered servers by name. See
         // `embed_servers_for_agent`'s doc comment for the full story.
@@ -1139,7 +1138,6 @@ pub fn build_agent_with_model(
         // reach servers even when `manifest_agent.tools` is empty.
         let secrets = granted_secrets(&deps.mcp_servers, grants);
         let mcp_policies = granted_policies(&deps.mcp_servers, grants);
-        tools.push(Box::new(OcMcpListServersTool::new(registry.clone())));
         tools.push(Box::new(McpListToolsTool::new(registry.clone())));
         // `OcMcpCallTool` replaces upstream's `McpCallTool`: same name/schema,
         // but it classifies + scrubs failures, rewrites the agent-facing text,
@@ -1161,9 +1159,10 @@ pub fn build_agent_with_model(
             },
             mcp_policies,
         )));
-        // Stale-memory mitigation: direct the agent to answer capability
-        // questions from a live `mcp_list_servers` call, never from memory.
-        persona.push_str(&capability_brief());
+        persona.push_str(&capability_brief(&granted_server_names(
+            &deps.mcp_servers,
+            grants,
+        )));
     }
 
     // Orchestrator seam (issues #53 + #67 + #71): the company's orchestrator agent
@@ -1472,7 +1471,6 @@ pub const OPENHUMAN_NATIVE_TOOLS: &[&str] = &[
     "http_request",
     "curl",
     "image_info",
-    "mcp_list_servers",
     "mcp_list_tools",
     "mcp_call_tool",
 ];
@@ -1583,47 +1581,9 @@ pub fn agent_spec_for(
     // The MCP attachment stays for what MCP is actually for — the speech tools
     // an episode seat answers with, and any server an operator connected to
     // this company. A company with neither carries no bridge tools at all.
-    let mut tool_names = blueprint.native_tool_names.clone();
+    let tool_names = scope_tool_names(blueprint, belt, mcp.is_some());
     let mut system_prompt = blueprint.system_prompt.clone();
-    if let Some(belt) = belt {
-        for tool in belt.iter() {
-            let name = tool.name().to_string();
-            if blueprint.unadvertised.contains(&name) {
-                continue;
-            }
-            if !tool_names.contains(&name) {
-                tool_names.push(name);
-            }
-        }
-    }
-    // **The scope has to allow what a seated turn may carry.**
-    //
-    // `ToolScopeSpec::Named` is fixed when the agent is registered; the
-    // episode's belt arrives per turn. A name the scope does not list is
-    // dropped before the model sees it, so a seat was offered its teammate's
-    // belt and told to reach the room over MCP -- the envelope this work
-    // exists to remove, still there because the scope had never heard of
-    // `desk_complete_episode`.
-    //
-    // Listing them here costs nothing on an ordinary turn: the belt factory
-    // decides whether the tools exist at all, and the episode's own admission
-    // gates them when they do. The scope only stops being a reason they
-    // cannot.
-    for speech in crate::hive::tools::served_speech_tool_names()
-        .into_iter()
-        .chain([crate::hive::takeover::TAKE_OVER_TOOL])
-    {
-        let prefixed = format!("{}{speech}", crate::hive::host::TOOL_PREFIX);
-        if !tool_names.contains(&prefixed) {
-            tool_names.push(prefixed);
-        }
-    }
     if let Some(mcp) = mcp {
-        for bridge in ["mcp_list_tools", "mcp_call_tool"] {
-            if !tool_names.iter().any(|name| name == bridge) {
-                tool_names.push(bridge.to_string());
-            }
-        }
         system_prompt.push_str(&opencompany_mcp_brief(&mcp.allow_tools));
     }
     let entry = registry_entry(
@@ -1822,7 +1782,66 @@ pub fn agent_spec_for(
         // agent shapes disagreed about the tool protocol for no reason. Pin the
         // pooled path to the same one.
         config.agent.tool_dispatcher = "native".into();
+        withhold_openhuman_docs(config);
     })
+}
+
+/// Turns off OpenHuman's own documentation server, which its default config
+/// seeds into every agent's MCP registry, along with the docs tools it backs.
+fn withhold_openhuman_docs(config: &mut oh::config::Config) {
+    config.gitbooks.enabled = false;
+}
+
+/// The names an agent's `ToolScopeSpec::Named` scope lists: the belt's
+/// native subset, the rest of the shared belt, the speech tools a seated turn
+/// may carry, and — when an MCP server is attached — the two bridge tools.
+fn scope_tool_names(
+    blueprint: &AgentBlueprint,
+    belt: Option<&Arc<Vec<Arc<dyn Tool>>>>,
+    mcp_attached: bool,
+) -> Vec<String> {
+    let mut tool_names = blueprint.native_tool_names.clone();
+    if let Some(belt) = belt {
+        for tool in belt.iter() {
+            let name = tool.name().to_string();
+            if blueprint.unadvertised.contains(&name) {
+                continue;
+            }
+            if !tool_names.contains(&name) {
+                tool_names.push(name);
+            }
+        }
+    }
+    // **The scope has to allow what a seated turn may carry.**
+    //
+    // `ToolScopeSpec::Named` is fixed when the agent is registered; the
+    // episode's belt arrives per turn. A name the scope does not list is
+    // dropped before the model sees it, so a seat was offered its teammate's
+    // belt and told to reach the room over MCP -- the envelope this work
+    // exists to remove, still there because the scope had never heard of
+    // `desk_complete_episode`.
+    //
+    // Listing them here costs nothing on an ordinary turn: the belt factory
+    // decides whether the tools exist at all, and the episode's own admission
+    // gates them when they do. The scope only stops being a reason they
+    // cannot.
+    for speech in crate::hive::tools::served_speech_tool_names()
+        .into_iter()
+        .chain([crate::hive::takeover::TAKE_OVER_TOOL])
+    {
+        let prefixed = format!("{}{speech}", crate::hive::host::TOOL_PREFIX);
+        if !tool_names.contains(&prefixed) {
+            tool_names.push(prefixed);
+        }
+    }
+    if mcp_attached {
+        for bridge in ["mcp_list_tools", "mcp_call_tool"] {
+            if !tool_names.iter().any(|name| name == bridge) {
+                tool_names.push(bridge.to_string());
+            }
+        }
+    }
+    tool_names
 }
 
 /// The prompt section that tells an agent where this crate's tools went: on

@@ -316,7 +316,7 @@ fn every_registered_tool_is_declared() {
         "file_read",
         "describe_skill",
         #[cfg(feature = "mcp")]
-        "mcp_list_servers",
+        "mcp_list_tools",
         #[cfg(feature = "mcp")]
         "mcp_call_tool",
     ] {

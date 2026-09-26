@@ -291,3 +291,35 @@ fn stdio_command_is_rejected_in_hosted_v1() {
         "{problems:?}"
     );
 }
+
+#[test]
+fn a_reserved_server_name_is_refused_in_any_case() {
+    for name in ["opencompany", "OpenCompany", " gitbooks ", "GITBOOKS"] {
+        let problems = validate_one("mcp server", &server(name, "https://mcp.example/mcp"));
+        assert_eq!(problems.len(), 1, "`{name}` must be refused: {problems:?}");
+        assert!(problems[0].contains("reserved"), "{problems:?}");
+    }
+    assert!(
+        validate_one(
+            "mcp server",
+            &server("opencompany-crm", "https://mcp.example/mcp")
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_manifest_declaring_a_reserved_server_name_fails_validation() {
+    let problems = validate_servers(&[server("OpenCompany", "https://mcp.example/mcp")]);
+    assert!(
+        problems.iter().any(|problem| problem.contains("reserved")),
+        "{problems:?}"
+    );
+}
+
+#[cfg(feature = "openhuman")]
+#[test]
+fn the_reserved_names_are_the_servers_the_runtime_owns() {
+    assert!(RESERVED_SERVER_NAMES.contains(&crate::hive::mcp_server::SERVER_SLUG));
+    assert!(RESERVED_SERVER_NAMES.contains(&openhuman_core::mcp::host::GITBOOKS_SERVER_NAME));
+}

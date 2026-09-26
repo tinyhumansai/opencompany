@@ -359,7 +359,7 @@ fn mcp_registry_tools_fail_closed_with_no_registry_home() {
         &CompanyId::new("acme"),
         "Acme",
         &manifest_agent,
-        policy,
+        std::sync::Arc::new(policy),
         &deps,
         &grants,
         &[],

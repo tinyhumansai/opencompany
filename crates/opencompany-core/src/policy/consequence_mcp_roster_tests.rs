@@ -6,12 +6,8 @@ use serde_json::json;
 /// than answer a capability question from memory. They read local
 /// registration state and reach nothing.
 #[test]
-pub(super) fn listing_mcp_servers_and_tools_never_parks_but_calling_through_one_does() {
-    for tool in [
-        "mcp_list_servers",
-        "mcp_list_tools",
-        "mcp_registry_list_tools",
-    ] {
+pub(super) fn listing_mcp_tools_never_parks_but_calling_through_a_server_does() {
+    for tool in ["mcp_list_tools", "mcp_registry_list_tools"] {
         assert_eq!(c(tool).reach, Reach::Nothing, "`{tool}` reads local state");
     }
     for tool in ["mcp_call_tool", "mcp_registry_tool_call"] {
@@ -20,6 +16,23 @@ pub(super) fn listing_mcp_servers_and_tools_never_parks_but_calling_through_one_
             "`{tool}` can perform any effect the remote server advertises"
         );
     }
+}
+
+/// `mcp_list_servers` answers with each configured server's credentials, so it
+/// is kept out of every company agent's scope rather than classified as the read
+/// its name suggests. Undeclared is therefore the intended state, and an
+/// undeclared name grades as a per-call consequence — the safe direction.
+///
+/// Asserted here so that putting the name back in the roster as a free read has
+/// to be a deliberate change to this test, not a quiet one.
+#[test]
+pub(super) fn listing_the_configured_servers_is_not_a_free_read_for_a_company_agent() {
+    let listing = c("mcp_list_servers");
+    assert!(
+        listing.reach.parks_under_supervision(),
+        "an undeclared `mcp_list_servers` must not grade as a read: {listing:?}"
+    );
+    assert_eq!(listing.standing, Standing::PerCall);
 }
 
 /// The sibling defects the same sweep turned up: four pure reads of the

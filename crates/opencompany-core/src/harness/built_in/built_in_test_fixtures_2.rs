@@ -459,9 +459,8 @@ pub(super) fn belt(grants: &[&str], is_orchestrator: bool, wire_everything: bool
             crate::company::credentials::Credential::from_value("managed-platform-token"),
             crate::company::DEFAULT_SEARCH_DAILY_CALLS,
         ));
-        // A registered MCP server is what puts `mcp_list_servers`,
-        // `mcp_list_tools` and `mcp_call_tool` on the belt — the three
-        // tools issue #443 is about. Without one the coverage check would
+        // A registered MCP server is what puts `mcp_list_tools` and
+        // `mcp_call_tool` on the belt — the tools issue #443 is about. Without one the coverage check would
         // pass while never having looked at them.
         // A skills source dir is what puts `list_skills`, `describe_skill`
         // and `read_skill_resource` on the belt (named for skills since

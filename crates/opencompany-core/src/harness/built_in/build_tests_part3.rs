@@ -199,3 +199,88 @@ fn the_tool_iteration_cap_is_uniform_and_not_manifest_configurable() {
         );
     }
 }
+
+#[cfg(feature = "mcp")]
+#[test]
+fn an_agent_granted_a_company_server_is_never_scoped_to_list_servers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut deps = pin_deps(dir.path().to_path_buf());
+    deps.mcp_servers = vec![crate::company::mcp::McpServerDecl {
+        name: "notes".to_string(),
+        endpoint: "https://mcp.example.test/notes".to_string(),
+        description: None,
+        allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+        read_only_tools: Vec::new(),
+        timeout_secs: 30,
+        enabled: true,
+        source: crate::company::mcp::McpSource::Runtime,
+        auth: crate::company::mcp::AuthMaterial::Bearer("sk-notes-secret".to_string()),
+        tool_policies: Default::default(),
+        tool_inventory: Default::default(),
+    }];
+    let policy = ApprovalPolicy::new(&Policy::default(), None);
+    let blueprint = build_agent(
+        &CompanyId::new("acme"),
+        "Acme",
+        &manifest_agent("Desk Lead", None),
+        std::sync::Arc::new(policy),
+        &deps,
+        &["mcp:notes".to_string()],
+        &[],
+        &[],
+        None,
+        false,
+    )
+    .expect("agent builds");
+
+    for attached in [false, true] {
+        let scope = scope_tool_names(&blueprint, None, attached);
+        assert!(
+            scope.iter().any(|name| name == "mcp_list_tools"),
+            "a granted server must still be reachable: {scope:?}"
+        );
+        assert!(
+            !scope.iter().any(|name| name == "mcp_list_servers"),
+            "`mcp_list_servers` answers with each server's credentials: {scope:?}"
+        );
+    }
+    assert!(
+        !blueprint
+            .tool_names()
+            .iter()
+            .any(|name| name == "mcp_list_servers"),
+        "{:?}",
+        blueprint.tool_names()
+    );
+    assert!(
+        blueprint
+            .system_prompt
+            .contains("Your connected MCP servers: `notes`."),
+        "the brief names the granted server"
+    );
+    assert!(!blueprint.system_prompt.contains("mcp_list_servers"));
+    assert!(!blueprint.system_prompt.contains("mcp.example.test"));
+    assert!(!blueprint.system_prompt.contains("sk-notes-secret"));
+}
+
+#[test]
+fn a_company_agent_config_seeds_no_openhuman_docs_server() {
+    let mut config = openhuman_core::config::Config::default();
+    config.mcp_client.enabled = true;
+    let seeded = |config: &openhuman_core::config::Config| {
+        openhuman_core::mcp::host::client_config(config)
+            .servers
+            .iter()
+            .any(|server| server.name == openhuman_core::mcp::host::GITBOOKS_SERVER_NAME)
+    };
+    assert!(
+        seeded(&config),
+        "the premise: OpenHuman's default config seeds its docs server"
+    );
+
+    withhold_openhuman_docs(&mut config);
+
+    assert!(!config.gitbooks.enabled);
+    assert!(!seeded(&config));
+}
