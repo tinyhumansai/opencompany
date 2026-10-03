@@ -239,8 +239,9 @@ A SearXNG instance URL is an operator-supplied address the host will fetch, whic
 makes this an authenticated "fetch an arbitrary URL" primitive.
 
 The repo already has a guard — and **it turned out not to be reusable**, which is
-worth recording because the plan said it would be. `guard_link` in
-`src/server/ops/memory_ingest.rs` refuses loopback, link-local *and every RFC1918
+worth recording because the plan said it would be. `guard_link` (since replaced in
+`src/server/ops/memory_ingest.rs` by `link_refusal` in front of TinyMemory's
+SSRF-pinned `fetch_url`, with the same refusals) refused loopback, link-local *and every RFC1918
 address*, plus `.internal` hostnames, re-checking after DNS resolution. That is
 right for fetching a link an operator pasted from the internet and wrong here:
 **a SearXNG instance is legitimately on a private network**, and

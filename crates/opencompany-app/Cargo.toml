@@ -97,10 +97,6 @@ path = "src/main.rs"
 # Deliberately NOT compiled at all, in the default set or the release one, and
 # each for a reason rather than an oversight:
 #
-# * `tinycortex` / `tinymemory-embedded` — the in-pod memory engines. They carry
-#   tinycortex, `tinyagents/sqlite` and a second bundled SQLite build into the
-#   bundle for a surface the desktop does not offer; the runtime keeps its
-#   fs-backed memory stores.
 # * `media` — the image/video generation tools. Unlike `composio` it is
 #   `["openhuman", "openhuman_core/media"]`, so it does pull an upstream domain
 #   this build otherwise never compiles, and its credential really is managed:
@@ -125,12 +121,13 @@ path = "src/main.rs"
 # for it.
 #
 # `tinymemory` IS here, in the features below. It is the cheap half of the
-# memory seam — the hosted/remote driver registry (Supermemory, Mem0, Cognee,
-# "No memory"), pure Rust and already in the lockfile — and the memory-engine
-# catalog is a console surface the desktop serves too. Without it four of its
-# tiles render disabled with "this build was compiled without the `tinymemory`
-# feature", an instruction no desktop user can follow. Only the in-pod engines
-# above are excluded.
+# memory seam — TinyMemory v2's engine registry (CortexDB direct, CortexDB via
+# the TinyHumans backend), plus the host's own "No memory" engine — pure Rust and
+# already in the lockfile — and the memory-engine catalog is a console surface
+# the desktop serves too. Without it its tiles render disabled with "this build
+# was compiled without the `tinymemory` feature", an instruction no desktop user
+# can follow. There is no in-pod memory engine to exclude any more; the runtime
+# keeps its fs-backed memory stores.
 # `tinyhumans` is what makes this host able to ask the hub whose credential it
 # is holding. Without it `HttpHubIdentityExchange` and `HttpTinyHumansClient`
 # are not compiled, `hub_identity()` stays `None`, and the Account page reports
@@ -186,16 +183,13 @@ tauri-build = { version = "2", features = [] }
 # and this crate is deliberately its own workspace (see the header). Until the
 # `mcp` feature above put `openhuman_core` in this graph none of these crates
 # were reachable from here, so the table could be omitted; now they are, and
-# without it Cargo resolves `tinycortex-api`, `tinyflows` and friends from
+# without it Cargo resolves `tinyflows` and friends from
 # crates.io (where some do not exist at all) instead of the vendored checkouts
 # the host is built against — and any that did resolve would be a *second*
 # copy, whose trait identities would not match the ones `opencompany` compiled.
 #
 # Keep this byte-identical to the root table modulo the `../../` prefix. The
 # comments explaining each entry live there; this is the replica.
-[patch."https://github.com/tinyhumansai/tinymemory"]
-tinymemory-api = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory-api" }
-
 # At the 1ecf1b0 pin `tinyinference` is a workspace of six crates
 # (`tinyinference-{core,embeddings,llm,local,providers,voice}`) and the single
 # `tinyinference` package no longer exists; the entries mirror the root
@@ -226,12 +220,6 @@ tinytools-agent = { path = "../../vendor/openhuman/vendor/tinyagents/vendor/tiny
 
 [patch.crates-io]
 tinyflows = { path = "../../vendor/openhuman/vendor/tinyflows/crates/tinyflows" }
-# TinyCortex moved under TinyMemory at the openhuman pin — see the note on the
-# same two entries in the root manifest. Both worlds patch it and both had the
-# stale path; fixing only the root left the Desktop lane failing with the same
-# eager-path-resolution error.
-tinycortex = { path = "../../vendor/openhuman/vendor/tinymemory/vendor/tinycortex" }
-tinycortex-api = { path = "../../vendor/openhuman/vendor/tinymemory/vendor/tinycortex/api" }
 tinychannels = { path = "../../vendor/openhuman/vendor/tinychannels" }
 motosan-ai-oauth = { path = "../../vendor/openhuman/vendor/motosan-ai-oauth" }
 # The six tinyinference crates by registry name as well, matching the root

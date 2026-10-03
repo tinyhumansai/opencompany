@@ -196,7 +196,7 @@ export function memoryStats(
 
 /** One engine the host offers, from `GET …/memory/engine`. */
 export interface EngineOption {
-  /** `store` | `embedded` | `namespace` | `supermemory` | `mem0` | `cognee` | `null`. */
+  /** `store`, a hosted engine id (`cortexdb`, `tinyhumans`), or `null`. */
   id: string;
   label: string;
   description: string;
@@ -205,6 +205,10 @@ export interface EngineOption {
   /** Which feature it needs, when it is not available. */
   unavailableReason?: string;
   requiresUrl: boolean;
+  /** Whether the engine takes an endpoint at all (optional when `requiresUrl` is false). */
+  acceptsUrl: boolean;
+  /** The endpoint used when none is given. */
+  defaultUrl?: string;
   requiresKey: boolean;
   /** `false` only for the null engine, which the picker warns on. */
   durable: boolean;

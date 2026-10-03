@@ -15,7 +15,7 @@ L4  Surfaces        Axum HTTP (operator API, A2A, webhooks), CLI, console
 L3  Company Brain   cycle loop, approvals, effect routing, feedback loop
 L2  Kernel ports    Brain, CompanyStore, EventLog, MemoryStore, ContextStore,
                     ChannelAdapter, ToolProvider, AgentEconomy, ApprovalGate
-L1  Adapters        hosted-medulla | openhuman (embedded) | tinyhivemind | tinycortex |
+L1  Adapters        hosted-medulla | openhuman (embedded) | tinyhivemind | tinymemory |
                     tinyplace | fs (default)
 L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 ```
@@ -28,11 +28,11 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | Model access, billing                                    | TinyHumans backend     | sends tier names + credential; never sees SKUs   |
 | Tools, channels, credentials                             | OpenHuman              | consumed via JSON-RPC; gaps go upstream as PRs   |
 | In-process LLM sub-work                                  | TinyAgents             | embedded library behind `ToolProvider`           |
-| Long-term memory                                         | TinyCortex (candidate) | behind `MemoryStore`; default is file-based      |
+| Long-term memory                                         | TinyMemory v2 engines (CortexDB) | behind `MemoryStore`; default is file-based      |
 | Identity, discovery, payments                            | tiny.place             | behind `AgentEconomy`                            |
 | Company definition, brain state, lifecycle, HTTP surface | **OpenCompany**        | owned outright                                   |
 
-The takeaway: OpenCompany reuses Medulla, OpenHuman, TinyAgents, TinyCortex, and tiny.place instead of reimplementing them. Changes those layers need go **upstream as PRs.**
+The takeaway: OpenCompany reuses Medulla, OpenHuman, TinyAgents, TinyMemory, and tiny.place instead of reimplementing them. Changes those layers need go **upstream as PRs.**
 
 ## Crate layout
 

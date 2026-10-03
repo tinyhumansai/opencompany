@@ -155,15 +155,6 @@ fn scrub_truncates_utf8_safely() {
     assert!(out.ends_with('…'));
 }
 
-#[test]
-fn strip_endpoint_drops_query() {
-    assert_eq!(
-        strip_endpoint("https://host/mcp?apiKey=secret&projectId=pid"),
-        "https://host/mcp"
-    );
-    assert_eq!(strip_endpoint("https://host/mcp"), "https://host/mcp");
-}
-
 // ---- classify (string arms — no live dial) -----------------------------
 
 #[test]

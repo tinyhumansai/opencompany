@@ -121,7 +121,6 @@ pub mod ledger_tools;
 pub mod lifecycle;
 pub mod mcp;
 pub mod mcp_probe;
-pub mod memory;
 pub mod memory_loop;
 pub mod memory_tools;
 /// Recovering a tool call that a model on the **native** transport wrote into
@@ -177,6 +176,7 @@ mod publish_turn_dispatch_tests;
 mod publish_turn_helpers_tests;
 #[cfg(test)]
 mod publish_turn_link_tests;
+pub mod redact;
 pub mod run_origin;
 pub mod run_trace;
 pub mod run_turn;
@@ -304,7 +304,7 @@ pub struct HarnessDeps {
     /// every agent, so a ten-agent roster on three harnesses would stand up
     /// thirty live agents to use ten.
     pub serves: Option<std::collections::HashSet<String>>,
-    /// Context store backing every agent's [`OcMemory`](memory::OcMemory).
+    /// Context store backing every agent's memory tools and loop.
     pub context: Arc<dyn ContextStore>,
 
     /// Company store the cost hook appends ledger entries to.

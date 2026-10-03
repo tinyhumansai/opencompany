@@ -48,21 +48,8 @@ anyhow = "1"
 # rather than beside the dependencies they redirect (in
 # `crates/opencompany-core/Cargo.toml`). Paths are relative to this file.
 #
-# WS4 one level further: `tinycortex-api` (since tinycortex@8401346,
-# tinymemory#18 §A1) re-exports the TinyMemory contract and therefore depends
-# on `tinymemory-api` by git URL. A git source is not redirected by
-# `[patch.crates-io]`, so without this section that git checkout joins the
-# graph BESIDE the vendored path copy the core manifest declares — and every shared
-# contract type (`MemoryTaint`, `MemoryEntry`, ...) becomes two distinct
-# types, which stops `tinymemory-core` compiling. openhuman carries exactly
-# this entry for itself (`[patch."https://github.com/tinyhumansai/tinymemory"]`
-# in its Cargo.toml); replicated here with the path rebased onto the vendored
-# checkout, same as the WS4 entries below.
-[patch."https://github.com/tinyhumansai/tinymemory"]
-tinymemory-api = { path = "vendor/openhuman/vendor/tinymemory/crates/tinymemory-api" }
-
-# The same hazard one crate over: `tinycortex` depends on `tinyinference` by git
-# rev, which `[patch.crates-io]` does not rewrite either. Without this entry
+# Vendored crates name `tinyinference` by git rev, which `[patch.crates-io]`
+# does not rewrite. Without this entry
 # cargo resolves a second `tinyinference` beside the path copy openhuman and
 # this crate use, and the two `ChatModel`s are different types. Replicated from
 # openhuman's own Cargo.toml with the path rebased onto the vendored checkout.
@@ -130,17 +117,6 @@ tinyinference-llm = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinfe
 tinyinference-local = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-local" }
 tinyinference-providers = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-providers" }
 tinyinference-voice = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyinference/crates/tinyinference-voice" }
-# TinyCortex moved under TinyMemory at the openhuman pin: `vendor/tinycortex`
-# is no longer a submodule there, and the crate is reached through
-# `vendor/tinymemory/vendor/tinycortex` instead. A patch path is resolved
-# eagerly whatever the feature set — the same trap the `tinyplace` note below
-# records — so a stale path here fails `cargo metadata --locked` outright,
-# before any feature gate is consulted.
-tinycortex = { path = "vendor/openhuman/vendor/tinymemory/vendor/tinycortex" }
-# `tinymemory-core` consumes the TinyCortex contract by version while
-# OpenHuman consumes the implementation by path. Keep both on one checkout so
-# their public trait identities remain identical.
-tinycortex-api = { path = "vendor/openhuman/vendor/tinymemory/vendor/tinycortex/api" }
 tinychannels = { path = "vendor/openhuman/vendor/tinychannels" }
 # No `tinyplace` entry: openhuman dropped the submodule, so the path this
 # patched onto no longer exists at the pin and Cargo fails to load the source

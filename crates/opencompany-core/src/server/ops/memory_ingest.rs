@@ -33,9 +33,12 @@
 //! `POST …/memory/ingest/links` makes this server issue an outbound request to
 //! an operator-supplied URL — the shape of a server-side request forgery. The
 //! request is therefore restricted to `http`/`https` and refused for any host
-//! that resolves to a loopback, link-local, or private address, which is what
-//! stops "remember this page" from being a read primitive against the
-//! deployment's own network.
+//! that is, or resolves to, a loopback, link-local, or private address, which
+//! is what stops "remember this page" from being a read primitive against the
+//! deployment's own network. The enforcing guard is TinyMemory's
+//! `sources::fetch::fetch_url`, which connects only to the addresses it vetted
+//! (closing DNS rebinding) and re-checks every redirect hop; the check in this
+//! module is an early, readable refusal in front of it.
 
 use axum::extract::Path;
 use axum::extract::multipart::MultipartError;
@@ -62,17 +65,6 @@ const INGEST_BODY_LIMIT: usize = 8 * MAX_DOCUMENT_BYTES;
 /// The largest page body a link ingest will read.
 #[cfg(feature = "documents")]
 const MAX_LINK_BYTES: usize = 4 * 1024 * 1024;
-
-/// How long the host waits for a link to answer.
-#[cfg(feature = "documents")]
-const LINK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// How long one host may take to resolve before the link is refused.
-///
-/// Separate from [`LINK_TIMEOUT`], which bounds the fetch and starts only once
-/// the guard has answered. Well under it, because a name that has not resolved
-/// in five seconds is not going to be fetched inside the remaining ten.
-const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Builds the ingest route fragment.
 pub fn router() -> Router<AppState> {
@@ -357,51 +349,47 @@ async fn ingest_links(
             "no links were sent".to_string(),
         )));
     }
-    let client = reqwest::Client::builder()
-        .timeout(LINK_TIMEOUT)
-        // No redirect chasing: a permitted URL that redirects to `localhost`
-        // would walk straight past the guard below, and following it is not
-        // worth re-implementing the check per hop.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| ApiError(OpenCompanyError::Config(format!("no HTTP client: {e}"))))?;
-
     let mut items = Vec::new();
     for url in request.urls {
         let url = url.trim().to_string();
-        if let Err(refusal) = guard_link(&url).await {
+        if let Err(refusal) = link_refusal(&url) {
             items.push(IngestedItem::failed(url, refusal));
             continue;
         }
-        items.push(fetch_link(&company, &client, url).await);
+        items.push(fetch_link(&company, url).await);
     }
     Ok(Json(IngestedDto::of(items)))
 }
 
+/// Refuses, by its spelling alone, a URL this host must not fetch: a scheme
+/// other than http(s), a literal internal address, or an internal host name.
+///
+/// A cheap early answer with a readable reason, not the guard itself. The
+/// guard is TinyMemory's fetcher ([`tinymemory::sources::fetch::fetch_url`]):
+/// its client resolves through a public-only resolver and connects to exactly
+/// the addresses it vetted, and re-checks every redirect hop. That is what
+/// closes DNS rebinding — the host's own resolve-then-connect check it
+/// replaces vetted one lookup and let the client make another.
+#[cfg(feature = "documents")]
+fn link_refusal(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http:// and https:// links can be fetched".to_string());
+    }
+    if !tinymemory::sources::readers::ssrf::is_url_allowed(&parsed) {
+        return Err("that host is inside this deployment's own network".to_string());
+    }
+    Ok(())
+}
+
 /// Fetches one link and stores what it said.
 #[cfg(feature = "documents")]
-async fn fetch_link(
-    company: &ScopedCompany,
-    client: &reqwest::Client,
-    url: String,
-) -> IngestedItem {
-    let response = match client.get(&url).send().await {
-        Ok(response) => response,
+async fn fetch_link(company: &ScopedCompany, url: String) -> IngestedItem {
+    let document = match tinymemory::sources::fetch::fetch_url(&url).await {
+        Ok(document) => document,
         Err(error) => return IngestedItem::failed(url, format!("could not be fetched: {error}")),
     };
-    if !response.status().is_success() {
-        return IngestedItem::failed(url, format!("answered {}", response.status()));
-    }
-    let declared = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => return IngestedItem::failed(url, format!("could not be read: {error}")),
-    };
-    if bytes.len() > MAX_LINK_BYTES {
+    if document.bytes.len() > MAX_LINK_BYTES {
         return IngestedItem::failed(
             url,
             format!(
@@ -410,6 +398,10 @@ async fn fetch_link(
             ),
         );
     }
+    let declared = document
+        .declared_mime
+        .as_deref()
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
     // A URL has no extension to dispatch on, so the declared content type
     // decides — with `text/html` the overwhelming case, and the extractor
     // handling `application/pdf` and friends from the same signal.
@@ -417,140 +409,11 @@ async fn fetch_link(
         Some("text/html") | Some("application/xhtml+xml") | None => format!("{url}#html"),
         _ => url.clone(),
     };
-    let mut item = store_source(company, name, declared.as_deref(), &bytes).await;
+    let mut item = store_source(company, name, declared.as_deref(), &document.bytes).await;
     // Report the URL the operator typed, not the extension-bearing name the
     // dispatch needed.
     item.source = url;
     item
-}
-
-/// Whether an address belongs to the deployment rather than the internet.
-///
-/// The set the fetch below must never reach: loopback, RFC1918, link-local
-/// (which is where a cloud metadata service lives), unspecified, and their
-/// IPv6 equivalents including unique-local and the v4-mapped forms, since
-/// `::ffff:127.0.0.1` is a loopback address written the long way.
-#[cfg(feature = "documents")]
-fn is_internal_address(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])
-        }
-        std::net::IpAddr::V6(v6) => {
-            // `::1` and `::` are judged as themselves before any v4 reading of
-            // them: `to_ipv4` maps `::1` to `0.0.0.1`, which is not internal by
-            // v4 rules, so testing that first would admit loopback.
-            if v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.segments()[0] & 0xfe00 == 0xfc00
-                || v6.segments()[0] & 0xffc0 == 0xfe80
-            {
-                return true;
-            }
-            // `to_ipv4`, not `to_ipv4_mapped`: the mapped form (`::ffff:a.b.c.d`)
-            // is only half of it. The deprecated IPv4-compatible form
-            // (`::a.b.c.d`) carries the same address, is not `is_loopback`, and
-            // `to_ipv4_mapped` answers `None` for it — so reading only the
-            // mapped form admits `::127.0.0.1`.
-            v6.to_ipv4()
-                .is_some_and(|v4| is_internal_address(std::net::IpAddr::V4(v4)))
-        }
-    }
-}
-
-/// Refuses a URL this host must not fetch on an operator's behalf.
-///
-/// Two checks, and the second is the one that matters. A literal address is
-/// judged directly. A **hostname** is resolved, and refused when any address
-/// it answers with belongs to this deployment — without that step
-/// `http://anything.example/` pointing at `169.254.169.254` reads as an
-/// ordinary public URL, and the fetch below reaches the metadata service.
-/// Refusing the literal form alone stops the accident and none of the intent.
-///
-/// The residual TOCTOU is real and is not what this closes: a name that
-/// resolves publicly here can answer differently for the client a moment
-/// later. Narrowing that means having the connector pin the address this
-/// validated, which is a change to the client rather than to this check.
-///
-/// The agent runtime carries the same rule for the tools it exposes
-/// (`validate_url_with_dns_check`), but it is not reachable from every build
-/// this route ships in — `documents` is a default feature and `openhuman` is
-/// not — and pulling the whole runtime into the default build to borrow forty
-/// lines of URL guard costs more than it saves. The lasting fix is to lift
-/// this rule somewhere both can depend on; until then the two are deliberate
-/// copies rather than an oversight.
-#[cfg(feature = "documents")]
-async fn guard_link(url: &str) -> Result<(), String> {
-    guard_link_resolving_with(url, |host, port| async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map(|addrs| addrs.map(|socket| socket.ip()).collect())
-    })
-    .await
-}
-
-/// [`guard_link`], against a resolver the caller supplies.
-///
-/// The split exists so the resolving arm can be tested without a lookup. A
-/// case that reaches real DNS to prove this fails on a runner without it, and
-/// that failure says nothing about the product — the wrong way round for a
-/// check that sits in the default feature set. The runtime's own guard is
-/// split the same way and for the same reason.
-#[cfg(feature = "documents")]
-async fn guard_link_resolving_with<F, Fut>(url: &str, resolve: F) -> Result<(), String>
-where
-    F: FnOnce(String, u16) -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>>,
-{
-    let parsed = url
-        .parse::<axum::http::Uri>()
-        .map_err(|_| "not a URL".to_string())?;
-    match parsed.scheme_str() {
-        Some("http") | Some("https") => {}
-        _ => return Err("only http:// and https:// links can be fetched".to_string()),
-    }
-    let host = parsed
-        .host()
-        .ok_or_else(|| "no host in the URL".to_string())?;
-    // A bracketed IPv6 literal keeps its brackets in `Uri::host`.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let lowered = host.to_ascii_lowercase();
-    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".internal") {
-        return Err("that host is internal to this deployment".to_string());
-    }
-
-    if let Ok(address) = lowered.parse::<std::net::IpAddr>() {
-        return if is_internal_address(address) {
-            Err("that address is inside this deployment's own network".to_string())
-        } else {
-            Ok(())
-        };
-    }
-
-    let port = parsed.port_u16().unwrap_or(match parsed.scheme_str() {
-        Some("https") => 443,
-        _ => 80,
-    });
-    let resolved = tokio::time::timeout(DNS_TIMEOUT, resolve(lowered.clone(), port))
-        .await
-        .map_err(|_| format!("`{lowered}` took too long to resolve"))?
-        .map_err(|e| format!("that host could not be resolved: {e}"))?;
-    if resolved.is_empty() {
-        return Err(format!("`{lowered}` resolved to no addresses"));
-    }
-    for address in resolved {
-        if is_internal_address(address) {
-            return Err(format!(
-                "`{lowered}` resolves to {address}, which is inside this deployment's own network"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Without the feature there is no HTTP client to fetch with, so the route

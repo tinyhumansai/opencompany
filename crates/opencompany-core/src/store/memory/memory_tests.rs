@@ -1,308 +1,92 @@
-//! End-to-end tests for the decorator, against a real provider.
+//! `BoundMemory` against an in-memory engine: the port conformance suites,
+//! the tenant boundary, provenance, and the per-scope cache bound.
 //!
-//! The fake below is a full `tinymemory_api::traits::Memory` backend composed
-//! through `MemoryTraitProvider`, which is the same composition every shipped
-//! driver goes through — so these exercise the real provider path rather than a
-//! mock of it. It **overrides `store_with_taint`**, which is the whole reason a
-//! backend is written by hand here: the trait's default silently drops the taint
-//! argument, and a fake that inherited it would make the taint tests pass while
-//! proving nothing.
+//! The engine is TinyMemory's own `ReferenceEngine` — the same in-memory
+//! implementation upstream's conformance suite certifies — so these tests
+//! exercise this host's decorator, not a fake written to agree with it.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use tinymemory::mandatory::MemoryTraitProvider;
-use tinymemory::registry::DriverClass;
-use tinymemory_api::traits::Memory;
-use tinymemory_api::types::{
-    MemoryCategory, MemoryEntry, MemoryTaint, NamespaceSummary, RecallOpts,
+use tinymemory::{
+    EngineDescriptor, EngineHealth, Error as EngineError, FetchPage, FetchRequest, ForgetReport,
+    ForgetTarget, ListPage, ListRequest, MemoryEngine, MetaFilter, RecallAnswer, RecallRequest,
+    StoreItem, StoreReceipt, async_trait,
 };
+use tinymemory_conformance::ReferenceEngine;
 
 use super::BoundMemory;
+use super::facades::EXTERNAL_TAG;
 use super::tests_behavior::ConformanceStores;
 use crate::ports::{CompanyId, ContextChunk, FactKind, FactRecord};
 use crate::store::conformance;
 use crate::store::{FsCompanyStore, FsEventLog};
 
-/// An in-memory `Memory` backend, keyed exactly as the contract specifies.
-#[derive(Default)]
-pub(super) struct FakeEngine {
-    rows: Mutex<BTreeMap<(String, String), MemoryEntry>>,
-}
-
-impl FakeEngine {
-    pub(super) fn provider() -> Arc<dyn tinymemory_api::provider::MemoryProvider> {
-        Self::with_handle().1
-    }
-
-    /// The engine *and* its provider, for tests that need to inspect what was
-    /// actually persisted rather than what a read path chose to return.
-    pub(super) fn with_handle() -> (Arc<Self>, Arc<dyn tinymemory_api::provider::MemoryProvider>) {
-        let engine = Arc::new(Self::default());
-        let provider = Arc::new(MemoryTraitProvider::new(engine.clone(), "fake-engine"));
-        (engine, provider)
-    }
-
-    /// The taint actually stored alongside the row whose content contains
-    /// `needle`.
-    ///
-    /// Reads the backing rows directly. Going through a read path would test the
-    /// read path's fidelity as much as the write's, and taint is a property of
-    /// what was *written* — a read that dropped it would make this pass.
-    pub(super) fn taint_of(&self, needle: &str) -> Option<MemoryTaint> {
-        self.rows
-            .lock()
-            .unwrap()
-            .values()
-            .find(|entry| entry.content.contains(needle))
-            .map(|entry| entry.taint)
-    }
-}
-
-#[async_trait]
-impl Memory for FakeEngine {
-    fn name(&self) -> &str {
-        "fake-engine"
-    }
-
-    async fn store(
-        &self,
-        namespace: &str,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.store_with_taint(
-            namespace,
-            key,
-            content,
-            category,
-            session_id,
-            MemoryTaint::Internal,
-        )
-        .await
-    }
-
-    /// Overridden — see the module docs. The default drops `taint`.
-    async fn store_with_taint(
-        &self,
-        namespace: &str,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-        taint: MemoryTaint,
-    ) -> anyhow::Result<()> {
-        self.rows.lock().unwrap().insert(
-            (namespace.to_string(), key.to_string()),
-            MemoryEntry {
-                id: format!("{namespace}/{key}"),
-                key: key.to_string(),
-                content: content.to_string(),
-                namespace: Some(namespace.to_string()),
-                category,
-                timestamp: "1970-01-01T00:00:00Z".to_string(),
-                session_id: session_id.map(str::to_owned),
-                score: None,
-                taint,
-            },
-        );
-        Ok(())
-    }
-
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        opts: RecallOpts<'_>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let rows = self.rows.lock().unwrap();
-        Ok(rows
-            .values()
-            .filter(|entry| {
-                opts.namespace
-                    .is_none_or(|ns| entry.namespace.as_deref() == Some(ns))
-            })
-            .filter(|entry| entry.content.to_lowercase().contains(&query.to_lowercase()))
-            .take(limit)
-            .cloned()
-            .collect())
-    }
-
-    async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        Ok(self
-            .rows
-            .lock()
-            .unwrap()
-            .get(&(namespace.to_string(), key.to_string()))
-            .cloned())
-    }
-
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let rows = self.rows.lock().unwrap();
-        Ok(rows
-            .values()
-            .filter(|entry| namespace.is_none_or(|ns| entry.namespace.as_deref() == Some(ns)))
-            .filter(|entry| category.is_none_or(|cat| &entry.category == cat))
-            .filter(|entry| session_id.is_none_or(|s| entry.session_id.as_deref() == Some(s)))
-            .cloned()
-            .collect())
-    }
-
-    async fn forget(&self, namespace: &str, key: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .rows
-            .lock()
-            .unwrap()
-            .remove(&(namespace.to_string(), key.to_string()))
-            .is_some())
-    }
-
-    async fn namespace_summaries(&self) -> anyhow::Result<Vec<NamespaceSummary>> {
-        // Real summaries, derived from the rows: the mandatory composition's
-        // `export_page` WALKS these namespaces — a fake that reports none
-        // exports nothing, and every export/import test silently asserts on
-        // an empty page.
-        let rows = self.rows.lock().unwrap();
-        let mut namespaces: Vec<String> = rows.keys().map(|(ns, _)| ns.clone()).collect();
-        namespaces.sort();
-        namespaces.dedup();
-        Ok(namespaces
-            .into_iter()
-            .map(|namespace| {
-                let count = rows.keys().filter(|(ns, _)| *ns == namespace).count();
-                NamespaceSummary {
-                    namespace,
-                    count,
-                    last_updated: None,
-                }
-            })
-            .collect())
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        Ok(self.rows.lock().unwrap().len())
-    }
-
-    async fn health_check(&self) -> bool {
-        true
-    }
-}
-
-/// A `Memory` backend that wraps [`FakeEngine`] and injects one failure into
-/// the archive partition.
+/// An engine that wraps [`ReferenceEngine`] and injects one failure into the
+/// archive partition.
 ///
-/// `store_with_taint` counts writes whose namespace is the archive tier and
-/// errors on the `fail_archive_store_on`-th one, then recovers. Eviction's
+/// Counts stores whose workspace is an archive tier and errors on the
+/// `fail_archive_store_on`-th one, then recovers. Eviction's
 /// archive-then-delete order is what this targets: the maintenance loop
 /// archives a few traces, hits the injected failure, and the archive must
 /// still be bounded on that partial-failure path.
-#[derive(Clone)]
 pub(super) struct FlakyStore {
-    inner: Arc<FakeEngine>,
+    inner: ReferenceEngine,
     fail_archive_store_on: u32,
-    archive_stores: Arc<Mutex<u32>>,
+    archive_stores: Mutex<u32>,
 }
 
 impl FlakyStore {
-    pub(super) fn arc(fail_archive_store_on: u32) -> Arc<dyn Memory> {
+    pub(super) fn arc(fail_archive_store_on: u32) -> Arc<dyn MemoryEngine> {
         Arc::new(Self {
-            inner: Arc::new(FakeEngine::default()),
+            inner: ReferenceEngine::new(),
             fail_archive_store_on,
-            archive_stores: Arc::new(Mutex::new(0)),
+            archive_stores: Mutex::new(0),
         })
     }
 }
 
 #[async_trait]
-impl Memory for FlakyStore {
-    fn name(&self) -> &str {
-        "flaky-store"
+impl MemoryEngine for FlakyStore {
+    fn descriptor(&self) -> &EngineDescriptor {
+        self.inner.descriptor()
     }
 
-    async fn store(
-        &self,
-        namespace: &str,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.store_with_taint(
-            namespace,
-            key,
-            content,
-            category,
-            session_id,
-            MemoryTaint::Internal,
-        )
-        .await
+    async fn health(&self) -> EngineHealth {
+        self.inner.health().await
     }
 
-    async fn store_with_taint(
-        &self,
-        namespace: &str,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-        taint: MemoryTaint,
-    ) -> anyhow::Result<()> {
-        if namespace.ends_with("/archive") {
+    async fn recall(&self, req: RecallRequest) -> tinymemory::Result<RecallAnswer> {
+        self.inner.recall(req).await
+    }
+
+    async fn fetch(&self, req: FetchRequest) -> tinymemory::Result<FetchPage> {
+        self.inner.fetch(req).await
+    }
+
+    async fn store(&self, item: StoreItem) -> tinymemory::Result<StoreReceipt> {
+        let archive = item
+            .meta()
+            .workspace
+            .as_deref()
+            .is_some_and(|workspace| workspace.ends_with("/archive"));
+        if archive {
             let mut stores = self.archive_stores.lock().unwrap();
             *stores += 1;
             if *stores == self.fail_archive_store_on {
-                anyhow::bail!("injected archive store failure");
+                return Err(EngineError::Unavailable(
+                    "injected archive store failure".into(),
+                ));
             }
         }
-        self.inner
-            .store_with_taint(namespace, key, content, category, session_id, taint)
-            .await
+        self.inner.store(item).await
     }
 
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        opts: RecallOpts<'_>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.inner.recall(query, limit, opts).await
+    async fn forget(&self, target: ForgetTarget) -> tinymemory::Result<ForgetReport> {
+        self.inner.forget(target).await
     }
 
-    async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        self.inner.get(namespace, key).await
-    }
-
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.inner.list(namespace, category, session_id).await
-    }
-
-    async fn forget(&self, namespace: &str, key: &str) -> anyhow::Result<bool> {
-        self.inner.forget(namespace, key).await
-    }
-
-    async fn namespace_summaries(&self) -> anyhow::Result<Vec<NamespaceSummary>> {
-        self.inner.namespace_summaries().await
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        self.inner.count().await
-    }
-
-    async fn health_check(&self) -> bool {
-        self.inner.health_check().await
+    async fn list(&self, req: ListRequest) -> tinymemory::Result<ListPage> {
+        self.inner.list(req).await
     }
 }
 
@@ -311,7 +95,21 @@ impl Memory for FlakyStore {
 /// deliberately no per-company binding to build — the engine is process-scoped
 /// and the company arrives with each call.
 pub(super) fn engine() -> BoundMemory {
-    BoundMemory::bind(FakeEngine::provider(), DriverClass::Embedded).unwrap()
+    BoundMemory::bind(Arc::new(ReferenceEngine::new()))
+}
+
+/// [`engine`], plus the raw engine for asserting what actually landed in it.
+pub(super) fn with_handle() -> (Arc<ReferenceEngine>, BoundMemory) {
+    let raw = Arc::new(ReferenceEngine::new());
+    (raw.clone(), BoundMemory::bind(raw))
+}
+
+/// Every item the raw engine holds, unfiltered.
+pub(super) async fn everything(raw: &ReferenceEngine) -> Vec<tinymemory::Hit> {
+    raw.list(ListRequest::new(MetaFilter::default(), 10_000))
+        .await
+        .unwrap()
+        .items
 }
 
 pub(super) fn acme_id() -> CompanyId {
@@ -396,17 +194,13 @@ async fn conformance_context_delete_label_survives_a_concurrent_identical_put() 
     conformance::assert_delete_label_survives_a_concurrent_identical_put(engine().context()).await;
 }
 
-/// #914's acceptance names "taint survives export and re-import" and #1113
-/// found no test for it. This is the round trip: inbound content stored
-/// through the decorator (stamped `ExternalSync`), exported through the
-/// provider's portability family, imported into a *fresh* engine — and the
-/// taint must still be `ExternalSync` on the other side. A driver or a
-/// migration that laundered the stamp here would let content a company read
-/// from the web re-enter as something the company decided.
+/// #914's acceptance names "taint survives export and re-import". v2 has no
+/// taint, so provenance is the `EXTERNAL_TAG` this host stamps — and it must
+/// survive an engine-to-engine migration: content a company read from the web
+/// must not re-enter the target as something the company decided.
 #[tokio::test]
-async fn taint_survives_export_and_reimport() {
-    let (_fake, provider) = FakeEngine::with_handle();
-    let memory = BoundMemory::bind(provider.clone(), DriverClass::Embedded).unwrap();
+async fn provenance_survives_migration() {
+    let (raw, memory) = with_handle();
     memory
         .inbound_context()
         .put(
@@ -419,43 +213,55 @@ async fn taint_survives_export_and_reimport() {
         .await
         .unwrap();
 
-    let page = provider.export_page(None, 100).await.unwrap();
-    let exported: Vec<_> = page
-        .records
-        .iter()
-        .filter(|record| record.payload.to_string().contains("must stay external"))
+    let from: Arc<dyn MemoryEngine> = raw;
+    let fresh = Arc::new(ReferenceEngine::new());
+    let to: Arc<dyn MemoryEngine> = fresh.clone();
+    super::migrate::migrate(&from, &to, 10, None, |_| {})
+        .await
+        .unwrap()
+        .unwrap();
+
+    let landed: Vec<_> = everything(&fresh)
+        .await
+        .into_iter()
+        .filter(|hit| hit.text.contains("must stay external"))
         .collect();
-    assert!(!exported.is_empty(), "the inbound chunk must export");
-    for record in &exported {
-        assert_eq!(
-            record.taint,
-            MemoryTaint::ExternalSync,
-            "export must carry the stamp, record {}",
-            record.id
+    assert!(!landed.is_empty(), "the inbound chunk must migrate");
+    for hit in landed {
+        assert!(
+            hit.meta.tags.iter().any(|tag| tag == EXTERNAL_TAG),
+            "migration must carry the external mark: {:?}",
+            hit.meta
         );
     }
-
-    let (importer, fresh) = FakeEngine::with_handle();
-    fresh.import_records(page.records).await.unwrap();
-    assert_eq!(
-        importer.taint_of("must stay external"),
-        Some(MemoryTaint::ExternalSync),
-        "re-import must land the content still stamped ExternalSync"
-    );
 }
 
-/// The fake's `namespace_summaries` is what the mandatory composition's export
-/// WALKS, so a wrong count or a duplicated namespace there silently weakens
-/// every export test built on it. The round trip above uses one namespace and
-/// cannot see either fault; this pins both directly.
+/// Internal writes are never marked external — the mark has to mean something.
 #[tokio::test]
-async fn namespace_summaries_reports_each_namespace_once_with_its_count() {
-    let (fake, provider) = FakeEngine::with_handle();
-    let memory = BoundMemory::bind(provider.clone(), DriverClass::Embedded).unwrap();
+async fn internal_writes_carry_no_external_mark() {
+    let (raw, memory) = with_handle();
+    memory
+        .context()
+        .put(
+            &acme_id(),
+            ContextChunk {
+                label: "plan".into(),
+                body: "the company decided this".into(),
+            },
+        )
+        .await
+        .unwrap();
+    for hit in everything(&raw).await {
+        assert!(!hit.meta.tags.iter().any(|tag| tag == EXTERNAL_TAG));
+    }
+}
 
-    // Two companies so the namespaces differ, and differing key counts so a
-    // summary that reported the store's total instead of the namespace's
-    // would fail.
+/// Every write lands under its own company's workspace, and each company's
+/// items are counted in its own workspace only — the raw-engine view of the
+/// tenant boundary the port tests check from the outside.
+#[tokio::test]
+async fn every_write_lands_in_its_own_companys_workspace() {
+    let (raw, memory) = with_handle();
     for (id, keys) in [(acme_id(), 3usize), (globex_id(), 1usize)] {
         for index in 0..keys {
             memory
@@ -464,33 +270,35 @@ async fn namespace_summaries_reports_each_namespace_once_with_its_count() {
                     &id,
                     ContextChunk {
                         label: format!("chunk-{index}"),
-                        body: format!("body {index}"),
+                        body: format!("{} body {index}", id.as_ref()),
                     },
                 )
                 .await
                 .unwrap();
         }
     }
-
-    let summaries = fake.namespace_summaries().await.unwrap();
-    let mut namespaces: Vec<&str> = summaries.iter().map(|s| s.namespace.as_str()).collect();
-    namespaces.sort_unstable();
-    let mut deduped = namespaces.clone();
-    deduped.dedup();
-    assert_eq!(
-        namespaces, deduped,
-        "each namespace must appear exactly once"
-    );
-
-    let total: usize = summaries.iter().map(|s| s.count).sum();
-    assert_eq!(
-        total, 4,
-        "counts must sum to the rows stored: {summaries:?}"
-    );
-    assert!(
-        summaries.iter().any(|s| s.count == 3) && summaries.iter().any(|s| s.count == 1),
-        "each namespace must carry ITS own count, not the store total: {summaries:?}"
-    );
+    let items = everything(&raw).await;
+    assert_eq!(items.len(), 4);
+    let mut workspaces: Vec<String> = items
+        .iter()
+        .map(|hit| hit.meta.workspace.clone().unwrap())
+        .collect();
+    workspaces.sort();
+    workspaces.dedup();
+    assert_eq!(workspaces.len(), 2, "{workspaces:?}");
+    for hit in &items {
+        let workspace = hit.meta.workspace.as_deref().unwrap();
+        assert_eq!(hit.meta.folder.as_deref(), Some(workspace));
+        let company = if hit.text.contains("acme body") {
+            "acme"
+        } else {
+            "globex"
+        };
+        assert!(
+            workspace.starts_with(&format!("oc/{company}-")),
+            "{workspace}"
+        );
+    }
 }
 
 #[test]

@@ -90,10 +90,10 @@ project-scoped containers and data volume on exit. Shared dependency caches are
 preserved. Run it with `./scripts/test-compose-e2e.sh`; on failure the script
 prints the Compose status and logs.
 
-For a selectable memory engine, add `tinymemory` (hosted engines —
-Supermemory, Mem0, Cognee — plus the `null` driver) and `tinymemory-embedded`
-(the durable in-pod `namespace` store) to `OPENCOMPANY_FEATURES`, then select
-one with the `OPENCOMPANY_MEMORY*` variables (`.env.example` here has the block;
+For a selectable memory engine, make sure `OPENCOMPANY_FEATURES` carries
+`tinymemory` (it is a default feature; the hosted engines `cortexdb` and
+`tinyhumans`, plus the `null` engine), then select one with the
+`OPENCOMPANY_MEMORY*` variables (`.env.example` here has the block;
 `docs/spec/runtime/memory-engine.md` has the full guide and the
 engine-switch runbook).
 

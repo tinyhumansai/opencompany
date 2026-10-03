@@ -27,7 +27,7 @@ being *required*.
 
 ## Vendoring and versioning
 
-- `vendor/openhuman` is a git submodule; OpenHuman nests TinyAgents, TinyCortex,
+- `vendor/openhuman` is a git submodule; OpenHuman nests TinyAgents, TinyMemory,
   and the tiny.place SDK as its own submodules.
 - Published crates are preferred where they exist: `tinyagents = "2.1"`
   (path-patched to OpenHuman's nested submodule via `[patch.crates-io]`),

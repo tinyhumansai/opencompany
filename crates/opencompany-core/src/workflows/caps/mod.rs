@@ -9,7 +9,7 @@
 //!   a roster teammate id) routes to the company's
 //!   [`HarnessPool`](crate::harness::HarnessPool), so the step runs on the same
 //!   live openhuman agent as chat/task dispatch — inheriting its persona, model,
-//!   [`OcMemory`](crate::harness::memory), approval policy, and cost metering.
+//!   the company memory ports, approval policy, and cost metering.
 //! * **tool_call** ([`WorkflowToolInvoker`](tools::WorkflowToolInvoker)) — a
 //!   `tool_call` node executes a real Cell A toolbelt tool (`shell` / `code` /
 //!   `web`, plus the metered `search` family behind an explicit `search` grant)

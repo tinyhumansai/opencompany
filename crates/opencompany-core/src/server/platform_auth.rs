@@ -123,7 +123,10 @@ impl StaticPlatformVerifier {
 
 impl PlatformVerifier for StaticPlatformVerifier {
     fn verify(&self, bearer: &str) -> crate::Result<PlatformClaims> {
-        if constant_time_eq(bearer, &self.platform_secret) {
+        if bool::from(subtle::ConstantTimeEq::ct_eq(
+            bearer.as_bytes(),
+            self.platform_secret.as_bytes(),
+        )) {
             return Ok(PlatformClaims {
                 tenant: "tenant:platform".to_string(),
                 scopes: HashSet::from([SCOPE_PLATFORM.to_string(), "operator".to_string()]),
@@ -134,31 +137,6 @@ impl PlatformVerifier for StaticPlatformVerifier {
             "unrecognized token".to_string(),
         ))
     }
-}
-
-/// Compares two strings without the short-circuit a plain `==` on `&str`
-/// takes at the first differing byte.
-///
-/// [`StaticPlatformVerifier::verify`] is the whole authentication mechanism
-/// for the shared platform secret: knowledge of the exact value is what grants
-/// a full platform-scope token. A short-circuiting byte compare turns "how
-/// long did verification take" into a per-byte oracle over that secret, which
-/// is exactly the shape a timing attack walks a guess forward one correct byte
-/// at a time. This still runs in time proportional to the **longer** input
-/// (so a caller can still learn there was a length mismatch from timing alone,
-/// same as `subtle::ConstantTimeEq` and every other implementation of this
-/// pattern) — what it removes is the byte-position leak `==` has once lengths
-/// already match, which is the exploitable half against a fixed-length secret.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// The signed-JWT verifier (HS256) for tenant-scoped machine tokens. The claim

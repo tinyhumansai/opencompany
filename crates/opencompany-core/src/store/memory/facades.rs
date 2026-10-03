@@ -1,347 +1,67 @@
-//! Typed facades over one [`MemoryProvider`].
+//! Typed facades over one [`MemoryEngine`].
 //!
 //! The three memory ports stay, because their types are the company's
 //! vocabulary and every call site is written against them. What collapses is the
 //! *backends*: instead of three independent stores, all three ports become thin
-//! views onto a single bound provider.
+//! views onto a single bound engine.
 //!
-//! ## Why the records are JSON, not provider-native structure
+//! ## How a keyed record maps onto an item
 //!
-//! `MemoryCore::store` takes `content: &str`. The contract does have a
-//! documents family that could carry structure natively — but it is optional,
-//! and the composition every driver we can actually bind goes through
-//! (`MemoryTraitProvider`) advertises exactly the three mandatory families and
-//! leaves `as_documents()` at `None`. Encoding here rather than reaching for a
-//! family the bound driver may not have is what keeps one facade working against
-//! the embedded engine and a hosted service alike; the price is that the facade
-//! owns the encoding, so each one carries a round-trip test.
+//! The ports are keyed (a fact id, a chunk address, a cycle id); the v2 contract
+//! is not — `store` mints a content fingerprint and there is no `get(key)`. So
+//! every record is one `Document` item whose metadata carries the addressing:
+//!
+//! - `workspace` = the record's [`Namespace`] (company root + scope), and
+//! - `source.id` = the port's key.
+//!
+//! Those are exactly the two fields a hosted engine narrows on server-side
+//! (CortexDB labels them), so a keyed read is one narrowed listing, not a walk.
+//! A rewrite stores the new body first and forgets the old items second: a
+//! crash in between leaves a duplicate the next read reconciles (newest
+//! `observed_at` wins), never a lost record.
+//!
+//! ## Why the records are JSON, not item-native structure
+//!
+//! The port records are richer than any item kind (a trace, a fact with a
+//! kind and a timestamp, a chunk with a label set), so the facade owns the
+//! encoding and each one carries a round-trip test.
 //!
 //! ## Every read is re-checked against the namespace it asked for
 //!
-//! A driver is somebody else's code — increasingly, somebody else's *service*.
-//! Asking for a namespace and trusting the answer to be within it is exactly
+//! An engine is somebody else's code — increasingly, somebody else's *service*.
+//! Asking for a workspace and trusting the answer to be within it is exactly
 //! the assumption a hosted engine is in a position to violate, by bug or
-//! otherwise. So every decode path drops entries whose reported namespace falls
-//! outside the one this facade owns (`Namespace::contains`). The filter should
-//! never fire; if it does, the alternative was serving one tenant another's
-//! memory.
+//! otherwise. So every decode path drops items whose reported workspace is not
+//! the one this facade owns. The filter should never fire; if it does, the
+//! alternative was serving one tenant another's memory.
+
+mod bound;
+mod traces;
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tinymemory_api::error::MemoryError;
-use tinymemory_api::provider::MemoryProvider;
-use tinymemory_api::types::{MemoryCategory, MemoryEntry, MemoryTaint};
+use serde::{Deserialize, Serialize};
 
-use super::namespace::{Namespace, Scope};
+pub use bound::EXTERNAL_TAG;
+use bound::decode;
+pub(super) use bound::{Bound, ENVELOPE_MIME, Provenance};
+pub use traces::ProviderMemoryStore;
+
 use crate::error::OpenCompanyError;
 use crate::ports::{
-    ChunkAddr, ChunkHit, ChunkMeta, CompanyId, CompressedTrace, ContextChunk, ContextStore,
-    EvictionPolicy, FactKind, FactRecord, FactStore, MemoryStore, TaskResult,
+    ChunkAddr, ChunkHit, ChunkMeta, CompanyId, ContextChunk, ContextStore, FactKind, FactRecord,
+    FactStore,
 };
-use crate::runtime::maintenance::TRACE_RETENTION_LIMIT;
 use crate::store::text::{ceil_boundary, slice_on_char_boundaries};
 use crate::{Result, store::content_address};
-
-/// Envelope version. Bumped only if the on-the-wire shape of a record changes
-/// incompatibly; a decoder that meets a version it does not know refuses rather
-/// than guessing, because a half-understood memory record is worse than a
-/// missing one.
-const ENVELOPE_VERSION: u8 = 1;
-
-/// The wire form of a typed port record inside a provider entry's `content`.
-#[derive(Debug, Serialize, Deserialize)]
-struct Envelope<T> {
-    /// Format version — see [`ENVELOPE_VERSION`].
-    v: u8,
-    /// The port's own record, verbatim.
-    record: T,
-}
-
-/// Characters a hosted engine removes from `content`, escaped on the way out.
-///
-/// Supermemory strips `U+FFFD` server-side (tinymemory#80, measured against
-/// the live API rather than inferred). An engine is within its rights to
-/// sanitise text it is handed; what breaks is that this host does not hand it
-/// text, it hands it a JSON envelope, and a character removed from the middle
-/// of that envelope comes back as a record whose body is quietly one character
-/// shorter than it was written.
-///
-/// `U+0000` is deliberately absent: RFC 8259 requires escaping `U+0000`
-/// through `U+001F`, so `serde_json` already emits it as `\u0000` and it never
-/// reaches an engine as a literal. Measured, not assumed — a NUL survives this
-/// path against live Supermemory today, and a `U+FFFD` does not. Listing it
-/// here would be dead weight implying a protection that JSON already provides.
-const CHARACTERS_ENGINES_STRIP: [char; 1] = ['\u{FFFD}'];
-
-/// Encodes a typed record for the provider's `content` field.
-///
-/// The escaping pass exists because the envelope has to survive engines that
-/// sanitise content. `\ufffd` and a literal `U+FFFD` are the same string to
-/// every JSON reader, so this changes nothing a decoder sees — including for
-/// records already written the other way, which keep decoding unchanged.
-///
-/// Rewriting the serialized text is safe here in a way it would not be in
-/// general: JSON's structural characters are all ASCII, so a character from
-/// [`CHARACTERS_ENGINES_STRIP`] can only ever occur inside a string literal,
-/// and `serde_json` has already escaped any backslash around it. Substituting
-/// its `\uXXXX` form therefore yields an equivalent document and cannot
-/// introduce or terminate an escape sequence.
-fn encode<T: Serialize>(record: &T) -> Result<String> {
-    let json = serde_json::to_string(&Envelope {
-        v: ENVELOPE_VERSION,
-        record,
-    })
-    .map_err(|error| OpenCompanyError::Store(format!("could not encode memory record: {error}")))?;
-    Ok(CHARACTERS_ENGINES_STRIP
-        .iter()
-        .fold(json, |text, character| {
-            if text.contains(*character) {
-                text.replace(*character, &format!("\\u{:04x}", *character as u32))
-            } else {
-                text
-            }
-        }))
-}
-
-/// Decodes one entry, or `None` when it is not ours to read.
-///
-/// Returns `None` — rather than an error — for an entry outside `namespace` or
-/// written by a version we do not understand. A single unreadable row must not
-/// fail a whole `list`: on a shared hosted engine the store may legitimately
-/// hold rows this build did not write.
-///
-/// A row *inside* our namespace that fails to parse is different: nothing else
-/// writes there, so it is a record this host stored and can no longer read — a
-/// corrupted write, not foreign data. It is still skipped (one bad row must not
-/// fail the list), but loudly: #1201 was exactly this shape — the embedded
-/// driver's PII scrubber redacted digits out of the JSON envelope, and the
-/// silent `None` here made a corrupted record indistinguishable from one that
-/// was never written.
-fn decode<T: DeserializeOwned>(entry: &MemoryEntry, namespace: &Namespace) -> Option<T> {
-    let reported = entry.namespace.as_deref().unwrap_or_default();
-    if !namespace.contains(reported) {
-        tracing::warn!(
-            expected = namespace.as_str(),
-            reported,
-            "memory driver returned an entry outside the requested namespace; dropping it"
-        );
-        return None;
-    }
-    // Two-stage parse, version before record: a row written by an envelope
-    // version this build does not know may carry a record shape `T` cannot
-    // deserialize, and collapsing both steps into one `Envelope<T>` parse
-    // would misreport that legitimate skip as corruption. Only a row whose
-    // envelope is unreadable, or whose version matches and record still does
-    // not parse, is a record we wrote and can no longer read.
-    let corrupt = |error: &dyn std::fmt::Display| {
-        tracing::warn!(
-            namespace = namespace.as_str(),
-            key = %entry.key,
-            %error,
-            "memory entry in our namespace failed to decode; dropping it \
-             (a record we wrote and can no longer read — see #1201)"
-        );
-    };
-    let envelope: Envelope<serde_json::Value> = match serde_json::from_str(&entry.content) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            corrupt(&error);
-            return None;
-        }
-    };
-    if envelope.v != ENVELOPE_VERSION {
-        tracing::debug!(
-            namespace = namespace.as_str(),
-            key = %entry.key,
-            version = envelope.v,
-            "memory entry has an envelope version this build does not understand; skipping it"
-        );
-        return None;
-    }
-    match serde_json::from_value(envelope.record) {
-        Ok(record) => Some(record),
-        Err(error) => {
-            corrupt(&error);
-            None
-        }
-    }
-}
-
-/// Maps a provider error onto the crate error type.
-pub(super) fn store_error(error: MemoryError) -> OpenCompanyError {
-    match error {
-        MemoryError::NotFound(what) => OpenCompanyError::NotFound(what),
-        MemoryError::Invalid(why) => OpenCompanyError::InvalidRequest(why),
-        // Not `Unimplemented`: that variant means *this build* has no code for a
-        // port. This means the operator bound an engine that cannot do what was
-        // asked, which is a deployment fact they can act on, so the driver's own
-        // words are worth keeping.
-        MemoryError::Unsupported { capability } => OpenCompanyError::Store(format!(
-            "the bound memory engine does not support the `{capability}` capability"
-        )),
-        other => OpenCompanyError::Store(other.to_string()),
-    }
-}
-
-/// Category tags. Namespaces already partition these records; the category is a
-/// second, driver-visible axis so an engine's own tooling shows something
-/// meaningful, and it is `Custom` so it can never be confused with an engine's
-/// native semantics for `Core` / `Daily` / `Conversation`.
-fn category(tag: &str) -> MemoryCategory {
-    MemoryCategory::Custom(format!("oc:{tag}"))
-}
-
-/// Shared plumbing: a provider, and which partition of a company's memory this
-/// facade addresses.
-///
-/// # Why the company is a per-call argument, not a field
-///
-/// One `MemoryOverlay` is opened per *process* and injected into every
-/// company's runtime, so a facade instance is shared by every tenant this host
-/// serves. A namespace fixed at construction would therefore be one company's
-/// namespace serving all of them — a cross-tenant leak, and exactly the defect
-/// this module exists to prevent.
-///
-/// So the namespace is derived on every call from the `&CompanyId` the port
-/// method was given. That is strictly stronger than deriving it once: the
-/// namespace is a pure function of the argument the port contract already
-/// requires, so it cannot be stale, cannot be mismatched with the caller's
-/// intent, and cannot be set to a company the caller was not holding.
-#[derive(Clone)]
-pub(super) struct Bound {
-    provider: std::sync::Arc<dyn MemoryProvider>,
-    scope: Scope,
-    taint: MemoryTaint,
-}
-
-impl Bound {
-    pub(super) fn new(
-        provider: std::sync::Arc<dyn MemoryProvider>,
-        scope: Scope,
-        taint: MemoryTaint,
-    ) -> Self {
-        Self {
-            provider,
-            scope,
-            taint,
-        }
-    }
-
-    /// The namespace this facade addresses for `company`.
-    fn namespace(&self, company: &CompanyId) -> Namespace {
-        Namespace::company_root(company).child(&self.scope)
-    }
-
-    /// Stores one typed record.
-    ///
-    /// Taint is passed on every call because [`MemoryCore::store`] requires it —
-    /// there is no defaulted, taint-dropping overload on the provider contract
-    /// to fall into. (The engine-side `Memory::store_with_taint` *does* have one,
-    /// which is precisely why nothing here wraps a bare `Memory`.)
-    async fn put<T: Serialize + Sync>(
-        &self,
-        company: &CompanyId,
-        key: &str,
-        record: &T,
-        tag: &str,
-    ) -> Result<()> {
-        self.provider
-            .store(
-                self.namespace(company).as_str(),
-                key,
-                &encode(record)?,
-                category(tag),
-                None,
-                self.taint,
-            )
-            .await
-            .map_err(store_error)
-    }
-
-    /// Fetches one typed record by key.
-    async fn get<T: DeserializeOwned>(&self, company: &CompanyId, key: &str) -> Result<Option<T>> {
-        let namespace = self.namespace(company);
-        Ok(self
-            .provider
-            .get(namespace.as_str(), key)
-            .await
-            .map_err(store_error)?
-            .and_then(|entry| decode(&entry, &namespace)))
-    }
-
-    /// Whether the engine holds a record at `key` at all, **without decoding
-    /// it**.
-    ///
-    /// [`Self::get`] answers `None` for two different facts: the engine has no
-    /// such record, and the engine has one this build cannot read (a foreign
-    /// envelope version, or the corrupted-write shape #1201 was). Callers that
-    /// only read may treat those alike. A caller that reports "there was
-    /// nothing there" to a user must not — that turns an unreadable record
-    /// into a silent no-op and leaves it serving recall forever.
-    async fn exists(&self, company: &CompanyId, key: &str) -> Result<bool> {
-        let namespace = self.namespace(company);
-        Ok(self
-            .provider
-            .get(namespace.as_str(), key)
-            .await
-            .map_err(store_error)?
-            .is_some())
-    }
-
-    /// Lists every typed record in this company's partition.
-    async fn list<T: DeserializeOwned>(&self, company: &CompanyId) -> Result<Vec<T>> {
-        let namespace = self.namespace(company);
-        Ok(self
-            .provider
-            .list(Some(namespace.as_str()), None, None)
-            .await
-            .map_err(store_error)?
-            .iter()
-            .filter_map(|entry| decode(entry, &namespace))
-            .collect())
-    }
-
-    /// Deletes one record, reporting whether it existed.
-    async fn forget(&self, company: &CompanyId, key: &str) -> Result<bool> {
-        self.provider
-            .forget(self.namespace(company).as_str(), key)
-            .await
-            .map_err(store_error)
-    }
-
-    /// Ranked recall, narrowed to this partition on the way in and re-checked on
-    /// the way out.
-    async fn recall(
-        &self,
-        company: &CompanyId,
-        query: &str,
-        limit: usize,
-    ) -> Result<(Namespace, Vec<MemoryEntry>)> {
-        let namespace = self.namespace(company);
-        let opts = tinymemory_api::recall::OwnedRecallOpts {
-            namespace: Some(namespace.as_str().to_string()),
-            ..Default::default()
-        };
-        let hits = self
-            .provider
-            .recall(query, limit, &opts, None)
-            .await
-            .map_err(store_error)?
-            .into_iter()
-            .filter(|entry| namespace.contains(entry.namespace.as_deref().unwrap_or_default()))
-            .collect();
-        Ok((namespace, hits))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // FactStore
 // ---------------------------------------------------------------------------
 
-/// The operator's hand-curated facts, over `MemoryCore`.
+/// The operator's hand-curated facts.
 ///
 /// The closest fit of the three ports: `list`/`upsert`/`delete` map onto
 /// `list`/`store`/`forget` almost exactly, and `forget` already returns the
@@ -399,7 +119,7 @@ impl FactStore for ProviderFactStore {
 // ContextStore
 // ---------------------------------------------------------------------------
 
-/// The RLM environment, over `MemoryCore` + `MemoryRecall`.
+/// The RLM environment.
 ///
 /// Two host-side gaps the contract does not cover, both called out in
 /// `docs/spec/runtime/orchestration/memory.md`:
@@ -675,18 +395,17 @@ impl ContextStore for ProviderContextStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ChunkHit>> {
-        let (namespace, entries) = self.bound.recall(company, query, limit).await?;
-        Ok(entries
+        let (namespace, hits) = self.bound.search(company, query, limit).await?;
+        Ok(hits
             .iter()
-            .filter_map(|entry| {
-                let chunk: StoredChunk = decode(entry, &namespace)?;
+            .filter_map(|hit| {
+                let chunk: StoredChunk = decode(hit, &namespace)?;
                 Some(ChunkHit {
                     addr: ChunkAddr::new(content_address(&chunk.body)),
                     snippet: snippet(&chunk.body),
-                    // The port promises `[0, 1]`. A driver that reports no score
-                    // (the mandatory-only composition does not) still produced a
-                    // hit, so it ranks above nothing rather than being dropped.
-                    score: entry.score.unwrap_or(1.0).clamp(0.0, 1.0),
+                    // The port promises `[0, 1]`; engines rank on their own
+                    // scale, so clamp rather than trust it.
+                    score: f64::from(hit.score).clamp(0.0, 1.0),
                 })
             })
             .take(limit)
@@ -701,233 +420,6 @@ fn snippet(body: &str) -> String {
         return body.to_string();
     }
     body[..ceil_boundary(body, MAX)].to_string()
-}
-
-// ---------------------------------------------------------------------------
-// MemoryStore
-// ---------------------------------------------------------------------------
-
-/// The brain's compressed traces and task results.
-///
-/// The spec sequences this port last, and says it may reasonably never move:
-/// append-only, eviction-driven trace rows are the shape the contract suits
-/// least. It is here because leaving one port on a different backend would mean
-/// the export bundle spans two engines.
-///
-/// The gap this closes is `evict`. The contract has no archive tier and no bulk
-/// delete by predicate, so eviction is a **move** between two namespaces — see
-/// [`ProviderMemoryStore::evict`].
-pub struct ProviderMemoryStore {
-    traces: Bound,
-    archive: Bound,
-    task_results: Bound,
-}
-
-impl ProviderMemoryStore {
-    pub(super) fn new(traces: Bound, archive: Bound, task_results: Bound) -> Self {
-        Self {
-            traces,
-            archive,
-            task_results,
-        }
-    }
-
-    /// Reads the live trace set, oldest first.
-    async fn ordered_traces(&self, company: &CompanyId) -> Result<Vec<CompressedTrace>> {
-        let mut traces: Vec<CompressedTrace> = self.traces.list(company).await?;
-        // Total order, not just by timestamp: two traces stamped in the same
-        // millisecond must not reorder between reads, or `recent_traces` returns
-        // a different window each call and eviction evicts a different set.
-        traces.sort_by(|a, b| {
-            a.at_millis
-                .cmp(&b.at_millis)
-                .then_with(|| a.cycle_id.cmp(&b.cycle_id))
-        });
-        Ok(traces)
-    }
-
-    /// Reads the archived trace set, for the operator's inspection.
-    ///
-    /// The archive is a bounded recovery tier on this facade: eviction moves
-    /// traces here rather than destroying them. The export path carries this
-    /// tier separately from the live `GET /memory/traces` window — both read
-    /// distinct namespaces. This accessor exists so the operator tier and the
-    /// "archives rather than destroys" property tests can observe the tier itself.
-    pub(super) async fn archived_traces(
-        &self,
-        company: &CompanyId,
-    ) -> Result<Vec<CompressedTrace>> {
-        self.archive.list(company).await
-    }
-
-    /// Restores traces directly into the archive tier.
-    pub(super) async fn restore_archived_traces(
-        &self,
-        company: &CompanyId,
-        traces: &[CompressedTrace],
-    ) -> Result<()> {
-        for trace in traces {
-            self.archive
-                .put(company, &trace.cycle_id, trace, "trace")
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Bounds the archive tier to the newest `n` archived traces.
-    ///
-    /// Eviction moves traces OUT of the live window rather than destroying
-    /// them; without a matching cap here the archive would retain every trace a
-    /// company ever evicted, so the documented retention policy would bound the
-    /// inspectable window but not storage. Keeping the newest `n` evicted
-    /// traces bounds the tier at `n` and total trace storage at `2n` — the live
-    /// window plus the eviction history nearest to it.
-    async fn prune_archive(&self, id: &CompanyId, n: usize) -> Result<()> {
-        if n == 0 {
-            let archived = self.archive.list::<CompressedTrace>(id).await?;
-            for trace in archived {
-                self.archive.forget(id, &trace.cycle_id).await?;
-            }
-            return Ok(());
-        }
-        let mut archived = self.archive.list::<CompressedTrace>(id).await?;
-        if archived.len() <= n {
-            return Ok(());
-        }
-        // Same total order as the live set, so "newest" is unambiguous even
-        // when two traces share a millisecond.
-        archived.sort_by(|a, b| {
-            a.at_millis
-                .cmp(&b.at_millis)
-                .then_with(|| a.cycle_id.cmp(&b.cycle_id))
-        });
-        let prune = archived.len() - n;
-        for trace in archived.into_iter().take(prune) {
-            self.archive.forget(id, &trace.cycle_id).await?;
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl MemoryStore for ProviderMemoryStore {
-    async fn save_trace(&self, id: &CompanyId, trace: CompressedTrace) -> Result<()> {
-        self.traces.put(id, &trace.cycle_id, &trace, "trace").await
-    }
-
-    async fn recent_traces(&self, id: &CompanyId, limit: usize) -> Result<Vec<CompressedTrace>> {
-        // Avoid even touching the provider when the caller requests no rows.
-        // This matters for the provider-backed facade because `list` has no
-        // limit argument and otherwise decodes the entire trace partition.
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let traces = self.ordered_traces(id).await?;
-        // Newest last, per the port contract, so the tail is the window.
-        let skip = traces.len().saturating_sub(limit);
-        Ok(traces.into_iter().skip(skip).collect())
-    }
-
-    async fn save_task_result(&self, id: &CompanyId, result: TaskResult) -> Result<()> {
-        self.task_results
-            .put(id, &result.task_id, &result, "task-result")
-            .await
-    }
-
-    /// Evicts per `policy`, **archiving rather than destroying**.
-    ///
-    /// `docs/spec/company-brain/memory.md` makes this normative: "evicted traces
-    /// are archived, not deleted, until retention policy or the Operator says
-    /// otherwise". The contract offers no archive tier, so the behaviour lives
-    /// here as a move between two namespaces.
-    ///
-    /// Order matters and is not arbitrary: the archive write happens **before**
-    /// the live delete. There is no transaction spanning two provider calls, so
-    /// one of the two orders has to be chosen for what it does when the process
-    /// dies in between. Archive-then-delete leaves a trace in both places — a
-    /// duplicate the next read reconciles. Delete-then-archive loses it. For a
-    /// port whose whole promise is "not destroyed", that asymmetry decides it.
-    ///
-    /// The returned count is **traces this call removed from the live set**, not
-    /// traces archived. Those differ when `forget` reports a key was already
-    /// gone: the archive write has happened by then, so the archive can hold an
-    /// entry this call did not remove. That is a concurrent eviction having got
-    /// there first, and the entry is archived either way — which is the
-    /// behaviour the port promises. Reporting it as removed *here* would be the
-    /// lie, so the count stays narrow.
-    ///
-    /// The same asymmetry appears if a `put` or `forget` fails mid-loop: the
-    /// error propagates and the traces already processed stay archived. That is
-    /// the archive-then-delete order behaving as designed under partial failure
-    /// — a duplicate the next read reconciles, never a loss. What must NOT be
-    /// skipped on that path is the archive bound itself: traces already moved
-    /// by the failed pass are still in the archive, so the prune below runs
-    /// before the error propagates, keeping the tier at its limit even when a
-    /// maintenance pass repeatedly fails partway.
-    ///
-    /// Every eviction additionally bounds the archive itself to the newest
-    /// `n` evicted traces (see [`ProviderMemoryStore::prune_archive`]): a
-    /// `KeepRecent { n }` eviction bounds it to `n`, and `OlderThan` — which
-    /// has no `n` of its own — to the retention limit, so the policy that
-    /// bounds the live window also bounds storage on every path: a company
-    /// that runs for years does not accumulate every trace it ever evicted
-    /// beside the 32 it keeps, and an operator-sized `OlderThan` sweep cannot
-    /// grow the archive without bound. That bound is what keeps
-    /// `GET /memory/archives` a bounded read by construction rather than a
-    /// download of the whole archive followed by a discard.
-    async fn evict(&self, id: &CompanyId, policy: EvictionPolicy) -> Result<u64> {
-        let traces = self.ordered_traces(id).await?;
-        let doomed: Vec<CompressedTrace> = match &policy {
-            EvictionPolicy::KeepRecent { n } => {
-                let keep_from = traces.len().saturating_sub(*n);
-                traces.into_iter().take(keep_from).collect()
-            }
-            EvictionPolicy::OlderThan { before_millis } => traces
-                .into_iter()
-                .filter(|trace| trace.at_millis < *before_millis)
-                .collect(),
-        };
-        let mut evicted = 0u64;
-        let move_result = (async {
-            for trace in doomed {
-                self.archive
-                    .put(id, &trace.cycle_id, &trace, "trace")
-                    .await?;
-                if self.traces.forget(id, &trace.cycle_id).await? {
-                    evicted += 1;
-                }
-            }
-            Ok::<(), OpenCompanyError>(())
-        })
-        .await;
-        // Bound the archive on every eviction path — the partial-failure path
-        // included. `KeepRecent` prunes to its own `n`; `OlderThan` has no `n`
-        // to bound by, so it prunes to the retention limit — the same window
-        // the live set is held to, which is what keeps the tier "the eviction
-        // history nearest to the live window" and the archive read bounded for
-        // any policy.
-        let bound = match policy {
-            EvictionPolicy::KeepRecent { n } => n,
-            EvictionPolicy::OlderThan { .. } => TRACE_RETENTION_LIMIT,
-        };
-        if let Err(move_err) = move_result {
-            // A provider failure mid-loop still leaves the traces already
-            // moved sitting in the archive, and a maintenance pass that keeps
-            // failing partway must not grow the tier past its bound across
-            // retries. Prune best-effort, then report the failure that
-            // actually happened.
-            if let Err(prune_err) = self.prune_archive(id, bound).await {
-                tracing::warn!(
-                    error = %prune_err,
-                    "archive prune failed after a partial eviction failure; the archive may exceed \
-                     its retention bound"
-                );
-            }
-            return Err(move_err);
-        }
-        self.prune_archive(id, bound).await?;
-        Ok(evicted)
-    }
 }
 
 #[cfg(test)]

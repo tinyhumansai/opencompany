@@ -28,13 +28,13 @@ const STATE: MemoryEngineState = {
   editable: true,
   configPath: "/data/config.toml",
   options: [
-    { id: "store", label: "Store", description: "Built-in.", available: true, requiresUrl: false, requiresKey: false, durable: true },
+    { id: "store", label: "Store", description: "Built-in.", available: true, requiresUrl: false, acceptsUrl: false, requiresKey: false, durable: true },
     {
-      id: "supermemory",
+      id: "cortexdb",
       label: "Supermemory",
       description: "Hosted.",
       available: true,
-      requiresUrl: true,
+      requiresUrl: true, acceptsUrl: true,
       requiresKey: true,
       durable: true,
     },
@@ -90,7 +90,7 @@ describe("the probe path never binds anything", () => {
     await show(client);
 
     await act(async () => {
-      tile("supermemory")!.click();
+      tile("cortexdb")!.click();
     });
     const testButton = Array.from(container.querySelectorAll("button")).find(
       (b) => b.textContent?.trim() === "Test connection",
@@ -104,7 +104,7 @@ describe("the probe path never binds anything", () => {
     // click must have actually reached the probe route for the candidate,
     // not just left the screen looking untouched.
     expect(test).toHaveBeenCalledTimes(1);
-    expect(test).toHaveBeenCalledWith(expect.objectContaining({ engine: "supermemory" }));
+    expect(test).toHaveBeenCalledWith(expect.objectContaining({ engine: "cortexdb" }));
     expect(put).not.toHaveBeenCalled();
     expect(container.querySelector('[data-testid="memory-engine-health"]')?.textContent).toContain(
       "store",
@@ -120,7 +120,7 @@ describe("the probe path never binds anything", () => {
     await show(client);
 
     await act(async () => {
-      tile("supermemory")!.click();
+      tile("cortexdb")!.click();
     });
     const testButton = Array.from(container.querySelectorAll("button")).find(
       (b) => b.textContent?.trim() === "Test connection",
@@ -130,7 +130,7 @@ describe("the probe path never binds anything", () => {
     });
 
     expect(test).toHaveBeenCalledTimes(1);
-    expect(test).toHaveBeenCalledWith(expect.objectContaining({ engine: "supermemory" }));
+    expect(test).toHaveBeenCalledWith(expect.objectContaining({ engine: "cortexdb" }));
     expect(put).not.toHaveBeenCalled();
     expect(container.querySelector('[data-testid="memory-engine-health"]')?.textContent).toContain(
       "store",

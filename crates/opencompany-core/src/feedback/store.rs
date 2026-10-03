@@ -15,7 +15,6 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::Result;
 use crate::error::OpenCompanyError;
 use crate::feedback::types::FeedbackItem;
-use crate::ports::generate_id;
 use crate::store::paths::Bundle;
 
 /// Process-wide, per-item confirm locks.
@@ -193,19 +192,10 @@ impl FeedbackStore {
         Ok(out)
     }
 
+    /// The shared fs-backend write (temp file, fsync, rename, cancellation
+    /// safe), rather than a weaker copy without the fsync.
     async fn write_atomic(&self, contents: &str) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| self.io_err(parent.to_path_buf(), e))?;
-        }
-        let tmp = self.path.with_extension(format!("tmp-{}", generate_id()));
-        tokio::fs::write(&tmp, contents)
-            .await
-            .map_err(|e| self.io_err(tmp.clone(), e))?;
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .map_err(|e| self.io_err(self.path.clone(), e))
+        crate::store::fs::write_atomic(&self.path, contents).await
     }
 
     fn io_err(&self, path: PathBuf, source: std::io::Error) -> OpenCompanyError {

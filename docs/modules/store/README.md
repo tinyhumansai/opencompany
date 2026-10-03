@@ -8,5 +8,5 @@ append-only `events.jsonl` and `ledger.jsonl`, and the `memory/`, `context/`,
 `keys/`, and `secrets/` directories — one bundle per `CompanyId`.
 
 Append-only files are never rewritten; each company gets its own namespace so
-isolation holds. Alternate backends (sqlite, TinyCortex, operator-supplied)
+isolation holds. Alternate backends (sqlite, a hosted TinyMemory engine, operator-supplied)
 implement the same ports.

@@ -122,11 +122,13 @@ fn auth_material_maps_onto_transport_config() {
 }
 
 #[tokio::test]
-async fn list_servers_tool_never_emits_a_credential() {
+async fn upstream_list_servers_tool_never_emits_a_credential() {
     let mut d = decl("notion", "https://notion.example/mcp");
     d.auth = AuthMaterial::Bearer("sk-super-secret-token".into());
     let reg = registry_for_agent(&[d], &grants(&["mcp:*"])).expect("registry");
-    let tool = OcMcpListServersTool::new(reg);
+    // Upstream's tool, which this host relies on rather than replacing: the
+    // guarantee is still this host's to check.
+    let tool = tinymcp::tools::McpListServersTool::new(reg);
     let result = tool.execute(json!({})).await.expect("execute");
 
     // The whole serialized result (JSON + markdown) must not carry the token.
@@ -350,6 +352,80 @@ async fn oc_call_tool_scrubs_reflected_credential() {
     assert!(
         !serialized.contains(CANARY),
         "the drained failure leaked the reflected credential: {serialized}"
+    );
+}
+
+/// A *successful* response that reflects the credential is scrubbed too.
+///
+/// The failure path above was the only one scrubbed until tinymcp's
+/// `SecretScrubber` was applied to the success branch: a server echoing the
+/// bearer inside an ordinary `tools/call` result would otherwise hand it to the
+/// agent verbatim.
+#[tokio::test]
+async fn oc_call_tool_scrubs_a_credential_reflected_in_a_successful_result() {
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use oh::security::SecurityPolicy;
+
+    async fn handler(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Json(match method {
+            "initialize" => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {},
+                            "serverInfo": { "name": "fixture", "version": "0" } }
+            }),
+            "tools/list" => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "tools": [{ "name": "echo", "description": "e",
+                                        "inputSchema": { "type": "object" } }] }
+            }),
+            _ => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "content": [{ "type": "text", "text": format!("ok — you sent {auth}") }] }
+            }),
+        })
+    }
+
+    let app = Router::new().route("/mcp", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    const CANARY: &str = "sk-canary-SUCCESS-4242";
+    let mut d = decl("fixture", &format!("http://{addr}/mcp"));
+    d.auth = AuthMaterial::Bearer(CANARY.into());
+    let secrets = granted_secrets(std::slice::from_ref(&d), &grants(&["mcp:*"]));
+    let registry = registry_for_agent(&[d], &grants(&["mcp:*"])).expect("registry");
+    let tool = OcMcpCallTool::new(
+        registry,
+        Arc::new(SecurityPolicy::default()),
+        secrets,
+        McpFailureQueue::default(),
+        McpMetering::off(),
+        Default::default(),
+    );
+
+    let result = tool
+        .execute(json!({ "server": "fixture", "tool": "echo", "arguments": {} }))
+        .await
+        .expect("mcp_call_tool");
+    assert!(!result.is_error, "the call succeeded");
+    let out = serde_json::to_string(&result).unwrap();
+    assert!(
+        out.contains("ok — you sent"),
+        "the result still carries the reply: {out}"
+    );
+    assert!(
+        !out.contains(CANARY),
+        "a successful result leaked the credential: {out}"
     );
 }
 

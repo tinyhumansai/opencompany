@@ -1,29 +1,32 @@
-//! The TinyMemory `MemoryProvider` seam (issue #914).
+//! The TinyMemory `MemoryEngine` seam (issue #914).
 //!
-//! One engine-neutral driver contract behind the three memory ports, with the
-//! engine chosen by configuration: the embedded engine in-pod, a hosted service
-//! behind a URL and a credential, or nothing at all.
+//! One engine-neutral contract behind the three memory ports, with the engine
+//! chosen by configuration: a hosted engine behind a URL and a credential
+//! (CortexDB, or the TinyHumans memory wire), or nothing at all.
 //!
 //! # The decorator is the whole point
 //!
-//! [`BoundMemory`] is the **only** public way to obtain a memory port from a
-//! provider. That is a deliberate constraint, not an ergonomic accident.
+//! [`BoundMemory`] is the **only** public way to obtain a memory port from an
+//! engine. That is a deliberate constraint, not an ergonomic accident.
 //!
 //! The three ports take `&CompanyId` as an explicit first argument — a
-//! compiler-enforced tenant-isolation invariant. `MemoryProvider` takes
-//! `namespace: &str`. Handing the raw provider to call sites would trade a
-//! guarantee the compiler checks for a convention the reviewer checks, and a
-//! missing prefix would be a silent cross-tenant leak with nothing to catch it.
-//! With a hosted engine it is worse still: the namespace string is the only
-//! thing separating tenants inside somebody else's database.
+//! compiler-enforced tenant-isolation invariant. `MemoryEngine` has no tenant
+//! argument at all: TinyMemory v2 dropped namespaces, and the only scoping it
+//! offers is metadata (`MemoryMeta::workspace`, `MetaFilter`). Handing the raw
+//! engine to call sites would trade a guarantee the compiler checks for a
+//! convention the reviewer checks, and a missing filter would be a silent
+//! cross-tenant leak with nothing to catch it. With a hosted engine it is worse
+//! still: that metadata is the only thing separating tenants inside somebody
+//! else's database.
 //!
 //! So: [`Namespace`](namespace::Namespace) has no public constructor, every
 //! port method takes `&CompanyId` and derives its namespace fresh from it
-//! (`Namespace::company_root` is the only way to make one), and there is no
-//! `pub fn` in this module tree that accepts a namespace string. Note the
-//! enforcement lives in the *port signatures and the namespace type*, not in
-//! `bind` — `BoundMemory::bind(provider, class)` itself takes no company,
-//! because one bound engine serves every company this host runs.
+//! (`Namespace::company_root` is the only way to make one), every write stamps
+//! that namespace onto the item's `workspace`, every read forces it into the
+//! filter, and every hit that comes back is re-checked against it. There is no
+//! `pub fn` in this module tree that accepts a namespace string or exposes the
+//! engine. `BoundMemory::bind(engine)` itself takes no company, because one
+//! bound engine serves every company this host runs.
 //!
 //! # What else the decorator owns
 //!
@@ -31,31 +34,21 @@
 //!
 //! - **Scratch firewall.** Provisional working-out lives in its own namespace
 //!   and is unreachable from durable recall *by construction* — the durable
-//!   facades scope recall to their own namespace and re-check every hit that
-//!   comes back, so scratch cannot appear in a durable result even if a driver
-//!   ignores the filter.
+//!   facades scope every read to their own namespace and re-check every hit
+//!   that comes back, so scratch cannot appear in a durable result even if an
+//!   engine ignores the filter.
 //! - **Archive on evict.** The contract has no archive tier, so eviction is a
 //!   move between namespaces rather than a delete — and every eviction bounds
 //!   the archive by the eviction policy's own `n` or, for a policy without
 //!   one, by the retention limit, so the move cannot grow storage without
 //!   bound either. See [`facades::ProviderMemoryStore::evict`].
-//! - **Taint.** Inbound-channel writes are stamped
-//!   [`MemoryTaint::ExternalSync`] via [`BoundMemory::inbound_context`].
-//!   Note the contract's `MemoryCore::store` requires taint on every call and
-//!   has no dropping default — the defaulted `store_with_taint` lives on the
-//!   *engine* trait, which is exactly why nothing here wraps a bare `Memory`.
+//! - **Provenance.** Inbound-channel writes are marked external via
+//!   [`BoundMemory::inbound_context`] (`SourceKind::Link` plus the
+//!   [`facades::EXTERNAL_TAG`] tag). The v1 contract carried a taint enum; v2
+//!   does not, so the mark is metadata this host stamps and owns.
 //! - **Per-agent and per-desk scoping**, which neither cognition port has today.
 //! - **Operator rights** — inspect, delete, redact, export — from
 //!   `docs/spec/company-brain/memory.md`.
-//!
-//! # Class is host-side
-//!
-//! [`DriverClass`] is taken from *configuration*, never from the driver. The
-//! contract crate excludes it on purpose: a driver that self-reported its class
-//! could claim to be embedded and skip the egress and trust checks that class
-//! gates. [`bind`](BoundMemory::bind) therefore takes the class as an
-//! argument rather than asking the provider for it.
-
 //!
 //! ## Who may run `migrate`
 //!
@@ -68,25 +61,21 @@
 //! migration surface is ever added, it must carry its own operator-auth and
 //! per-tenant scoping; do not lift this function onto a route as-is.
 
-pub mod cortexdb;
 pub mod driver;
 pub mod facades;
 pub mod migrate;
 mod namespace;
+pub mod null;
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use tinymemory::registry::DriverClass;
-use tinymemory_api::capabilities::Capabilities;
-use tinymemory_api::provider::{MemoryProvider, audit_provider};
-use tinymemory_api::types::MemoryTaint;
+use tinymemory::MemoryEngine;
 
-use facades::{Bound, ProviderContextStore, ProviderFactStore, ProviderMemoryStore};
+use facades::{Bound, Provenance, ProviderContextStore, ProviderFactStore, ProviderMemoryStore};
 use namespace::Scope;
 
 use crate::Result;
-use crate::error::OpenCompanyError;
 use crate::ports::{CompanyId, ContextStore, FactStore, MemoryStore};
 
 #[async_trait::async_trait]
@@ -115,9 +104,7 @@ impl crate::store::select::MemoryScopes for BoundMemory {
     }
 }
 
-pub use driver::{
-    MemoryDriverConfig, MemoryDriverError, MemoryMode, RemoteDeployment, open_driver,
-};
+pub use driver::{MemoryDriverConfig, MemoryDriverError, MemoryMode, open_driver};
 
 /// Process-wide cache of per-scope context stores, keyed by the scope label.
 ///
@@ -149,118 +136,101 @@ const SCOPED_CONTEXT_CACHE_CAPACITY: usize = 4096;
 /// per-call argument rather than a field — briefly, a namespace fixed at
 /// construction would be one tenant's namespace serving all of them.
 ///
-/// Clone is cheap: the provider is shared.
+/// Clone is cheap: the engine is shared.
 #[derive(Clone)]
 pub struct BoundMemory {
-    provider: Arc<dyn MemoryProvider>,
-    class: DriverClass,
-    driver_id: String,
-    capabilities: Capabilities,
+    engine: Arc<dyn MemoryEngine>,
+    engine_id: String,
     context_stores: ContextStoreCache,
 }
 
 impl std::fmt::Debug for BoundMemory {
-    /// Renders the driver identity and class only.
+    /// Renders the engine identity only.
     ///
-    /// Never anything from the provider's own configuration, which is where the
+    /// Never anything from the engine's own configuration, which is where the
     /// endpoint and the credential live.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BoundMemory")
-            .field("driver_id", &self.driver_id)
-            .field("class", &self.class.as_str())
+            .field("engine_id", &self.engine_id)
             .finish_non_exhaustive()
     }
 }
 
 impl BoundMemory {
-    /// Binds `provider` as this host's memory engine.
+    /// Binds `engine` as this host's memory engine.
     ///
-    /// `class` comes from the host's configuration, never from the driver — see
-    /// the module docs.
-    ///
-    /// Runs [`audit_provider`] before returning anything usable. An engine that
-    /// advertises a capability family it cannot actually serve fails here, at
-    /// boot, rather than on the first call that needs it — which for a memory
-    /// family could be days later, on a path nobody is watching.
-    pub fn bind(provider: Arc<dyn MemoryProvider>, class: DriverClass) -> Result<Self> {
-        audit_provider(provider.as_ref()).map_err(|audit| {
-            OpenCompanyError::Config(format!(
-                "memory driver `{}` failed its capability audit at bind time: {audit}. \
-                 This is an engine bug, not a configuration problem — the driver claims a \
-                 capability family it cannot serve, or serves one it does not advertise.",
-                provider.driver_id()
-            ))
-        })?;
-        Ok(Self {
-            driver_id: provider.driver_id().to_string(),
-            capabilities: provider.capabilities(),
-            provider,
-            class,
+    /// Offline by design: nothing is sent to the engine here. Reachability is
+    /// the boot path's separate, bounded probe
+    /// ([`MemoryOverlay::refresh_health`](crate::store::select::MemoryOverlay::refresh_health)).
+    pub fn bind(engine: Arc<dyn MemoryEngine>) -> Self {
+        Self {
+            engine_id: engine.descriptor().id.to_string(),
+            engine,
             context_stores: Arc::new(OnceLock::new()),
-        })
+        }
     }
 
-    /// The bound provider's own name (`supermemory`, `mem0`, `cognee`, `null`, …).
+    /// The bound engine's own id (`cortexdb`, `tinyhumans`, `null`, …).
     ///
     /// Safe to surface to an operator — unlike the endpoint and the credential,
     /// which are not.
-    pub fn driver_id(&self) -> &str {
-        &self.driver_id
+    pub fn engine_id(&self) -> &str {
+        &self.engine_id
     }
 
-    /// How this driver was bound, from configuration.
-    pub fn class(&self) -> DriverClass {
-        self.class
-    }
-
-    /// The negotiated capability families, as stable names for status output.
+    /// The retrieval modes the engine serves, as stable names for status
+    /// output (`keyword`, `vector`, `hybrid`).
     ///
-    /// An operator looking at a hosted engine needs to see what it *cannot* do:
-    /// most hosted services have no summary tree, no graph, and no taint, and
-    /// finding that out from a failed cycle is worse than reading it here.
+    /// The v2 contract's only negotiated surface: every engine serves the same
+    /// five operations, and differs only in how `fetch` ranks.
     pub fn capability_names(&self) -> Vec<&'static str> {
-        self.capabilities.iter().map(|cap| cap.as_str()).collect()
+        self.engine
+            .descriptor()
+            .fetch_modes
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect()
     }
 
     /// Builds a facade addressing one scope of a company's memory.
-    fn bound(&self, scope: Scope, taint: MemoryTaint) -> Bound {
-        Bound::new(self.provider.clone(), scope, taint)
+    fn bound(&self, scope: Scope, provenance: Provenance) -> Bound {
+        Bound::new(self.engine.clone(), scope, provenance)
     }
 
     /// The operator's hand-curated facts.
     ///
-    /// Operator-authored, so `Internal` — this is the company writing about
+    /// Operator-authored, so internal — this is the company writing about
     /// itself, not content arriving from outside.
     pub fn facts(&self) -> Arc<dyn FactStore> {
         Arc::new(ProviderFactStore::new(
-            self.bound(Scope::Facts, MemoryTaint::Internal),
+            self.bound(Scope::Facts, Provenance::Internal),
         ))
     }
 
     /// The durable context store: the RLM environment the brain queries.
     pub fn context(&self) -> Arc<dyn ContextStore> {
         Arc::new(ProviderContextStore::new(
-            self.bound(Scope::Context, MemoryTaint::Internal),
+            self.bound(Scope::Context, Provenance::Internal),
         ))
     }
 
     /// The durable context store, for writes arriving from an inbound channel.
     ///
     /// Identical to [`context`](Self::context) except that every write is
-    /// stamped [`MemoryTaint::ExternalSync`]. A company that reads the web needs
+    /// marked external ([`Provenance::External`]). A company that reads the web needs
     /// this: content that arrived from outside must stay marked as such, because
     /// laundering it into internal-trust content is what lets a page the agent
     /// read be treated as something the company decided.
     pub fn inbound_context(&self) -> Arc<dyn ContextStore> {
         Arc::new(ProviderContextStore::new(
-            self.bound(Scope::Context, MemoryTaint::ExternalSync),
+            self.bound(Scope::Context, Provenance::External),
         ))
     }
 
     pub fn agent_context(&self, agent_id: &str) -> Arc<dyn ContextStore> {
         self.scoped_context(format!("agent:{agent_id}"), || {
             ProviderContextStore::new(
-                self.bound(Scope::Agent(agent_id.to_string()), MemoryTaint::Internal),
+                self.bound(Scope::Agent(agent_id.to_string()), Provenance::Internal),
             )
         })
     }
@@ -269,7 +239,7 @@ impl BoundMemory {
     pub fn desk_context(&self, desk_id: &str) -> Arc<dyn ContextStore> {
         self.scoped_context(format!("desk:{desk_id}"), || {
             ProviderContextStore::new(
-                self.bound(Scope::Desk(desk_id.to_string()), MemoryTaint::Internal),
+                self.bound(Scope::Desk(desk_id.to_string()), Provenance::Internal),
             )
         })
     }
@@ -331,7 +301,7 @@ impl BoundMemory {
     /// retrying.
     pub fn scratch(&self) -> Arc<dyn ContextStore> {
         Arc::new(ProviderContextStore::new(
-            self.bound(Scope::Scratch, MemoryTaint::Internal),
+            self.bound(Scope::Scratch, Provenance::Internal),
         ))
     }
 
@@ -344,9 +314,9 @@ impl BoundMemory {
     /// carry.
     fn trace_store(&self) -> ProviderMemoryStore {
         ProviderMemoryStore::new(
-            self.bound(Scope::Traces, MemoryTaint::Internal),
-            self.bound(Scope::Archive, MemoryTaint::Internal),
-            self.bound(Scope::TaskResults, MemoryTaint::Internal),
+            self.bound(Scope::Traces, Provenance::Internal),
+            self.bound(Scope::Archive, Provenance::Internal),
+            self.bound(Scope::TaskResults, Provenance::Internal),
         )
     }
 
@@ -381,12 +351,3 @@ mod tests;
 #[cfg(test)]
 #[path = "memory_behavior_tests.rs"]
 mod tests_behavior;
-#[cfg(test)]
-#[path = "memory_upstream_conformance_tests.rs"]
-mod tests_upstream_conformance;
-#[cfg(test)]
-#[path = "memory_upstream_conformance_hosted_tests.rs"]
-mod tests_upstream_conformance_hosted;
-#[cfg(test)]
-#[path = "memory_upstream_conformance_vendors_tests.rs"]
-mod tests_upstream_conformance_vendors;

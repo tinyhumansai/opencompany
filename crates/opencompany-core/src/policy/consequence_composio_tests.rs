@@ -540,7 +540,7 @@ pub(super) fn a_catalogued_build_never_reports_the_catalogue_absent() {
 #[test]
 #[cfg(feature = "openhuman")]
 pub(super) fn we_do_not_fall_back_to_the_upstream_read_default() {
-    use tinymemory_api::composio::scopes::{ToolScope, classify_unknown};
+    use openhuman_core::integrations::composio::contract::scopes::{ToolScope, classify_unknown};
     assert_eq!(
         classify_unknown("GITHUB_INVENT_A_NEW_VERB"),
         ToolScope::Read,
@@ -588,8 +588,10 @@ pub(super) fn we_do_not_fall_back_to_the_upstream_read_default() {
 #[test]
 #[cfg(feature = "openhuman")]
 pub(super) fn the_fallback_never_calls_a_curated_write_a_read() {
-    use tinymemory_api::composio::catalogs::catalog_for_toolkit;
-    use tinymemory_api::composio::scopes::{ToolScope, agent_ready_toolkits};
+    use openhuman_core::integrations::composio::contract::catalogs::catalog_for_toolkit;
+    use openhuman_core::integrations::composio::contract::scopes::{
+        ToolScope, agent_ready_toolkits,
+    };
 
     let entries: Vec<_> = agent_ready_toolkits()
         .into_iter()

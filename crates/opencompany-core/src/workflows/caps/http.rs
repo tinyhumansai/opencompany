@@ -178,170 +178,24 @@ fn parse_http_output(output: &str) -> (Value, String) {
 ///
 /// # Never stricter than the real guard
 ///
-/// Every rule below mirrors one the real guard applies, so anything refused here
-/// is refused by a real run too. That direction is the one that matters: a dry
-/// run that wrongly refuses blocks a working graph and cannot be told from a
-/// real refusal without arming it anyway. Where a rule is ambiguous — a
-/// malformed allowlist, an unparseable URL — this returns `None` and checks
-/// nothing rather than guessing.
+/// This *is* the real guard, minus its DNS step: the same allowlist
+/// normalization (`normalize_allowed_domains`, fail-closed sentinel included)
+/// and the same URL rules (`validate_url`) that `validate_url_with_dns_check`
+/// runs before it resolves. It used to be a hand-maintained copy of those rules,
+/// held to agreement by inspection and then by a behavioural test (#1075), and
+/// it had already drifted both ways once — a trailing-dot host refused here and
+/// allowed there, and an IPv4-compatible IPv6 literal read differently. Calling
+/// the rules instead of copying them removes the drift rather than policing it.
 ///
-/// That invariant held only by inspection until #1075, and inspection had already
-/// missed a break: allowlist *entries* were normalized with
-/// `trim_end_matches('.')` while the **host** was not, so `https://example.com./x`
-/// against `["example.com"]` was refused here and allowed by the real guard —
-/// exactly the blocked-working-graph failure the paragraph above rules out.
-///
-/// `dry_run_refusal_matches_the_real_client` pins the agreement **behaviourally**,
-/// by driving the same URLs through [`GuardedHttpClient`], so this stays correct
-/// when upstream changes its internals rather than only when someone re-reads
-/// them. It is two-directional as of #1075: a one-directional "both refuse"
-/// comparison structurally cannot see this copy becoming *too strict*, which is
-/// why the trailing-dot break survived it.
+/// `dry_run_refusal_matches_the_real_client` still drives the same URLs through
+/// [`GuardedHttpClient`], so a future change to the real path's order of checks
+/// is caught here too.
 pub(super) fn preflight_refusal(request: &Value, allowed_domains: &[String]) -> Option<String> {
-    let url = request.get("url")?.as_str()?.trim();
-
-    // The real guard refuses all three before it reads a host.
-    if url.is_empty() {
-        return Some("URL cannot be empty".to_string());
-    }
-    if url.chars().any(char::is_whitespace) {
-        return Some("URL cannot contain whitespace".to_string());
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Some("Only http:// and https:// URLs are allowed".to_string());
-    }
-
-    let host = match host_of(url) {
-        Ok(host) => host,
-        Err(reason) => return Some(reason.to_string()),
-    };
-
-    if is_private_or_local_host(&host) {
-        return Some(format!("Blocked local/private host: {host}"));
-    }
-
-    // An empty list is open-public mode upstream, so there is nothing to refuse.
-    if allowed_domains.is_empty() {
-        return None;
-    }
-    // Upstream substitutes a fail-closed sentinel when *every* entry is
-    // malformed, which would refuse all traffic. Rather than reproduce that
-    // subtlety — the easiest place for a copy to invent a refusal the real run
-    // would not make — an allowlist this cannot read cleanly is left unchecked.
-    let normalized: Vec<String> = allowed_domains
-        .iter()
-        .filter_map(|d| normalize(d))
-        .collect();
-    if normalized.len() != allowed_domains.len() {
-        return None;
-    }
-    let allowed = normalized.iter().any(|domain| {
-        domain == "*"
-            || host == *domain
-            || host
-                .strip_suffix(domain.as_str())
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    });
-    (!allowed).then(|| format!("URL not in allowed domains: {host}"))
-}
-
-/// The host of an `http`/`https` URL as the real guard's `extract_host` reads
-/// it: lowercased, port stripped, **trailing dot stripped**, and rejected —
-/// not read past — when the authority carries userinfo or an IPv6 literal.
-///
-/// Every `Err` is a rule the real guard applies before the allowlist, so the
-/// message is its message. This used to read past userinfo and unwrap IPv6
-/// brackets (a *missing* refusal) and to leave a trailing dot on the host
-/// (a *false* refusal, since [`normalize`] strips one from allowlist entries).
-/// See #1075.
-fn host_of(url: &str) -> Result<String, &'static str> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or("Only http:// and https:// URLs are allowed")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() {
-        return Err("URL must include a host");
-    }
-    if authority.contains('@') {
-        return Err("URL userinfo is not allowed");
-    }
-    if authority.starts_with('[') {
-        return Err("IPv6 hosts are not supported in http_request");
-    }
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
-    if host.is_empty() {
-        return Err("URL must include a valid host");
-    }
-    Ok(host)
-}
-
-/// Mirrors the real guard's allowlist entry normalization.
-fn normalize(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-    (!d.is_empty() && !d.chars().any(char::is_whitespace)).then_some(d)
-}
-
-/// Mirrors the real guard's private/local rule.
-fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if bare == "localhost"
-        || bare.ends_with(".localhost")
-        || bare.rsplit('.').next().is_some_and(|tld| tld == "local")
-    {
-        return true;
-    }
-    match bare.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => is_non_global_v4(v4),
-        Ok(std::net::IpAddr::V6(v6)) => {
-            let segs = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (segs[0] & 0xfe00) == 0xfc00
-                || (segs[0] & 0xffc0) == 0xfe80
-                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-                || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
-        }
-        Err(_) => false,
-    }
-}
-
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (a == 100 && (64..=127).contains(&b))
-        || a >= 240
-        || (a == 192 && b == 0 && (c == 0 || c == 2))
-        || (a == 198 && b == 51)
-        || (a == 203 && b == 0)
-        || (a == 198 && (18..=19).contains(&b))
+    let url = request.get("url")?.as_str()?;
+    let allowed = tinytools_std::url_guard::normalize_allowed_domains(allowed_domains.to_vec());
+    tinytools_std::url_guard::validate_url(url, &allowed)
+        .err()
+        .map(|refusal| refusal.to_string())
 }
 
 #[cfg(test)]

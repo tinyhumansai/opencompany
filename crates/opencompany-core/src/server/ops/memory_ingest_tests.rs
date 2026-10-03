@@ -328,19 +328,13 @@ async fn a_request_over_the_body_limit_is_refused_as_413_not_malformed() {
     );
 }
 
-/// The server-side request forgery guard: this route makes the *host* fetch a
-/// URL, so the deployment's own network is off limits.
-///
-/// Every case here is decided without a lookup — a literal address, or a
-/// scheme refused before any host is considered — so the test does not depend
-/// on the runner having DNS. The arm that does resolve is the one this now
-/// delegates: a hostname answering with a private address is refused by
-/// `dns_check_with_empty_allowlist_blocks_private_resolved_ip` and
-/// `dns_check_blocks_localhost_resolution` in the runtime's own
-/// `url_guard_tests.rs`, both against the empty allow-list this passes.
+/// The early, spelling-only refusals: schemes, literal internal addresses and
+/// internal names. What a name *resolves* to is judged by TinyMemory's pinned
+/// resolver at connect time, and is tested there — as is the IPv4-compatible
+/// `::127.0.0.1` form (tinyhumansai/tinymemory#190).
 #[cfg(feature = "documents")]
-#[tokio::test]
-async fn link_ingestion_refuses_this_deployments_own_network() {
+#[test]
+fn link_ingestion_refuses_this_deployments_own_network() {
     for refused in [
         "http://localhost:8080/admin",
         "http://127.0.0.1/",
@@ -348,117 +342,19 @@ async fn link_ingestion_refuses_this_deployments_own_network() {
         "http://10.0.0.5/",
         "http://192.168.1.1/",
         "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://metadata.internal/",
         "file:///etc/passwd",
         "ftp://example.com/x",
+        "not a url",
     ] {
         assert!(
-            super::guard_link(refused).await.is_err(),
+            super::link_refusal(refused).is_err(),
             "{refused} must be refused"
         );
     }
-    // A public literal, so the answer is the guard's and not a resolver's.
-    assert!(
-        super::guard_link("https://93.184.216.34/pricing")
-            .await
-            .is_ok()
-    );
-}
-
-/// The half a string check cannot do.
-///
-/// A host that is not a literal was admitted on its spelling alone, so
-/// `http://anything.example/` answering `169.254.169.254` read as an ordinary
-/// public URL and the fetch reached the metadata service. The guard resolves
-/// the name and refuses it on what it answers with.
-///
-/// Through an injected resolver rather than real DNS: a case that reaches the
-/// network to prove this fails on a runner without it, and that failure says
-/// nothing about the product — the wrong way round for a check in the default
-/// feature set.
-#[cfg(feature = "documents")]
-#[tokio::test]
-async fn a_host_that_resolves_into_this_network_is_refused_on_what_it_resolves_to() {
-    for (answer, label) in [
-        ("127.0.0.1", "loopback"),
-        ("169.254.169.254", "the metadata service"),
-        ("10.0.0.5", "an RFC1918 address"),
-        ("::1", "v6 loopback"),
-    ] {
-        let address: std::net::IpAddr = answer.parse().expect("a literal");
-        let refusal =
-            super::guard_link_resolving_with("http://anything.example/x", |_, _| async move {
-                Ok(vec![address])
-            })
-            .await
-            .unwrap_err();
-        assert!(
-            refusal.contains("resolves to") && refusal.contains("own network"),
-            "a name answering {label} must be refused, naming the address: {refusal}"
-        );
-    }
-}
-
-/// One internal answer among several is still internal.
-///
-/// A resolver may hand back a list. Refusing only when *every* address is
-/// internal would admit a name that answers one public address and one
-/// loopback, which is the shape a rebinding setup produces.
-#[cfg(feature = "documents")]
-#[tokio::test]
-async fn a_host_answering_one_internal_address_among_public_ones_is_refused() {
-    let refusal = super::guard_link_resolving_with("http://anything.example/x", |_, _| async {
-        Ok(vec![
-            "93.184.216.34".parse().unwrap(),
-            "127.0.0.1".parse().unwrap(),
-        ])
-    })
-    .await
-    .unwrap_err();
-    assert!(refusal.contains("127.0.0.1"), "{refusal}");
-}
-
-/// A wholly public answer is admitted, so the guard is not refusing every name.
-#[cfg(feature = "documents")]
-#[tokio::test]
-async fn a_host_answering_only_public_addresses_is_admitted() {
-    super::guard_link_resolving_with("http://anything.example/x", |_, _| async {
-        Ok(vec!["93.184.216.34".parse().unwrap()])
-    })
-    .await
-    .expect("a public answer is fetchable");
-}
-
-/// A name that will not resolve does not hold the request open.
-///
-/// `LINK_TIMEOUT` bounds the fetch, which starts only once this guard has
-/// answered, so the lookup needs its own ceiling: the route walks its URLs one
-/// at a time, and a list of names whose resolver blackholes queries would
-/// otherwise cost their sum.
-#[cfg(feature = "documents")]
-#[tokio::test(start_paused = true)]
-async fn a_resolver_that_never_answers_is_bounded_rather_than_waited_on() {
-    let refusal = super::guard_link_resolving_with("http://anything.example/x", |_, _| async {
-        std::future::pending::<()>().await;
-        unreachable!("the lookup timeout must fire long before this wakes")
-    })
-    .await
-    .unwrap_err();
-    assert!(
-        refusal.contains("too long to resolve"),
-        "the refusal must say the lookup was cut short: {refusal}"
-    );
-}
-
-/// A resolver that answers nothing is refused rather than admitted.
-#[cfg(feature = "documents")]
-#[tokio::test]
-async fn a_host_that_resolves_to_no_addresses_is_refused() {
-    let refusal = super::guard_link_resolving_with("http://anything.example/x", |_, _| async {
-        Ok(Vec::new())
-    })
-    .await
-    .unwrap_err();
-    assert!(refusal.contains("no addresses"), "{refusal}");
+    assert!(super::link_refusal("https://93.184.216.34/pricing").is_ok());
+    assert!(super::link_refusal("https://example.com/pricing").is_ok());
 }
 
 /// Dropping the wrong folder is a mistake an operator makes once; without a

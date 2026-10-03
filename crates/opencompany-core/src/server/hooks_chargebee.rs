@@ -89,18 +89,6 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// Length-checked, branch-independent byte comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Decodes an `Authorization: Basic <base64>` header into `user:pass`.
 ///
 /// Hand-rolled because `base64` is behind the `mcp` feature and this route ships
@@ -206,7 +194,10 @@ async fn verify(
     else {
         return Err(unauthorized().into());
     };
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        provided.as_bytes(),
+        expected.as_bytes(),
+    )) {
         return Err(unauthorized().into());
     }
     Ok(())

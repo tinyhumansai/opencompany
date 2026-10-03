@@ -368,7 +368,7 @@ pub struct ConfigFile {
 ///
 /// The engine used to be selectable only through `OPENCOMPANY_MEMORY*`, which
 /// means only by whoever controls the process environment. A self-hosted
-/// operator who wants their company's memory in Supermemory or mem0 had to
+/// operator who wants their company's memory in CortexDB had to
 /// edit a unit file and restart. This is the same second layer the rest of the
 /// instance's configuration already has (`docs/spec/runtime/config.md`), so
 /// the console can write the choice and
@@ -386,12 +386,13 @@ pub struct ConfigFile {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MemorySection {
-    /// `store` | `embedded` | `remote` | `null`, parsed by
+    /// `store` | `remote` | `null`, parsed by
     /// [`MemoryBackend`](crate::store::MemoryBackend). Absent leaves the
     /// default (`store` — the base backend's own memory).
     pub backend: Option<String>,
-    /// The engine id for a provider-backed mode: `supermemory`, `mem0`,
-    /// `cognee`, or `namespace` for the in-pod contract store.
+    /// The engine id for `remote` mode: `cortexdb` (alias `cortex`) or
+    /// `tinyhumans`, the registry TinyMemory v2 ships. Retired ids are refused
+    /// by name at open.
     pub driver: Option<String>,
     /// The hosted engine's endpoint.
     pub url: Option<String>,

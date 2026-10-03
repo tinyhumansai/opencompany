@@ -213,6 +213,24 @@ pub fn existing() -> Option<Arc<Runtime>> {
     GLOBAL.get().cloned()
 }
 
+/// The domain families the one process-wide runtime registers.
+///
+/// The embed default (`DomainSet::embedded()` plus MCP and skills), with
+/// OpenHuman's own **memory domain switched off**. That domain is one engine
+/// bound to this runtime's single `Config` and credential, and with it on, its
+/// conversation-ingest subscriber batches every committed turn into that one
+/// engine — across every company this process serves. Company memory belongs to
+/// `store::memory::BoundMemory`, which scopes every read and write to the
+/// company the call is made for; a second, unscoped memory path beside it would
+/// be a cross-tenant leak.
+pub(crate) fn host_domains() -> openhuman_core::core::runtime::DomainSet {
+    let mut domains = openhuman_core::core::runtime::DomainSet::embedded();
+    domains.mcp = true;
+    domains.skills = true;
+    domains.memory = false;
+    domains
+}
+
 async fn build(boot: RuntimeBoot) -> crate::Result<Arc<Runtime>> {
     let boot = boot.resolved();
     // Advertise every OpenHuman tool group except its Composio pack. The
@@ -223,6 +241,7 @@ async fn build(boot: RuntimeBoot) -> crate::Result<Arc<Runtime>> {
     // both sources leaves resumed session snapshots with stale declarations.
     let mut builder = Runtime::builder()
         .workspace(boot.workspace())
+        .domains(host_domains())
         .tool_groups(crate::harness::built_in::tool_posture::host_tool_groups());
     if let Some(transport) = crate::harness::backend_transport::ensure_installed() {
         builder = builder.backend_transport(transport);

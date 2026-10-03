@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use super::super::namespace::Scope;
+use tinymemory::{Hit, ItemId, ItemKind, MemoryMeta, SourceKind, SourceRef};
+
+use super::super::namespace::{Namespace, Scope};
+use super::bound::{CHARACTERS_ENGINES_STRIP, encode};
 use super::*;
+use crate::ports::CompressedTrace;
 
 /// Captures warnings emitted synchronously on this test's thread.
 ///
@@ -67,17 +71,22 @@ fn ns(company: &str, scope: Scope) -> Namespace {
     Namespace::company_root(&CompanyId::new(company)).child(&scope)
 }
 
-fn entry_in(namespace: &Namespace, content: &str) -> MemoryEntry {
-    MemoryEntry {
-        id: "id".into(),
-        key: "key".into(),
-        content: content.to_string(),
-        namespace: Some(namespace.as_str().to_string()),
-        category: category("test"),
-        timestamp: "1970-01-01T00:00:00Z".into(),
-        session_id: None,
-        score: None,
-        taint: MemoryTaint::Internal,
+fn entry_in(namespace: &Namespace, content: &str) -> Hit {
+    Hit {
+        id: ItemId::new("id"),
+        kind: ItemKind::Document,
+        text: content.to_string(),
+        meta: MemoryMeta {
+            workspace: Some(namespace.as_str().to_string()),
+            folder: Some(namespace.as_str().to_string()),
+            source: SourceRef {
+                kind: SourceKind::Agent,
+                id: Some("key".into()),
+            },
+            ..MemoryMeta::default()
+        },
+        score: 0.0,
+        confidence: None,
     }
 }
 
@@ -179,7 +188,7 @@ fn escaping_preserves_the_record_including_around_a_backslash() {
 
 #[test]
 fn another_companys_entry_is_dropped_not_decoded() {
-    // The cross-tenant guard: a driver answering with somebody else's row
+    // The cross-tenant guard: an engine answering with somebody else's row
     // must not reach a caller holding this company's id.
     let mine = ns("acme", Scope::Facts);
     let theirs = ns("globex", Scope::Facts);
@@ -207,7 +216,7 @@ fn a_sibling_scope_of_the_same_company_is_dropped() {
 fn an_entry_with_no_namespace_is_dropped() {
     let facts = ns("acme", Scope::Facts);
     let mut entry = entry_in(&facts, &encode(&a_fact()).unwrap());
-    entry.namespace = None;
+    entry.meta.workspace = None;
     assert!(decode::<FactRecord>(&entry, &facts).is_none());
 }
 
@@ -238,7 +247,7 @@ fn unreadable_content_is_dropped_rather_than_failing_the_read() {
         assert!(decode::<FactRecord>(&entry, &facts).is_none());
     });
     assert!(
-        warnings.contains("memory entry in our namespace failed to decode"),
+        warnings.contains("memory item in our namespace failed to decode"),
         "unreadable content in our namespace must be reported: {warnings:?}"
     );
 }
@@ -264,17 +273,7 @@ fn a_snippet_never_splits_a_character() {
 #[test]
 fn decode_classifies_unknown_versions_and_corruption_separately() {
     let namespace = Namespace::company_root(&CompanyId::new("acme"));
-    let entry = |content: &str| MemoryEntry {
-        id: "id".into(),
-        key: "key".into(),
-        content: content.into(),
-        namespace: Some(namespace.as_str().to_string()),
-        category: tinymemory_api::types::MemoryCategory::Custom("oc:trace".into()),
-        timestamp: String::new(),
-        session_id: None,
-        score: None,
-        taint: MemoryTaint::Internal,
-    };
+    let entry = |content: &str| entry_in(&namespace, content);
 
     // Round-trip control: a current-version envelope decodes.
     let good = encode(&42u32).unwrap();
@@ -299,7 +298,7 @@ fn decode_classifies_unknown_versions_and_corruption_separately() {
         assert!(decode::<Timestamp>(&entry(mangled), &namespace).is_none());
     });
     assert!(
-        warnings.contains("memory entry in our namespace failed to decode"),
+        warnings.contains("memory item in our namespace failed to decode"),
         "matching-version record corruption must be reported: {warnings:?}"
     );
 
@@ -308,7 +307,7 @@ fn decode_classifies_unknown_versions_and_corruption_separately() {
         assert_eq!(decode::<u32>(&entry("not json"), &namespace), None);
     });
     assert!(
-        warnings.contains("memory entry in our namespace failed to decode"),
+        warnings.contains("memory item in our namespace failed to decode"),
         "envelope-less content in our namespace must be reported: {warnings:?}"
     );
 }

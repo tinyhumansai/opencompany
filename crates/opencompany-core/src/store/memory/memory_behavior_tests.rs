@@ -1,18 +1,9 @@
 use std::sync::Arc;
 
-use tinymemory::mandatory::MemoryTraitProvider;
-use tinymemory::registry::DriverClass;
-use tinymemory_api::types::MemoryTaint;
-
 use super::BoundMemory;
-use super::tests::{FakeEngine, FlakyStore, a_fact, acme_id, engine, globex_id};
+use super::facades::EXTERNAL_TAG;
+use super::tests::{FlakyStore, a_fact, acme_id, engine, everything, globex_id, with_handle};
 use crate::ports::{CompressedTrace, ContextChunk, EvictionPolicy};
-
-#[tokio::test]
-async fn binding_runs_the_capability_audit() {
-    let provider = FakeEngine::provider();
-    assert!(BoundMemory::bind(provider, DriverClass::Embedded).is_ok());
-}
 
 #[tokio::test]
 async fn facts_round_trip_through_the_provider() {
@@ -195,11 +186,10 @@ async fn an_agent_and_a_desk_sharing_the_same_raw_id_do_not_share_a_partition() 
 }
 
 #[tokio::test]
-async fn inbound_writes_are_stamped_external_and_internal_writes_are_not() {
+async fn inbound_writes_are_marked_external_and_internal_writes_are_not() {
     // Laundering external content into internal-trust content is the failure
-    // the taint parameter exists to prevent.
-    let (fake, provider) = FakeEngine::with_handle();
-    let memory = BoundMemory::bind(provider, DriverClass::Embedded).unwrap();
+    // the provenance mark exists to prevent.
+    let (raw, memory) = with_handle();
     let id = acme_id();
     memory
         .inbound_context()
@@ -224,14 +214,21 @@ async fn inbound_writes_are_stamped_external_and_internal_writes_are_not() {
         .await
         .unwrap();
 
+    let items = everything(&raw).await;
+    let external = |needle: &str| {
+        items
+            .iter()
+            .find(|hit| hit.text.contains(needle))
+            .map(|hit| hit.meta.tags.iter().any(|tag| tag == EXTERNAL_TAG))
+    };
     assert_eq!(
-        fake.taint_of("scraped from a page"),
-        Some(MemoryTaint::ExternalSync),
+        external("scraped from a page"),
+        Some(true),
         "an inbound-channel write must stay marked as external"
     );
     assert_eq!(
-        fake.taint_of("the company decided this"),
-        Some(MemoryTaint::Internal),
+        external("the company decided this"),
+        Some(false),
         "the company's own writes must not be marked external"
     );
 }
@@ -457,11 +454,7 @@ async fn evict_bounds_the_archive_when_the_loop_fails_partway() {
     // second archives one trace (call 5), then fails on the next (call 6) —
     // leaving c5 and c4 in the archive, which the failure-path prune must
     // bring back down to the newest one (c5).
-    let mem = BoundMemory::bind(
-        Arc::new(MemoryTraitProvider::new(FlakyStore::arc(6), "flaky-engine")),
-        DriverClass::Embedded,
-    )
-    .unwrap();
+    let mem = BoundMemory::bind(FlakyStore::arc(6));
     let id = acme_id();
     let memory = mem.memory();
     for (n, cycle) in ["c1", "c2", "c3", "c4", "c5"].iter().enumerate() {
@@ -585,25 +578,34 @@ async fn re_putting_an_identical_body_keeps_the_first_stamp() {
 }
 
 #[tokio::test]
-async fn the_driver_id_and_capabilities_are_reportable() {
+async fn the_engine_id_and_fetch_modes_are_reportable() {
     let mem = engine();
-    assert_eq!(mem.driver_id(), "fake-engine");
-    let caps = mem.capability_names();
-    // The mandatory three, and — for a mandatory-only composition — nothing else.
-    assert!(caps.contains(&"core"), "{caps:?}");
-    assert!(caps.contains(&"recall"), "{caps:?}");
-    assert!(caps.contains(&"portability"), "{caps:?}");
-    assert!(!caps.contains(&"graph"), "{caps:?}");
+    assert_eq!(mem.engine_id(), "reference");
+    assert_eq!(mem.capability_names(), vec!["keyword", "vector", "hybrid"]);
 }
 
 #[tokio::test]
-async fn debug_names_the_driver_and_its_class() {
+async fn debug_names_the_engine_and_nothing_else() {
     // The engine is process-scoped and structurally holds no company, so the
-    // only thing `Debug` can say is which driver was bound and how — which is
-    // exactly what an operator reading a boot log needs, and nothing more.
+    // only thing `Debug` can say is which engine was bound — which is exactly
+    // what an operator reading a boot log needs, and nothing more.
     let rendered = format!("{:?}", engine());
-    assert!(rendered.contains("fake-engine"), "{rendered}");
-    assert!(rendered.contains("embedded"), "{rendered}");
+    assert!(rendered.contains("reference"), "{rendered}");
+}
+
+/// A rewrite replaces the record rather than accumulating versions: one live
+/// item per key, so a `list` never returns a stale copy beside the new one.
+#[tokio::test]
+async fn upserting_a_fact_leaves_one_item_per_key() {
+    let (raw, mem) = with_handle();
+    let facts = mem.facts();
+    let id = acme_id();
+    facts.upsert(&id, &a_fact("f1", "first")).await.unwrap();
+    facts.upsert(&id, &a_fact("f1", "second")).await.unwrap();
+    let listed = facts.list(&id, None, None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "second");
+    assert_eq!(everything(&raw).await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,10 +613,10 @@ async fn debug_names_the_driver_and_its_class() {
 // ---------------------------------------------------------------------------
 //
 // Issue #914 requires the same conformance suite to hold for every port that
-// binds a provider, so a provider-backed store is held to the identical
+// binds an engine, so an engine-backed store is held to the identical
 // assertions the fs, sqlite and mongodb backends are. This matters more here
 // than for an in-tree backend: these facades encode records into an opaque
-// `content` string and re-derive everything on the way out, so "it round-trips"
+// item text and re-derive everything on the way out, so "it round-trips"
 // is a property to prove against the shared suite rather than to assume.
 //
 // `assert_fact_store` is new coverage rather than a mirror of the cortex
@@ -625,7 +627,7 @@ use crate::ports::events::EventLog;
 use crate::ports::store::CompanyStore;
 
 /// The four trait objects the suite drives: fs company and event stores, paired
-/// with provider-backed memory and context. The two fs slots are the ports a
+/// with engine-backed memory and context. The two fs slots are the ports a
 /// memory engine does not implement — same arrangement the cortex backends use.
 pub(super) type ConformanceStores = (
     Arc<dyn CompanyStore>,

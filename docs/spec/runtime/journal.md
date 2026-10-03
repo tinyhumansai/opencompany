@@ -30,9 +30,8 @@ The journal used to be constructed unconditionally on the filesystem, at
 `StorageHandles` swaps for every other durable store.
 
 On a hosted tenant with `OPENCOMPANY_STORAGE=mongodb` the container's `/data` is
-documented **ephemeral scratch** — the same fact the TinyCortex boot refusal
-exists for (see
-[memory-engine.md](memory-engine.md#durability-contract--the-data-is-scratch-caveat)).
+documented **ephemeral scratch** — the same fact the removed in-pod memory
+engine's boot refusal existed for (see [memory-engine.md](memory-engine.md)).
 Container replacement — a deploy, a reschedule, a node drain, an OOM kill —
 discarded the file. Every previously executed effect became eligible to fire
 again, and every parked approval, grant and standing grant silently vanished.
@@ -166,8 +165,8 @@ import, and nothing can retroactively recover keys that were already lost.
 
 ## No interim boot refusal
 
-The TinyCortex refusal ([memory-engine.md](memory-engine.md)) guards an *opt-in*
-engine that has alternatives to point at. The journal is unconditional and has no knob, every
+The removed in-pod memory engine's refusal ([memory-engine.md](memory-engine.md)) guarded an *opt-in*
+engine that had alternatives to point at. The journal is unconditional and has no knob, every
 staging tenant runs mongodb, and a refusal would take the hosted fleet down to
 protect it from a risk it is already living with — while stranding tenants with
 no remedy. What is adopted from that precedent instead is **fail-loud

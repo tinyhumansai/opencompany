@@ -116,8 +116,9 @@ no match. Those are the cases the ordering and the per-provider dispatch exist
 for.
 
 The address guard **is** written here, against the plan's intention, and
-[`connect-flow.md`](connect-flow.md) records why: `guard_link` in
-`src/server/ops/memory_ingest.rs` refuses every private address including
+[`connect-flow.md`](connect-flow.md) records why: `guard_link` (since replaced by
+`link_refusal` plus TinyMemory's SSRF-pinned `fetch_url` in
+`src/server/ops/memory_ingest.rs`) refused every private address including
 `.internal` hostnames, which is exactly where a self-hosted SearXNG instance
 lives, and it is `#[cfg(feature = "documents")]` while this surface is ungated.
 `guard_instance_url` is therefore a narrower rule — metadata and link-local only —

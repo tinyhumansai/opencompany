@@ -157,28 +157,6 @@ fn jwt_verifier_refuses_an_unsigned_token() {
     assert!(JwtPlatformVerifier::new(secret).verify(&signed).is_ok());
 }
 
-/// [`constant_time_eq`] must agree with `==` on every outcome — the
-/// property it changes is timing, never which strings compare equal.
-#[test]
-fn constant_time_eq_matches_ordinary_string_equality() {
-    assert!(constant_time_eq("", ""));
-    assert!(constant_time_eq("top-secret", "top-secret"));
-    assert!(!constant_time_eq("top-secret", ""));
-    assert!(!constant_time_eq("", "top-secret"));
-    // Differing length, shorter and longer than the reference.
-    assert!(!constant_time_eq("top-secret", "top-secre"));
-    assert!(!constant_time_eq("top-secret", "top-secrets"));
-    // Same length, differing at the first byte, the last byte, and the
-    // middle — a short-circuiting compare returns at different points for
-    // each of these, so a constant-time one must not accidentally special
-    // case any of them.
-    assert!(!constant_time_eq("top-secret", "xop-secret"));
-    assert!(!constant_time_eq("top-secret", "top-secreX"));
-    assert!(!constant_time_eq("top-secret", "top-Xecret"));
-    // Every byte differs.
-    assert!(!constant_time_eq("aaaa", "zzzz"));
-}
-
 #[test]
 fn unrecognized_token_is_rejected() {
     let verifier = StaticPlatformVerifier::new("top-secret");

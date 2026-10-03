@@ -24,11 +24,11 @@ import { EngineSection } from "@/views/memory/EngineSection";
 
 const OPTIONS: EngineOption[] = [
   {
-    id: "supermemory",
+    id: "cortexdb",
     label: "Supermemory",
     description: "A hosted engine.",
     available: true,
-    requiresUrl: true,
+    requiresUrl: true, acceptsUrl: true,
     requiresKey: true,
     durable: true,
   },
@@ -36,9 +36,9 @@ const OPTIONS: EngineOption[] = [
 
 function state(): MemoryEngineState {
   return {
-    active: "supermemory",
+    active: "cortexdb",
     capabilities: [],
-    selected: "supermemory",
+    selected: "cortexdb",
     apiKeySet: false,
     layer: "default",
     editable: true,

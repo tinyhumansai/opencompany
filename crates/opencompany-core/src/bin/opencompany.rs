@@ -280,15 +280,15 @@ enum Command {
 enum MemoryCmd {
     /// Copy every record from the env-selected memory engine (the FROM side —
     /// `OPENCOMPANY_MEMORY*`, exactly what a boot would bind today) into
-    /// another engine, over the contract's Portability family. Namespaces,
-    /// record kinds and provenance taint round-trip untouched. Run it BEFORE
+    /// another engine. Every company's records move with their workspace,
+    /// keys and provenance untouched. Run it BEFORE
     /// flipping the environment: migrate, then set the variables, restart,
     /// and verify `/spec`.
     Migrate {
-        /// Target driver: `namespace`, `supermemory`, `mem0`, or `cognee`.
+        /// Target engine: `cortexdb` or `tinyhumans`.
         #[arg(long)]
         to: String,
-        /// Target endpoint (hosted engines only).
+        /// Target endpoint (required unless the engine has a default).
         #[arg(long)]
         to_url: Option<String>,
         /// Target credential (hosted engines only).
@@ -1637,9 +1637,9 @@ async fn import_from_dir(dir: &std::path::Path, home: Option<PathBuf>) -> Result
 ///
 /// FROM is deliberately not a flag: it is the env-selected engine, exactly
 /// what a boot would bind — you migrate *before* flipping the environment, so
-/// the environment still names the source. Only provider-backed engines can
-/// migrate (the seam is what `export_page`/`import_records` live on); the
-/// `store` default is refused by name.
+/// the environment still names the source. Only engine-backed memory can
+/// migrate (`list` → `store` across two `MemoryEngine`s); the `store` default
+/// is refused by name.
 #[cfg(feature = "tinymemory")]
 async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
     use opencompany::store::StorageSettings;
@@ -1677,16 +1677,9 @@ async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
     // precondition printed below still applies to remote writers.
     let _home_lock: Option<()> = None;
 
-    let (from, _) = open_driver(&from_config)?.ok_or_else(|| {
-        opencompany::error::OpenCompanyError::Config(
-            "the source configuration bound no provider (host bug — the routing above should \
-             have refused)."
-                .into(),
-        )
-    })?;
-    // Dry run touches ONLY the source: opening the target would create its
-    // store (a namespace target mints the SQLite dir on open), and "without
-    // writing anything" must mean the filesystem too.
+    let from = open_driver(&from_config)?;
+    // Dry run touches ONLY the source: "without writing anything" means the
+    // target is not even opened.
     if dry_run {
         let resumed = resume_cursor.is_some();
         let total = opencompany::store::memory::migrate::count_records(
@@ -1699,32 +1692,26 @@ async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
             println!(
                 "dry run (from --resume-cursor): {} records remain to migrate {} -> {}",
                 total,
-                from.driver_id(),
+                from.descriptor().id,
                 to
             );
         } else {
             println!(
                 "dry run: {} records would migrate {} -> {}",
                 total,
-                from.driver_id(),
+                from.descriptor().id,
                 to
             );
         }
         return Ok(());
     }
 
-    let (target, target_class) = open_driver(&to_config)?.ok_or_else(|| {
-        opencompany::error::OpenCompanyError::Config(
-            "the target configuration bound no provider (host bug).".into(),
-        )
-    })?;
-
-    if matches!(target_class, tinymemory::registry::DriverClass::External) {
+    let target = open_driver(&to_config)?;
+    if target.descriptor().hosted {
         eprintln!(
-            "note: `{}` is a hosted engine — its exact-CRUD writes are enumeration-based, so a \
-             large import is slow and chatty. Prefer off-peak, and expect wall-clock to grow \
-             with store size.",
-            target.driver_id()
+            "note: `{}` is a hosted engine — every record is one write, so a large import is \
+             slow and chatty. Prefer off-peak, and expect wall-clock to grow with store size.",
+            target.descriptor().id
         );
     }
 
@@ -1738,8 +1725,8 @@ async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
     );
     println!(
         "migrating {} -> {} ({} records/page)…",
-        from.driver_id(),
-        target.driver_id(),
+        from.descriptor().id,
+        target.descriptor().id,
         page_size
     );
     let outcome = migrate(&from, &target, page_size, resume_cursor, |progress| {
@@ -1792,8 +1779,8 @@ async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
                 .unwrap_or_else(|| "the beginning (the first page failed)".into());
             Err(opencompany::error::OpenCompanyError::Store(format!(
                 "migration stopped after {} imported / {} skipped of {} exported; fix the \
-                 target and re-run with {resume} — import is idempotent by (namespace, key), \
-                 so re-running the failed page cannot duplicate.",
+                 target and re-run with {resume} — a store is idempotent by content \
+                 fingerprint, so re-running the failed page cannot duplicate.",
                 stopped.summary.imported, stopped.summary.skipped, stopped.summary.exported
             )))
         }
@@ -1808,7 +1795,7 @@ async fn run_memory_cmd(cmd: MemoryCmd) -> Result<()> {
     let MemoryCmd::Migrate { .. } = cmd;
     Err(opencompany::error::OpenCompanyError::Config(
         "`memory migrate` requires a build with the `tinymemory` feature (the provider seam \
-         its Portability family lives on)."
+         `migrate` copies through)."
             .into(),
     ))
 }
@@ -2425,10 +2412,9 @@ async fn async_main(sso_secret: Option<opencompany::ports::types::SecretValue>) 
                     .refresh_health(std::time::Duration::from_secs(5))
                     .await;
                 state = state.with_memory_overlay(overlay);
-                // `as_str`, not `{:?}`: the enum's Debug name is `Tinycortex`
-                // while `/spec` and the docs call that engine `embedded`. An
-                // operator comparing a boot log against a status response should
-                // not have to work out that those are the same thing.
+                // `as_str`, not `{:?}`: the wire spelling is what `/spec` and
+                // the docs use. An operator comparing a boot log against a
+                // status response should not have to map one onto the other.
                 println!(
                     "memory backend: {}",
                     storage_settings.memory_backend.as_str()

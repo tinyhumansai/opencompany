@@ -7,8 +7,8 @@
  * `OPENCOMPANY_MEMORY*` and the host refuses a write that would be silently
  * ignored — and this section renders exactly the old read-only panel in that
  * case, saying who owns the choice. What changed is the self-hosted operator,
- * for whom "edit a unit file and restart" was the only way to try Supermemory
- * or mem0: the host now persists the choice to `config.toml` and rebinds it
+ * for whom "edit a unit file and restart" was the only way to try a hosted
+ * engine: the host now persists the choice to `config.toml` and rebinds it
  * live, so the picker below is the whole flow.
  *
  * ## What is asserted, and what is only saved
@@ -126,14 +126,14 @@ export function EngineSection({ client, company, onApplied }: Props) {
   const option = state.options.find((o) => o.id === chosen);
   const dirty =
     chosen !== state.selected ||
-    (option?.requiresUrl && url.trim() !== (state.url ?? "")) ||
+    (option?.acceptsUrl && url.trim() !== (state.url ?? "")) ||
     apiKey.trim().length > 0;
 
   /** The body a test or an apply sends. */
   function choice() {
     return {
       engine: chosen,
-      url: option?.requiresUrl ? url.trim() : undefined,
+      url: option?.acceptsUrl && url.trim() ? url.trim() : undefined,
       // Omitted rather than sent empty: the host reads absence as "keep the
       // stored credential" and an empty string as "clear it", and a console
       // that always sent a value would wipe a key on an endpoint edit.
@@ -305,16 +305,18 @@ export function EngineSection({ client, company, onApplied }: Props) {
           ))}
         </div>
 
-        {state.editable && option && (option.requiresUrl || option.requiresKey) && (
+        {state.editable && option && (option.acceptsUrl || option.requiresKey) && (
           <div className="grid gap-3 sm:grid-cols-2">
-            {option.requiresUrl && (
+            {option.acceptsUrl && (
               <div className="space-y-1.5">
-                <Label htmlFor="memory-engine-url">Endpoint</Label>
+                <Label htmlFor="memory-engine-url">
+                  {option.requiresUrl ? "Endpoint" : "Endpoint (optional)"}
+                </Label>
                 <Input
                   id="memory-engine-url"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://api.example.com"
+                  placeholder={option.defaultUrl ?? "https://api.example.com"}
                   autoComplete="off"
                 />
               </div>
@@ -352,7 +354,7 @@ export function EngineSection({ client, company, onApplied }: Props) {
               )}
               Use this engine
             </Button>
-            {(option?.requiresUrl || option?.requiresKey) && (
+            {(option?.acceptsUrl || option?.requiresKey) && (
               <Button variant="outline" onClick={() => void test()} disabled={busy !== null}>
                 {busy === "testing" && <Loader2 className="size-4 animate-spin" />}
                 Test connection

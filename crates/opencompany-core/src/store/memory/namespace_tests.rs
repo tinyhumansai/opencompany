@@ -123,29 +123,44 @@ fn member_derivation_is_stable_across_calls() {
     );
 }
 
+/// Whether the engine's `folder` filter for `wanted` admits an item filed
+/// under `held` — the `/`-aware prefix rule `migrate` and every scope rely on.
+fn folder_admits(wanted: &str, held: &str) -> bool {
+    use tinymemory::{ItemKind, MemoryMeta, MetaFilter};
+    let filter = MetaFilter {
+        folder: Some(wanted.to_string()),
+        ..MetaFilter::default()
+    };
+    let meta = MemoryMeta {
+        folder: Some(held.to_string()),
+        ..MemoryMeta::default()
+    };
+    filter.matches(ItemKind::Document, &meta)
+}
+
 #[test]
-fn contains_is_boundary_aware() {
+fn the_folder_filter_is_boundary_aware() {
     // `oc/acme-1` must not swallow `oc/acme-10` — a prefix test without the
     // separator check would hand one company another's entries.
-    let root = Namespace("oc/acme-1".to_string());
-    assert!(root.contains("oc/acme-1"));
-    assert!(root.contains("oc/acme-1/facts"));
-    assert!(!root.contains("oc/acme-10"));
-    assert!(!root.contains("oc/acme-10/facts"));
-    assert!(!root.contains("oc/globex-2/facts"));
+    assert!(folder_admits("oc/acme-1", "oc/acme-1"));
+    assert!(folder_admits("oc/acme-1", "oc/acme-1/facts"));
+    assert!(!folder_admits("oc/acme-1", "oc/acme-10"));
+    assert!(!folder_admits("oc/acme-1", "oc/acme-10/facts"));
+    assert!(!folder_admits("oc/acme-1", "oc/globex-2/facts"));
 }
 
 #[test]
-fn a_company_root_never_contains_another_companys_namespace() {
+fn a_company_root_never_admits_another_companys_namespace() {
     let a = Namespace::company_root(&id("acme"));
     let b = Namespace::company_root(&id("globex"));
-    assert!(!a.contains(b.as_str()));
-    assert!(!b.contains(a.as_str()));
+    assert!(!folder_admits(a.as_str(), b.as_str()));
+    assert!(!folder_admits(b.as_str(), a.as_str()));
 }
 
 #[test]
-fn agent_scopes_are_nested_under_the_company() {
+fn every_namespace_is_under_the_host_root() {
     let root = Namespace::company_root(&id("acme"));
     let agent = root.child(&Scope::Agent("cto".into()));
-    assert!(root.contains(agent.as_str()));
+    assert!(folder_admits(root.as_str(), agent.as_str()));
+    assert!(folder_admits(ROOT, agent.as_str()));
 }

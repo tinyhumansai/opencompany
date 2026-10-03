@@ -133,8 +133,9 @@ why the probe route is `AdminScopedCompany` here where inference allows
 `ScopedCompany`.
 
 The guard itself is **not** rewritten: `guard_link` in
-`src/server/ops/memory_ingest.rs` already does the resolving check, and a second
-copy of a rule like that drifts. It is lifted and called.
+`src/server/ops/memory_ingest.rs` (now `link_refusal`, with the resolving check
+moved into TinyMemory's SSRF-pinned `fetch_url`) already did the resolving check,
+and a second copy of a rule like that drifts. It was lifted and called.
 
 ## Inherited without change
 

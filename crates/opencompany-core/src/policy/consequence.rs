@@ -2298,11 +2298,11 @@ pub fn standing_scope_of(tool: &str, args: &serde_json::Value) -> Option<String>
 /// catalogue has never heard of it.
 #[cfg(feature = "openhuman")]
 fn composio_toolkit_of(slug: &str) -> Option<String> {
-    // The curated catalogue moved upstream into TinyMemory's Composio
-    // vocabulary; `tinymemory_api` re-exports `tinymemory_bus::composio`
-    // wholesale, so this is the same items openhuman itself now uses.
-    use tinymemory_api::composio::catalogs::catalog_for_toolkit;
-    use tinymemory_api::composio::scopes::toolkit_from_slug;
+    // The curated catalogue lives in OpenHuman's Composio contract (it moved
+    // back out of TinyMemory with memory v2), so these are the same items
+    // openhuman itself classifies with.
+    use openhuman_core::integrations::composio::contract::catalogs::catalog_for_toolkit;
+    use openhuman_core::integrations::composio::contract::scopes::toolkit_from_slug;
     let toolkit = toolkit_from_slug(slug)?;
     // The slug's prefix is *some* word for every non-empty slug, so the
     // catalogue lookup is what separates a real toolkit from a typo.
@@ -2320,8 +2320,10 @@ fn composio_toolkit_of(_slug: &str) -> Option<String> {
 /// curated catalogue? Unknown is **not** a read.
 #[cfg(feature = "openhuman")]
 fn composio_catalog_lookup(slug: &str) -> CatalogLookup {
-    use tinymemory_api::composio::catalogs::catalog_for_toolkit;
-    use tinymemory_api::composio::scopes::{ToolScope, find_curated, toolkit_from_slug};
+    use openhuman_core::integrations::composio::contract::catalogs::catalog_for_toolkit;
+    use openhuman_core::integrations::composio::contract::scopes::{
+        ToolScope, find_curated, toolkit_from_slug,
+    };
     let Some(toolkit) = toolkit_from_slug(slug) else {
         return CatalogLookup::UnknownToolkit { toolkit: None };
     };

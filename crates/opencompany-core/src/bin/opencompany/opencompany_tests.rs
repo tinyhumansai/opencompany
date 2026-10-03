@@ -153,7 +153,7 @@ fn live_ports_layers_the_config_file_memory_section() {
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(
         tmp.join("config.toml"),
-        "[memory]\nbackend = \"remote\"\ndriver = \"supermemory\"\nurl = \"https://memory.example\"\n",
+        "[memory]\nbackend = \"remote\"\ndriver = \"cortexdb\"\nurl = \"https://memory.example\"\n",
     )
     .unwrap();
     let settings =
@@ -162,7 +162,7 @@ fn live_ports_layers_the_config_file_memory_section() {
         settings.memory_backend,
         opencompany::store::MemoryBackend::Remote
     );
-    assert_eq!(settings.memory_driver.as_deref(), Some("supermemory"));
+    assert_eq!(settings.memory_driver.as_deref(), Some("cortexdb"));
     assert_eq!(
         settings.memory_url.as_deref(),
         Some("https://memory.example")

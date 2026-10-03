@@ -42,7 +42,7 @@ pub(crate) mod text;
 /// The shared lexical ranker behind `ContextStore::search`.
 ///
 /// Stood four times over in `mongodb.rs`, `fs.rs`, `sqlite.rs` and
-/// `tinycortex.rs`; three of those four copies carried the same two defects (a
+/// the since-removed in-pod engine's module; three of those four copies carried the same two defects (a
 /// substring test scored 1.0, and truncation to `limit` before any sorting).
 /// One module, so the backends cannot drift apart again.
 pub mod lexical;
@@ -58,14 +58,14 @@ pub mod sqlite;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
-/// The TinyMemory `MemoryProvider` seam (issue #914): one engine-neutral driver
-/// contract behind the three memory ports, with the provider chosen by
-/// configuration — a hosted service behind a URL and a credential, or nothing.
-/// [`memory::BoundMemory`] is the only public way to
-/// get a port out of a provider, and it derives the namespace from the
-/// `CompanyId`, which is what keeps the tenant-isolation invariant the ports'
-/// `&CompanyId` argument gives us and the contract's bare `namespace: &str` does
-/// not. Only links under `tinymemory`.
+/// The TinyMemory `MemoryEngine` seam (issue #914): one engine-neutral contract
+/// behind the three memory ports, with the engine chosen by configuration — a
+/// hosted engine behind a credential (CortexDB, or the TinyHumans memory wire),
+/// or nothing. [`memory::BoundMemory`] is the only public way to get a port out
+/// of an engine, and it derives the tenant workspace from the `CompanyId`, which
+/// is what keeps the tenant-isolation invariant the ports' `&CompanyId`
+/// argument gives us and the engine's metadata-only scoping does not. Only
+/// links under `tinymemory`.
 #[cfg(feature = "tinymemory")]
 pub mod memory;
 

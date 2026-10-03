@@ -20,7 +20,7 @@
 //! ## It applies live, and says so honestly when it cannot
 //!
 //! A saved-but-not-applied engine is the failure this surface exists to avoid:
-//! an operator who picks Supermemory and is then shown their old memory has no
+//! an operator who picks a hosted engine and is then shown their old memory has no
 //! way to tell whether the choice landed. So [`apply`] opens the replacement
 //! overlay, probes it, swaps it onto the [`AppState`], and rebuilds every
 //! registered company so the new ports are actually the ones a turn will use
@@ -89,11 +89,11 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EngineOption {
-    /// What a `PUT` sends back: `store`, `supermemory`, `mem0`, `cognee`, or
-    /// `null`.
+    /// What a `PUT` sends back: `store`, a remote engine id from TinyMemory's
+    /// registry (`cortexdb`, `tinyhumans`), or `null`.
     ///
     /// Deliberately flatter than the `(backend, driver)` pair the runtime
-    /// takes: "remote, driver mem0" is one choice to an operator and two knobs
+    /// takes: "remote, driver cortexdb" is one choice to an operator and two knobs
     /// to the host, and asking a console to model that correctly is how a UI
     /// ends up offering `remote` with no driver — a combination the host
     /// refuses at bind.
@@ -104,7 +104,7 @@ struct EngineOption {
     description: &'static str,
     /// Whether this build can actually construct it. A `false` tile renders
     /// disabled with `unavailableReason` rather than vanishing: an operator
-    /// looking for Supermemory should learn their build lacks the feature, not
+    /// looking for a hosted engine should learn their build lacks the feature, not
     /// conclude the product has no such thing.
     available: bool,
     /// Which Cargo feature it needs, when `available` is false.
@@ -112,6 +112,13 @@ struct EngineOption {
     unavailable_reason: Option<String>,
     /// Whether the engine needs an endpoint.
     requires_url: bool,
+    /// Whether the engine takes an endpoint at all. True with `requires_url`
+    /// false means "optional": the engine has a default (`default_url`) and an
+    /// operator may point it at their own instance instead.
+    accepts_url: bool,
+    /// The endpoint used when none is given, for the field's placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_url: Option<&'static str>,
     /// Whether the engine needs a credential.
     requires_key: bool,
     /// Whether anything this engine stores survives a restart. `false` for
@@ -127,31 +134,28 @@ struct EngineDto {
     /// from the file, so a saved-but-unapplied change is visible as a
     /// difference between this and [`Self::selected`].
     active: String,
-    /// The capability families the live engine negotiated at bind time.
+    /// The retrieval modes the live engine serves (`keyword`, `vector`, `hybrid`).
     capabilities: Vec<String>,
     /// The last probe's verdict; absent when the engine was never probed.
     #[serde(skip_serializing_if = "Option::is_none")]
     healthy: Option<bool>,
-    /// Advertised families the live engine did not answer when probed. Empty
-    /// is healthy; absent means the engine was never probed.
+    /// Operations (`"list"`) the live engine refused when probed. Empty is
+    /// healthy; absent means the engine was never probed. The wire name keeps
+    /// the v1 "families" spelling for console compatibility.
     ///
     /// Separate from [`Self::capabilities`] on purpose: that list is what the
-    /// driver *claims*, and the bind-time audit cannot contradict it for the
-    /// mandatory families. This is what the engine actually answered.
+    /// engine *serves* (retrieval modes), this is what it actually answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     unreachable_families: Option<Vec<String>>,
-    /// Advertised **optional** families the live engine refused when probed.
+    /// The engine's own reason when it reported `Degraded` health.
     ///
-    /// Reported, never blocking: an engine that cannot serve `people` still
-    /// serves every cycle, and taking it away from an operator who has no
-    /// other one would be the worse failure. The harm it does name is real —
-    /// the agent tools and routes these families gate are offered and fail on
-    /// their first call — which is why it is on the page rather than only in a
-    /// log line.
+    /// Reported, never blocking: a degraded engine still serves, and taking it
+    /// away from an operator who has no other one would be the worse failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_families: Option<Vec<String>>,
-    /// Families the engine did not answer inside the probe budget. Slow is not
-    /// the same verdict as refused, so it is reported separately.
+    /// Operations (`"health"`, `"list"`) that did not answer inside the probe
+    /// budget. Slow is not the same verdict as refused, so it is reported
+    /// separately.
     #[serde(skip_serializing_if = "Option::is_none")]
     slow_families: Option<Vec<String>>,
     /// The engine id the saved selection names (the file, or the environment
@@ -247,111 +251,95 @@ struct ProbeDto {
     detail: Option<String>,
 }
 
-/// The engine catalog.
+/// The engine catalog: the built-in store, every engine TinyMemory's registry
+/// ships, and "No memory".
 ///
-/// The remote ids mirror `store::memory::driver::SUPPORTED_REMOTE_DRIVERS`,
-/// duplicated because that module is `tinymemory`-gated while this route is
-/// always compiled — the same duplication, for the same reason, that
-/// `ops::memory` keeps for the outcome label prefix. The
-/// `catalog_matches_driver_registry` test under the feature keeps them honest.
+/// The hosted tiles come from `tinymemory::list_engines()` itself, so the
+/// console offers exactly what this build can bind — a tile list maintained
+/// here by hand drifted from the registry once already (it offered three
+/// engines the v2 registry no longer has).
 fn catalog() -> Vec<EngineOption> {
-    // Feature availability, resolved once. `cfg!` rather than `#[cfg]` blocks
-    // so the catalog is one list in one order in every build — an option that
-    // disappears entirely reads as "this product has no such engine".
     let tinymemory = cfg!(feature = "tinymemory");
     let feature = |on: bool, name: &str| {
         (!on).then(|| format!("this build was compiled without the `{name}` feature"))
     };
-    vec![
-        EngineOption {
-            id: "store",
-            label: "Built-in store",
-            description: "Memory lives in this instance's own storage backend. No engine, no \
-                          network call, nothing to configure.",
+    let mut options = vec![EngineOption {
+        id: "store",
+        label: "Built-in store",
+        description: "Memory lives in this instance's own storage backend. No engine, no \
+                      network call, nothing to configure.",
+        available: true,
+        unavailable_reason: None,
+        requires_url: false,
+        accepts_url: false,
+        default_url: None,
+        requires_key: false,
+        durable: true,
+    }];
+    options.extend(remote_options());
+    options.push(EngineOption {
+        id: "null",
+        label: "No memory",
+        description: "Every write is accepted and discarded, every read is empty. For \
+                      testing what the company does without memory.",
+        available: tinymemory,
+        unavailable_reason: feature(tinymemory, "tinymemory"),
+        requires_url: false,
+        accepts_url: false,
+        default_url: None,
+        requires_key: false,
+        durable: false,
+    });
+    options
+}
+
+/// The hosted-engine tiles, straight from TinyMemory's registry.
+#[cfg(feature = "tinymemory")]
+fn remote_options() -> Vec<EngineOption> {
+    tinymemory::list_engines()
+        .into_iter()
+        .map(|engine| EngineOption {
+            id: engine.id,
+            label: engine.label,
+            description: engine.description,
             available: true,
             unavailable_reason: None,
-            requires_url: false,
-            requires_key: false,
+            // An engine with a default endpoint can be bound with the URL left
+            // blank, or pointed at a self-run instance.
+            requires_url: engine.needs_endpoint,
+            accepts_url: true,
+            default_url: engine.default_endpoint,
+            requires_key: engine.needs_key,
             durable: true,
-        },
-        EngineOption {
-            id: "supermemory",
-            label: "Supermemory",
-            description: "A hosted memory engine. Your company's memory is stored by Supermemory \
-                          under this instance's namespace.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: true,
-            requires_key: true,
-            durable: true,
-        },
-        EngineOption {
-            id: "mem0",
-            label: "Mem0",
-            description: "A hosted memory engine. Your company's memory is stored by Mem0 under \
-                          this instance's namespace.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: true,
-            requires_key: true,
-            durable: true,
-        },
-        EngineOption {
-            id: "cognee",
-            label: "Cognee",
-            description: "A hosted memory engine with a knowledge graph. Stored by Cognee under \
-                          this instance's namespace.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: true,
-            requires_key: true,
-            durable: true,
-        },
-        // Two adapters reach the same CortexDB service, so both are offered
-        // and the tile says which is which. `cortexdb` is this repo's own HTTP
-        // adapter (`store::memory::cortexdb`), which carries the
-        // `X-Cortex-Actor` header an instance that pins actor-to-token
-        // agreement requires; `cortex` is the dialect `tinymemory-remote`
-        // ships. The order here is `SUPPORTED_REMOTE_DRIVERS`' order, which
-        // `catalog_matches_driver_registry` pins.
-        EngineOption {
-            id: "cortexdb",
-            label: "CortexDB (self-hosted adapter)",
-            description: "A self-hosted memory engine. Your company's memory is stored by a \
-                          CortexDB instance you run, under this instance's namespace. Sends \
-                          `X-Cortex-Actor`, so use this one against an instance that refuses a \
-                          request whose actor does not match its bearer token.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: true,
-            requires_key: true,
-            durable: true,
-        },
-        EngineOption {
-            id: "cortex",
-            label: "CortexDB",
-            description: "An append-only event log with ranked recall. Replacement is \
-                          reconstructed on read, so keyed lookups scan the namespace and a \
-                          write is not readable for a second or two — see \
-                          docs/spec/runtime/memory-engine-cortex.md before choosing it.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: true,
-            requires_key: true,
-            durable: true,
-        },
-        EngineOption {
-            id: "null",
-            label: "No memory",
-            description: "Every write is accepted and discarded, every read is empty. For \
-                          testing what the company does without memory.",
-            available: tinymemory,
-            unavailable_reason: feature(tinymemory, "tinymemory"),
-            requires_url: false,
-            requires_key: false,
-            durable: false,
-        },
+        })
+        .collect()
+}
+
+/// Without the feature there is no registry to ask, but the tiles still
+/// render — disabled, with the reason — so an operator learns their build lacks
+/// the feature rather than concluding the product has no hosted engines.
+#[cfg(not(feature = "tinymemory"))]
+fn remote_options() -> Vec<EngineOption> {
+    [
+        ("cortexdb", "CortexDB"),
+        ("tinyhumans", "TinyHumans memory"),
     ]
+    .into_iter()
+    .map(|(id, label)| EngineOption {
+        id,
+        label,
+        description: "A hosted memory engine.",
+        available: false,
+        unavailable_reason: Some(
+            "this build was compiled without the `tinymemory` feature".to_string(),
+        ),
+        requires_url: false,
+        accepts_url: true,
+        default_url: None,
+        requires_key: true,
+        durable: true,
+    })
+    .collect()
 }
 
 /// Looks an engine id up in the catalog.
@@ -364,13 +352,11 @@ fn option_for(engine: &str) -> Option<EngineOption> {
 fn split_engine(engine: &str) -> Option<(MemoryBackend, Option<&'static str>)> {
     match engine {
         "store" => Some((MemoryBackend::Store, None)),
-        "supermemory" => Some((MemoryBackend::Remote, Some("supermemory"))),
-        "mem0" => Some((MemoryBackend::Remote, Some("mem0"))),
-        "cognee" => Some((MemoryBackend::Remote, Some("cognee"))),
-        "cortexdb" => Some((MemoryBackend::Remote, Some("cortexdb"))),
-        "cortex" => Some((MemoryBackend::Remote, Some("cortex"))),
         "null" => Some((MemoryBackend::Null, None)),
-        _ => None,
+        other => catalog()
+            .into_iter()
+            .find(|option| option.id == other)
+            .map(|option| (MemoryBackend::Remote, Some(option.id))),
     }
 }
 
@@ -575,7 +561,7 @@ fn selection_from(
         // Carried only for the engines that use them: leaving a stale URL on a
         // selection that switched to the built-in store would write dead keys
         // into `config.toml` and confuse the next reader of the file.
-        url: option.requires_url.then_some(url).flatten(),
+        url: option.accepts_url.then_some(url).flatten(),
         api_key: option.requires_key.then_some(api_key).flatten(),
     })
 }

@@ -116,18 +116,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// [`OUTCOME_LABEL_PREFIX`] and carrying both the task and the answer so a later
 /// `search` matches on either side.
 ///
-/// Both sides pass through [`redact_secrets`](super::memory::redact_secrets):
+/// Both sides pass through [`redact_secrets`](super::redact::redact_secrets):
 /// this write path stores the operator message verbatim (the motivating
-/// `/secret/` and bearer-token leak), and it bypasses
-/// [`Memory::store`](crate::harness::built_in::memory::OcMemory), so the
-/// redaction has to live here, at the chunk's single construction point.
+/// `/secret/` and bearer-token leak), so the redaction lives here, at the
+/// chunk's single construction point.
 pub fn outcome_chunk(agent_id: &str, message: &str, reply: &str) -> ContextChunk {
     ContextChunk {
         label: format!("{OUTCOME_LABEL_PREFIX}/{agent_id}"),
         body: format!(
             "Task: {}\nOutcome: {}",
-            super::memory::redact_secrets(message),
-            super::memory::redact_secrets(reply)
+            super::redact::redact_secrets(message),
+            super::redact::redact_secrets(reply)
         ),
     }
 }

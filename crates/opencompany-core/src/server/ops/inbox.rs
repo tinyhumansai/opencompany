@@ -144,7 +144,10 @@ async fn ingest(runtime: Arc<CompanyRuntime>, headers: &HeaderMap, raw: &[u8]) -
     };
 
     let expected = signer().sign(&secret, raw);
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(
+        provided.as_bytes(),
+        expected.as_bytes(),
+    )) {
         return unauthorized();
     }
 
@@ -179,18 +182,6 @@ async fn ingest(runtime: Arc<CompanyRuntime>, headers: &HeaderMap, raw: &[u8]) -
     (StatusCode::ACCEPTED, Json(IngestAck { ok: true, inbox })).into_response()
 }
 
-/// A length-checked, branch-independent byte comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// `POST /api/v1/companies/{id}/inboxes/ingest`.
 async fn ingest_by_id(
     State(state): State<AppState>,
@@ -211,7 +202,3 @@ async fn ingest_single(State(state): State<AppState>, headers: HeaderMap, raw: B
         Err(err) => err.into_response(),
     }
 }
-
-#[cfg(test)]
-#[path = "inbox_tests.rs"]
-mod tests;

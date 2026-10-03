@@ -452,6 +452,9 @@ quick-xml = { version = "0.41", optional = true }
 zip = { version = "7", default-features = false, features = ["deflate"] }
 
 sha2 = "0.10"
+# Constant-time secret comparison for bearer / webhook / ingest credentials,
+# instead of a hand-rolled XOR fold per call site.
+subtle = "2.6"
 getrandom = "0.4"
 
 # Argon2id password hashing. Unconditional for the same reason as sha2: a build
@@ -476,24 +479,26 @@ rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 # Only links under the `mongodb` feature; the default build stays offline.
 mongodb = { version = "3", optional = true }
 
-# TinyMemory — the engine-neutral memory contract. `MemoryProvider` with three
-# mandatory capability families and ten optional ones, negotiated once at bind
-# time. OpenCompany ships only the remote and null providers; embedded engines
-# stay outside this crate.
+# TinyMemory v2 — the engine-neutral `MemoryEngine` contract (recall, fetch,
+# store, forget, list over typed items with `MemoryMeta`) plus the engine
+# registry (`build_engine`, `list_engines`: CortexDB direct and the TinyHumans
+# hosted wire). OpenCompany binds it behind its own tenant boundary
+# (`store::memory::BoundMemory`); nothing here hands a raw engine to callers.
 #
-# These are path deps rather than `[patch.crates-io]` entries because the crates
-# are `publish = false`: there is no registry version for a patch to replace.
-# The paths are byte-identical to the ones `vendor/openhuman/Cargo.toml`
-# declares, which is load-bearing — Cargo unifies two path deps only when they
-# resolve to the same directory, and two copies of `tinymemory-api` would mean
-# two nominally distinct `MemoryProvider` traits in one process.
-#
-# `tinymemory` carries the driver registry (`DriverRegistry::admit`) and the
-# mandatory-family composition (`MemoryTraitProvider`); `tinymemory-remote`
-# carries the HTTP adapters for hosted engines.
-tinymemory = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory", optional = true }
-tinymemory-api = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory-api", optional = true }
-tinymemory-remote = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory-remote", optional = true }
+# A path dep rather than a `[patch.crates-io]` entry because the crates are
+# `publish = false`. The path is byte-identical to the one
+# `vendor/openhuman/crates/openhuman-core/Cargo.toml` declares, which is
+# load-bearing — Cargo unifies two path deps only when they resolve to the same
+# directory, and two copies of `tinymemory` would mean two nominally
+# distinct `MemoryEngine` traits in one process. Features are added by the
+# host features that need them (`documents` pulls the converters and the
+# SSRF-pinned link fetcher, `tinymemory` the scrubber).
+tinymemory = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory", optional = true, default-features = false }
+
+# The TinyHumans backend's own SDK, for the hub calls this host makes directly
+# (feedback forwarding, the key exchange). Same byte-identical path openhuman's
+# `openhuman-tinyhumans` uses, without the Socket.IO default.
+tinyhumans-sdk = { path = "../../vendor/openhuman/vendor/tinyhumans-sdk", optional = true, default-features = false }
 
 # `sanitize_api_error` — scrubs bearer tokens and other secrets out of a raw
 # provider error string before it's logged or surfaced on the event bus. At
@@ -609,17 +614,13 @@ tinyhivemind-openhuman = { path = "../../vendor/tinyhivemind/crates/tinyhivemind
 # dependency (`jsonwebtoken`), already in `Cargo.lock`.
 #
 # `tinymemory` ships in the standard build because the memory-engine catalog is
-# a console surface in every build, and without this feature four of its eight
-# tiles ("Supermemory", "Mem0", "Cognee", "No memory") render disabled with
-# "this build was compiled without the `tinymemory` feature" — an instruction
-# to go and find a differently compiled binary, which for the desktop app and
-# for anyone running the shipped container is not an instruction they can
-# follow. It is the cheap half of the memory seam: the driver registry, the
-# contract API and the HTTP remote, all pure Rust already in `Cargo.lock`. The
-# in-pod engines stay opt-in (`tinycortex`, `tinymemory-embedded`) because
-# those do cost a bundled SQLite build, and the desktop — which offers no
-# in-pod memory surface — keeps them off; it enables `tinymemory` itself in
-# `src-tauri/Cargo.toml`, so the hosted catalog tiles are live there too.
+# a console surface in every build, and without this feature its engine tiles
+# (CortexDB, TinyHumans memory, "No memory") render disabled with "this build
+# was compiled without the `tinymemory` feature" — an instruction to go and
+# find a differently compiled binary, which for the desktop app and for anyone
+# running the shipped container is not an instruction they can follow. It is
+# pure Rust already in `Cargo.lock` (the contract, the registry and the cortex
+# HTTP engine); there is no in-pod engine to opt into any more.
 default = ["oauth", "platform-jwt", "documents", "tinymemory"]
 # Text extraction for files dropped on the Brain page (PDF, Word, Excel,
 # PowerPoint). Without it those formats still upload and are still refused
@@ -631,7 +632,17 @@ default = ["oauth", "platform-jwt", "documents", "tinymemory"]
 # "remember this file" from the operator's side, and a build that reads a
 # dropped PDF but cannot fetch a URL would be a distinction nobody asked for.
 # It is already in the default set via `oauth`, so this adds nothing there.
-documents = ["dep:pdf-extract", "dep:calamine", "dep:quick-xml", "dep:reqwest"]
+documents = [
+    "dep:pdf-extract",
+    "dep:calamine",
+    "dep:quick-xml",
+    "dep:reqwest",
+    # Link fetches go through TinyMemory's SSRF-pinned fetcher (a public-only
+    # resolver the connection is pinned to, redirect hops re-checked) rather
+    # than a host-side resolve-then-connect guard that DNS rebinding defeats.
+    "dep:tinymemory",
+    "tinymemory/sources-network",
+]
 
 tiny = ["tinyagents-harness", "tinyinference"]
 # WS4: embed `vendor/openhuman` (`openhuman_core`) directly as the tenant agent
@@ -676,7 +687,7 @@ github = ["dep:reqwest"]
 # instance records reports against its credential's owner. The
 # `TinyHumansClient` trait + offline mock + the whole routing decision compile
 # without this; only `HttpTinyHumansClient` is gated behind it.
-tinyhumans = ["dep:reqwest"]
+tinyhumans = ["dep:reqwest", "dep:tinyhumans-sdk"]
 # Real HTTP/Socket.IO transport to hosted Medulla. The wire types + offline
 # MockTransport compile without this; only the networked transport is gated.
 medulla = ["dep:reqwest"]
@@ -726,22 +737,14 @@ sqlite = ["dep:rusqlite"]
 # each tenant its own database on a shared cluster. The fs stores and the
 # port-conformance suite compile without this; only `MongoStore` is gated here.
 mongodb = ["dep:mongodb"]
-# The TinyMemory `MemoryProvider` contract (issue #914): binds the three memory
-# ports to a hosted engine or the explicit null provider.
+# The TinyMemory `MemoryEngine` contract (issue #914): binds the three memory
+# ports to a hosted engine (CortexDB or the TinyHumans memory wire) or the
+# explicit null engine, behind the `BoundMemory` tenant boundary.
 tinymemory = [
     "dep:tinymemory",
-    "dep:tinymemory-api",
-    "dep:tinymemory-remote",
-    # The contract's storage trait (`tinymemory_api::traits::Memory`) returns
-    # `anyhow::Result`, so anything implementing or calling it has to name
-    # `anyhow` directly. Already an optional dep for other features.
-    "dep:anyhow",
-    # `src/store/memory/cortexdb.rs` speaks the CortexDB HTTP API directly
-    # (the vendored `tinymemory-remote` dialects are `pub(crate)` there and
-    # not reusable from this crate), so this feature needs its own `reqwest`
-    # rather than relying on `oauth`/`documents` pulling it into the default
-    # set. Already an optional dep, already in `Cargo.lock`.
-    "dep:reqwest",
+    # Secret/PII scrubbing applied before anything an agent writes reaches
+    # memory (`harness::built_in::redact::redact_secrets`).
+    "tinymemory/safety",
 ]
 # Node sidecar brain for self-hosters (bring-your-own-inference). Adds
 # `SidecarBrain`, which speaks the same `/orchestration/v1` wire frames as the
@@ -834,13 +837,12 @@ paypal = ["dep:reqwest"]
 tempfile = "3"
 tinyflows = { version = "0.8", features = ["mock"] }
 
-# The upstream driver-conformance suite (`assert_provider`, `retains_writes`),
-# run in `src/store/memory/upstream_conformance_test.rs` against the providers
-# `open_driver` constructs. Unconditional on purpose — dev-dependencies cannot
-# be optional — and cheap on purpose: the crate is contract-only
-# (tinymemory-api + async-trait + serde_json + anyhow), deliberately barred
-# from reaching any engine, so it adds no engine weight to any lane's graph.
-# Same byte-identical-path rule as the `tinymemory*` entries above.
+# The upstream engine-conformance suite (`tinymemory_conformance::run`) and its
+# in-memory `ReferenceEngine`, which the `store::memory` tests bind behind
+# `BoundMemory`. Unconditional on purpose — dev-dependencies cannot be
+# optional — and cheap: the crate is contract-only (tinymemory-api +
+# async-trait), so it adds no engine weight to any lane's graph. Same
+# byte-identical-path rule as the `tinymemory` entry above.
 tinymemory-conformance = { path = "../../vendor/openhuman/vendor/tinymemory/crates/tinymemory-conformance" }
 # `test-util` only — for `#[tokio::test(start_paused = true)]`, which the git
 # deadline test needs to fire a timeout deterministically instead of racing a

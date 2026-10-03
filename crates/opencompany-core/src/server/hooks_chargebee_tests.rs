@@ -352,14 +352,6 @@ fn a_long_credential_decodes_exactly() {
 }
 
 #[test]
-fn constant_time_eq_still_compares_correctly() {
-    assert!(constant_time_eq(b"secret", b"secret"));
-    assert!(!constant_time_eq(b"secret", b"secreT"));
-    // A length difference must not be reported as equal.
-    assert!(!constant_time_eq(b"secret", b"secretx"));
-}
-
-#[test]
 fn only_the_three_billing_events_are_acted_on() {
     // Over-subscribing in the Chargebee dashboard is the normal case; an
     // unlisted event must be ignorable, not a reason to retry.

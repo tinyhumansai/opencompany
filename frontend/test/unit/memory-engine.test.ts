@@ -32,11 +32,11 @@ function engine(overrides: Partial<MemoryEngineState>): MemoryEngineState {
 // "New memory" button and the drop zone against it.
 describe("the discarding engine", () => {
   it("is the null engine, whatever the saved selection says", () => {
-    expect(engine({ active: "null", selected: "mem0" }).active === "null").toBe(true);
+    expect(engine({ active: "null", selected: "tinyhumans" }).active === "null").toBe(true);
   });
 
   it("is not any engine that actually retains", () => {
-    for (const active of ["store", "embedded", "namespace", "supermemory", "mem0", "cognee"]) {
+    for (const active of ["store", "cortexdb", "tinyhumans"]) {
       expect(engine({ active }).active === "null").toBe(false);
     }
   });

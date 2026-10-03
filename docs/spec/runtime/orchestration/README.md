@@ -30,7 +30,7 @@ This section is not only additive. It removes three things.
    away instead. Workflows stay what they are: the static, inspectable graph
    for work that is a pipeline rather than a conversation.
 3. **[Memory becomes generic](memory.md)**. Three bespoke ports plus a
-   hand-rolled `CortexClient` collapse onto one `MemoryProvider` contract.
+   hand-rolled `CortexClient` collapse onto one `MemoryEngine` contract.
 
 ## The three principles
 

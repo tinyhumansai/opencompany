@@ -3,9 +3,9 @@
 //! The three memory ports take `&CompanyId` as an explicit first argument, and
 //! that argument is a *compiler-enforced* isolation guarantee: a call site
 //! cannot reach company B's facts while holding company A's id, because there is
-//! nowhere to put the wrong value. [`MemoryProvider`] has no such argument. It
-//! has `namespace: &str`, and a missing or wrong prefix is a silent cross-tenant
-//! leak that nothing in the type system catches. That gets worse with a hosted
+//! nowhere to put the wrong value. `MemoryEngine` has no such argument — only
+//! metadata (`workspace`, `folder`) — and a missing or wrong value is a silent
+//! cross-tenant leak that nothing in the type system catches. That gets worse with a hosted
 //! engine, where the namespace string is the only thing keeping tenants apart
 //! inside somebody else's database.
 //!
@@ -16,7 +16,6 @@
 //! [`Namespace::company_root`], which takes a `&CompanyId` — so the *only* way
 //! to name a namespace is to already hold the company whose namespace it is.
 //!
-//! [`MemoryProvider`]: tinymemory_api::provider::MemoryProvider
 
 use sha2::{Digest, Sha256};
 
@@ -24,10 +23,11 @@ use crate::ports::CompanyId;
 
 /// Root segment prefixing every namespace this host mints.
 ///
-/// Present so a hosted engine shared with other tenants of that engine — a
-/// Supermemory or Mem0 workspace that is not exclusively ours — cannot collide
-/// with namespaces some other product wrote into the same account.
-const ROOT: &str = "oc";
+/// Present so a hosted engine shared with other products — an engine account
+/// that is not exclusively ours — cannot collide with workspaces some other
+/// product wrote into it, and so `migrate` can select exactly this host's
+/// records with one `folder` prefix.
+pub(super) const ROOT: &str = "oc";
 
 /// The namespace segment holding provisional working-out.
 ///
@@ -120,21 +120,6 @@ impl Namespace {
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Whether `candidate` — a namespace string that came *back* from a driver —
-    /// is inside this namespace.
-    ///
-    /// Used to check what a driver returned rather than what we asked it for. A
-    /// remote engine is somebody else's code answering our query, and a driver
-    /// that over-returns (ignoring the namespace filter, or honouring it
-    /// loosely) would otherwise hand one tenant another's entries. The boundary
-    /// check is `/`-aware so `oc/acme-1` never matches `oc/acme-10`.
-    pub(super) fn contains(&self, candidate: &str) -> bool {
-        candidate == self.0
-            || candidate
-                .strip_prefix(&self.0)
-                .is_some_and(|rest| rest.starts_with('/'))
-    }
 }
 
 /// Maps a raw company id to a path-safe, **collision-resistant** namespace
@@ -155,7 +140,7 @@ impl Namespace {
 /// company ids can be chosen by a caller.
 ///
 /// This mirrors the removed in-pod engine's `workspace_name` (deleted with
-/// the `tinycortex` backend in #1568), which solved the same problem for
+/// the in-pod backend in #1568), which solved the same problem for
 /// on-disk workspace directories. The two are intentionally separate —
 /// that one named a filesystem path, this one names a namespace inside a
 /// possibly-remote engine — but the collision argument is identical, and a

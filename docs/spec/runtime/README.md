@@ -35,12 +35,9 @@ Supporting docs:
   - [workspace-names.md](workspace-names.md) — the one naming rule for
     everything the runtime puts in a workspace (lowercase, dashed), where it is
     applied, and how a company created before it keeps working
-  - [memory-engine.md](memory-engine.md) — the `OPENCOMPANY_MEMORY` overlay and
-    why an ephemeral data root refuses to boot
-  - [memory-engine-cortex.md](memory-engine-cortex.md) — the hosted-Cortex
-    design record for #1936, with its measurements split into
-    [memory-engine-cortex-evidence.md](memory-engine-cortex-evidence.md),
-    which also carries the cross-scope bypass that settled the topology
+  - [memory-engine.md](memory-engine.md) — the `OPENCOMPANY_MEMORY` overlay,
+    the TinyMemory v2 engines (`cortexdb`, `tinyhumans`), the boot probe and
+    the engine-switch runbook
   - [data-root.md](data-root.md) — the root itself: resolution order, ownership,
     and two processes wanting the same directory
   - [offline.md](offline.md) — running with no network at all: the documented
@@ -111,10 +108,11 @@ Supporting docs:
   primitive, and containerised code tools. Also the three entities this removes
   — the kanban board as the work model, desks, and two of the three memory
   backends
-  - [orchestration/memory.md](orchestration/memory.md) — `MemoryProvider`
-    replacing the bespoke `CortexClient` backend, with `MemoryStore`,
+  - [orchestration/memory.md](orchestration/memory.md) — the one engine
+    contract replacing the bespoke `CortexClient` backend (written against
+    TinyMemory v1, since migrated to v2), with `MemoryStore`,
     `ContextStore` and `FactStore` kept as typed facades over the one
-    provider rather than as three independent backends, and why the host
+    engine rather than as three independent backends, and why the host
     decorator is the only safe constructor
   - [orchestration/context-routing.md](orchestration/context-routing.md) — what
     each role is told, why the exclusions matter as much as the entries, and
@@ -211,7 +209,7 @@ The kernel owns:
 
 The kernel explicitly does **not** own cognition (Medulla), model routing
 (TinyHumans backend), tool implementations (OpenHuman / TinyAgents), memory
-internals (TinyCortex or any store), or the agent economy (tiny.place).
+internals (any memory engine or store), or the agent economy (tiny.place).
 
 ## Crate layout (target)
 
@@ -240,7 +238,7 @@ port returns the crate `Result<T>`.
 | *(default)* | kernel, fs store, hosted brain client, operator API |
 | `tiny` | TinyAgents embedding (existing flag; used by stub brain and local workers) |
 | `sqlite` | SQLite store implementations |
-| `tinymemory` | Hosted/null memory engine seam (`MemoryProvider` contract) |
+| `tinymemory` | Hosted/null memory engine seam (TinyMemory v2 `MemoryEngine` contract) |
 | `tinyplace` | tiny.place economy adapter and A2A routes |
 | `sidecar` | Node sidecar brain for self-hosters |
 

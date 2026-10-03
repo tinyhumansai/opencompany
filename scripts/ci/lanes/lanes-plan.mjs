@@ -448,6 +448,19 @@ export function buildPlan({ profile, areas, env = {} }) {
           run: `scripts/ci/run-scoped-suite.sh "analytics" analytics analytics`,
         },
         {
+          // The TinyHumans hub clients (feedback forwarding, the key
+          // exchange), gated on `tinyhumans`; HTTP-level tests against a
+          // local stub.
+          name: "tinyhumans-feedback",
+          when: rust,
+          run: `scripts/ci/run-scoped-suite.sh "tinyhumans feedback" tinyhumans feedback::tinyhumans`,
+        },
+        {
+          name: "tinyhumans-hub-identity",
+          when: rust,
+          run: `scripts/ci/run-scoped-suite.sh "tinyhumans hub identity" tinyhumans server::hub_identity`,
+        },
+        {
           name: "crash-reporting",
           when: rust,
           run: `scripts/ci/run-scoped-suite.sh "crash reporting" crash-reporting observability`,

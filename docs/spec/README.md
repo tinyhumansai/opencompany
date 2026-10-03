@@ -43,7 +43,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | Tools, agents, sessions, credentials | OpenHuman | embedded as a library (`openhuman_embed`); gaps go upstream as PRs |
 | Desk deliberation: episodes, rounds, speech, Jev routing, referral | tinyhivemind | hosted over the embedded agents (`tinyhivemind-openhuman`); the host commits, the library folds |
 | In-process LLM sub-work | TinyAgents | embedded library behind `ToolProvider` |
-| Long-term memory | TinyCortex (candidate) | behind `MemoryStore`; default is file-based |
+| Long-term memory | TinyMemory v2 engines (CortexDB) | behind `MemoryStore`; default is file-based |
 | Identity, discovery, payments, A2A | tiny.place | behind `AgentEconomy` |
 | Company definition, brain state, lifecycle, approvals, HTTP surface | **OpenCompany** | owned outright |
 
@@ -109,7 +109,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/console-sections.md](runtime/console-sections.md) | Rule 8 written out: the four sidebar sections, sub-navigation in the sidebar rather than a content rail, Room as the chat column moved whole, the collapsed rail, Room at its real cap, and the nine Rule 6 calls |
 | [runtime/pages.md](runtime/pages.md) | Agent-authored internal dashboard pages: the `pages/<slug>/` convention, the compile-on-write contract, and the two-part isolation model |
 | [runtime/orchestration/README.md](runtime/orchestration/README.md) | Making a many-agent company converge: the three collapses, the three principles, phasing |
-| [runtime/orchestration/memory.md](runtime/orchestration/memory.md) | One memory contract: `MemoryProvider` replaces three ports, and the host decorator that keeps tenants apart |
+| [runtime/orchestration/memory.md](runtime/orchestration/memory.md) | One memory contract: `MemoryEngine` replaces three ports, and the host decorator that keeps tenants apart |
 | [runtime/orchestration/context-routing.md](runtime/orchestration/context-routing.md) | Which workspace documents reach which role's prompt, the load-bearing exclusions, and assembly order |
 | [runtime/orchestration/alignment.md](runtime/orchestration/alignment.md) | The budgeted brief, the derived ledgers, the assertion board |
 | [runtime/orchestration/demand-ledger.md](runtime/orchestration/demand-ledger.md) | The demand ledger as the work model (normative): dedup, closure by evidence, the column projection |
@@ -173,7 +173,7 @@ what the console ships *today*, because their source of truth is a stylesheet
 
 - Make simple company workflows concise; make complex workflows explicit,
   inspectable, and testable.
-- Reuse Medulla, OpenHuman, TinyAgents, TinyCortex, and tiny.place instead of
+- Reuse Medulla, OpenHuman, TinyAgents, TinyMemory, and tiny.place instead of
   reimplementing them; changes those layers need go upstream as PRs.
 - Keep the default build small; deeper integrations are feature-gated.
 - One required credential; everything else optional and gracefully degrading.

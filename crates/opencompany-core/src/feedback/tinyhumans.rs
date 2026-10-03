@@ -363,63 +363,43 @@ mod http {
     /// owning account, which is what makes a forwarded report "recorded on
     /// behalf of the key owner".
     pub struct HttpTinyHumansClient {
-        api_url: String,
-        credential: SecretValue,
-        http: reqwest::Client,
+        sdk: tinyhumans_sdk::TinyHumansClient,
     }
 
     impl HttpTinyHumansClient {
         /// Builds a client posting to `api_url` as `credential`'s owner.
         pub fn new(api_url: impl Into<String>, credential: SecretValue) -> Self {
+            // This client bypasses the embedded openhuman_core entirely, so
+            // unlike the harness's `IntegrationClient`-backed calls it must tag
+            // itself with our product identity directly — see `crate::product`.
+            let (name, value) = crate::product::product_identity_header();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(name, reqwest::header::HeaderValue::from_static(value));
             Self {
                 // Trailing slashes would produce `//feedback/ingest`.
-                api_url: api_url.into().trim_end_matches('/').to_string(),
-                credential,
-                http: reqwest::Client::new(),
+                sdk: tinyhumans_sdk::TinyHumansClient::new(api_url.into().trim_end_matches('/'))
+                    // The credential rides the header and only the header.
+                    .with_token(Some(credential.expose().to_string()))
+                    .with_default_headers(headers),
             }
         }
 
-        fn err(context: &str, e: impl std::fmt::Display) -> OpenCompanyError {
-            OpenCompanyError::TinyHumans {
-                code: context.to_string(),
-                message: e.to_string(),
+        /// Maps an SDK failure onto the crate error with the hub's own message.
+        fn err(error: tinyhumans_sdk::Error) -> OpenCompanyError {
+            match error {
+                tinyhumans_sdk::Error::Status { status, body } => OpenCompanyError::TinyHumans {
+                    code: format!("http_{status}"),
+                    message: wire_error(&body).unwrap_or_else(|| format!("HTTP {status}")),
+                },
+                tinyhumans_sdk::Error::Http(e) => OpenCompanyError::TinyHumans {
+                    code: "unreachable".to_string(),
+                    message: e.to_string(),
+                },
+                other => OpenCompanyError::TinyHumans {
+                    code: "decode".to_string(),
+                    message: other.to_string(),
+                },
             }
-        }
-
-        /// A request builder carrying the product header and the credential.
-        ///
-        /// Every board call is the same shape as `ingest` — the credential rides
-        /// the header and only the header — so they share one place that knows
-        /// it, rather than each remembering to attach it.
-        fn authed(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-            let (product_header_name, product_header_value) =
-                crate::product::product_identity_header();
-            self.http
-                .request(method, format!("{}{path}", self.api_url))
-                .header(product_header_name, product_header_value)
-                .bearer_auth(self.credential.expose())
-        }
-
-        /// Sends a board request and returns the `data` payload of the hub's
-        /// `{ success, data }` envelope, mapping a failure status onto the
-        /// crate error with the hub's own message.
-        async fn data(&self, request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
-            let resp = request
-                .send()
-                .await
-                .map_err(|e| Self::err("unreachable", e))?;
-            let status = resp.status();
-            let value: serde_json::Value = resp.json().await.map_err(|e| Self::err("decode", e))?;
-            if !status.is_success() {
-                return Err(OpenCompanyError::TinyHumans {
-                    code: format!("http_{}", status.as_u16()),
-                    message: wire_error(&value).unwrap_or_else(|| status.to_string()),
-                });
-            }
-            Ok(value
-                .get("data")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null))
         }
     }
 
@@ -501,56 +481,33 @@ mod http {
     #[async_trait]
     impl TinyHumansClient for HttpTinyHumansClient {
         async fn ingest(&self, request: &IngestRequest) -> Result<IngestOutcome> {
-            let url = format!("{}/feedback/ingest", self.api_url);
-            let body = serde_json::json!({
-                "type": request.wire_type(),
-                "title": request.title,
-                "body": request.body,
-                "product": PRODUCT,
-                "origin": request.origin,
-                "externalRef": request.external_ref,
-            });
-            let (product_header_name, product_header_value) =
-                crate::product::product_identity_header();
-            let resp = self
-                .http
-                .post(&url)
-                // This client bypasses the embedded openhuman_core entirely, so
-                // unlike the harness's `IntegrationClient`-backed calls it must
-                // tag itself with our product identity directly — see
-                // `crate::product`. `body` already carries the same value under
-                // `"product"`, but that is the hub's own routing field over the
-                // JSON payload; this header is the transport-level marker every
-                // backend endpoint reads, feedback or otherwise.
-                .header(product_header_name, product_header_value)
-                // The credential rides the header and only the header.
-                .bearer_auth(self.credential.expose())
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| Self::err("unreachable", e))?;
-
-            let status = resp.status();
-            let value: serde_json::Value = resp.json().await.map_err(|e| Self::err("decode", e))?;
-
-            // The daily-limit refusal is a normal outcome for a busy operator,
-            // not a transport failure: report it rather than erroring.
-            if status.as_u16() == 429 {
-                return Ok(IngestOutcome::RateLimited {
-                    reason: wire_error(&value)
-                        .unwrap_or_else(|| "daily feedback limit reached".to_string()),
-                });
-            }
-            if !status.is_success() {
-                return Err(OpenCompanyError::TinyHumans {
-                    code: format!("http_{}", status.as_u16()),
-                    message: wire_error(&value).unwrap_or_else(|| status.to_string()),
-                });
-            }
-
-            // { success, data: { accepted, reason, feedback } } — a 200 with
-            // `accepted: false` is a moderation rejection, not an error.
-            let data = value.get("data").unwrap_or(&serde_json::Value::Null);
+            use tinyhumans_sdk::api::types::{FeedbackType, IngestFeedbackRequest};
+            let body = IngestFeedbackRequest {
+                kind: match request.wire_type() {
+                    "bug" => FeedbackType::Bug,
+                    _ => FeedbackType::Feature,
+                },
+                title: request.title.clone(),
+                body: request.body.clone(),
+                product: PRODUCT.to_string(),
+                origin: Some(request.origin.clone()),
+                external_ref: Some(request.external_ref.clone()),
+            };
+            let data = match self.sdk.feedback().ingest_feedback(&body).await {
+                Ok(data) => data.0,
+                // The daily-limit refusal is a normal outcome for a busy
+                // operator, not a transport failure: report it rather than
+                // erroring.
+                Err(tinyhumans_sdk::Error::Status { status: 429, body }) => {
+                    return Ok(IngestOutcome::RateLimited {
+                        reason: wire_error(&body)
+                            .unwrap_or_else(|| "daily feedback limit reached".to_string()),
+                    });
+                }
+                Err(error) => return Err(Self::err(error)),
+            };
+            // { accepted, reason, feedback } — a 200 with `accepted: false` is
+            // a moderation rejection, not an error.
             let accepted = data
                 .get("accepted")
                 .and_then(|v| v.as_bool())
@@ -575,20 +532,23 @@ mod http {
 
         async fn list_board(&self, query: BoardQuery) -> Result<BoardPage> {
             let query = query.clamped();
-            let mut request = self
-                .authed(reqwest::Method::GET, "/feedback")
-                .query(&[("sort", query.sort.as_str())])
-                .query(&[
-                    ("page", query.page.to_string()),
-                    ("limit", query.limit.to_string()),
-                ]);
-            if let Some(kind) = query.kind {
-                request = request.query(&[("type", kind.as_str())]);
-            }
-            if let Some(status) = query.status {
-                request = request.query(&[("status", status.as_str())]);
-            }
-            let data = self.data(request).await?;
+            let params: Vec<tinyhumans_sdk::QueryParam> = vec![
+                ("sort", Some(query.sort.as_str().to_string())),
+                ("page", Some(query.page.to_string())),
+                ("limit", Some(query.limit.to_string())),
+                ("type", query.kind.map(|kind| kind.as_str().to_string())),
+                (
+                    "status",
+                    query.status.map(|status| status.as_str().to_string()),
+                ),
+            ];
+            let data = self
+                .sdk
+                .feedback()
+                .list_feedback(&params)
+                .await
+                .map_err(Self::err)?
+                .0;
             let items = data
                 .get("items")
                 .and_then(|v| v.as_array())
@@ -610,8 +570,13 @@ mod http {
         }
 
         async fn board_item(&self, id: &str) -> Result<BoardDetail> {
-            let path = format!("/feedback/{}", urlencode(id));
-            let data = self.data(self.authed(reqwest::Method::GET, &path)).await?;
+            let data = self
+                .sdk
+                .feedback()
+                .get_feedback(id)
+                .await
+                .map_err(Self::err)?
+                .0;
             let item = data
                 .get("feedback")
                 .ok_or_else(|| decode_err("detail without a feedback item"))?;
@@ -622,36 +587,30 @@ mod http {
         }
 
         async fn vote_board_item(&self, id: &str, value: VoteValue) -> Result<BoardItem> {
-            let path = format!("/feedback/{}/vote", urlencode(id));
-            let request = self
-                .authed(reqwest::Method::POST, &path)
-                .json(&serde_json::json!({ "value": value.as_i8() }));
-            parse_item(&self.data(request).await?)
+            let vote = tinyhumans_sdk::api::types::FeedbackVoteRequest {
+                value: value.as_i8(),
+            };
+            let data = self
+                .sdk
+                .feedback()
+                .vote_feedback(id, &vote)
+                .await
+                .map_err(Self::err)?;
+            parse_item(&data.0)
         }
 
         async fn comment_board_item(&self, id: &str, body: &str) -> Result<BoardComment> {
-            let path = format!("/feedback/{}/comments", urlencode(id));
-            let request = self
-                .authed(reqwest::Method::POST, &path)
-                .json(&serde_json::json!({ "body": body }));
-            Ok(parse_comment(&self.data(request).await?))
+            let comment = tinyhumans_sdk::api::types::FeedbackCommentRequest {
+                body: body.to_string(),
+            };
+            let data = self
+                .sdk
+                .feedback()
+                .comment_feedback(id, &comment)
+                .await
+                .map_err(Self::err)?;
+            Ok(parse_comment(&data.0))
         }
-    }
-
-    /// Percent-encodes a path segment.
-    ///
-    /// Board ids are hub ObjectIds today, but an id is the hub's to choose: a
-    /// future one containing `/` or `?` must not rewrite the route it travels in.
-    fn urlencode(segment: &str) -> String {
-        segment
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    (b as char).to_string()
-                }
-                other => format!("%{other:02X}"),
-            })
-            .collect()
     }
 
     /// The `error` string from a failure envelope, when present.

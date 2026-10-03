@@ -52,7 +52,7 @@ pub(super) fn fp_policy(mode: &str, always: &[&str], cap: Option<f64>, ttl: Opti
     }
 }
 
-/// In-memory `ContextStore` so `OcMemory` has somewhere to land.
+/// In-memory `ContextStore` so the memory tools have somewhere to land.
 #[derive(Default)]
 pub(super) struct MockContext {
     pub(super) chunks: StdMutex<Vec<(ChunkAddr, ContextChunk)>>,

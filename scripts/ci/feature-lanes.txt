@@ -109,7 +109,7 @@ opencompany-tui/sqlite  | tested | sqlite  | The `rust` lane runs the TUI agains
 # features.
 
 github         | compile-only | - | Only `HttpGitHubClient` is gated. `GitHubClient`, its mock and the whole issue-filing flow test at default features (src/feedback/github.rs tests sit outside the gated `mod http`).
-tinyhumans     | compile-only | - | Only `HttpTinyHumansClient` / `HttpHubIdentityExchange` are gated. The trait, mock and routing decision test at default features.
+tinyhumans     | partial      | tinyhumans                      | feedback::tinyhumans server::hub_identity
 medulla        | compile-only | - | Only the HTTP/Socket.IO transport is gated. Wire types + `MockTransport` test at default features; the gated `http` module carries no test.
 dns            | compile-only | - | Only `HickoryDnsResolver` is gated. The `DnsResolver` trait, `StaticDnsResolver` and the pure record generation test at default features.
 

@@ -608,14 +608,6 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
     strip_url_queries(&out)
 }
 
-/// Remove the entire endpoint credential surface from an agent-visible endpoint
-/// string: strip its query + fragment. Kept separate so [`crate::harness::mcp`]'s
-/// list-servers tool can sanitize endpoints without the full [`scrub`] pipeline.
-pub fn strip_endpoint(endpoint: &str) -> String {
-    let cut = endpoint.find(['?', '#']).unwrap_or(endpoint.len());
-    endpoint[..cut].to_string()
-}
-
 /// Cut the query/fragment off any `http(s)://…` URL embedded anywhere in `text`.
 fn strip_url_queries(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

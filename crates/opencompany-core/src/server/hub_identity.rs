@@ -282,22 +282,12 @@ mod http {
 
     /// The hub's envelope for `POST /auth/keys`.
     #[derive(Debug, Deserialize)]
-    struct KeyResponse {
-        data: KeyData,
-    }
-
-    #[derive(Debug, Deserialize)]
     struct KeyData {
         /// The plaintext key. The hub emits it exactly once.
         key: String,
     }
 
-    /// The hub's envelope for `GET /payments/summary`.
-    #[derive(Debug, Deserialize)]
-    struct SummaryResponse {
-        data: SummaryData,
-    }
-
+    /// The `data` of the hub's `GET /payments/summary` envelope.
     #[derive(Debug, Deserialize)]
     struct SummaryData {
         #[serde(default)]
@@ -333,10 +323,9 @@ mod http {
     }
 
     /// A [`HubIdentityExchange`] backed by the hub's own `POST /auth/keys` and
-    /// `GET /payments/summary`.
+    /// `GET /payments/summary`, through the TinyHumans SDK.
     pub struct HttpHubIdentityExchange {
         api_url: String,
-        http: reqwest::Client,
     }
 
     impl HttpHubIdentityExchange {
@@ -345,96 +334,86 @@ mod http {
             Self {
                 // Trailing slashes would produce `//auth/keys`.
                 api_url: api_url.into().trim_end_matches('/').to_string(),
-                http: reqwest::Client::new(),
             }
         }
 
-        fn err(context: &str, e: impl std::fmt::Display) -> OpenCompanyError {
-            OpenCompanyError::TinyHumans {
-                code: context.to_string(),
+        /// An SDK client for one call, tagged with our product identity.
+        ///
+        /// `api_url` is the TinyHumans backend itself, so this is our own
+        /// backend and is tagged like every other call we make to it — the SDK
+        /// client is not built through `openhuman_core`'s `IntegrationClient`,
+        /// so it never inherits the header `set_product_identity` attaches
+        /// (see `crate::product`). Built per call because the bearer differs
+        /// per call (none for a redemption, the redeemed key for a summary).
+        fn sdk(&self, token: Option<&str>) -> tinyhumans_sdk::TinyHumansClient {
+            let (name, value) = crate::product::product_identity_header();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(name, reqwest::header::HeaderValue::from_static(value));
+            tinyhumans_sdk::TinyHumansClient::new(&self.api_url)
+                .with_token(token.map(str::to_string))
+                .with_default_headers(headers)
+        }
+
+        /// Maps an SDK failure onto the crate error. A failure body is the
+        /// hub's own words about the code's or key's standing; neither secret
+        /// is ever in it (the key rides a header), and it is capped anyway.
+        fn err(error: tinyhumans_sdk::Error) -> OpenCompanyError {
+            let (code, message) = match error {
+                tinyhumans_sdk::Error::Status { status, body } => {
+                    (format!("http_{status}"), truncate(&body.to_string(), 200))
+                }
+                tinyhumans_sdk::Error::Http(e) => ("unreachable".to_string(), e.to_string()),
+                other => ("decode".to_string(), other.to_string()),
+            };
+            OpenCompanyError::TinyHumans { code, message }
+        }
+
+        fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T> {
+            serde_json::from_value(value).map_err(|e| OpenCompanyError::TinyHumans {
+                code: "decode".to_string(),
                 message: e.to_string(),
-            }
+            })
         }
     }
 
     #[async_trait]
     impl HubIdentityExchange for HttpHubIdentityExchange {
         async fn redeem_key_grant(&self, code: &str, verifier: &str) -> Result<String> {
-            let url = format!("{}/auth/keys", self.api_url);
-            // `api_url` is the TinyHumans backend itself (`AppConfig::api_url`,
-            // defaulting to `crate::app::config::DEFAULT_API_URL`), so this is
-            // our own backend and is tagged like every other call we make to
-            // it. A bespoke `reqwest::Client`, not one built through
-            // `openhuman_core`'s `IntegrationClient`, so it never inherits the
-            // header `set_product_identity` attaches — see `crate::product`.
-            let (product_header_name, product_header_value) =
-                crate::product::product_identity_header();
             // No bearer: the hub's redemption route is unauthenticated, and the
             // verifier is what authenticates it. That is the whole point of the
             // exchange — this host never holds a credential belonging to the
             // person who approved the grant.
-            let resp = self
-                .http
-                .post(&url)
-                .header(product_header_name, product_header_value)
-                .json(&serde_json::json!({ "code": code, "code_verifier": verifier }))
-                .send()
+            let request = tinyhumans_sdk::api::types::RedeemKeyGrantRequest {
+                code: code.to_string(),
+                code_verifier: verifier.to_string(),
+            };
+            let data = self
+                .sdk(None)
+                .auth()
+                .redeem_key_grant(&request)
                 .await
-                .map_err(|e| Self::err("unreachable", e))?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                // The hub's message describes the code's standing ("invalid or
-                // expired", "verifier does not match"), never the key. Neither
-                // argument is echoed: both are live secrets, and the response
-                // body is the hub's own words about its own flow.
-                let detail = resp.text().await.unwrap_or_default();
-                return Err(Self::err(
-                    &format!("http_{}", status.as_u16()),
-                    truncate(&detail, 200),
-                ));
-            }
-
-            let parsed: KeyResponse = resp.json().await.map_err(|e| Self::err("decode", e))?;
-            Ok(parsed.data.key)
+                .map_err(Self::err)?;
+            Ok(Self::decode::<KeyData>(data.0)?.key)
         }
 
         async fn billing_summary(&self, key: &str) -> Result<BillingSummary> {
-            let url = format!("{}/payments/summary", self.api_url);
-            let (product_header_name, product_header_value) =
-                crate::product::product_identity_header();
-            let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(key)
-                .header(product_header_name, product_header_value)
-                .send()
+            let data = self
+                .sdk(Some(key))
+                .payments()
+                .get_summary()
                 .await
-                .map_err(|e| Self::err("unreachable", e))?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                // The hub's words describe the key's standing — expired, revoked,
-                // wrong scope. The key is in a header, so neither the body nor
-                // `reqwest`'s Display can carry it into this error.
-                let detail = resp.text().await.unwrap_or_default();
-                return Err(Self::err(
-                    &format!("http_{}", status.as_u16()),
-                    truncate(&detail, 200),
-                ));
-            }
-
-            let parsed: SummaryResponse = resp.json().await.map_err(|e| Self::err("decode", e))?;
+                .map_err(Self::err)?;
+            let parsed: SummaryData = Self::decode(data.0)?;
             Ok(BillingSummary {
-                balance_usd: parsed.data.credits.total_usd,
+                balance_usd: parsed.credits.total_usd,
                 // A hub that names no plan is on the free one — the field is
                 // absent there rather than spelled out, and a card reading
                 // "unknown" would be a worse answer than the true one.
-                plan: parsed.data.plan.plan.unwrap_or_else(|| "free".to_string()),
-                active_subscription: parsed.data.plan.has_active_subscription,
-                plan_expiry: parsed.data.plan.plan_expiry,
-                top_up_url: parsed.data.links.top_up_url,
-                manage_url: parsed.data.links.manage_url,
+                plan: parsed.plan.plan.unwrap_or_else(|| "free".to_string()),
+                active_subscription: parsed.plan.has_active_subscription,
+                plan_expiry: parsed.plan.plan_expiry,
+                top_up_url: parsed.links.top_up_url,
+                manage_url: parsed.links.manage_url,
             })
         }
     }

@@ -1,5 +1,4 @@
-//! Per-agent MCP registry assembly + a credential-redacting list-servers tool
-//! (issue #50).
+//! Per-agent MCP registry assembly and the hardened `mcp_call_tool` (issue #50).
 //!
 //! [`registry_for_agent`] folds a company's effective [`McpServerDecl`]s into an
 //! OpenHuman [`McpServerRegistry`](oh::mcp::config_servers::McpServerRegistry) scoped to
@@ -8,10 +7,13 @@
 //! so remote tool metadata is scanned for prompt-injection before an agent ever
 //! sees it.
 //!
-//! **Security**: upstream's [`McpListServersTool`](oh::tools::McpListServersTool)
-//! serializes `server.auth` — including bearer tokens — into agent-visible
-//! output. [`OcMcpListServersTool`] is a drop-in replacement that emits the same
-//! shape **minus** any credential (only a non-secret `auth_configured` bool).
+//! **Security**: `mcp_list_servers` is upstream's own
+//! [`McpListServersTool`](tinymcp::tools::McpListServersTool), which reports only
+//! a non-secret `auth_configured` / `auth_kind` per server — this module used to
+//! carry a redacting replacement from when upstream serialized `server.auth`.
+//! [`OcMcpCallTool`] scrubs both failed *and* successful results against the
+//! server's own credentials ([`tinymcp::tools::SecretScrubber`]), since a
+//! server can reflect its credential into a normal response.
 //!
 //! Compiled only under `feature = "openhuman"` (the whole `harness` module is).
 
@@ -25,7 +27,7 @@ use serde_json::{Value, json};
 use openhuman_core as oh;
 
 use oh::config::{Config, McpAuthConfig, McpServerConfig};
-use oh::mcp::config_servers::{McpRegistrySource, McpServerRegistry};
+use oh::mcp::config_servers::McpServerRegistry;
 use oh::mcp::registry::types::{ConnStatus, InstalledServer, McpTool};
 use oh::security::{SecurityPolicy, ToolOperation};
 use tinytools::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
@@ -33,7 +35,7 @@ use tinytools::{PermissionLevel, Tool, ToolCallOptions, ToolResult};
 use crate::company::mcp::{AuthMaterial, McpServerDecl};
 use crate::error::OpenCompanyError;
 use crate::harness::mcp_probe::{
-    McpFailure, McpFailureQueue, classify_mcp_error, operator_message, scrub, strip_endpoint,
+    McpFailure, McpFailureQueue, classify_mcp_error, operator_message, scrub,
 };
 use crate::ports::types::CompanyId;
 use crate::ports::usage::UsageMeter;
@@ -320,121 +322,6 @@ pub async fn discover_tools(
         .collect())
 }
 
-/// A credential-redacting replacement for OpenHuman's `mcp_list_servers` tool.
-///
-/// Emits the same agent-facing shape (name / endpoint / description / timeout /
-/// tool lists / source) but **never** the `auth` block — only a non-secret
-/// `auth_configured` flag. Keeps the upstream tool name so agent prompts and the
-/// bridge contract are unchanged.
-pub struct OcMcpListServersTool {
-    registry: Arc<McpServerRegistry>,
-}
-
-impl OcMcpListServersTool {
-    pub fn new(registry: Arc<McpServerRegistry>) -> Self {
-        Self { registry }
-    }
-}
-
-#[async_trait]
-impl Tool for OcMcpListServersTool {
-    fn name(&self) -> &str {
-        "mcp_list_servers"
-    }
-
-    fn description(&self) -> &str {
-        "List named remote MCP servers available to you. Use this before browsing tools on a specific MCP server."
-    }
-
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        })
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
-    }
-
-    fn supports_markdown(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
-        let servers = self
-            .registry
-            .list()
-            .into_iter()
-            .map(|server| {
-                json!({
-                    "name": server.name,
-                    // Strip the query string: a query-parameter credential rides
-                    // in the endpoint URL, so the agent-visible endpoint must
-                    // never carry it.
-                    "endpoint": strip_endpoint(&server.endpoint),
-                    "description": server.description,
-                    "timeout_secs": server.timeout_secs,
-                    "allowed_tools": server.allowed_tools,
-                    "disallowed_tools": server.disallowed_tools,
-                    // Non-secret status ONLY — the credential is never emitted.
-                    "auth_configured": !matches!(server.auth, tinymcp::McpAuthConfig::None),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let markdown = if servers.is_empty() {
-            "# MCP Servers\n\nNo remote MCP servers are available.".to_string()
-        } else {
-            let mut md = String::from("# MCP Servers\n");
-            for server in self.registry.list() {
-                let source = match server.source {
-                    McpRegistrySource::Config => "config",
-                    // Renamed upstream: the host-seeded source is no longer
-                    // gitbooks-specific. The wire value is unchanged so an
-                    // operator's existing filters keep matching.
-                    McpRegistrySource::Host => "legacy_gitbooks",
-                    // `#[non_exhaustive]`: a source this build does not know
-                    // still has to render as something.
-                    _ => "unknown",
-                };
-                let auth = if matches!(server.auth, tinymcp::McpAuthConfig::None) {
-                    "none"
-                } else {
-                    "configured"
-                };
-                md.push_str(&format!(
-                    "\n- **{}** ({source})\n  - endpoint: `{}`\n  - auth: {auth}",
-                    server.name,
-                    strip_endpoint(&server.endpoint),
-                ));
-                if let Some(description) = server.description.as_deref() {
-                    md.push_str(&format!("\n  - {description}"));
-                }
-                if !server.allowed_tools.is_empty() {
-                    md.push_str(&format!(
-                        "\n  - allowed tools: `{}`",
-                        server.allowed_tools.join("`, `")
-                    ));
-                }
-                if !server.disallowed_tools.is_empty() {
-                    md.push_str(&format!(
-                        "\n  - disallowed tools: `{}`",
-                        server.disallowed_tools.join("`, `")
-                    ));
-                }
-            }
-            md
-        };
-
-        Ok(ToolResult::success_with_markdown(
-            json!({ "servers": servers }),
-            markdown,
-        ))
-    }
-}
-
 /// What `mcp_call_tool` needs to record an `OauthCall` usage sample.
 ///
 /// Mirrors [`ComposioMetering`](crate::harness::composio::ComposioMetering):
@@ -632,7 +519,13 @@ impl Tool for OcMcpCallTool {
                 }
                 // Use tinymcp's shared conversion rather than reimplementing
                 // the mapping of output text, metadata, and error state.
-                let mut result: ToolResult = tinymcp::tools::tool_result(result.rendered);
+                let result: ToolResult = tinymcp::tools::tool_result(result.rendered);
+                // A successful response can still reflect the server's own
+                // credential (an echoed header, a URL with its query-string
+                // key); scrub it the same way a failure is scrubbed.
+                let mut result =
+                    tinymcp::tools::SecretScrubber::for_server(&self.registry, &server)
+                        .scrub_result(result);
                 if options.prefer_markdown && result.markdown_formatted.is_none() {
                     result.markdown_formatted = Some(result.output());
                 }

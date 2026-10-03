@@ -28,7 +28,7 @@
 //!    index order, so with more than `limit` matches the *oldest* won over the
 //!    *best*.
 //!
-//! A fourth copy — `store/tinycortex.rs::score_chunks` — already did the right
+//! A fourth copy — the removed in-pod engine's `score_chunks` — already did the right
 //! thing (distinct-token overlap, sorted, zero-overlap dropped). That is what
 //! made this easy to miss: the good version was three files away in the same
 //! directory. This module is that version, hardened, and now used by all of

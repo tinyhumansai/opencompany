@@ -96,13 +96,14 @@ Moved to [`workspace-layout.md`](workspace-layout.md) — this file was over the
 Moved to [`memory-engine.md`](memory-engine.md) — this file was over the repository's 500-line limit. See that page for the full detail.
 
 `OPENCOMPANY_MEMORY` selects `store` (default), `remote`, or `null`. A hosted engine additionally needs
-`OPENCOMPANY_MEMORY_DRIVER`, `OPENCOMPANY_MEMORY_URL` and
-`OPENCOMPANY_MEMORY_API_KEY`; each refuses at boot when missing, naming the
+`OPENCOMPANY_MEMORY_DRIVER` (`cortexdb` or `tinyhumans`) and
+`OPENCOMPANY_MEMORY_API_KEY`; `OPENCOMPANY_MEMORY_URL` is optional (each engine
+has a default endpoint). A missing driver or key refuses at boot, naming the
 knob, and never falls back to the base store's memory. The in-pod
-`embedded`/`tinycortex` engine and its `namespace` provider-store mode were
+`embedded`/`tinycortex` engine was
 removed in #1568 and refuse at boot if still selected. The credential and the
 endpoint never appear in logs, `/healthz`, `/spec`, status output, or an export
-— `/spec` reports the engine's `driver_id` and negotiated capabilities only.
+— `/spec` reports the engine's id and the retrieval modes it serves only.
 
 ## MongoDB backend (`src/store/mongodb.rs`)
 

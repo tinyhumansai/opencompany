@@ -140,7 +140,7 @@ fn every_offered_engine_resolves_to_a_runtime_selection() {
 }
 
 /// And the round trip holds: the id a selection renders as is the id that
-/// produced it. Without this the console could apply `mem0` and be shown
+/// produced it. Without this the console could apply `tinyhumans` and be shown
 /// `remote` afterwards, which reads as a failed save.
 #[test]
 fn engine_ids_round_trip_through_a_selection() {
@@ -168,7 +168,7 @@ fn catalog_matches_driver_registry() {
         .collect();
     assert_eq!(
         offered,
-        crate::store::memory::driver::SUPPORTED_REMOTE_DRIVERS.to_vec()
+        crate::store::memory::driver::supported_remote_engines()
     );
 }
 
@@ -176,21 +176,17 @@ fn catalog_matches_driver_registry() {
 /// somebody remembered to pass `--features tinymemory` to.
 ///
 /// This is a regression pin with a support case behind it: the memory-engine
-/// catalog is a console surface in every build, and without `tinymemory` four
-/// of its tiles ("Supermemory", "Mem0", "Cognee", "No memory") render disabled
+/// catalog is a console surface in every build, and without `tinymemory` its
+/// engine tiles (CortexDB, TinyHumans memory, "No memory") render disabled
 /// with "this build was compiled without the `tinymemory` feature" — an
 /// instruction to go and find a differently compiled binary. For the desktop
 /// app and for anyone running the shipped container that is not an instruction
 /// they can follow, so the feature ships in the default set (see `Cargo.toml`)
 /// and this asserts it from a lane that passes no features at all.
 ///
-/// Deliberately NOT quantified over the whole catalog: the in-pod engines
-/// (`embedded`, `namespace`) do cost a bundled SQLite build and stay opt-in.
-/// The desktop keeps those off too — it offers no in-pod memory surface — and
-/// enables the hosted drivers itself via `tinymemory` in `src-tauri/Cargo.toml`.
 #[test]
 fn the_hosted_memory_engines_ship_in_the_default_build() {
-    let hosted = ["supermemory", "mem0", "cognee", "null"];
+    let hosted = ["cortexdb", "tinyhumans", "null"];
     let entries: Vec<_> = catalog()
         .into_iter()
         .filter(|option| hosted.contains(&option.id))
@@ -222,7 +218,7 @@ fn the_hosted_memory_engines_ship_in_the_default_build() {
 /// with the reason that actually blocks it.
 #[test]
 fn an_engine_this_build_cannot_bind_is_refused_by_availability() {
-    let refused = ensure_available("supermemory");
+    let refused = ensure_available("cortexdb");
     if cfg!(feature = "tinymemory") {
         assert!(refused.is_ok());
     } else {
@@ -233,29 +229,35 @@ fn an_engine_this_build_cannot_bind_is_refused_by_availability() {
         ensure_available("pinecone")
             .unwrap_err()
             .to_string()
-            .contains("supermemory"),
+            .contains("cortexdb"),
         "an unknown id lists the catalog"
     );
 }
 
-/// A hosted engine with no endpoint is refused before anything is written,
-/// with a message naming the field rather than an environment variable the
-/// operator never set.
+/// A hosted engine with a default endpoint binds with the URL left blank —
+/// the console shows the field as optional — but still refuses a missing key.
 #[test]
-fn a_hosted_engine_without_an_endpoint_is_refused() {
-    let error = selection_from(
+fn a_hosted_engine_takes_its_default_endpoint_but_needs_a_key() {
+    let selection = selection_from(
         &EngineRequest {
-            engine: "supermemory".to_string(),
+            engine: "cortexdb".to_string(),
             url: None,
             api_key: Some("k".to_string()),
         },
         &MemorySelection::default(),
     )
+    .unwrap();
+    assert_eq!(selection.url, None);
+    let error = selection_from(
+        &EngineRequest {
+            engine: "cortexdb".to_string(),
+            url: None,
+            api_key: None,
+        },
+        &MemorySelection::default(),
+    )
     .unwrap_err();
-    assert!(
-        error.to_string().contains("endpoint"),
-        "unexpected message: {error}"
-    );
+    assert!(error.to_string().contains("API key"), "unexpected: {error}");
 }
 
 /// An omitted key keeps the stored one. A console showing a redacted key must
@@ -265,13 +267,13 @@ fn a_hosted_engine_without_an_endpoint_is_refused() {
 fn an_omitted_key_keeps_the_stored_credential() {
     let stored = MemorySelection {
         backend: MemoryBackend::Remote,
-        driver: Some("mem0".to_string()),
+        driver: Some("tinyhumans".to_string()),
         url: Some("https://old.example".to_string()),
         api_key: Some("secret".to_string()),
     };
     let selection = selection_from(
         &EngineRequest {
-            engine: "mem0".to_string(),
+            engine: "tinyhumans".to_string(),
             url: Some("https://new.example".to_string()),
             api_key: None,
         },
@@ -289,7 +291,7 @@ fn an_omitted_key_keeps_the_stored_credential() {
 fn switching_to_the_built_in_store_drops_endpoint_and_credential() {
     let stored = MemorySelection {
         backend: MemoryBackend::Remote,
-        driver: Some("mem0".to_string()),
+        driver: Some("tinyhumans".to_string()),
         url: Some("https://old.example".to_string()),
         api_key: Some("secret".to_string()),
     };
@@ -328,7 +330,7 @@ async fn the_default_host_reports_the_built_in_store_as_editable() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|o| o["id"] == "supermemory"),
+            .any(|o| o["id"] == "cortexdb"),
         "the catalog is offered whether or not this build can bind it"
     );
 }
@@ -393,7 +395,7 @@ fn a_refused_optional_family_is_a_caveat_and_not_a_refusal() {
     let degraded = ["people".to_string()];
 
     assert!(
-        super::family_refusal("supermemory", None).is_none()
+        super::family_refusal("cortexdb", None).is_none()
             && super::probe_is_bindable(Some(true), None),
         "nothing about a degraded family may reach the refusal path"
     );
@@ -426,7 +428,7 @@ fn a_refused_optional_family_is_a_caveat_and_not_a_refusal() {
 /// and refuses a read, which is a bigger harness than the decision deserves.
 #[test]
 fn a_refused_family_blocks_a_bind_and_a_slow_one_does_not() {
-    let refusal = super::family_refusal("supermemory", Some(&["recall".to_string()]))
+    let refusal = super::family_refusal("cortexdb", Some(&["recall".to_string()]))
         .expect("a refused family must block the bind");
     assert!(refusal.contains("recall"), "{refusal}");
     assert!(
@@ -435,11 +437,11 @@ fn a_refused_family_blocks_a_bind_and_a_slow_one_does_not() {
     );
 
     assert!(
-        super::family_refusal("supermemory", Some(&[])).is_none(),
+        super::family_refusal("cortexdb", Some(&[])).is_none(),
         "an engine that refused nothing must bind"
     );
     assert!(
-        super::family_refusal("supermemory", None).is_none(),
+        super::family_refusal("cortexdb", None).is_none(),
         "an unprobed engine must bind -- absent is not the same as refused"
     );
 }
@@ -460,14 +462,14 @@ fn test_and_apply_agree_about_a_refusing_candidate() {
         "test must not report a candidate bindable when apply will reject it"
     );
     assert!(
-        super::family_refusal("supermemory", Some(&refused)).is_some(),
+        super::family_refusal("cortexdb", Some(&refused)).is_some(),
         "apply must reject the same candidate"
     );
 
     // The other direction, so the two cannot drift into disagreeing by both
     // becoming permissive: nothing refused means bindable and no refusal.
     assert!(super::probe_is_bindable(Some(true), Some(&[])));
-    assert!(super::family_refusal("supermemory", Some(&[])).is_none());
+    assert!(super::family_refusal("cortexdb", Some(&[])).is_none());
 
     // Health still dominates: an engine that did not answer at all is not
     // bindable regardless of the family list.
@@ -613,7 +615,7 @@ async fn an_unknown_engine_is_refused_with_the_catalog() {
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("supermemory"),
+            .contains("cortexdb"),
         "{body}"
     );
 }

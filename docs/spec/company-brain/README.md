@@ -69,7 +69,7 @@ single-approval-queue model.
 | State | System of record | Notes |
 | --- | --- | --- |
 | Charter, roster, ledger, approvals | OpenCompany (`CompanyStore`/`EventLog`) | never delegated |
-| Working memory (compressed traces) | `MemoryStore` — fs default, TinyCortex target | hosted Medulla also keeps server-side compressed state per session; the local copy is authoritative for export |
+| Working memory (compressed traces) | `MemoryStore` — fs default, TinyMemory engine overlay | hosted Medulla also keeps server-side compressed state per session; the local copy is authoritative for export |
 | Context chunks | `ContextStore` | ditto |
 | Conversation history with the hosted brain | TinyHumans backend (per-session messages) | mirrored locally via the read surface when needed |
 | Channel credentials, tool state | OpenHuman domains | reached through ports, never copied |
