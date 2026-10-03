@@ -38,7 +38,7 @@ src/hive/               Hive desks: completion episodes, speech over MCP, Jev ro
 src/tiny/               TinyAgents/OpenHuman status surface
 src/globals/            The global baseline: agents, workflows, skills, starting tool belt
 src/ledger/             Dynamic ledgers: declared record shapes and the append-only fold
-src/economy/            tiny.place economy: identity, Agent Cards, SIWX auth, x402 payments
+src/crypto/             Offline Ed25519 verification (wallet sign-in, runner handshake)
 src/ingest/             Turning dropped files and links into memory
 src/metering/           Usage and finances metering projections
 src/harness/            Harness engines agents run their turns on
@@ -74,7 +74,7 @@ vendor/openhuman/vendor/tinyagents/
 | `tiny` | Vendored TinyAgents status |
 | `companies/_globals` | The global baseline every company starts from |
 | `ledger` | Dynamic ledgers and the append-only fold |
-| `economy` | tiny.place identity, Agent Cards, SIWX auth, x402 payments |
+| `crypto` | Offline Ed25519 signature verification |
 | `ingest` | Dropped files and links into memory |
 | `metering` | Usage and finances metering projections |
 | `harness` | Engines agents run their turns on |

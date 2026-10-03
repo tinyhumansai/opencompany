@@ -15,8 +15,7 @@ Supporting docs:
     `ChannelAdapter` and the `TurnStep` activity trace
   - [ports-state.md](ports-state.md) — `CompanyStore`, `EventLog`,
     `MemoryStore`, `ContextStore`, `SecretStore`, and the identity trio
-  - [ports-effects.md](ports-effects.md) — `ToolProvider`, `AgentEconomy`,
-    `ApprovalGate`
+  - [ports-effects.md](ports-effects.md) — `ToolProvider`, `ApprovalGate`
   - [ports-console.md](ports-console.md) — the WS3 console-surface stores
     - [ports-console-workspace.md](ports-console-workspace.md) — `WorkspaceStore`,
       the Obsidian-style note tree, its binary half, folder claims, and the
@@ -207,11 +206,11 @@ The kernel owns:
 - **Multi-company hosting**: a registry of running `CompanyRuntime`s with
   per-company isolation (one serial cycle queue each; companies run
   concurrently).
-- **The HTTP surface**: operator API, agent-facing A2A endpoint, webhooks.
+- **The HTTP surface**: operator API, webhooks.
 
 The kernel explicitly does **not** own cognition (Medulla), model routing
 (TinyHumans backend), tool implementations (OpenHuman / TinyAgents), memory
-internals (TinyCortex or any store), or the agent economy (tiny.place).
+internals (TinyCortex or any store).
 
 ## Crate layout (target)
 
@@ -220,17 +219,17 @@ Today's modules (`src/app`, `src/server`, `src/harness`, `src/hive`, `src/tiny`
 
 ```text
 src/ports/      one file per port trait (brain, store, events, memory,
-                context, channel, tools, economy, approvals, secrets)
+                context, channel, tools, approvals, secrets)
 src/company/    manifest.rs, runtime.rs (CompanyRuntime, RuntimeBuilder),
                 cycle.rs (CycleRunner), registry.rs (CompanyRegistry)
 src/brain/      hosted.rs (HostedMedullaBrain), stub.rs, sidecar.rs (gated)
-src/economy/    tinyplace adapter, card generation, signer management
+src/crypto/     offline Ed25519 verification (wallet sign-in, runner handshake)
 src/store/      fs (default), sqlite (gated)
 src/feedback/   capture, scrubber, github filing
 ```
 
 `AppState` grows a `CompanyRegistry`; `src/error.rs` grows variants
-(`Manifest`, `Store`, `Brain`, `Economy`, `PolicyDenied`, `Http`) so every
+(`Manifest`, `Store`, `Brain`, `PolicyDenied`, `Http`) so every
 port returns the crate `Result<T>`.
 
 ## Feature flags
@@ -241,7 +240,6 @@ port returns the crate `Result<T>`.
 | `tiny` | TinyAgents embedding (existing flag; used by stub brain and local workers) |
 | `sqlite` | SQLite store implementations |
 | `tinymemory` | Hosted/null memory engine seam (`MemoryProvider` contract) |
-| `tinyplace` | tiny.place economy adapter and A2A routes |
 | `sidecar` | Node sidecar brain for self-hosters |
 
 The default build MUST stay small and compile offline; every feature degrades

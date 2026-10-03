@@ -16,7 +16,6 @@ pub(super) fn defaults_fill_in_when_nothing_set() {
     let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
 
     assert_eq!(cfg.api_url, DEFAULT_API_URL);
-    assert_eq!(cfg.tinyplace_api_url, DEFAULT_TINYPLACE_API_URL);
     assert_eq!(cfg.bind, DEFAULT_BIND);
     assert_eq!(cfg.brain_mode, BrainMode::Hosted);
     assert!(cfg.tinyhumans_credential.is_none());
@@ -411,23 +410,17 @@ pub(super) fn projected_file_outranks_a_static_key_for_the_source() {
 }
 
 #[test]
-pub(super) fn public_url_and_tinyplace_url_resolve_by_precedence() {
-    // public_url: env wins; tinyplace_api_url only in config.toml.
+pub(super) fn public_url_resolves_by_precedence() {
+    // public_url: env wins over config.toml.
     let env = MapEnv::new([("OPENCOMPANY_PUBLIC_URL", "https://public.example")]);
     let file = ConfigFile {
         public_url: Some("https://toml.example".into()),
-        tinyplace_api_url: Some("https://tp.toml".into()),
         ..ConfigFile::default()
     };
     let (cfg, prov) = resolve(&env, Some(&file), &default_manifest()).unwrap();
 
     assert_eq!(cfg.public_url.as_deref(), Some("https://public.example"));
     assert_eq!(prov.layer("public_url"), Some(ConfigLayer::Env));
-    assert_eq!(cfg.tinyplace_api_url, "https://tp.toml");
-    assert_eq!(
-        prov.layer("tinyplace_api_url"),
-        Some(ConfigLayer::ConfigToml)
-    );
 }
 
 #[test]
@@ -488,7 +481,7 @@ pub(super) fn empty_env_value_is_ignored() {
 // -----------------------------------------------------------------
 // resolve_base_url (AD-001 / AD-014): a hosted tenant is handed its
 // whole environment by the platform that provisions it, so an unset
-// api_url/tinyplace_api_url must refuse to boot instead of silently
+// api_url must refuse to boot instead of silently
 // becoming production. Every other deployment kind is unaffected — the
 // pinned decision in `defaults_fill_in_when_nothing_set` above still
 // holds for an undeclared (self-hosted) process.
@@ -509,65 +502,19 @@ pub(super) fn hosted_tenant_refuses_to_boot_with_no_api_url() {
     assert!(message.contains("TINYHUMANS_API_URL"), "{message}");
 }
 
-/// **The tiny.place hub is opt-in, so an unset URL is not a
-/// misconfiguration.**
-///
-/// `maybe_build_economy` returns `None` before reading this unless the
-/// manifest sets `place.discoverable` and names a handle — `discoverable`
-/// defaults to false and no shipped company turns it on — and on the path
-/// that does read it, it takes this same default when handed `None`.
-///
-/// Refusing here stopped every hosted tenant from booting over a URL it
-/// would never have built a client for. `api_url` keeps its refusal: that
-/// backend is reached unconditionally, so a silent production default
-/// there is a destination nobody chose.
-#[test]
-pub(super) fn hosted_tenant_defaults_tinyplace_api_url_rather_than_refusing() {
-    // api_url set so the resolve under test turns on tinyplace_api_url
-    // alone, not the sibling field checked above.
-    let env = hosted_tenant_env([("TINYHUMANS_API_URL", "https://api.tinyhumans.ai")]);
-    let (cfg, prov) = resolve(&env, None, &default_manifest())
-        .expect("an unset tiny.place URL is not a boot failure");
-    assert_eq!(cfg.tinyplace_api_url, DEFAULT_TINYPLACE_API_URL);
-    assert_eq!(
-        prov.layer("tinyplace_api_url"),
-        Some(ConfigLayer::Default),
-        "and it is recorded as the default it is"
-    );
-}
-
-/// The sibling still refuses, so this change narrowed the rule rather
-/// than removing it.
-#[test]
-pub(super) fn hosted_tenant_still_refuses_a_missing_api_url_with_tinyplace_set() {
-    let env = hosted_tenant_env([("TINYPLACE_API_URL", "https://staging-api.tiny.place")]);
-    let err = resolve(&env, None, &default_manifest()).unwrap_err();
-    assert_eq!(err.code(), "config_error");
-    let message = err.to_string();
-    assert!(message.contains("TINYHUMANS_API_URL"), "{message}");
-}
-
 #[test]
 pub(super) fn hosted_tenant_treats_an_empty_api_url_as_unset() {
-    let env = hosted_tenant_env([
-        ("TINYHUMANS_API_URL", "   "),
-        ("TINYPLACE_API_URL", "https://api.tiny.place"),
-    ]);
+    let env = hosted_tenant_env([("TINYHUMANS_API_URL", "   ")]);
     let err = resolve(&env, None, &default_manifest()).unwrap_err();
     assert!(err.to_string().contains("TINYHUMANS_API_URL"));
 }
 
 #[test]
 pub(super) fn hosted_tenant_uses_an_explicitly_set_api_url_unchanged() {
-    let env = hosted_tenant_env([
-        ("TINYHUMANS_API_URL", "https://staging-api.tinyhumans.ai"),
-        ("TINYPLACE_API_URL", "https://staging-api.tiny.place"),
-    ]);
+    let env = hosted_tenant_env([("TINYHUMANS_API_URL", "https://staging-api.tinyhumans.ai")]);
     let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
     assert_eq!(cfg.api_url, "https://staging-api.tinyhumans.ai");
     assert_eq!(prov.layer("api_url"), Some(ConfigLayer::Env));
-    assert_eq!(cfg.tinyplace_api_url, "https://staging-api.tiny.place");
-    assert_eq!(prov.layer("tinyplace_api_url"), Some(ConfigLayer::Env));
 }
 
 /// A hosted tenant may also state the URL in `config.toml` rather than
@@ -577,7 +524,6 @@ pub(super) fn hosted_tenant_accepts_api_url_from_config_toml() {
     let env = hosted_tenant_env([]);
     let file = ConfigFile {
         api_url: Some("https://staging-api.tinyhumans.ai".into()),
-        tinyplace_api_url: Some("https://staging-api.tiny.place".into()),
         ..ConfigFile::default()
     };
     let (cfg, prov) = resolve(&env, Some(&file), &default_manifest()).unwrap();
@@ -601,7 +547,6 @@ pub(super) fn self_hosted_and_desktop_still_default_api_url_when_unset() {
     let env = MapEnv::new([("OPENCOMPANY_DEPLOYMENT", "desktop")]);
     let (cfg, prov) = resolve(&env, None, &default_manifest()).unwrap();
     assert_eq!(cfg.api_url, DEFAULT_API_URL);
-    assert_eq!(cfg.tinyplace_api_url, DEFAULT_TINYPLACE_API_URL);
     assert_eq!(prov.layer("api_url"), Some(ConfigLayer::Default));
 }
 

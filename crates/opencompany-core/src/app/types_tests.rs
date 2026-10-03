@@ -15,16 +15,19 @@ fn resolve_host_takes_the_hub_the_environment_names() {
 /// And the file under it, which is the layer the first-run setup wizard
 /// writes — a host that ignored it would honour an operator's choice until
 /// they quit.
+///
+/// The file also carries `tinyplace_api_url`, which the setup wizard wrote
+/// before tiny.place was removed. A retired key is ignored, not refused: an
+/// existing install's `config.toml` must keep loading.
 #[test]
 fn resolve_host_falls_through_to_the_config_file() {
     let file = toml::from_str::<crate::app::config::ConfigFile>(
         "api_url = \"https://toml-api.example\"\ntinyplace_api_url = \"https://toml-place.example\"\n",
     )
-    .expect("parses");
+    .expect("a config.toml holding the retired tiny.place key still parses");
     let config = AppConfig::resolve_host(&crate::app::config::MapEnv::new([("", "")]), Some(&file))
         .expect("resolves");
     assert_eq!(config.api_url, "https://toml-api.example");
-    assert_eq!(config.tinyplace_api_url, "https://toml-place.example");
 }
 
 /// The environment outranks the file, and a value that is only whitespace

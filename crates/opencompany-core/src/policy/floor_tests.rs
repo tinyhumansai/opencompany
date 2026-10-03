@@ -68,7 +68,7 @@ fn a_metered_read_is_not_a_commitment() {
 /// deliberate seam rather than an accident: without the catalogue every
 /// action is read as a send, which is the cautious direction and the answer
 /// a default build must keep giving. Asserting only the catalogued answer
-/// is what made this test green locally and red on the `tinyplace` lane.
+/// is what made this test green locally and red on a non-`openhuman` lane.
 #[test]
 #[cfg(feature = "openhuman")]
 fn a_composio_read_is_silent_and_a_composio_send_is_not() {

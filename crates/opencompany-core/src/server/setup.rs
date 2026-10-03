@@ -574,12 +574,6 @@ const FIELDS: &[FieldSpec] = &[
         secret: false,
     },
     FieldSpec {
-        key: "tinyplace_api_url",
-        prov: Some("tinyplace_api_url"),
-        requires_restart: true,
-        secret: false,
-    },
-    FieldSpec {
         key: "github_token",
         prov: Some("github_token"),
         requires_restart: true,
@@ -861,7 +855,6 @@ fn effective_value(file: Option<&ConfigFile>, key: &str) -> Option<String> {
         "api_url" => file.api_url.clone(),
         "openhuman_url" => file.openhuman_url.clone(),
         "public_url" => file.public_url.clone(),
-        "tinyplace_api_url" => file.tinyplace_api_url.clone(),
         "workspace.clear_tmp_on_startup" => {
             file.workspace.clear_tmp_on_startup.map(|v| v.to_string())
         }

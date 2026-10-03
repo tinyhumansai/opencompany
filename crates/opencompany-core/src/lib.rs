@@ -31,12 +31,14 @@ mod build_stamp;
 #[cfg(feature = "chargebee")]
 pub mod chargebee;
 pub mod company;
+/// Offline cryptographic primitives: base58 Ed25519 signature verification
+/// shared by wallet sign-in and the runner handshake.
+pub mod crypto;
 /// Local-only runtime host used by the packaged Tauri desktop application.
 /// It embeds the existing operator API and ships the curated company presets;
 /// it deliberately does not pull OpenHuman's local-AI configuration into the
 /// OpenCompany product.
 pub mod desktop;
-pub mod economy;
 pub mod error;
 pub mod feedback;
 /// The global baseline every company gets, whichever vertical it started from:
@@ -116,7 +118,6 @@ pub mod workflows;
 pub use app::{AppConfig, AppState};
 pub use brain::EchoBrain;
 pub use company::{CompanyManifest, run_company};
-pub use economy::{build_agent_card, render_skill_md};
 pub use error::{OpenCompanyError, Result};
 pub use feedback::{
     ConsentMode, FeedbackCategory, FeedbackInput, FeedbackItem, FeedbackResponse, FeedbackStore,

@@ -126,16 +126,6 @@ fn maps_company_data_errors_to_400_and_422() {
     assert_eq!(invalid.0.code(), "data_invalid");
 }
 
-#[test]
-fn maps_tinyplace_transport_to_503_and_502() {
-    let unreachable = ApiError(OpenCompanyError::tinyplace("unreachable", "offline"));
-    assert_eq!(unreachable.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(unreachable.0.code(), "tinyplace_unreachable");
-
-    let upstream = ApiError(OpenCompanyError::tinyplace("http_500", "boom"));
-    assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
-}
-
 /// Issue #1016: a `WorkflowInvalid` renders a `400` whose envelope additively
 /// carries a `problems` array, each entry naming its node + field.
 #[tokio::test]

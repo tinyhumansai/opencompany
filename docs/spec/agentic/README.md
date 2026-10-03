@@ -70,7 +70,7 @@ under $5? You've approved 14 like this."). Exposing "the Architect agent" or
   batch-bundle its own proposals; the Architect cannot launch a company the
   Operator has not reviewed.
 - **MUST NOT escalate.** No proposal may raise `[budget].monthly_usd`,
-  flip `[place].discoverable`, remove an `always_approve` entry for
+  remove an `always_approve` entry for
   money/publish/filing effects, or alter the Manager's own tick, limits, or
   proposal quota. Those changes exist, but only as Operator-initiated edits.
 - **MUST preserve provenance.** Every applied change records its origin

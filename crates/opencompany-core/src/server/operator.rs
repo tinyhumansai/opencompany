@@ -1442,7 +1442,7 @@ fn project_stream_item_for_viewer(
 /// The projection is deny-by-default: every emitted object carries only
 /// domain fields that already exist on the [`CompanyEvent`], and any variant not
 /// explicitly listed — `OperatorMessage` (the operator's own echo),
-/// `WebhookReceived` / `A2aTaskReceived` (raw third-party payloads),
+/// `WebhookReceived` (a raw third-party payload), `Unknown` (a retired kind),
 /// `ScheduleFired`, `FeedbackFiled`, `MemoryFactDeleted`, `ReactionToggled` —
 /// is dropped so nothing unexpected (or secret-bearing) ever reaches the
 /// console. `ReactionToggled` is dropped on purpose rather than by oversight

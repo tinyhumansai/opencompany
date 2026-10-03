@@ -28,7 +28,7 @@ live cognition is gated.
 | `OPENCOMPANY_COMPANY` | The company to load (used by container images). |
 | `OPENCOMPANY_BIND` | Bind address; the platform harness injects `0.0.0.0:8080`. See [bind precedence](#bind-precedence). |
 | `OPENCOMPANY_DATA_DIR` | Where durable state lives; defaults to a local folder. Set it to run two hosts side by side without them sharing one company store. The `--home` flag overrides it for company bundles only — the shared workspace directories still follow this variable, so isolating two hosts with `--home` alone only half-works. |
-| `OPENCOMPANY_PUBLIC_URL` | The externally reachable URL, used for discovery. |
+| `OPENCOMPANY_PUBLIC_URL` | The externally reachable URL (inbound webhooks, sign-in links). |
 
 The CLI mirrors several of these as flags — see the [CLI reference](cli.md).
 
@@ -99,18 +99,6 @@ nothing to provision). The MongoDB backend is opt-in:
 | `OPENCOMPANY_TENANT_ID` | Shared-single-DB mode only; namespaces company ids. |
 
 See [Deployment](deployment.md) for how the hosted platform injects these.
-
-## tiny.place
-
-Both optional and off by default:
-
-| Variable | Purpose |
-| --- | --- |
-| `TINYPLACE_API_URL` | The tiny.place API endpoint. |
-| `OPENCOMPANY_PUBLIC_URL` | Your company's public URL for the Agent Card. |
-
-Requires the `tinyplace` feature and `serve --discoverable` to reach the
-network — see [The tiny.place economy](../overview/tiny-place.md).
 
 ## Channels: Telegram
 

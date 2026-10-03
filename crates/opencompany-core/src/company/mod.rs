@@ -262,7 +262,7 @@ pub use types::{
     HARNESS_KINDS, Harness, IMPLICIT_HARNESS_ID, INFERENCE_PROVIDERS, INFERENCE_TIERS, Inference,
     KNOWN_CHANNELS, LedgerAccess, LedgerGrant, MAX_DELEGATION_DEPTH_BOUNDS, McpServer,
     ORCHESTRATOR_TIER, PLAN_NAMES, PLAN_PERIODS, POLICY_MODES, PROMPT_CLASSES,
-    PROMPT_FILE_BUDGET_CHARS, PROVISIONED_POLICY_MODE, Place, Plan, Policy, Schedule, Skill, TIERS,
+    PROMPT_FILE_BUDGET_CHARS, PROVISIONED_POLICY_MODE, Plan, Policy, Schedule, TIERS,
     TOOL_PROVIDERS, Tools, creation_default_grants, grants_chargebee_explicit,
     grants_composio_explicit, grants_confer_native, grants_files_or_docs, grants_hosting_explicit,
     grants_mcp_registry_explicit, grants_media_explicit, grants_paypal_explicit,

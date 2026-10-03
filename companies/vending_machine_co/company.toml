@@ -45,7 +45,6 @@
 name = "Northgate Vending"
 output = "A fleet that is stocked, working, and on contracts worth having — with the reasoning behind each call written down"
 human_role = "Set the commercial envelope, approve capital and contract terms, and read the decision ledger"
-handle = "northgatevending"
 
 [brain]
 mode = "hosted"

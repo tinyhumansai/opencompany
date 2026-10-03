@@ -490,7 +490,6 @@ fn desktop_builder(
     .with_id(id)
     // The host-wide sign-in mode, which outranks the manifest's own.
     .with_auth_mode_override(state.auth_mode_override())
-    .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
     .with_default_mcp_servers(state.config().default_mcp_servers.clone())
     .with_workspace_quota(state.config().workspace_quota)
     .with_workspace_git_enabled(state.config().workspace_git_enabled)

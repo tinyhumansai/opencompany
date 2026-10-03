@@ -1,10 +1,9 @@
 //! The [`CompanyRuntime`] assembly: one running company's wired-together ports.
 //!
-//! The struct matches the sketch in `docs/spec/runtime/ports.md` — the nine
-//! ports, with `economy` the only optional one. Three runtime-internal fields
-//! are added: the company `id`, a per-company serial lock so exactly one cycle
-//! runs at a time, and the [`RuntimeJournal`] backing at-most-once effects and
-//! the durable approval queue.
+//! The struct matches the sketch in `docs/spec/runtime/ports.md`. Three
+//! runtime-internal fields are added: the company `id`, a per-company serial
+//! lock so exactly one cycle runs at a time, and the [`RuntimeJournal`] backing
+//! at-most-once effects and the durable approval queue.
 //!
 //! The cycle logic itself lives in [`CycleRunner`](crate::runtime::CycleRunner);
 //! the methods here are thin delegations so callers hold a single
@@ -34,10 +33,10 @@ use crate::ports::types::{
     Actor, ActorKind, ApprovalId, CompanyEvent, CompanyId, EventSeq, Mention, Verdict,
 };
 use crate::ports::{
-    AgentEconomy, ApprovalGate, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore,
-    EventLog, FactStore, InboxStore, LoginCodeStore, MemoryStore, NotificationStore,
-    ReadStateStore, RunStore, SecretStore, SessionStore, SkillStateStore, TaskRecord, TaskStore,
-    ToolProvider, UsageMeter, UserStore, WorkflowRevisionStore, WorkspaceStore,
+    ApprovalGate, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
+    FactStore, InboxStore, LoginCodeStore, MemoryStore, NotificationStore, ReadStateStore,
+    RunStore, SecretStore, SessionStore, SkillStateStore, TaskRecord, TaskStore, ToolProvider,
+    UsageMeter, UserStore, WorkflowRevisionStore, WorkspaceStore,
 };
 // Separate line (#241) so this addition is a pure append, not a reflow of the
 // grouped import that sibling store-seam branches (#274, #596) also edit.
@@ -261,7 +260,6 @@ pub struct CompanyRuntime {
     pub(crate) memory_scopes: Option<Arc<dyn crate::store::MemoryScopes>>,
     pub(crate) tools: Arc<dyn ToolProvider>,
     pub(crate) channels: Vec<Arc<dyn ChannelAdapter>>,
-    pub(crate) economy: Option<Arc<dyn AgentEconomy>>,
     pub(crate) approvals: Arc<dyn ApprovalGate>,
     /// The concrete gate, kept alongside the `dyn` port so the runtime can reach
     /// the amend and expiry-sweep methods that live outside the trait without a
@@ -576,7 +574,6 @@ impl CompanyRuntime {
         inbound_context: Arc<dyn ContextStore>,
         tools: Arc<dyn ToolProvider>,
         channels: Vec<Arc<dyn ChannelAdapter>>,
-        economy: Option<Arc<dyn AgentEconomy>>,
         approval_gate: Arc<ManifestApprovalGate>,
         journal: Arc<RuntimeJournal>,
         secrets: Arc<dyn SecretStore>,
@@ -609,7 +606,6 @@ impl CompanyRuntime {
             memory_scopes: None,
             tools,
             channels,
-            economy,
             approvals,
             approval_gate,
             gate_injected: false,
@@ -2056,11 +2052,6 @@ impl CompanyRuntime {
     /// This company's pending magic-link login codes.
     pub fn login_codes(&self) -> &Arc<dyn LoginCodeStore> {
         &self.ops.login_codes
-    }
-
-    /// Whether an agent economy (tiny.place) is wired in.
-    pub fn has_economy(&self) -> bool {
-        self.economy.is_some()
     }
 
     /// Stops this runtime accepting new cycles, then waits for the one in flight
@@ -7831,7 +7822,6 @@ impl std::fmt::Debug for CompanyRuntime {
         f.debug_struct("CompanyRuntime")
             .field("id", &self.id)
             .field("channels", &self.channels.len())
-            .field("has_economy", &self.economy.is_some())
             .finish_non_exhaustive()
     }
 }

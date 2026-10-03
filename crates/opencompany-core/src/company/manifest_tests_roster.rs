@@ -295,7 +295,6 @@ fn defaults_are_prosumer_safe() {
     assert_eq!(manifest.brain.mode, "hosted");
     assert_eq!(manifest.tools.provider, "openhuman");
     assert_eq!(manifest.policy.mode, "supervised");
-    assert!(!manifest.place.discoverable);
     // Issue #684: this asserted the three-string default verbatim, which is
     // how the defect survived — the list's *contents* were pinned and its
     // *effect* never was, so a list that matched nothing passed. It is

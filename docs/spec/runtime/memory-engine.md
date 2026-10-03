@@ -310,8 +310,8 @@ Four determinations from the depth pass (issue #1113), recorded so nobody
 re-derives them:
 
 - **Taint routing is by trigger, at the cycle.** A cycle triggered by
-  `WebhookReceived` or `A2aTaskReceived` — outside content: a channel
-  message, an email, a third-party callback, a remote agent's payload —
+  `WebhookReceived` — outside content: a channel message, an email, a
+  third-party callback —
   writes its brain-chosen context puts through the overlay's inbound port,
   which stamps `ExternalSync`; everything else (`OperatorMessage`,
   `FeedbackFiled`, `PaymentReceived`, the company's own machinery) stamps

@@ -17,7 +17,7 @@ ever hold.
 GET    /api/v1/companies                       list running companies
 POST   /api/v1/companies                       boot from an uploaded manifest (platform)
 GET    /api/v1/companies/{id}                  status: charter, roster, budget burn,
-                                               lifecycle state, tiny.place state
+                                               lifecycle state
 POST   /api/v1/companies/{id}/chat             operator message → event; SSE reply stream
 POST   /api/v1/companies/{id}/chat/upload      multipart file → attachment reference (#1682)
 GET    /api/v1/companies/{id}/chat/history     one desk's transcript (?desk=<thread>)
@@ -365,31 +365,13 @@ Moved to [`api-write-plane.md`](api-write-plane.md) — this file was over the r
 
 Moved to [`api-graphql.md`](api-graphql.md) — this file was over the repository's 500-line limit. See that page for the full detail.
 
-## Agent-facing (tiny.place-compatible)
+## Retired: agent-facing (tiny.place)
 
-Enabled per company by `[place].discoverable`; served only with the
-`tinyplace` feature.
-
-```text
-POST   /a2a/{handle}                        A2A JSON-RPC (tasks/send …), SIWX-verified
-GET    /a2a/{handle}/skill.md               capability discovery doc
-GET    /.well-known/agent-card.json         single-company mode
-GET    /companies/{handle}/.well-known/agent-card.json   platform mode
-```
-
-- Inbound requests carry tiny.place per-action signatures
-  (`Authorization: tiny.place <agentId>:<signature>:<timestamp>`); the
-  runtime verifies via the `tinyplace` SDK before anything reaches the brain.
-- **x402-priced skills**: if the requested skill has a price on the Agent
-  Card, the route responds `402 Payment Required` with the x402 challenge;
-  on resubmission the payment is verified through
-  `AgentEconomy`/the facilitator, receipted to the ledger, and the task
-  enters the event queue as `A2aTaskReceived`.
-- Untrusted counterparty text is prompt-guard sanitized before it reaches the
-  brain (mirroring tiny.place's own promptguard practice).
-- **"Skill" here is the economy word.** `skill.md` renders `[place].skills` —
-  priced A2A capabilities this company *sells* — not a skill **bundle**, the
-  `SKILL.md` a teammate *reads* ([skills.md](../../modules/skills.md)).
+`/a2a/{handle}`, `/.well-known/agent-card.json` and
+`/companies/{handle}/.well-known/agent-card.json` were the tiny.place A2A and
+Agent Card surface, removed with tiny.place. No route serves them; `/a2a` and
+every `.well-known` path stay reserved so a peer still probing one gets a `404`
+rather than the console shell.
 
 ## Inbound integrations
 
@@ -406,7 +388,6 @@ payloads are dropped with a 401 and never become events.
 | --- | --- |
 | Prosumer operator (local) | Operator token minted at first run, stored in the OS keychain / config dir; the desktop UI holds it. |
 | Platform | Platform-issued JWT per tenant; `POST /api/v1/companies` and suspend/archive require a platform-scope claim. |
-| Peer agents (A2A) | tiny.place SIWX signatures + optional x402 payment; no accounts. |
 | Webhook senders | Per-channel HMAC secrets. |
 
 The runtime's own upstream credential (`TINYHUMANS_API_KEY` / JWT) is never
@@ -415,7 +396,7 @@ accepted inbound; it is outbound-only ([config.md](config.md)).
 ## Errors
 
 JSON error envelope `{ "error": string, "code": string }` with stable `code`
-values; 4xx for caller mistakes, 402 reserved for x402 challenges, 409 for
+values; 4xx for caller mistakes, 409 for
 lifecycle-state conflicts (e.g. chatting with an archived company).
 
 `409` is the most overloaded status here, so **the `code` carries the meaning,

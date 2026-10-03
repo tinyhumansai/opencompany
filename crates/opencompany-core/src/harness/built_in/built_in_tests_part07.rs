@@ -575,7 +575,7 @@ async fn ensure_without_a_plan_never_gates() {
 }
 
 #[tokio::test]
-async fn monthly_inference_cap_refuses_a_non_discoverable_company_after_spend() {
+async fn monthly_inference_cap_refuses_a_company_after_spend() {
     let dir = tempfile::tempdir().expect("temporary workspace");
     let store = Arc::new(crate::store::FsCompanyStore::new(dir.path()));
     let provider = Arc::new(ScriptedProvider::new(vec![Ok("model-ran".to_string())]));
@@ -584,7 +584,6 @@ async fn monthly_inference_cap_refuses_a_non_discoverable_company_after_spend() 
     deps.provider = provider.clone();
 
     let mut rec = record();
-    rec.manifest.place.discoverable = false;
     rec.manifest.budget.monthly_usd = Some(1.0);
     let prior_spend = LedgerEntry {
         at_millis: crate::ports::now_millis(),

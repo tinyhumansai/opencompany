@@ -114,7 +114,7 @@ env:
   # `sentry` plus a small `ureq` on the `rustls` already in the graph; no second
   # HTTP client and no native TLS (`cargo tree -d` is unchanged but for
   # `base64`).
-  TENANT_FEATURES: mongodb,openhuman,tinyplace,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,medulla,sidecar,chargebee,paypal,tinymemory,analytics,crash-reporting
+  TENANT_FEATURES: mongodb,openhuman,github,smtp,dns,tinyhumans,webhooks,platform-jwt,export,mcp,media,composio,imap,medulla,sidecar,chargebee,paypal,tinymemory,analytics,crash-reporting
 
 jobs:
   publish:

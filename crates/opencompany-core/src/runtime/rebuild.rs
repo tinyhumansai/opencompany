@@ -75,19 +75,11 @@ use crate::runtime::handover::RuntimeHandover;
 /// The boot-only builder inputs a rebuild cannot recover from the runtime or the
 /// environment, stashed at registration so a later rebuild configures the
 /// successor exactly as boot configured its predecessor.
-///
-/// `discoverable` is the motivating case: `serve --discoverable` exists only in
-/// the `serve` stack frame and mutates the manifest *before* the build, so a
-/// rebuild that re-read `company.toml` from `source_dir` would silently drop it
-/// and un-publish a public company.
 #[derive(Clone, Debug, Default)]
 pub struct BootInputs {
     /// The company's on-disk source directory (`companies/<name>`), used to seed
     /// the workspace and resolve committed skills/workflows.
     pub source_dir: Option<PathBuf>,
-    /// Whether `serve --discoverable` forced this company public regardless of
-    /// its manifest `[place].discoverable`.
-    pub discoverable: bool,
 }
 
 /// Everything a [`RuntimeRebuilder`] needs to produce a successor runtime.
@@ -97,12 +89,10 @@ pub struct RebuildRequest {
     /// The company's **materialized** manifest, read from its persisted record
     /// rather than re-parsed from disk.
     ///
-    /// This is the manifest the running company actually has, which matters for
-    /// two things a fresh `company.toml` read would drop: the console-created
-    /// workflows merged into `[workflows].enabled`, and the `[place]` fields
-    /// `serve --discoverable` mutated before the original build. A
-    /// platform-provisioned tenant has no `company.toml` at all, so the record is
-    /// the only source.
+    /// This is the manifest the running company actually has, which matters
+    /// because a fresh `company.toml` read would drop the console-created
+    /// workflows merged into `[workflows].enabled`. A platform-provisioned
+    /// tenant has no `company.toml` at all, so the record is the only source.
     pub manifest: CompanyManifest,
     /// The boot-only inputs recorded when this company was registered.
     pub boot: BootInputs,

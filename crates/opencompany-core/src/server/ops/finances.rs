@@ -12,9 +12,7 @@
 //! Data maturity: the ledger fills on a harness (`openhuman`-feature) build via
 //! `src/harness/cost.rs` (an `inference.spend` line per billed turn); the
 //! offline build has no cost hook, so the journal is empty and every figure is
-//! (correctly) zero. The wallet balance is Phase 2: like the GraphQL resolver we
-//! pass `economy_balance = None`, so `balanceUsd` reads the bookkeeping net until
-//! the economy wallet balance is surfaced through a read accessor.
+//! (correctly) zero. `balanceUsd` is the bookkeeping net of the ledger.
 
 use axum::Json;
 use axum::Router;
@@ -43,15 +41,7 @@ async fn project_finances(runtime: &CompanyRuntime) -> Result<Finances, ApiError
         Some(record) => (record.ledger.clone(), record.manifest.budget.clone()),
         None => (Vec::new(), crate::company::Budget::default()),
     };
-    // The economy wallet balance is not yet surfaced through a read accessor
-    // (Phase 2); ledger-only projection mirrors `graphql/finances.rs`.
-    let economy_balance = None;
-    Ok(finances_from(
-        &ledger,
-        &budget,
-        economy_balance,
-        now_millis(),
-    ))
+    Ok(finances_from(&ledger, &budget, now_millis()))
 }
 
 /// `GET …/finances` — the company's finance read surface.

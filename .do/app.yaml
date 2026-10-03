@@ -25,9 +25,6 @@ spec:
         - key: OPENCOMPANY_COMPANY
           scope: RUN_TIME
           value: marketing_agency
-        - key: OPENCOMPANY_DISCOVERABLE
-          scope: RUN_TIME
-          value: "false"
         # Optional: unlocks live cognition. Set in the dashboard as a secret.
         - key: TINYHUMANS_API_KEY
           scope: RUN_TIME

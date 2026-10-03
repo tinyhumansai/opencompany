@@ -51,10 +51,9 @@ reporting a success which changed nothing.
 
 1. **Read the manifest** from the company's persisted record — before anything
    else, so a store failure can never leave a company parked. The record's
-   manifest is the *materialized* one, which matters for two things a fresh
-   `company.toml` read would drop: console-created workflows merged into
-   `[workflows].enabled`, and the `[place]` fields `serve --discoverable`
-   mutated before the original build.
+   manifest is the *materialized* one, which matters because a fresh
+   `company.toml` read would drop the console-created workflows merged into
+   `[workflows].enabled`.
 2. **Quiesce** (`CompanyRuntime::quiesce`). Sets a flag that makes every cycle
    entry point refuse with `Quiescing` (`503`), then waits on the per-company
    `serial` lock, which a cycle holds for a whole turn. Both halves are
@@ -83,8 +82,8 @@ not; a second copy of any of them is a correctness bug:
 | `ManifestApprovalGate` + `GrantSet` | Parked approvals and unredeemed single-use grants. Rehydrating a fresh copy from the journal resurrects what the live one has already resolved |
 | `OpsStores` (incl. the `RunStore`) | Carried whole, so the dispatch choke point, the successor's `HarnessBrain` and the (suppressed) reaper all address one set of attempt rows. A second store would strand every live run and restart attempt ordinals at 1 |
 
-Deliberately **not** carried over: the brain, tools, channels, workflow runner
-and economy (replacing those is the point), and the in-flight steer registry
+Deliberately **not** carried over: the brain, tools, channels and workflow
+runner (replacing those is the point), and the in-flight steer registry
 (the successor's harness deps mint their own; sound only because the swap
 happens after the drain, so the outgoing registry is empty).
 
@@ -192,7 +191,7 @@ inputs (harness pool, OpenHuman RPC transport, managed media/search backends,
 the manager-injected per-tenant mailbox) are assembled there from the process
 environment and feature flags. `AppState::with_rebuilder` installs it, and
 `AppState::set_boot_inputs` stashes what a rebuild cannot recover any other way
-(`--discoverable`, the source directory).
+(the source directory).
 
 A host that wires **no** rebuilder keeps the pre-#290 behaviour exactly: the
 status still reports `restartRequired`, and the console still says so. That is

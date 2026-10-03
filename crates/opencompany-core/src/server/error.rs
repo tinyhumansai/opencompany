@@ -124,15 +124,11 @@ impl ApiError {
             // The company is at its roster-proposal burst cap: each call runs
             // a real, metered model pass, so this is a rate-limit refusal too.
             OpenCompanyError::RosterProposalRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
-            // tiny.place transport: an unreachable backend degrades to 503 so
-            // callers retry; any other protocol failure is an upstream 502.
-            OpenCompanyError::Tinyplace { code, .. } if code == "unreachable" => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            OpenCompanyError::Tinyplace { .. } => StatusCode::BAD_GATEWAY,
-            // The TinyHumans hub degrades the same way. In practice feedback
-            // forwarding swallows these (the report is already stored locally),
-            // so this mapping only applies if a future caller propagates one.
+            // The TinyHumans hub: an unreachable backend degrades to 503 so
+            // callers retry; any other protocol failure is an upstream 502. In
+            // practice feedback forwarding swallows these (the report is
+            // already stored locally), so this mapping only applies if a future
+            // caller propagates one.
             OpenCompanyError::TinyHumans { code, .. } if code == "unreachable" => {
                 StatusCode::SERVICE_UNAVAILABLE
             }

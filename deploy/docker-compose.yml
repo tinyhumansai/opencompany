@@ -36,7 +36,6 @@ services:
       # explicitly to boot unconfigured; the hosted platform does this and
       # authorizes first-run setup with its SSO bootstrap token.
       OPENCOMPANY_COMPANY: ${OPENCOMPANY_COMPANY-marketing_agency}
-      OPENCOMPANY_DISCOVERABLE: ${OPENCOMPANY_DISCOVERABLE:-false}
       # Optional: cargo features to compile the host with (e.g. "medulla").
       # Blank = the small default build; the dev overlay reads it so a key has
       # a live brain to talk to.

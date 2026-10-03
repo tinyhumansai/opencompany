@@ -2848,7 +2848,7 @@ fn short_thread_digest(thread: &str) -> String {
 /// * **two cards** — two `TaskDispatched` events, or a dispatch plus a
 ///   resolution belonging to a different card;
 /// * **a card and a non-card turn** — an operator chat message, a webhook, a
-///   schedule tick, an inbound A2A task, a payment or a filed feedback item
+///   schedule tick, a payment or a filed feedback item
 ///   batched alongside a dispatch. That turn's parked effect is not the card's
 ///   work, and stamping it with the card's id is the same misattribution one
 ///   level down. (Issue #357 guards this seam at a finer grain, per *attempt*,
@@ -2873,19 +2873,13 @@ fn short_thread_digest(thread: &str) -> String {
 /// the operator-facts authorship precedent. Named and pure so the boundary is
 /// testable — see `CycleHostImpl::external_trigger` for what rides on it.
 ///
-/// `A2aTaskReceived` sits WITH `WebhookReceived`: it is a remote agent's raw
-/// payload (the operator surface calls both "raw third-party payloads", and
-/// the A2A route promptguard-sanitizes it for exactly that reason) — the #68
-/// sibling review's M1 caught it missing here. `FeedbackFiled` is a
-/// deliberate Internal: feedback is filed through the company's own console
-/// by its own people — operator authorship, not outside content.
+/// `FeedbackFiled` is a deliberate Internal: feedback is filed through the
+/// company's own console by its own people — operator authorship, not
+/// outside content.
 fn cycle_is_external(events: &[CompanyEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            CompanyEvent::WebhookReceived { .. } | CompanyEvent::A2aTaskReceived { .. }
-        )
-    })
+    events
+        .iter()
+        .any(|event| matches!(event, CompanyEvent::WebhookReceived { .. }))
 }
 
 fn cycle_task_id(
@@ -2917,7 +2911,6 @@ fn cycle_task_id(
             CompanyEvent::OperatorMessage { .. }
             | CompanyEvent::WebhookReceived { .. }
             | CompanyEvent::ScheduleFired { .. }
-            | CompanyEvent::A2aTaskReceived { .. }
             | CompanyEvent::PaymentReceived { .. }
             | CompanyEvent::FeedbackFiled { .. } => return None,
             // Records of something that already happened, not triggers for new
@@ -3003,6 +2996,10 @@ fn cycle_task_id(
             // and asks nothing of anyone, so it starts no cycle. Neutral for the
             // same reason the run bracket above is.
             | CompanyEvent::WorkflowChildCallNotOffered { .. }
+            // A retired or unrecognised kind read back from an old journal.
+            // It carries nothing this build can act on, so it names no card,
+            // no thread, and rivals neither.
+            | CompanyEvent::Unknown
             | CompanyEvent::TaskSteered { .. }
             | CompanyEvent::TaskDiscussionPosted { .. }
             // A withdrawal (#358) is a record about a record: it starts no
@@ -3180,7 +3177,6 @@ fn cycle_conversation(
             CompanyEvent::TaskDispatched { .. }
             | CompanyEvent::WebhookReceived { .. }
             | CompanyEvent::ScheduleFired { .. }
-            | CompanyEvent::A2aTaskReceived { .. }
             | CompanyEvent::PaymentReceived { .. }
             | CompanyEvent::FeedbackFiled { .. } => return ApprovalConversation::default(),
             // Records of something that already happened, not stimuli for new
@@ -3252,6 +3248,10 @@ fn cycle_conversation(
             // Issue #617: likewise a record, not a message. It belongs to no
             // conversation and rivals none.
             | CompanyEvent::WorkflowChildCallNotOffered { .. }
+            // A retired or unrecognised kind read back from an old journal.
+            // It carries nothing this build can act on, so it names no card,
+            // no thread, and rivals neither.
+            | CompanyEvent::Unknown
             | CompanyEvent::TaskSteered { .. }
             | CompanyEvent::TaskDiscussionPosted { .. }
             // A withdrawal (#358) is a record about a record: it starts no
@@ -3382,8 +3382,7 @@ struct CycleHostImpl<'a> {
     thread_parent: Option<EventSeq>,
     /// Whether this cycle was triggered by content that arrived from OUTSIDE —
     /// a `WebhookReceived` (a channel message, an email, a third-party
-    /// callback) or an `A2aTaskReceived` (a remote agent's payload) in its
-    /// trigger batch. Computed once, like `task_id`. A brain-chosen
+    /// callback) in its trigger batch. Computed once, like `task_id`. A brain-chosen
     /// `ContextOp::Put` in such a cycle can be (and on the medulla path
     /// routinely is) the raw inbound payload echoed back, so the write goes
     /// through the taint-stamping inbound port instead of the internal one

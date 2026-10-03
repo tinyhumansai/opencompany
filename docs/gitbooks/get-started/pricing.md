@@ -34,12 +34,9 @@ Add the key when you're ready to let the agents run for real.
 
 ## Optional costs you control
 
-Two things can cost money, and both are gated behind your explicit approval:
+What can cost money is gated behind your explicit approval:
 
 - **Your company's monthly budget** — you set a cap; the company pauses itself
   when it's reached, and tells you it did.
-- **A tiny.place wallet** — only if you take your company
-  [public](../overview/tiny-place.md). Funding it is its own approval with a
-  clear dollar amount.
 
 Silence never spends money. Unanswered approval requests expire to "no."

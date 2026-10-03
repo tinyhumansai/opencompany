@@ -3,7 +3,7 @@
 //! `fs_defaults` assembles the Phase-1 stack — fs-backed stores, the
 //! manifest-`[policy]` [`ManifestApprovalGate`](crate::policy::ManifestApprovalGate),
 //! the offline [`EchoBrain`], a built-in operator channel, and the stub tool
-//! provider — with no agent economy. Operators swap any port through the
+//! provider. Operators swap any port through the
 //! `with_*` setters before [`build`](RuntimeBuilder::build).
 //!
 //! `build` performs boot replay: it loads the runtime journal and rehydrates
@@ -48,10 +48,9 @@ use crate::ports::types::{
     SecretValue, TemplateProvenance, ToolGrantsOverride, effective_policy, effective_tool_allow,
 };
 use crate::ports::{
-    AgentEconomy, ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog,
-    FactStore, InboxStore, LoginCodeStore, MemoryStore, RunStore, SecretStore, SessionStore,
-    SkillStateStore, TaskStore, ToolProvider, UsageMeter, UserStore, WorkflowRevisionStore,
-    WorkspaceStore,
+    ArtifactStore, Brain, ChannelAdapter, CompanyStore, ContextStore, EventLog, FactStore,
+    InboxStore, LoginCodeStore, MemoryStore, RunStore, SecretStore, SessionStore, SkillStateStore,
+    TaskStore, ToolProvider, UsageMeter, UserStore, WorkflowRevisionStore, WorkspaceStore,
 };
 #[cfg(feature = "openhuman")]
 use crate::runtime::delegation::RunTurn;
@@ -609,10 +608,6 @@ pub struct RuntimeBuilder {
     memory_engine: Option<u64>,
     tools: Option<Arc<dyn ToolProvider>>,
     channels: Option<Vec<Arc<dyn ChannelAdapter>>>,
-    economy: Option<Arc<dyn AgentEconomy>>,
-    discoverable_override: Option<bool>,
-    tinyplace_api_url: Option<String>,
-    host_base_url: Option<String>,
     approvals: Option<Arc<ManifestApprovalGate>>,
     secrets: Option<Arc<dyn SecretStore>>,
     inbox: Option<Arc<dyn InboxStore>>,
@@ -750,7 +745,7 @@ pub struct RuntimeBuilder {
     /// runtime must never duplicate (see [`RuntimeHandover`]), and its presence
     /// is also the "this is a rebuild" signal that suppresses the boot-only side
     /// effects below: journal replay, orphan-run reaping, workspace seeding,
-    /// going-public, and the MCP re-boot.
+    /// and the MCP re-boot.
     handover: Option<RuntimeHandover>,
 }
 
@@ -783,10 +778,6 @@ impl RuntimeBuilder {
             memory_engine: None,
             tools: None,
             channels: None,
-            economy: None,
-            discoverable_override: None,
-            tinyplace_api_url: None,
-            host_base_url: None,
             approvals: None,
             secrets: None,
             inbox: None,
@@ -1337,38 +1328,6 @@ impl RuntimeBuilder {
     /// Overrides the channel adapters (default: a single operator channel).
     pub fn with_channels(mut self, channels: Vec<Arc<dyn ChannelAdapter>>) -> Self {
         self.channels = Some(channels);
-        self
-    }
-
-    /// Wires an agent economy (default: none).
-    ///
-    /// An injected economy wins over the auto-wired tiny.place economy the
-    /// `tinyplace` feature would otherwise construct at [`build`](Self::build).
-    pub fn with_economy(mut self, economy: Arc<dyn AgentEconomy>) -> Self {
-        self.economy = Some(economy);
-        self
-    }
-
-    /// Forces going-public on (or off) regardless of `[place].discoverable`.
-    ///
-    /// Powers `serve --discoverable`, which opts every loaded company into the
-    /// tiny.place economy. Left unset, the manifest's `[place].discoverable`
-    /// decides.
-    pub fn with_discoverable(mut self, discoverable: bool) -> Self {
-        self.discoverable_override = Some(discoverable);
-        self
-    }
-
-    /// Sets the tiny.place economy API base URL used to build the networked
-    /// client under the `tinyplace` feature.
-    pub fn with_tinyplace_api_url(mut self, api_url: impl Into<String>) -> Self {
-        self.tinyplace_api_url = Some(api_url.into());
-        self
-    }
-
-    /// Sets the host base URL embedded in the published Agent Card endpoint.
-    pub fn with_host_base_url(mut self, host_base_url: impl Into<String>) -> Self {
-        self.host_base_url = Some(host_base_url.into());
         self
     }
 
@@ -4046,27 +4005,6 @@ impl RuntimeBuilder {
             gate.apply_effective_policy(effective_policy);
         }
 
-        // Economy: an injected economy wins; otherwise the `tinyplace` feature
-        // auto-wires one for a discoverable company with a handle. Going-public
-        // (the paid handle-claim) fires only when discovery is enabled.
-        let going_public = self
-            .discoverable_override
-            .unwrap_or(self.manifest.place.discoverable);
-        let economy: Option<Arc<dyn AgentEconomy>> = match self.economy {
-            Some(economy) => Some(economy),
-            None => {
-                maybe_build_economy(
-                    &self.manifest,
-                    &home,
-                    &id,
-                    store.clone(),
-                    self.tinyplace_api_url.clone(),
-                    going_public,
-                )
-                .await
-            }
-        };
-
         let mut runtime = CompanyRuntime::new(
             id.clone(),
             brain,
@@ -4077,7 +4015,6 @@ impl RuntimeBuilder {
             inbound_context,
             tools,
             channels,
-            economy.clone(),
             gate,
             journal,
             secrets,
@@ -4231,24 +4168,6 @@ impl RuntimeBuilder {
         #[cfg(feature = "openhuman")]
         if let Some(roster_builder) = roster_builder {
             runtime.set_roster_builder(roster_builder);
-        }
-
-        // Boot lifecycle step 3: going-public. Best-effort and non-blocking —
-        // any failure degrades to "private" with a warning and never fails boot.
-        //
-        // Skipped on a rebuild (issue #290): the handle claim is a paid,
-        // networked, once-per-boot action, and a company that is already public
-        // does not become more public by claiming again. Firing it on every
-        // inference save would spend money for nothing.
-        if handover.is_none() {
-            maybe_go_public(
-                &economy,
-                &self.manifest,
-                &id,
-                going_public,
-                self.host_base_url.as_deref(),
-            )
-            .await;
         }
 
         // Issue #86: seed the kill switch from the event log, so a company
@@ -4505,146 +4424,6 @@ fn resolve_seed_cards(
     }
 
     seeds
-}
-
-/// Auto-wires the tiny.place economy for a discoverable company (feature build).
-///
-/// Returns `None` unless `[place].discoverable` is set and a `@handle` is
-/// present; a missing/unreadable identity key degrades to `None` with a warning.
-///
-/// # The one place the Agent-Card replayer is attached (issue #454)
-///
-/// This function is the **only** production path that builds a concrete
-/// [`TinyplaceEconomy`], and the last point at which its outbox is still
-/// reachable: the return type erases it to `Arc<dyn AgentEconomy>`, a trait with
-/// no flush surface, which is precisely how the outbox came to have a `drain()`
-/// whose only caller lived in its own test module. So
-/// [`spawn_outbox_replayer`](crate::economy::adapter::spawn_outbox_replayer) is
-/// called here, before the erasure, and calling it is what entitles
-/// `publish_card` to answer `Ok(())` while offline. Delete the call and every
-/// offline publish starts erroring instead of lying — which is the failure
-/// direction we want, and which a test asserts.
-#[cfg(feature = "tinyplace")]
-async fn maybe_build_economy(
-    manifest: &CompanyManifest,
-    home: &std::path::Path,
-    id: &CompanyId,
-    store: Arc<dyn CompanyStore>,
-    tinyplace_api_url: Option<String>,
-    going_public: bool,
-) -> Option<Arc<dyn AgentEconomy>> {
-    use crate::economy::adapter::{OUTBOX_REPLAY_INTERVAL, spawn_outbox_replayer};
-    use crate::economy::signer::load_or_create_signer;
-    use crate::economy::{HttpTinyplaceClient, TinyplaceEconomy};
-    use crate::store::paths::Bundle;
-
-    if !(manifest.place.discoverable && manifest.company.handle.is_some()) {
-        return None;
-    }
-
-    let bundle = Bundle::new(home.to_path_buf(), id);
-    let signer = match load_or_create_signer(&bundle).await {
-        Ok(signer) => Arc::new(signer),
-        Err(err) => {
-            tracing::warn!(company = %id, "tiny.place identity unavailable ({err}); staying private");
-            return None;
-        }
-    };
-
-    let base = tinyplace_api_url
-        .unwrap_or_else(|| crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string());
-    let client = Arc::new(HttpTinyplaceClient::new(base, signer.clone()));
-    let economy = Arc::new(
-        TinyplaceEconomy::new(
-            client,
-            signer,
-            store,
-            id.clone(),
-            manifest.budget.monthly_usd,
-        )
-        .going_public(going_public),
-    );
-    // Issue #454: attach the replayer while the concrete type is still in hand.
-    // Without this line the outbox has no drain, and `publish_card` knows it —
-    // it stops queuing and starts returning the unreachable error instead.
-    spawn_outbox_replayer(&economy, OUTBOX_REPLAY_INTERVAL);
-    Some(economy)
-}
-
-/// Default build: no tiny.place economy is linked.
-#[cfg(not(feature = "tinyplace"))]
-async fn maybe_build_economy(
-    _manifest: &CompanyManifest,
-    _home: &std::path::Path,
-    _id: &CompanyId,
-    _store: Arc<dyn CompanyStore>,
-    _tinyplace_api_url: Option<String>,
-    _going_public: bool,
-) -> Option<Arc<dyn AgentEconomy>> {
-    None
-}
-
-/// Runs the going-public flow best-effort: `ensure_registered` then, on success,
-/// `publish_card`. Every outcome degrades to a warning; boot never blocks.
-#[cfg(feature = "tinyplace")]
-async fn maybe_go_public(
-    economy: &Option<Arc<dyn AgentEconomy>>,
-    manifest: &CompanyManifest,
-    id: &CompanyId,
-    going_public: bool,
-    host_base_url: Option<&str>,
-) {
-    use crate::economy::build_agent_card;
-    use crate::ports::types::{CompanyIdentity, RegistrationState};
-
-    if !going_public {
-        return;
-    }
-    let (Some(economy), Some(handle)) = (economy, manifest.company.handle.clone()) else {
-        return;
-    };
-    let identity = CompanyIdentity {
-        company: id.clone(),
-        handle,
-    };
-    match economy.ensure_registered(&identity).await {
-        Ok(RegistrationState::Registered { .. }) => {
-            let base = host_base_url
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("http://{}", crate::app::config::DEFAULT_BIND));
-            let card = build_agent_card(manifest, &base);
-            // Issue #454: an error here now means the card was NOT queued and
-            // nothing will retry it — the offline-but-recoverable case returns
-            // `Ok` and logs its own "queued for replay" line from the adapter, so
-            // the two are no longer the same message.
-            if let Err(err) = economy.publish_card(&identity, &card).await {
-                tracing::warn!(
-                    company = %id,
-                    "tiny.place publish_card failed ({err}); the card was not queued for replay, \
-                     so the directory entry stays stale until the next boot"
-                );
-            } else {
-                tracing::info!(company = %id, handle = %identity.handle, "tiny.place: discoverable (public)");
-            }
-        }
-        Ok(RegistrationState::Unregistered) => {
-            tracing::warn!(company = %id, "tiny.place: private (awaiting funding/identity approval)");
-        }
-        Err(err) => {
-            tracing::warn!(company = %id, "tiny.place go-public failed ({err}); staying private");
-        }
-    }
-}
-
-/// Default build: going-public is a no-op with no tiny.place economy.
-#[cfg(not(feature = "tinyplace"))]
-async fn maybe_go_public(
-    _economy: &Option<Arc<dyn AgentEconomy>>,
-    _manifest: &CompanyManifest,
-    _id: &CompanyId,
-    _going_public: bool,
-    _host_base_url: Option<&str>,
-) {
 }
 
 /// Chooses the hosted Medulla brain or the degraded echo brain.

@@ -33,7 +33,7 @@
 //! one kind would make the cap mean "part of what this teammate spent", which
 //! is not a cap anyone can reason about.
 //!
-//! It does **not** see executed x402 payments. Those land on the ledger, and
+//! It does **not** see executed payments. Those land on the ledger, and
 //! [`LedgerEntry`](crate::ports::types::LedgerEntry) carries no agent — there is
 //! no attribution to sum. The gate covers the *pre-flight* case instead (a tool
 //! call that declares an `amount_usd` which would breach the remaining budget

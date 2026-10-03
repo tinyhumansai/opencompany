@@ -46,12 +46,6 @@ enum Command {
         /// `$HOME/.opencompany`, with bundles under `companies/<slug>`.
         #[arg(long)]
         home: Option<PathBuf>,
-        /// Opt every loaded company into going public on tiny.place, regardless
-        /// of each manifest's `[place].discoverable`. Requires the `tinyplace`
-        /// feature to actually reach the network; without it the flag only marks
-        /// companies discoverable for the local A2A routes.
-        #[arg(long)]
-        discoverable: bool,
     },
     /// Print a JSON runtime specification.
     Spec {
@@ -449,24 +443,11 @@ async fn register_company(
     state: &AppState,
     home: &std::path::Path,
     dir: &std::path::Path,
-    discoverable: bool,
 ) -> Result<(String, String, Vec<Schedule>)> {
-    let mut manifest = CompanyManifest::from_path_for_reload(dir)?;
-    // `serve --discoverable` opts this company into going public regardless of
-    // its manifest: mark it discoverable and synthesize a @handle when absent so
-    // Agent Card generation and validation succeed.
-    if discoverable {
-        manifest.place.discoverable = true;
-        if manifest.company.handle.is_none() {
-            let handle = opencompany::runtime::company_id_from_name(&manifest.company.name)
-                .as_ref()
-                .to_string();
-            manifest.company.handle = Some(handle);
-        }
-    }
+    let manifest = CompanyManifest::from_path_for_reload(dir)?;
     let name = manifest.company.name.clone();
     // Capture the schedules before the manifest is moved into the builder; boot
-    // uses them to start this company's cron scheduler (lifecycle step 4).
+    // uses them to start this company's cron scheduler (lifecycle step 3).
     let schedules = manifest.schedules.clone();
     // The company's on-disk source directory (`companies/<name>`) seeds the
     // workspace tree on first boot and lets read resolvers find its committed
@@ -495,14 +476,8 @@ async fn register_company(
     // in one logical database. A no-op when `tenant_namespace` is unset.
     let derived = opencompany::runtime::company_id_from_name(&name);
     let company_id = state.config().namespaced_company_id(derived);
-    let mut builder = company_builder(
-        state,
-        home,
-        manifest,
-        &company_id,
-        Some(source_dir.clone()),
-        discoverable,
-    )?;
+    let mut builder =
+        company_builder(state, home, manifest, &company_id, Some(source_dir.clone()))?;
     if let Some(provenance) = provenance {
         builder = builder.with_template_provenance(provenance);
     }
@@ -539,13 +514,11 @@ async fn register_company(
         }
     }
     // Issue #290: stash what a later in-place rebuild cannot recover any other
-    // way. `--discoverable` is the case that forces this to exist: it lives only
-    // in the `serve` stack frame and mutates the manifest before the build.
+    // way: the source directory lives only in the `serve` stack frame.
     state.set_boot_inputs(
         company_id.clone(),
         opencompany::runtime::BootInputs {
             source_dir: Some(source_dir),
-            discoverable,
         },
     );
     state.registry().insert(company_id, Arc::new(runtime));
@@ -583,7 +556,6 @@ fn company_builder(
     manifest: CompanyManifest,
     company_id: &CompanyId,
     source_dir: Option<PathBuf>,
-    discoverable: bool,
 ) -> Result<RuntimeBuilder> {
     let mut builder = attach_tinyhumans_feedback(
         attach_harness(
@@ -592,12 +564,10 @@ fn company_builder(
         ),
         state.config(),
     )
-    .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
     // Install-wide MCP defaults (issue #527): every company built on this
     // instance gets them, which is what makes a fresh install useful with no
     // per-company setup. Already normalized when the config resolved.
     .with_default_mcp_servers(state.config().default_mcp_servers.clone())
-    .with_host_base_url(state.config().host_base_url())
     .with_workspace_quota(state.config().workspace_quota)
     .with_workspace_git_enabled(state.config().workspace_git_enabled)
     // Issue #752: the backend that serves this host's secrets, which the
@@ -665,9 +635,6 @@ fn company_builder(
             });
         }
     }
-    if discoverable {
-        builder = builder.with_discoverable(true);
-    }
     Ok(builder)
 }
 
@@ -692,7 +659,6 @@ impl opencompany::runtime::RuntimeRebuilder for BootRebuilder {
             request.manifest,
             &request.id,
             request.boot.source_dir,
-            request.boot.discoverable,
         )?
         // The whole point: the successor adopts the live journal, approval gate,
         // grant set, stores, harness pool, MCP runtime and serialising mutexes
@@ -1919,7 +1885,7 @@ fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
     }
 }
 
-/// Resolves a base-URL env var (`TINYHUMANS_API_URL`, `TINYPLACE_API_URL`)
+/// Resolves a base-URL env var (`TINYHUMANS_API_URL`)
 /// for `serve`'s manual `AppConfig` build. Mirrors
 /// `opencompany::app::config::resolve_base_url`'s precedence — kept as a
 /// small local twin because `serve` builds `AppConfig` field-by-field rather
@@ -2015,7 +1981,6 @@ async fn async_main(sso_secret: Option<opencompany::ports::types::SecretValue>) 
             openhuman_root,
             companies,
             home,
-            discoverable,
         }) => {
             // `--home` > OPENCOMPANY_DATA_DIR > $HOME/.opencompany, then any
             // legacy doubled install is moved up before a single bundle is read.
@@ -2132,21 +2097,6 @@ async fn async_main(sso_secret: Option<opencompany::ports::types::SecretValue>) 
             // production defaults below are refused rather than silently
             // applied for that kind alone. See `resolve_serve_base_url`.
             let deployment = opencompany::app::deployment::Deployment::from_env(&ProcessEnv);
-            // tiny.place economy + public-card configuration resolved from the
-            // environment (with built-in defaults); the a2a routes and boot
-            // going-public flow read these off `AppConfig`.
-            let tinyplace_api_url = resolve_serve_base_url(
-                "TINYPLACE_API_URL",
-                deployment,
-                // Opt-in: `maybe_build_economy` returns before reading this
-                // unless the manifest sets `place.discoverable` AND names a
-                // handle, and takes this same default when given `None`.
-                HostedDefault::Allow,
-                config_file
-                    .as_ref()
-                    .and_then(|c| c.tinyplace_api_url.clone()),
-                opencompany::app::config::DEFAULT_TINYPLACE_API_URL.to_string(),
-            )?;
             let public_url = std::env::var("OPENCOMPANY_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty());
@@ -2282,7 +2232,6 @@ async fn async_main(sso_secret: Option<opencompany::ports::types::SecretValue>) 
                 openhuman_root,
                 api_url,
                 web_url,
-                tinyplace_api_url,
                 public_url,
                 instance_name,
                 tenant_namespace,
@@ -2500,25 +2449,16 @@ async fn async_main(sso_secret: Option<opencompany::ports::types::SecretValue>) 
             let shutdown = Arc::new(Notify::new());
             let mut scheduler_handles = Vec::new();
             for dir in &companies {
-                let (id, name, schedules) =
-                    register_company(&state, &home, dir, discoverable).await?;
-                let visibility = if discoverable {
-                    " [discoverable: public]"
-                } else {
-                    ""
-                };
+                let (id, name, schedules) = register_company(&state, &home, dir).await?;
                 if let Some(handle) = spawn_scheduler(&state, &id, &schedules, &shutdown) {
                     scheduler_handles.push(handle);
                     println!(
-                        "registered company `{id}` ({name}) from {} with {} schedule(s){visibility}",
+                        "registered company `{id}` ({name}) from {} with {} schedule(s)",
                         dir.display(),
                         schedules.len()
                     );
                 } else {
-                    println!(
-                        "registered company `{id}` ({name}) from {}{visibility}",
-                        dir.display()
-                    );
+                    println!("registered company `{id}` ({name}) from {}", dir.display());
                 }
                 spawn_mailbox_poller(&state, &id, &shutdown, &mut scheduler_handles);
             }

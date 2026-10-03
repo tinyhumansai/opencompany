@@ -29,7 +29,8 @@ industry now treats as baseline:
 3. skills are **absent from the threat model** (zero mentions in
    `agent-isolation.md`, `grants.md`, `approvals.md`, `tools.md`);
 4. the stored `version` is **never compared**, so an install silently goes stale;
-5. "skill" means two unrelated things (`SKILL.md` bundles vs `[place].skills`);
+5. "skill" meant two unrelated things (`SKILL.md` bundles vs the since-removed
+   `[place].skills`);
 6. there is **no owning doc**;
 7. authoring is thinner than the baseline (no upload, no bundled files, no
    AI-assisted create).

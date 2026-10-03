@@ -33,7 +33,7 @@
 //!
 //! What is deliberately **not** carried over:
 //!
-//! - **The brain, tools, channels, workflow runner and economy.** Replacing
+//! - **The brain, tools, channels and workflow runner.** Replacing
 //!   those is the entire point of a rebuild.
 //! - **The in-flight steer registry.** The successor's harness deps mint their
 //!   own, and the operator steer routes read whichever runtime is registered.
@@ -68,7 +68,7 @@ use crate::runtime::workflow_gates::WorkflowGateQueue;
 ///
 /// Its presence is also what tells `build()` it is rebuilding rather than
 /// booting, which suppresses the boot-only side effects (journal replay, orphan
-/// run reaping, going-public, MCP re-boot) that must not fire a second time.
+/// run reaping, MCP re-boot) that must not fire a second time.
 #[derive(Clone)]
 pub struct RuntimeHandover {
     pub(crate) store: Arc<dyn CompanyStore>,

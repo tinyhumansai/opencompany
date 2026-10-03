@@ -5,8 +5,7 @@ company. A single human operator brings capital, taste, and judgment; a roster
 of AI teammates does every functional job. The runtime keeps each company's
 **brain** — its charter, roster, memory, ledger, and pending approvals —
 durable and consistent, drives it with **Medulla** (TinyHumans' hosted
-orchestrator-first model), and makes every company a first-class, discoverable
-citizen of the **tiny.place** agent economy.
+orchestrator-first model).
 
 Two personas are served by the same host crate (`crates/opencompany-core`;
 see [repository-layout.md](../repository-layout.md) for the crate layout):
@@ -18,8 +17,8 @@ see [repository-layout.md](../repository-layout.md) for the crate layout):
   one-person companies behind a provisioning API.
 
 One invariant binds everything: **the only mandatory external dependency is
-the TinyHumans API key.** Storage is DB-agnostic behind ports, tiny.place is
-opt-in, and every integration degrades gracefully.
+the TinyHumans API key.** Storage is DB-agnostic behind ports, and every
+integration degrades gracefully.
 
 ## Layered Architecture
 
@@ -27,13 +26,13 @@ Dependencies point strictly downward. OpenCompany owns the kernel; every
 neighbor sits behind a Rust trait ("port") and is swappable.
 
 ```text
-L4  Surfaces        Axum HTTP (operator API, A2A, webhooks), CLI, future UI
+L4  Surfaces        Axum HTTP (operator API, webhooks), CLI, future UI
 L3  Company Brain   cycle loop, approvals, effect routing, feedback loop
 L2  Kernel ports    Brain, CompanyStore, EventLog, MemoryStore, ContextStore,
-                    ChannelAdapter, ToolProvider, AgentEconomy, ApprovalGate
+                    ChannelAdapter, ToolProvider, ApprovalGate
 L1  Adapters        hosted-medulla | openhuman (embedded) | tinyhivemind |
-                    hosted-memory | tinyplace | fs (default)
-L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
+                    hosted-memory | fs (default)
+L0  Substrate       api.tinyhumans.ai, openhuman-core, filesystem
 ```
 
 | Concern | Owner | OpenCompany's role |
@@ -44,14 +43,12 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | Desk deliberation: episodes, rounds, speech, Jev routing, referral | tinyhivemind | hosted over the embedded agents (`tinyhivemind-openhuman`); the host commits, the library folds |
 | In-process LLM sub-work | TinyAgents | embedded library behind `ToolProvider` |
 | Long-term memory | TinyCortex (candidate) | behind `MemoryStore`; default is file-based |
-| Identity, discovery, payments, A2A | tiny.place | behind `AgentEconomy` |
 | Company definition, brain state, lifecycle, approvals, HTTP surface | **OpenCompany** | owned outright |
 
 ## Reading Paths
 
 - **Product / UX**: [product/](product/README.md) →
   [agentic/](agentic/README.md) →
-  [company-as-agent/](company-as-agent/README.md) →
   [feedback-loop/](feedback-loop/README.md)
 - **Runtime engineering**: [runtime/](runtime/README.md) →
   [company-brain/](company-brain/README.md) →
@@ -87,7 +84,7 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/ports.md](runtime/ports.md) | Port trait contracts (normative) — index, assembly, defaults |
 | [runtime/ports-cognition.md](runtime/ports-cognition.md) | `Brain`, `CycleHost`, `ChannelAdapter`, `TurnStep` |
 | [runtime/ports-state.md](runtime/ports-state.md) | `CompanyStore`, `EventLog`, memory/context, secrets, identity |
-| [runtime/ports-effects.md](runtime/ports-effects.md) | `ToolProvider`, `AgentEconomy`, `ApprovalGate` |
+| [runtime/ports-effects.md](runtime/ports-effects.md) | `ToolProvider`, `ApprovalGate` |
 | [runtime/ports-console.md](runtime/ports-console.md) | The WS3 console-surface stores |
 | [runtime/ports-runs.md](runtime/ports-runs.md) | `RunStore`: attempts and their traces |
 | [runtime/events.md](runtime/events.md) | `CompanyEvent` vocabulary + journal correlation rules |
@@ -135,14 +132,10 @@ L0  Substrate       api.tinyhumans.ai, openhuman-core, tiny.place, filesystem
 | [runtime/tracing.md](runtime/tracing.md) | Performance tracing and the request timeline: the sample-rate knobs and what they cost, the console-to-host distributed trace, transaction scrubbing, and why Session Replay is not shipped |
 | [runtime/hub-console.md](runtime/hub-console.md) | One console deployment operating many hosts on other origins |
 | [security/agent-isolation.md](security/agent-isolation.md) | What confines an agent and what does not — enforced controls, the gaps, and the capability that survives every planned control |
-| [company-as-agent/README.md](company-as-agent/README.md) | Companies as economy citizens |
-| [company-as-agent/identity.md](company-as-agent/identity.md) | Wallet, handle, Agent Card |
-| [company-as-agent/commerce.md](company-as-agent/commerce.md) | Selling, hiring, delegated signers, ledger |
 | [integrations/README.md](integrations/README.md) | Reuse-first rule, dependency matrix |
 | [integrations/medulla.md](integrations/medulla.md) | Brain contract and the hosted wire protocol |
 | [integrations/openhuman.md](integrations/openhuman.md) | OpenHuman seams and upstream PR list |
 | [integrations/tinyagents.md](integrations/tinyagents.md) | TinyAgents harness usage |
-| [integrations/tinyplace.md](integrations/tinyplace.md) | tiny.place protocol integration |
 | [feedback-loop/README.md](feedback-loop/README.md) | Feedback capture → GitHub issue → release loop |
 | [feedback-loop/privacy.md](feedback-loop/privacy.md) | Redaction rules (normative) |
 | [feedback-loop/triage.md](feedback-loop/triage.md) | Labels, triage, closing the loop |
@@ -173,7 +166,7 @@ what the console ships *today*, because their source of truth is a stylesheet
 
 - Make simple company workflows concise; make complex workflows explicit,
   inspectable, and testable.
-- Reuse Medulla, OpenHuman, TinyAgents, TinyCortex, and tiny.place instead of
+- Reuse Medulla, OpenHuman, TinyAgents, and TinyCortex instead of
   reimplementing them; changes those layers need go upstream as PRs.
 - Keep the default build small; deeper integrations are feature-gated.
 - One required credential; everything else optional and gracefully degrading.

@@ -37,7 +37,6 @@ fn a_costed_cycle_is_spending_not_revenue() {
     let finances = crate::metering::finances::finances_from(
         std::slice::from_ref(&entry),
         &crate::company::Budget { monthly_usd: None },
-        None,
         at_millis,
     );
 
@@ -80,7 +79,6 @@ fn a_charge_renders_as_an_outgoing_transaction_with_a_positive_amount() {
     let finances = crate::metering::finances::finances_from(
         std::slice::from_ref(&entry),
         &crate::company::Budget { monthly_usd: None },
-        None,
         at_millis,
     );
 

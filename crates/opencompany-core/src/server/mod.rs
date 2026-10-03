@@ -1,5 +1,3 @@
-#[cfg(feature = "tinyplace")]
-pub mod a2a;
 /// The Agent Client Protocol surface (the `acp` feature).
 ///
 /// The module's own docs reason about "a build without the feature"; this is

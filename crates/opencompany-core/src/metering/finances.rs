@@ -1,14 +1,13 @@
-//! Pure finances projection: the ledger + `[budget]` + (optional) economy
-//! wallet balance → the console's [`Finances`] shape.
+//! Pure finances projection: the ledger + `[budget]` → the console's
+//! [`Finances`] shape.
 //!
 //! No I/O and no ledger writes — the ledger stays the single financial source of
-//! truth (see `docs/spec/company-as-agent/commerce.md`); metering only reads it.
-//! WS2's `graphql/finances.rs` resolver loads `CompanyRecord.ledger`, the
-//! manifest's `[budget]`, and — under the `tinyplace` feature — the economy
-//! wallet balance, then calls [`finances_from`].
+//! truth; metering only reads it. The `graphql/finances.rs` resolver and its
+//! REST twin load `CompanyRecord.ledger` and the manifest's `[budget]`, then
+//! call [`finances_from`].
 //!
-//! Sign convention (set by the economy adapter and cost hook): outflows are
-//! negative `amount_usd`, inflows positive.
+//! Sign convention (set by the cost hook): outflows are negative `amount_usd`,
+//! inflows positive.
 
 use std::collections::HashMap;
 
@@ -22,15 +21,8 @@ use super::types::{CategorySpend, Direction, Finances, Transaction};
 ///
 /// - `ledger`: the company's append-only ledger (any order; sorted here).
 /// - `budget`: the manifest's `[budget]` (`monthly_usd` is the cap).
-/// - `economy_balance`: the tiny.place wallet balance when the `tinyplace`
-///   feature journals one; `None` falls back to the bookkeeping net.
 /// - `now_millis`: "now", used to find the current-month boundary (UTC).
-pub fn finances_from(
-    ledger: &[LedgerEntry],
-    budget: &Budget,
-    economy_balance: Option<f64>,
-    now_millis: u64,
-) -> Finances {
+pub fn finances_from(ledger: &[LedgerEntry], budget: &Budget, now_millis: u64) -> Finances {
     let month_start = month_start_millis(now_millis);
 
     let mut spent_usd = 0.0;
@@ -65,7 +57,7 @@ pub fn finances_from(
 
     // Bookkeeping net across all time: inflows (+) minus outflows (−).
     let bookkeeping_net: f64 = ledger.iter().map(|e| e.amount_usd).sum();
-    let balance_usd = economy_balance.unwrap_or(bookkeeping_net);
+    let balance_usd = bookkeeping_net;
 
     // Monetary entries only, newest first. The id keeps the entry's append
     // position (not the sorted order) so paging stays deterministic. Ties on
@@ -112,6 +104,9 @@ pub fn category_label(kind: &str) -> String {
     match prefix {
         "inference" => "Inference".to_string(),
         "tools" => "Tools".to_string(),
+        // `x402` is the retired tiny.place payment kind. Ledgers are
+        // append-only, so rows written before its removal still carry it and
+        // must keep rendering as the payments they were.
         "payment" | "x402" => "Payments".to_string(),
         "registry" => "Registry".to_string(),
         "filing" => "Filings".to_string(),

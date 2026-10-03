@@ -30,12 +30,12 @@ policy-HITL mode. It does **not** create approval cards in the current product:
 
 | Group | Effect kinds (examples) | Legacy `supervised` default |
 | --- | --- | --- |
-| **Spend** | `payment.send`, `subscription.start`, x402 outbound above cap | approval above `auto_approve_under_usd` |
+| **Spend** | `payment.send`, `subscription.start`, any payment above cap | approval above `auto_approve_under_usd` |
 | **Send** | `email.send`, `dm.external`, any first message to a new counterparty | approval for new counterparties; allowed for established threads |
 | **Sign** | `filing.submit`, `contract.accept` | always approval |
-| **Publish** | `external.publish`, Agent Card / price changes, website deploys | always approval |
-| **Hire** | outbound A2A engagement with a new company; firing a vendor | approval above threshold or first-time counterparty |
-| **Identity** | handle registration/renewal, key rotation, delegated signer mint/expand | always approval |
+| **Publish** | `external.publish`, price changes, website deploys | always approval |
+| **Hire** | engaging a new outside vendor; firing a vendor | approval above threshold or first-time counterparty |
+| **Identity** | domain or account registration/renewal, key rotation | always approval |
 
 `readonly` still denies applicable effects, and the emergency stop still denies
 ahead of every policy rule. `supervised`, `auto`, `full`, `always_approve`, and

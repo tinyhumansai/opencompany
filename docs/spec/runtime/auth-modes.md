@@ -133,9 +133,9 @@ a convention.
 
 ## `wallet`
 
-Ed25519 over base58 — the Solana-style address space the company's own
-tiny.place identity already uses, verified by the same `economy::signer` code, so
-there is one answer to "does this signature verify" rather than two.
+Ed25519 over base58 — the Solana-style address space — verified by
+`crypto::ed25519`, the same code the runner handshake uses, so there is one
+answer to "does this signature verify" rather than two.
 
 ```text
 POST …/auth/wallet/challenge  {address}            → {nonce, message, expiresAtMillis}

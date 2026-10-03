@@ -48,10 +48,6 @@ The default build is small; deeper integrations are feature-gated.
 cargo check --features tiny        # compile against vendored TinyAgents
 ```
 
-Building with the `tinyplace` feature and passing `serve --discoverable` opts
-loaded companies into the [tiny.place](../overview/tiny-place.md) economy — see
-[Deployment](deployment.md).
-
 ## Explore the runtimes without side effects
 
 ```sh

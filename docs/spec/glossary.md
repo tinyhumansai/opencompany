@@ -23,22 +23,14 @@ This file is the authoritative vocabulary for every document under
 | **Checkpoint** | A moment that requires human sign-off before an effect executes (spend, send, sign, publish, hire, identity change). |
 | **Approval** | The Operator's decision at a Checkpoint: approve, deny, or edit. |
 | **Effect** | Any action that touches the world (send a message, call a paid API, spend money, publish). Effects pass the `ApprovalGate` before execution. |
-| **Event** | A normalized stimulus entering a Company: operator message, webhook, schedule firing, A2A task, approval resolution, feedback filing. |
-| **Engagement** | A paid job between Companies delivered over A2A. |
+| **Event** | A normalized stimulus entering a Company: operator message, webhook, schedule firing, approval resolution, feedback filing. |
 | **Feedback Item** | A captured "this was wrong" (or thumbs-down) with scrubbed context, optionally filed as a public GitHub issue. |
-| **Skill bundle** | A `SKILL.md` instruction document — frontmatter plus a Markdown body — that a Company installs and its Teammates may **read**. It confers no capability: no tool, no grant, no credential. Shortened to *skill* only where the economy sense cannot be meant. See [modules/skills.md](../modules/skills.md). |
+| **Skill bundle** | A `SKILL.md` instruction document — frontmatter plus a Markdown body — that a Company installs and its Teammates may **read**. It confers no capability: no tool, no grant, no credential. Usually shortened to *skill*. See [modules/skills.md](../modules/skills.md). |
 | **Work Feed** | The prosumer surface listing what the team did, in plain language. |
 | **Architect** | The setup-time cognition job that turns an Operator conversation into a tailored Blueprint; invocable post-launch to propose reshaping. Internal-only name. See [agentic/setup.md](agentic/setup.md). |
 | **Blueprint** | The Architect's artifact: a complete draft company (manifest + charter + per-decision rationale + provenance), validated before the Operator reviews it at launch. |
 | **Manager** | The scheduled cognition job that watches how a Company actually runs and files Change Proposals. Internal-only name; its output surfaces as the company's own suggestions. See [agentic/manager.md](agentic/manager.md). |
 | **Change Proposal** | A typed, evidenced, Operator-approvable diff against a Company's effective configuration — the only way any agent changes a running company. See [agentic/proposals.md](agentic/proposals.md). |
-
-> **Naming.** **Skill** unqualified is ambiguous and SHOULD be avoided. A
-> *priced capability* is an economy concept — what a Company sells over A2A. A
-> *skill bundle* is an instruction document a Teammate reads. They share the
-> word and nearly the filename (`skill.md` versus `SKILL.md`) and share no code
-> path. The `[place].skills` manifest key keeps its name: it is a public field
-> behind a published route, so renaming it would be breaking.
 
 ## Brain and cycle terms (Medulla mapping)
 
@@ -54,19 +46,11 @@ Medulla vocabulary is adopted unchanged where it appears; see
 | **Device tool** | A tool the client registers over Socket.IO that the hosted brain calls back into (`orch:tool_call` → `orch:tool_result`). |
 | **ContextStore** | The RLM environment: addressable chunks the brain queries lazily (`put`/`list`/`peek`/`search`). |
 
-## Economy terms (tiny.place mapping)
+## Money terms
 
 | Term | Meaning here |
 | --- | --- |
-| **Handle** | The Company's paid `@name` on tiny.place, claimed via `POST /registry/names`. |
-| **Wallet** | The Company's Ed25519 keypair; the base58 Solana address of its public key is its `agentId`. The wallet *is* the identity — there are no API keys on tiny.place. |
-| **Agent Card** | The public directory listing (skills, capabilities, endpoint, payment requirements) published with `PUT /directory/agents/{id}`. Generated from the Charter's service catalog. |
-| **Priced capability** | A sellable capability priced in x402 USDC on the Agent Card, declared in the manifest's `[place].skills` and served at `GET /a2a/{handle}/skill.md`. The manifest key and the route say "skill"; both are the **economy** sense, not a **Skill bundle** (see Core nouns). |
-| **A2A** | Agent-to-agent JSON-RPC task delegation (`POST /a2a/{id}`, discovery via `GET /a2a/{id}/skill.md`). |
-| **x402** | The HTTP-402 micropayment protocol (USDC on Solana) used to price and settle priced capabilities. |
-| **Delegated Signer** | A budget-capped, expiring session key minted from the master wallet so agents can spend without holding the master key. |
-| **Ledger** | The Company's money and usage journal: every payment in/out, token spend, signer used, engagement link. Append-only. |
-| **SIWX** | Per-action wallet-signature authentication used by tiny.place (no bearer tokens). |
+| **Ledger** | The Company's money and usage journal: every payment in/out and token spend. Append-only. |
 
 ## Orchestration terms
 

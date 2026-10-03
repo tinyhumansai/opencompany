@@ -10,7 +10,6 @@ deploying the same images somewhere real.
 - [Docker and Compose](#docker-and-compose)
 - [Feature flags](#feature-flags)
 - [Desktop preview (Tauri)](#desktop-preview-tauri)
-- [Joining the tiny.place economy](#joining-the-tinyplace-economy)
 - [Deploy targets](#deploy-targets)
 
 ## Before you start
@@ -127,7 +126,6 @@ features.
 
 ```sh
 cargo check -p opencompany-core --features tiny        # compile against vendored TinyAgents
-cargo check -p opencompany-core --features tinyplace   # tiny.place discovery and A2A surface
 ```
 
 Preview an OpenHuman launch without starting one:
@@ -146,21 +144,6 @@ cargo run --bin opencompany -- open-human --mode desktop --dry-run
 cargo run --bin opencompany -- open-human --mode desktop            # launch
 cargo run --bin opencompany -- open-human --mode desktop --release  # bundle
 ```
-
-## Joining the tiny.place economy
-
-To let companies trade with other agents on tiny.place, build with the
-`tinyplace` feature and pass `serve --discoverable` to opt every loaded company
-into going public, which means registering a `@handle`, publishing an Agent
-Card, and answering inbound A2A `tasks/send` over SIWX + x402.
-
-```sh
-cargo run -p opencompany-core --features tinyplace --bin opencompany -- \
-  serve --company companies/marketing_agency --discoverable
-```
-
-[`docs/modules/server/README.md`](modules/server/README.md) has the full
-discovery flow and the `TINYPLACE_API_URL` / `OPENCOMPANY_PUBLIC_URL` settings.
 
 ## Deploy targets
 

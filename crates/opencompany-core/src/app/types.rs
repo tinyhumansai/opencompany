@@ -39,10 +39,9 @@ pub struct AppConfig {
     pub instance_name: Option<String>,
     /// Which brain the runtime drives.
     pub brain_mode: BrainMode,
-    /// tiny.place economy API base URL.
-    pub tinyplace_api_url: String,
-    /// Public host base URL advertised in published Agent Cards. When `None`,
-    /// the card endpoint falls back to `http://{bind}`.
+    /// This host's public base URL — what it is reachable at from outside
+    /// (`OPENCOMPANY_PUBLIC_URL`). When `None`,
+    /// [`host_base_url`](Self::host_base_url) falls back to `http://{bind}`.
     pub public_url: Option<String>,
     /// A **static** TinyHumans hosted-brain credential, if configured. Redacted
     /// in `Debug`. This is only the static tier: a hosted tenant instead reads a
@@ -151,7 +150,6 @@ impl Default for AppConfig {
             web_url: None,
             instance_name: None,
             brain_mode: BrainMode::Hosted,
-            tinyplace_api_url: crate::app::config::DEFAULT_TINYPLACE_API_URL.to_string(),
             public_url: None,
             tinyhumans_credential: None,
             default_mcp_servers: Vec::new(),
@@ -247,8 +245,8 @@ impl AppConfig {
         config_toml: Option<&crate::app::config::ConfigFile>,
     ) -> crate::Result<Self> {
         use crate::app::config::{
-            BaseUrlSources, ConfigProvenance, DEFAULT_API_URL, DEFAULT_TINYPLACE_API_URL,
-            HostedDefault, WEB_URL_ENV, resolve_base_url, resolve_opt,
+            BaseUrlSources, ConfigProvenance, DEFAULT_API_URL, HostedDefault, WEB_URL_ENV,
+            resolve_base_url, resolve_opt,
         };
 
         let deployment = crate::app::deployment::Deployment::from_env(env);
@@ -264,19 +262,6 @@ impl AppConfig {
                 env: env.get("TINYHUMANS_API_URL"),
                 toml: config_toml.and_then(|c| c.api_url.clone()),
                 default: DEFAULT_API_URL.to_string(),
-            },
-        )?;
-
-        let tinyplace_api_url = resolve_base_url(
-            &mut prov,
-            "tinyplace_api_url",
-            "TINYPLACE_API_URL",
-            deployment,
-            HostedDefault::Allow,
-            BaseUrlSources {
-                env: env.get("TINYPLACE_API_URL"),
-                toml: config_toml.and_then(|c| c.tinyplace_api_url.clone()),
-                default: DEFAULT_TINYPLACE_API_URL.to_string(),
             },
         )?;
 
@@ -332,7 +317,6 @@ impl AppConfig {
         Ok(Self {
             api_url,
             web_url,
-            tinyplace_api_url,
             tinyhumans_credential,
             default_mcp_servers,
             workspace_quota: workspace.quota,
@@ -447,8 +431,8 @@ impl AppConfig {
         }
     }
 
-    /// The host base URL to embed in published Agent Card endpoints: the
-    /// configured [`Self::public_url`] when set, otherwise `http://{bind}`.
+    /// The base URL this host answers on: the configured [`Self::public_url`]
+    /// when set, otherwise `http://{bind}`.
     pub fn host_base_url(&self) -> String {
         match &self.public_url {
             Some(url) => url.clone(),
@@ -460,8 +444,8 @@ impl AppConfig {
     /// is one — otherwise `None`.
     ///
     /// Distinct from [`Self::host_base_url`], which always answers *something*
-    /// (falling back to `http://{bind}`) because an Agent Card must carry an
-    /// endpoint. A webhook URL has no such fallback: a provider that cannot
+    /// (falling back to `http://{bind}`) for callers that need an address of
+    /// some kind. A webhook URL has no such fallback: a provider that cannot
     /// reach the URL simply never delivers. So this is `Some` only when an
     /// explicit `public_url` is configured **and** it is `https` — Telegram
     /// (issue #203) refuses any other scheme for `setWebhook`, and the
@@ -531,7 +515,6 @@ impl std::fmt::Debug for AppConfig {
             .field("openhuman_root", &self.openhuman_root)
             .field("api_url", &self.api_url)
             .field("brain_mode", &self.brain_mode)
-            .field("tinyplace_api_url", &self.tinyplace_api_url)
             .field("public_url", &self.public_url)
             .field(
                 "tinyhumans_credential",
@@ -552,8 +535,7 @@ impl std::fmt::Debug for AppConfig {
 pub struct AppState {
     config: AppConfig,
     registry: CompanyRegistry,
-    /// OpenCompany home root holding company bundles. Used by the tiny.place
-    /// A2A inbound routes to resolve a company's Ed25519 identity.
+    /// OpenCompany home root holding company bundles.
     home: std::path::PathBuf,
     /// The root `config.toml` — and everything the first-run setup flow
     /// (`crate::server::setup`) reads and writes — resolves under.
@@ -660,20 +642,6 @@ pub struct AppState {
     /// A lock rather than an atomic because [`AuthMode`] is not a primitive;
     /// it is read once per company build, never on a request path.
     auth_mode_override: Arc<RwLock<Option<AuthMode>>>,
-    /// Host-global replay-protection cache shared across every inbound A2A
-    /// request. Gated behind `tinyplace` so the default build links no crypto.
-    #[cfg(feature = "tinyplace")]
-    nonce: std::sync::Arc<crate::economy::NonceCache>,
-    /// Host-global spent-nonce set for inbound x402 payment authorizations.
-    ///
-    /// Separate from `nonce` because the two guard different values over
-    /// different windows: a SIWX signature is good for the clock-skew window,
-    /// an authorization nonce for
-    /// [`x402::MAX_AGE_SECS`](crate::economy::x402::MAX_AGE_SECS). Sharing one
-    /// set would let either keyspace prune the other's record, and a forgotten
-    /// payment nonce is a free task.
-    #[cfg(feature = "tinyplace")]
-    x402_nonce: std::sync::Arc<crate::economy::NonceCache>,
     /// In-flight console MCP OAuth flows, keyed by the opaque `state` the browser
     /// round-trips (issue #90). The `/mcp/servers/{name}/oauth/start` route parks
     /// a [`PendingOAuth`](crate::company::mcp_oauth::PendingOAuth) here; the
@@ -724,8 +692,7 @@ pub struct AppState {
     acp_sessions: Arc<crate::server::acp::SessionRegistry>,
     /// The boot-only builder inputs recorded per company at registration, so a
     /// rebuild configures the successor exactly as boot configured its
-    /// predecessor. See [`BootInputs`](crate::runtime::BootInputs) for why
-    /// `--discoverable` in particular cannot be recovered any other way.
+    /// predecessor. See [`BootInputs`](crate::runtime::BootInputs).
     boot_inputs: Arc<RwLock<HashMap<CompanyId, crate::runtime::BootInputs>>>,
 }
 
@@ -768,12 +735,6 @@ impl AppState {
             hub_identity: None,
             hub_links: Arc::new(crate::server::hub_link::HubLinks::new()),
             cors: crate::server::cors::CorsConfig::default(),
-            #[cfg(feature = "tinyplace")]
-            nonce: std::sync::Arc::new(crate::economy::NonceCache::new()),
-            #[cfg(feature = "tinyplace")]
-            x402_nonce: std::sync::Arc::new(crate::economy::NonceCache::with_ttl(
-                crate::economy::x402::MAX_AGE_SECS,
-            )),
             #[cfg(feature = "mcp")]
             oauth_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             analytics: crate::analytics::null_tracker(),
@@ -918,7 +879,7 @@ impl AppState {
 
     /// The boot-only builder inputs recorded for `id`, or the defaults when the
     /// company was registered without any (a platform-provisioned tenant has no
-    /// source directory and was never `--discoverable`).
+    /// source directory).
     pub fn boot_inputs(&self, id: &CompanyId) -> crate::runtime::BootInputs {
         self.boot_inputs
             .read()
@@ -1305,18 +1266,6 @@ impl AppState {
     /// The prebuilt GraphQL read-plane schema.
     pub fn schema(&self) -> &crate::server::graphql::OcSchema {
         &self.schema
-    }
-
-    /// The host-global A2A replay-protection nonce cache.
-    #[cfg(feature = "tinyplace")]
-    pub fn nonce(&self) -> &std::sync::Arc<crate::economy::NonceCache> {
-        &self.nonce
-    }
-
-    /// The host-global spent-nonce set for inbound x402 authorizations.
-    #[cfg(feature = "tinyplace")]
-    pub fn x402_nonce(&self) -> &std::sync::Arc<crate::economy::NonceCache> {
-        &self.x402_nonce
     }
 
     /// How long a parked OAuth flow stays reclaimable before it's swept. Longer

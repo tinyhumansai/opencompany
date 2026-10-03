@@ -4615,7 +4615,6 @@ impl HarnessPool {
         let spent = crate::metering::finances_from(
             &record.ledger,
             &record.manifest.budget,
-            None,
             crate::ports::now_millis(),
         )
         .spent_usd;

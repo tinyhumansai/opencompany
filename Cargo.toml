@@ -133,20 +133,14 @@ tinyinference-voice = { path = "vendor/openhuman/vendor/tinyagents/vendor/tinyin
 # TinyCortex moved under TinyMemory at the openhuman pin: `vendor/tinycortex`
 # is no longer a submodule there, and the crate is reached through
 # `vendor/tinymemory/vendor/tinycortex` instead. A patch path is resolved
-# eagerly whatever the feature set — the same trap the `tinyplace` note below
-# records — so a stale path here fails `cargo metadata --locked` outright,
-# before any feature gate is consulted.
+# eagerly whatever the feature set, so a stale path here fails
+# `cargo metadata --locked` outright, before any feature gate is consulted.
 tinycortex = { path = "vendor/openhuman/vendor/tinymemory/vendor/tinycortex" }
 # `tinymemory-core` consumes the TinyCortex contract by version while
 # OpenHuman consumes the implementation by path. Keep both on one checkout so
 # their public trait identities remain identical.
 tinycortex-api = { path = "vendor/openhuman/vendor/tinymemory/vendor/tinycortex/api" }
 tinychannels = { path = "vendor/openhuman/vendor/tinychannels" }
-# No `tinyplace` entry: openhuman dropped the submodule, so the path this
-# patched onto no longer exists at the pin and Cargo fails to load the source
-# outright — a patch path is resolved eagerly, whatever the feature set. Nothing
-# here consumes the crate either; the `tinyplace` FEATURE above is unrelated (it
-# only turns on `reqwest`).
 # Arrived with the #499 pin bump, and is NOT a submodule — openhuman vendors it
 # as a plain in-tree directory. Replicated for the same reason as the entries
 # above, but the reason it matters here is specific: without it Cargo resolves

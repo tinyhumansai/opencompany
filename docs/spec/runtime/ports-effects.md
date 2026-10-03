@@ -20,27 +20,6 @@ pub trait ToolProvider: Send + Sync {
 Tool grants come from the manifest (`[tools].allow`, per-agent `tools`);
 `invoke` MUST reject calls outside the grant before any side effect.
 
-## AgentEconomy
-
-The tiny.place seam ([integrations/tinyplace.md](../integrations/tinyplace.md)).
-
-```rust
-// src/ports/economy.rs
-pub trait AgentEconomy: Send + Sync {
-    async fn ensure_registered(&self, identity: &CompanyIdentity)
-        -> Result<RegistrationState>;
-    async fn publish_card(&self, identity: &CompanyIdentity, card: &AgentCard)
-        -> Result<()>;
-    async fn send_a2a_task(&self, to: &AgentAddr, task: A2aTask)
-        -> Result<A2aTaskHandle>;
-    async fn quote(&self, requirement: &PaymentRequirement) -> Result<Quote>;
-    async fn pay(&self, quote: &Quote, budget: &BudgetScope) -> Result<PaymentReceipt>;
-}
-```
-
-`pay` MUST fail if the `BudgetScope` (derived from `[budget]` and delegated
-signer caps) would be exceeded; the ledger records every receipt.
-
 ## ApprovalGate
 
 Policy evaluation and the approval queue

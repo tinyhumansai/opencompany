@@ -150,18 +150,6 @@ fn task_dispatched_carries_its_run_id_without_changing_the_untagged_shape() {
     assert_eq!(legacy, untagged);
 }
 
-#[test]
-fn legacy_agent_card_json_deserializes_with_defaults() {
-    // A card written by an earlier phase carried only three fields; the new
-    // `#[serde(default)]` fields must fill in without error.
-    let json = r#"{"handle":"acme","description":"d","skills":["a"]}"#;
-    let card: AgentCard = serde_json::from_str(json).expect("deserialize legacy card");
-    assert_eq!(card.handle, "acme");
-    assert!(card.name.is_empty());
-    assert!(card.payment_requirements.is_empty());
-    assert!(card.supported_interfaces.is_empty());
-}
-
 /// Issue #1682: an attachment round-trips on an `OperatorMessage`, and an
 /// empty list serializes *away* — the additive shape that makes the field
 /// zero-migration, on exactly the terms `mentions` / `deliverable` proved

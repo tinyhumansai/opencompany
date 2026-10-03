@@ -162,7 +162,7 @@ impl ProviderId {
     /// A fresh id, from OS entropy.
     ///
     /// `rand_core`'s `getrandom` feature is already a hard dependency of this
-    /// crate (the tiny.place signer uses it), so this needs no new one — which
+    /// crate, so this needs no new one — which
     /// matters because `uuid` here is optional and links only under the
     /// `openhuman` feature, while this module compiles in every build.
     pub fn new() -> Self {

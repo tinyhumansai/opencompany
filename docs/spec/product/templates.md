@@ -13,7 +13,6 @@ A template is a directory containing:
 | Manifest | `company.toml` | company metadata, roster, default policy/budget/place tables ([runtime/manifest.md](../runtime/manifest.md)) |
 | Story | `README.md` | what the company produces, the team, **what you keep** (human role) |
 | Charter defaults | in-manifest | mission/tone/never-do seeds the interview can override |
-| Skill catalog | `[place].skills` | what the company could sell if taken public (ships `discoverable = false`) |
 | Checkpoint list | `[policy]` | which effects always require the operator |
 
 Templates contain **no code**. The example crates shrink to a manifest plus
@@ -34,8 +33,7 @@ marketing agency keeps *campaign review and sign-off*; the law firm keeps
 
 - New templates are PRs adding a directory under `examples/`; CI runs
   `opencompany check` on every template manifest.
-- Lint rules: unique agent ids; every `[place].skills` entry priced and
-  described; `[policy]` present (a template without checkpoints is
+- Lint rules: unique agent ids; `[policy]` present (a template without checkpoints is
   rejected); README states the human role; prosumer-language rules apply to
   README and descriptions.
 - **Schema versioning**: the manifest carries an implicit schema version;

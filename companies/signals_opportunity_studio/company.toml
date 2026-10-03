@@ -17,7 +17,6 @@
 name = "Signals + Opportunity Studio"
 output = "A ranked weekly opportunity brief the operator can act on"
 human_role = "Deciding which opportunities to fund and pursue"
-handle = "signalstudio"
 
 [brain]
 mode = "hosted"
@@ -47,12 +46,6 @@ mode = "supervised"
 # not currently create cards.
 always_approve = ["publish_artifact"]
 auto_approve_under_usd = 1.0
-
-[place]
-discoverable = false
-skills = [
-  { id = "opportunity.brief", price_usd = "49.00", description = "A ranked, evidence-backed weekly opportunity brief for a chosen market." },
-]
 
 # The opportunity-review desk validates the weekly signal synthesis before it reaches the operator.
 [[group_chat]]

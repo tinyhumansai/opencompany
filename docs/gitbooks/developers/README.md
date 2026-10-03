@@ -18,7 +18,7 @@ OpenCompany is a **Rust 2024 crate** — one configurable host. Business types a
 
 ## The one invariant
 
-The only mandatory external dependency is the **TinyHumans API key.** Storage is DB-agnostic behind ports, tiny.place is opt-in, and every integration degrades gracefully. Keep it that way — a violation of the one-key promise is a release blocker.
+The only mandatory external dependency is the **TinyHumans API key.** Storage is DB-agnostic behind ports, and every integration degrades gracefully. Keep it that way — a violation of the one-key promise is a release blocker.
 
 ## Map of this section
 

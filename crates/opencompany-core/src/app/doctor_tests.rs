@@ -172,5 +172,4 @@ fn openhuman_and_github_capabilities_track_config() {
 
     assert!(cap(&report, "openhuman").available);
     assert!(cap(&report, "github").available);
-    assert!(cap(&report, "tinyplace").available);
 }

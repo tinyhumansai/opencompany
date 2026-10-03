@@ -14,7 +14,7 @@ Supporting docs: [charter.md](charter.md), [approvals.md](approvals.md),
 
 ```text
 CompanyBrain
-├── identity   CompanyId (ULID), Ed25519 keypair, tiny.place @handle, Agent Card
+├── identity   CompanyId (ULID)
 ├── charter    name, output, mission, human_role, policies (mutable at runtime)
 ├── roster     teammates: id, role, description, tier hint, tool grants, budgets
 ├── memory     compressed cycle traces + task results
@@ -73,7 +73,6 @@ single-approval-queue model.
 | Context chunks | `ContextStore` | ditto |
 | Conversation history with the hosted brain | TinyHumans backend (per-session messages) | mirrored locally via the read surface when needed |
 | Channel credentials, tool state | OpenHuman domains | reached through ports, never copied |
-| Reputation, payments record | tiny.place ledger (on-chain / directory) | the local ledger journals our view |
 
 The rule: **anything needed to move a company between hosts lives behind the
 four storage ports**; everything else is reconstructible or belongs to a

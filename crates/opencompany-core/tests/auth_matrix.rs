@@ -1548,7 +1548,6 @@ fn feature_enabled(feature: &str) -> bool {
         "acp" => cfg!(feature = "acp"),
         "documents" => cfg!(feature = "documents"),
         "webhooks" => cfg!(feature = "webhooks"),
-        "tinyplace" => cfg!(feature = "tinyplace"),
         unknown => panic!("matrix row names unknown Cargo feature {unknown:?}"),
     }
 }

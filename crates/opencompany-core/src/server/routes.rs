@@ -17,6 +17,10 @@ use crate::{AppState, Result};
 /// build without that feature), and absent server routes must keep 404ing so
 /// API and external clients can detect an unwired surface instead of receiving
 /// the `index.html` shell with a `200`.
+///
+/// `/a2a` is retired: it was the tiny.place inbound A2A surface, removed with
+/// tiny.place. It stays reserved so a peer still probing it gets an honest 404
+/// rather than the console shell with a `200`.
 const RESERVED_PREFIXES: [&str; 9] = [
     "/api", "/graphql", "/healthz", "/spec", "/tiny", "/a2a", "/hooks", "/oauth",
     // The ACP endpoint. Reserved even in a build that does not mount it: an
@@ -31,8 +35,9 @@ const RESERVED_PREFIXES: [&str; 9] = [
 /// match (`/spec`) or a sub-path (`/api/v1/...`) — or any `.well-known`
 /// discovery URI (RFC 8615). The latter is reserved wherever the segment
 /// appears, not just at the root: `/companies/{handle}/.well-known/agent-card.json`
-/// is a tiny.place Agent Card endpoint (feature-gated on `tinyplace`), and the
-/// SPA must never masquerade as one for a directory client probing it.
+/// was the retired tiny.place Agent Card endpoint, and no route serves any
+/// `.well-known` URI today — so a directory client probing one must get a 404,
+/// never the SPA masquerading as a discovery document.
 fn is_reserved_path(path: &str) -> bool {
     if path.split('/').any(|segment| segment == ".well-known") {
         return true;
@@ -138,9 +143,6 @@ fn router_with_console(state: AppState, console_dir: Option<PathBuf>) -> Router 
         .merge(crate::server::hub_link_callback::router());
     #[cfg(feature = "acp")]
     let router = router.merge(crate::server::acp::router());
-    // tiny.place A2A inbound + discovery routes, only when the feature is on.
-    #[cfg(feature = "tinyplace")]
-    let router = router.merge(crate::server::a2a::router());
     // Unauthenticated console MCP OAuth callback (issue #90), only under `mcp`.
     #[cfg(feature = "mcp")]
     let router = router.merge(crate::server::mcp_oauth::router());
@@ -153,8 +155,9 @@ fn router_with_console(state: AppState, console_dir: Option<PathBuf>) -> Router 
     // other unknown path (a client-side SPA route) falls through to
     // `index.html` so the React router can take over. Unmatched paths under a
     // reserved server prefix (`/api`, `/a2a`, `/.well-known`, ...) are the one
-    // exception: they 404 rather than serve the shell, so a feature-gated or
-    // otherwise absent API/discovery route stays detectable by its callers.
+    // exception: they 404 rather than serve the shell, so a feature-gated,
+    // retired, or otherwise absent API/discovery route stays detectable by its
+    // callers.
     // When no console dir is configured this is skipped entirely and unknown
     // paths keep 404ing.
     let router = match console_dir {

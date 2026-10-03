@@ -216,11 +216,14 @@ pub(crate) fn wire_event(seq: u64, event: &CompanyEvent) -> WireEvent {
             format!("[{cron}] {prompt}"),
             "schedule.fired",
         ),
-        CompanyEvent::A2aTaskReceived { from, task } => (
-            Role::User,
-            from.clone(),
-            task.to_string(),
-            "a2a.task_received",
+        // A retired or unrecognised kind read back from an old journal. There
+        // is nothing in it this build understands, so the brain hears only
+        // that something was skipped.
+        CompanyEvent::Unknown => (
+            Role::System,
+            "journal".to_string(),
+            "unrecognised event (skipped)".to_string(),
+            "event.unknown",
         ),
         // Issue #379: the brain is told a request is now waiting, so it can
         // reason about being blocked rather than only learning when the verdict

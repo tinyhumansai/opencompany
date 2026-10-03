@@ -612,11 +612,6 @@ impl Bundle {
         self.dir.join("keys")
     }
 
-    /// Path to the Ed25519 identity seed (`0600` on unix).
-    pub fn agent_key(&self) -> PathBuf {
-        self.keys_dir().join("agent.ed25519")
-    }
-
     /// Bundle subdirectories excluded from exports. A shared or copied bundle
     /// must never carry the company's private key or per-company secrets; an
     /// export flow honours this list unless explicitly overridden.
@@ -667,27 +662,6 @@ fn restrict_dir(dir: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn restrict_dir(_dir: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Restricts a file to owner read/write only (`0600`) on unix.
-///
-/// Used for identity key material (`keys/agent.ed25519`, and the runner's own
-/// key). A no-op on non-unix targets, which rely on directory isolation
-/// instead.
-#[cfg(unix)]
-pub(crate) fn restrict_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms).map_err(|source| OpenCompanyError::StoreIo {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-#[cfg(not(unix))]
-pub(crate) fn restrict_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 

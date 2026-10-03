@@ -32,11 +32,7 @@ All transitions are recorded as events in the `EventLog` with the acting
    ([manifest.md](manifest.md), provenance).
 2. **Open stores** (fs defaults unless the builder swapped them); **replay
    the `EventLog` tail** to rebuild in-flight tasks and the approval queue.
-3. **Economy (optional)**: if `[place].discoverable`, load or generate the
-   Ed25519 keypair, then `AgentEconomy::ensure_registered` and
-   `publish_card`. Failures degrade to "not discoverable" with a warning —
-   they MUST NOT block boot.
-4. **Start** channel adapters, the cron scheduler, the feedback poller; mount
+3. **Start** channel adapters, the cron scheduler, the feedback poller; mount
    routes ([api.md](api.md)).
 
 Platform mode (`--companies-root <dir>` or provisioning API) runs this
@@ -203,9 +199,6 @@ remains the backstop.
 
 `/healthz` is untouched by any of this. The manager's wake-on-request proxy
 blocks on that endpoint during **boot**, and nothing here runs before the signal.
-
-The tiny.place Agent Card stays published (the endpoint simply goes offline);
-liveness is a directory concern, not a registration concern.
 
 ## Multi-company isolation
 

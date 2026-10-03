@@ -197,11 +197,9 @@ exist yet." The console's read-only banner and "Agents can read this" label
    `read_skill_resource` is untrusted text by the repo's own standard for a fetched
    page or an MCP tool description. See [`03-prerequisites.md`](03-prerequisites.md).
 4. **No drift signal.** `version` is stored, never compared (above).
-5. **Naming collision.** `[place].skills = [{ id, price_usd, description }]`
-   (`docs/spec/runtime/manifest.md:172`) prices tiny.place A2A capabilities and is
-   served at `GET /a2a/{handle}/skill.md` (`docs/spec/runtime/api.md:388`). It shares
-   the word, and nearly the filename, with the `SKILL.md` bundle and nothing
-   signposts the difference.
+5. **Naming collision (resolved).** A manifest `[place].skills` table once
+   priced A2A capabilities under the same word as the `SKILL.md` bundle. It was
+   removed with tiny.place, so "skill" now means only the bundle.
 6. **No owning doc.** There is no `docs/spec/runtime/skills.md` and no
    `docs/modules/skills.md`, although `docs/modules/mcp.md` exists. Skills appear
    in passing across `globals.md`, `ports-console.md` (`:227-241`),

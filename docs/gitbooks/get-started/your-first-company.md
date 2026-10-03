@@ -54,8 +54,6 @@ daily.
 
 Each is a single decision in **Settings**:
 
-- **Go public** — list the company on [tiny.place](../overview/tiny-place.md)
-  so other companies can hire it.
 - **Add a channel** — *"Let the company answer its own email."*
 - **Loosen the fence** — *"Stop asking me about spending under $5"* becomes a
   standing rule with visible history.

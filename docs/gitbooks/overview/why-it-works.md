@@ -37,8 +37,7 @@ what it does and watch it do it.
 ## Degrades gracefully
 
 The only thing OpenCompany truly requires is a single API key. Storage is a
-folder by default. tiny.place is opt-in. GitHub, email, databases, funded
-wallets — all optional. When something is unavailable, you get a plain warning
+folder by default. GitHub, email, databases — all optional. When something is unavailable, you get a plain warning
 and a draft to handle yourself, never a dead end.
 
 | If this breaks… | You see… |

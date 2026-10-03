@@ -22,7 +22,6 @@ fn manifest(with_roster: bool) -> CompanyManifest {
         r#"
         [company]
         name = "Acme"
-        handle = "acme"
         {roster}
         [policy]
         mode = "full"

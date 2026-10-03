@@ -104,8 +104,7 @@ routes ([runtime/api.md](../runtime/api.md)).
 ## Agent-filed issues
 
 Assisted/auto filings are posted by a shared bot account and **signed with
-the company's @handle** in the issue body for provenance (verifiable against
-the tiny.place directory). Obligations: dedupe against existing issues
+the company's id** in the issue body for provenance. Obligations: dedupe against existing issues
 before filing (search first, comment instead of duplicating), rate-limit per
 company, and label `source/agent-filed` so triage can weight accordingly.
 

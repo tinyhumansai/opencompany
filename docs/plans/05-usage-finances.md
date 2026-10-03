@@ -3,7 +3,7 @@
 ## Scope
 
 Turn the raw spend/usage data the runtime already models (`TokenUsage`,
-`LedgerEntry`, `[budget]`, tiny.place economy payments) plus the new
+`LedgerEntry`, `[budget]`) plus the new
 `UsageSample` stream (WS4 cost hook) into the two console read surfaces:
 
 - **Usage** — token burn over time, tokens by teammate, calls by provider,
@@ -27,11 +27,10 @@ pub fn bucket_usage(samples: &[UsageSample], range: UsageRange, now_millis: u64)
 // - totals: token sums, cost_usd sum, oauth call count, connected count
 
 pub fn finances_from(ledger: &[LedgerEntry], budget: &Budget,
-                     economy_balance: Option<f64>, now_millis: u64) -> Finances;
+                     now_millis: u64) -> Finances;
 // - spent_usd: current-month outgoing entries; budget_usd from [budget].monthly_usd
-// - revenue_usd: incoming entries (payment.received / a2a sale receipts)
-// - balance_usd: economy wallet when the tinyplace feature is on, else
-//   revenue - spend (bookkeeping balance)
+// - revenue_usd: incoming entries (payment.received receipts)
+// - balance_usd: revenue - spend (bookkeeping balance)
 // - by_category: LedgerEntry.kind prefix mapping (inference.* -> "Inference",
 //   tools.* -> "Tools", payment.* -> "Payments", …) with prosumer labels
 // - transactions: ledger entries newest-first, paged
@@ -44,7 +43,6 @@ Pure functions over port data — trivially unit-testable, no I/O.
 ```
 openhuman TurnCost ──(WS4 cost hook)──► LedgerEntry("inference.spend") ─► Finances
                                     └─► UsageMeter::record(UsageSample) ─► Usage
-tiny.place payments ──(existing economy adapter journals)──► ledger ─────► Finances
 OAuth tool calls ──(WS4 hook, SampleKind::OauthCall)──► UsageMeter ──────► Usage.byProvider
 ```
 
@@ -61,9 +59,8 @@ default.)
 
 ### Spec alignment
 
-- The ledger stays the single financial source of truth, as
-  [`docs/spec/company-as-agent/commerce.md`](../spec/company-as-agent/commerce.md)
-  assumes; metering never writes the ledger, only reads it.
+- The ledger stays the single financial source of truth; metering never
+  writes the ledger, only reads it.
 - Budget exhaustion behavior is unchanged (pause + `budget.exhausted`
   webhook); Finances merely reports the same numbers.
 - Category and teammate labels follow the glossary — no "cycle", no "tier".

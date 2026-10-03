@@ -17,7 +17,6 @@ pub mod brain;
 pub mod channel;
 pub mod context;
 pub mod deep_trace;
-pub mod economy;
 pub mod events;
 pub mod facts;
 pub mod general_channel;
@@ -62,7 +61,6 @@ pub use deep_trace::{
     MAX_DEEP_RUNS_PER_COMPANY, MAX_DEEP_STEPS_PER_RUN, RunStepDetailRecord, TurnStepDetail,
     bound_detail,
 };
-pub use economy::AgentEconomy;
 pub use events::{EventLog, PruneReport, RetentionClass, RetentionPolicy, plan_prune};
 pub use facts::{FactKind, FactRecord, FactStore};
 pub(crate) use ids::MILLIS_PER_DAY;

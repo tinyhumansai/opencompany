@@ -273,7 +273,7 @@ pub(crate) async fn verify_challenge(
         &body.nonce,
         record.created_at_millis,
     );
-    crate::economy::signer::verify_b58(&address, message.as_bytes(), &body.signature).ok()?;
+    crate::crypto::ed25519::verify_b58(&address, message.as_bytes(), &body.signature).ok()?;
     Some(address)
 }
 

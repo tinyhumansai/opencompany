@@ -30,9 +30,6 @@ A `company.toml` seeds the whole company:
 - **Charter defaults** — mission, tone, and never-do seeds.
 - **`[policy]`** — the checkpoints: which effects always require the operator
   (spend, send, sign, publish). A definition with no checkpoints is rejected.
-- **`[place].skills`** — what the company *could* sell if taken
-  [public](../overview/tiny-place.md) (ships `discoverable = false`), each
-  entry priced and described.
 
 ## Author, validate, launch
 

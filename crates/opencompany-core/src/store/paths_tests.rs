@@ -161,7 +161,6 @@ fn bundle_paths_nest_under_company_slug() {
 fn keys_paths_nest_and_are_excluded_from_exports() {
     let bundle = Bundle::new("/root", &CompanyId::new("acme"));
     assert!(bundle.keys_dir().ends_with("companies/acme/keys"));
-    assert!(bundle.agent_key().ends_with("keys/agent.ed25519"));
     assert!(Bundle::export_excludes().contains(&"keys"));
     assert!(Bundle::export_excludes().contains(&"secrets"));
 }

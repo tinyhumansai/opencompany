@@ -377,15 +377,15 @@ fn outside_content_makes_a_cycle_external_and_own_machinery_does_not() {
     assert!(!cycle_is_external(&[]));
 }
 
-/// The #68 sibling review's M1: an A2A task is a remote agent's payload —
-/// third-party content, external. Mixed batches over-taint (any(), not
-/// all()): the safe direction, asserted in both orderings.
+/// Mixed batches over-taint (any(), not all()): the safe direction, asserted
+/// in both orderings. A retired kind read back from an old journal carries
+/// nothing, so on its own it taints nothing.
 #[test]
-fn a2a_tasks_are_external_and_mixed_batches_over_taint() {
+fn mixed_batches_over_taint_and_an_unknown_row_is_internal() {
     use crate::ports::types::Actor;
-    let a2a = || CompanyEvent::A2aTaskReceived {
-        from: "remote-agent".into(),
-        task: serde_json::json!({"text": "do the thing"}),
+    let webhook = || CompanyEvent::WebhookReceived {
+        channel: "telegram".into(),
+        body: serde_json::json!({"text": "do the thing"}),
     };
     let operator = || CompanyEvent::OperatorMessage {
         mentions: Vec::new(),
@@ -396,9 +396,10 @@ fn a2a_tasks_are_external_and_mixed_batches_over_taint() {
         deliverable: None,
         attachments: Vec::new(),
     };
-    assert!(cycle_is_external(&[a2a()]));
-    assert!(cycle_is_external(&[operator(), a2a()]));
-    assert!(cycle_is_external(&[a2a(), operator()]));
+    assert!(cycle_is_external(&[operator(), webhook()]));
+    assert!(cycle_is_external(&[webhook(), operator()]));
+    assert!(!cycle_is_external(&[CompanyEvent::Unknown]));
+    assert!(cycle_is_external(&[CompanyEvent::Unknown, webhook()]));
 }
 
 /// The routing the flag drives: an externally-triggered cycle's

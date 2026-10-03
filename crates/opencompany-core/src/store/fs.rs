@@ -2132,11 +2132,24 @@ impl EventLog for FsEventLog {
         let lock = path_lock(&path);
         let _guard = lock.lock().await;
 
-        // Strict parsing on purpose: `read_jsonl` fails the whole pass on a
-        // line it cannot read, where `read_jsonl_lenient` would skip it and
-        // then the rewrite below would drop it for good. A file we cannot
-        // fully understand is a file we must not rewrite.
-        let all = read_jsonl::<StoredEvent>(&path).await?;
+        // Strict parsing on purpose: one line that does not parse fails the
+        // whole pass, where a lenient read would skip it and then the rewrite
+        // below would drop it for good. A file we cannot fully understand is a
+        // file we must not rewrite.
+        //
+        // Each parsed record keeps the line it came from, and the rewrite
+        // emits that line rather than re-serializing the record. A retired
+        // event kind parses as the field-less `CompanyEvent::Unknown`, so
+        // re-serializing it would replace the row's body with
+        // `{"kind":"Unknown"}` — erasing a record this build merely cannot
+        // read. Writing the original bytes back keeps every kept row exact.
+        let contents = read_optional(&path).await?;
+        let mut lines: Vec<&str> = Vec::new();
+        let mut all: Vec<StoredEvent> = Vec::new();
+        for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+            all.push(serde_json::from_str(line)?);
+            lines.push(line);
+        }
         let doomed = plan_prune(&all, policy);
 
         let mut report = PruneReport {
@@ -2148,16 +2161,17 @@ impl EventLog for FsEventLog {
             return Ok(report);
         }
 
-        let kept: Vec<StoredEvent> = all
-            .into_iter()
-            .filter(|ev| doomed.binary_search(&ev.seq).is_err())
+        let kept: Vec<(&StoredEvent, &str)> = all
+            .iter()
+            .zip(lines)
+            .filter(|(ev, _)| doomed.binary_search(&ev.seq).is_err())
             .collect();
         report.removed = doomed.len();
-        report.oldest_retained = kept.iter().map(|e| e.seq).min();
+        report.oldest_retained = kept.iter().map(|(e, _)| e.seq).min();
 
         let mut body = String::new();
-        for record in &kept {
-            body.push_str(&serde_json::to_string(record)?);
+        for (_, line) in &kept {
+            body.push_str(line);
             body.push('\n');
         }
         write_atomic(&path, &body).await?;

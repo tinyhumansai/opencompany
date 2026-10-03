@@ -58,21 +58,10 @@ that a skill neither adds a grant nor bypasses one.
 
 ## 3.3 Disambiguate the two meanings of "skill"
 
-**Problem.** `[place].skills = [{ id, price_usd, description }]`
-(`docs/spec/runtime/manifest.md:172`) declares priced tiny.place A2A capabilities,
-served at `GET /a2a/{handle}/skill.md` (`docs/spec/runtime/api.md:388`). The
-`SKILL.md` bundle is unrelated. Anyone grepping "skill" hits both, interleaved.
-MCP had the same shape of problem (`mcp_call_tool` vs `mcp_registry_tool_call`).
-
-**Do (docs only).** Add a one-paragraph signpost at the top of
-`docs/modules/skills.md` and next to the `[place].skills` entry in `manifest.md`
-and `api.md`: "a *priced capability* is an economy concept; a *skill bundle* is an
-instruction document". Add both terms to `docs/spec/glossary.md`.
-
-**Do not** rename the manifest key: it is a public route and manifest field
-(`breaking` label territory). If a rename is ever wanted, that is its own issue.
-
-**Acceptance.** Glossary has two entries; each surface links to the other.
+**Resolved.** The collision came from the manifest's `[place].skills` table,
+which priced tiny.place A2A capabilities. tiny.place and `[place]` have been
+removed, so "skill" means only the `SKILL.md` bundle and nothing needs a
+signpost.
 
 ## 3.4 Spec-conformant validation
 

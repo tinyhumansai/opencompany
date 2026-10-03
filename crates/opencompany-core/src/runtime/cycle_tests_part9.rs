@@ -150,10 +150,6 @@ fn cycle_thread_id_reads_an_addressed_message_inherits_a_resolution_and_refuses_
             channel: "stripe".into(),
             body: serde_json::json!({}),
         },
-        CompanyEvent::A2aTaskReceived {
-            from: "peer".into(),
-            task: serde_json::json!({}),
-        },
         CompanyEvent::PaymentReceived {
             amount_usd: 10.0,
             memo: "invoice".into(),
@@ -177,6 +173,8 @@ fn cycle_thread_id_reads_an_addressed_message_inherits_a_resolution_and_refuses_
     // this cycle's own park event, which is appended after the park it
     // describes and would otherwise disqualify a second one.
     for record in [
+        // A retired kind read back from an old journal: nothing to rival with.
+        CompanyEvent::Unknown,
         CompanyEvent::ApprovalParked {
             approval_id: ApprovalId::new("appr-desk"),
             effect_kind: "payment.send".into(),

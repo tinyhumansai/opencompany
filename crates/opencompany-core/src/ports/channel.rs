@@ -19,7 +19,7 @@ use crate::Result;
 use crate::ports::types::{InboundMessage, OutboundMessage};
 
 /// A conversation surface. The built-in `"operator"` channel is always
-/// present; others (email, tinyplace-dm, …) usually delegate to OpenHuman.
+/// present; others (email, telegram, …) usually delegate to OpenHuman.
 ///
 /// Outbound-only: the live contract is [`send`](Self::send). Inbound messages
 /// reach the runtime through route-specific paths, not through this trait.

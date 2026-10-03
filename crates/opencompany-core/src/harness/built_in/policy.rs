@@ -95,7 +95,7 @@
 //! The manifest's per-agent `budget_usd_daily` was validated, persisted and
 //! passed all the way down to a field on this struct whose getter had no call
 //! sites. It was documentation. The company-wide `[budget].monthly_usd` **is**
-//! enforced on the economy path, so the two knobs presented identically while
+//! enforced on the ledger path, so the two knobs presented identically while
 //! only one of them was real.
 //!
 //! Spend arrives through two doors, so enforcement is two layers. Inference —
@@ -1343,7 +1343,7 @@ impl ApprovalPolicy {
     /// Three signals, any of which is enough:
     ///
     /// * the call **declares** an amount (`amount_usd` / `amount`) — the only
-    ///   pre-flight signal there is for an x402 payment;
+    ///   pre-flight signal there is for a payment;
     /// * it projects onto [`EffectGroup::Spend`] — `web_search`, whose backend
     ///   charges per request, plus `media_generate_*`, `pay_*`/`transfer_*`,
     ///   and anything else the group classifier already calls spend.
@@ -1472,7 +1472,7 @@ impl ApprovalPolicy {
     ///
     /// ## What the cap does not see
     ///
-    /// An **executed** x402 payment. The ledger carries no agent, so there is
+    /// An **executed** payment. The ledger carries no agent, so there is
     /// nothing to attribute; the pre-flight `declared_amount` check below covers
     /// the call *before* the money moves, and that is the whole of the coverage.
     /// Closing the gap is a store-shape change across three persistence

@@ -121,7 +121,6 @@ that does and does not imply.
 | `OPENCOMPANY_INFERENCE_URL` | `{TINYHUMANS_API_URL}/agent-integrations/openrouter` | Harness-brain OpenAI-compatible endpoint (`openhuman` feature); the TinyHumans OpenRouter proxy |
 | `OPENCOMPANY_INFERENCE_MODEL` | `chat-v1` | Roster-wide default model/tier for the harness brain (`openhuman` feature) |
 | `OPENCOMPANY_CONTEXT_WINDOW` | `240000` | Context window the managed inference profile advertises, in tokens (`openhuman` feature). Compression and deterministic trimming engage at 90% of it; set it to a smaller model's advertised window (with an estimation margin) or `off`/`0` to restore unbounded intra-turn history — see [harness history protection](providers.md#history-protection) |
-| `TINYPLACE_API_URL` | `https://api.tiny.place` | tiny.place base (staging/local override). Defaults on every deployment kind, hosted tenants included: the economy is read only when a company sets `place.discoverable` and names a handle, and takes this same default when unset |
 | `GITHUB_TOKEN` | — | Only for the feedback→issue flow; without it, feedback is stored locally and a prefilled "file it yourself" link is shown |
 | `OPENCOMPANY_MAIL_PROVIDER` | `smtp` when any `OPENCOMPANY_MAIL_*` is set | Host-level outbound mail transport. Supported: `smtp` |
 | `OPENCOMPANY_MAIL_HOST` | — | SMTP submission host. Setting it opts the host into platform mail |
@@ -250,15 +249,8 @@ added.
 | --- | --- | --- |
 | Cycles (the brain) | TinyHumans credential | build/inspect only |
 | Tools/channels beyond built-ins | OpenHuman reachable | built-in tools; non-operator channels warn and disable |
-| tiny.place presence | `tinyplace` feature + funded wallet for the paid handle claim | company runs privately; going-public prompts for funding |
 | Feedback auto-filing | `GITHUB_TOKEN` + consent | local capture + manual prefilled link |
 | SQLite / TinyCortex stores | respective features | fs bundle |
-
-tiny.place deliberately needs **no key**: identity is a locally generated
-Ed25519 keypair in the company bundle. Paid actions (the handle claim) wait
-until the wallet is funded, with a clear operator prompt. Whether TinyHumans
-sponsors handle claims via a delegated signer bundled with the account is an
-open product question ([company-as-agent/identity.md](../company-as-agent/identity.md)).
 
 ## Authentication
 

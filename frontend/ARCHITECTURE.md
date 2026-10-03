@@ -236,7 +236,7 @@ it. Responses mirror the TypeScript models in `src/lib/*` and `src/api/types.ts`
   The `Company.finances` projection below is unchanged; only the operator entry
   point is gone.
 - **Source:** ✅ real — `Company.finances` (GraphQL) projects the ledger +
-  `[budget]` + optional economy wallet balance (balance, budget vs spend,
+  `[budget]` (balance, budget vs spend,
   revenue, byCategory, transactions). **Caveat:** the inference-cost component
   of spend is `0` until openhuman#4940 (as with Usage).
 

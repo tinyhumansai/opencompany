@@ -59,7 +59,7 @@ that demo's data.
 
 Switch companies by editing `OPENCOMPANY_COMPANY` in `.env` and re-running
 `docker compose up`. Compile optional features into the host with
-`OPENCOMPANY_FEATURES="medulla tinyplace sqlite"`.
+`OPENCOMPANY_FEATURES="medulla sqlite"`.
 
 To exercise the development Compose flow end to end, including both published
 ports, first-admin initialization, and the console's proxy connection to the
@@ -177,5 +177,4 @@ volume at `/data`, and the console with `OC_UPSTREAM` pointed at the host. On
 Kubernetes, back `/data` with a PVC (one tenant per pod, or a shared PVC with a
 `subPath` per tenant) and cap it with a `ResourceQuota` / StorageClass quota —
 that quota is the hard enforcement of `[workspace].storage_quota_gb`. The host
-also honours `TINYHUMANS_API_KEY` (live cognition) and
-`OPENCOMPANY_DISCOVERABLE=true` (tiny.place, needs the `tinyplace` feature).
+also honours `TINYHUMANS_API_KEY` (live cognition).

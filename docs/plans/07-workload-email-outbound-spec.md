@@ -49,7 +49,7 @@ Add to `perform_effect` (`src/runtime/cycle.rs`): when `effect.kind == "email.se
 
 ### 4.5 Sender wiring
 - New `CompanyRuntime` field `mail: Option<CompanyMail>` where `CompanyMail { sender: Arc<dyn MailSender>, smtp: SmtpCredentials }` (both the sender **and** the tenant's creds live here — the injected `OPENCOMPANY_MAIL_*` creds are NOT in `SecretStore["__smtp"]`, so `perform_effect` reads them from `rt.mail`, not `load_credentials`).
-- `RuntimeBuilder`: `mail: Option<CompanyMail>` field + `with_mail(...)` setter + `unwrap`-to-`None` default at `build()` (mirror the `economy: Option<...>` optional pattern, not the always-defaulted `inbox`). Thread it into `CompanyRuntime::new(...)`.
+- `RuntimeBuilder`: `mail: Option<CompanyMail>` field + `with_mail(...)` setter + `unwrap`-to-`None` default at `build()` (an optional port, not the always-defaulted `inbox`). Thread it into `CompanyRuntime::new(...)`.
 - In `src/bin/opencompany.rs`: when `TenantMailboxConfig::from_env()` is `Some` and (under `#[cfg(feature="smtp")]`) a `LettreMailSender` is available, `builder = builder.with_mail(CompanyMail{ sender: Arc::new(LettreMailSender), smtp: cfg.smtp.clone() })` at company registration (same spot the poller is wired).
 
 ## 5. Test plan

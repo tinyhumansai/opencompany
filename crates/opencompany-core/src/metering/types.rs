@@ -148,7 +148,7 @@ pub struct Transaction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Finances {
-    /// The wallet balance (economy wallet when present, else bookkeeping net).
+    /// The balance: the bookkeeping net of the ledger across all time.
     pub balance_usd: f64,
     /// The monthly budget cap from `[budget].monthly_usd`; `None` when the
     /// manifest sets no cap, `Some(0.0)` when it is capped at zero.

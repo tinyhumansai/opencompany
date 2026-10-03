@@ -2,7 +2,7 @@
 
 # ── builder ────────────────────────────────────────────────────────────────
 # Compiles the `opencompany` host binary. `FEATURES` selects optional cargo
-# features (e.g. "medulla tinyplace sqlite"); empty = the small default build.
+# features (e.g. "medulla sqlite"); empty = the small default build.
 FROM docker.io/library/rust:1-slim-bookworm AS builder
 ARG FEATURES=""
 # The revision this image is built from, read by `build.rs` (see
@@ -251,7 +251,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /data
 ENV OPENCOMPANY_COMPANY="marketing_agency" \
     OPENCOMPANY_BIND=0.0.0.0:8080 \
     OPENCOMPANY_DATA_DIR=/data \
-    OPENCOMPANY_DISCOVERABLE=false \
     OPENCOMPANY_CONSOLE_DIR=/app/console
 
 EXPOSE 8080

@@ -222,7 +222,7 @@ impl FailureCode {
         let code = err.unwrapped().code();
         // The prefixed families first: their suffix is an upstream's own code
         // and is exactly what must not be carried through.
-        for family in ["tinyplace_", "tinyhumans_", "chargebee_", "paypal_"] {
+        for family in ["tinyhumans_", "chargebee_", "paypal_"] {
             if code.starts_with(family) {
                 return Self::Upstream;
             }

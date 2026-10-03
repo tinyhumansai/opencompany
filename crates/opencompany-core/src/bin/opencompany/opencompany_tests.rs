@@ -197,7 +197,7 @@ async fn register_company_loads_manifest_and_registers() {
         "/../../companies/law_firm"
     ));
 
-    let (id, name, _schedules) = register_company(&state, &home, dir, false).await.unwrap();
+    let (id, name, _schedules) = register_company(&state, &home, dir).await.unwrap();
 
     assert_eq!(name, "Agentic Law Firm");
     assert_eq!(id, "agentic-law-firm");
@@ -263,7 +263,7 @@ async fn register_company_accepts_a_manifest_file_path() {
         "/../../companies/law_firm/company.toml"
     ));
 
-    let (_id, name, _schedules) = register_company(&state, &home, file, false).await.unwrap();
+    let (_id, name, _schedules) = register_company(&state, &home, file).await.unwrap();
 
     assert_eq!(name, "Agentic Law Firm");
     let runtime = state.registry().sole().expect("sole company");
@@ -297,7 +297,7 @@ async fn register_company_stamps_provenance_from_directory() {
         "/../../companies/law_firm"
     ));
 
-    register_company(&state, &home, dir, false).await.unwrap();
+    register_company(&state, &home, dir).await.unwrap();
 
     let runtime = state.registry().sole().expect("sole company");
     let record = runtime
@@ -333,7 +333,7 @@ async fn register_company_stamps_provenance_from_manifest_file() {
         "/../../companies/law_firm/company.toml"
     ));
 
-    register_company(&state, &home, file, false).await.unwrap();
+    register_company(&state, &home, file).await.unwrap();
 
     let runtime = state.registry().sole().expect("sole company");
     let record = runtime
@@ -675,9 +675,8 @@ fn serve_base_url_ignores_a_blank_config_toml_value() {
 /// `serve` builds `AppConfig` field-by-field through this twin, so a rule
 /// relaxed only in `app::config::resolve_base_url` would leave every
 /// hosted tenant still refusing to start. Observed on staging: a tenant
-/// rolled onto an image carrying PR #2141 crash-looped with
-/// `TINYPLACE_API_URL is not set`, for a company whose manifest has no
-/// `[place]` block at all.
+/// rolled onto an image carrying PR #2141 crash-looped over an opt-in
+/// backend's unset URL, for a company that had never opted in.
 #[test]
 fn serve_base_url_lets_a_hosted_tenant_default_an_opt_in_backend() {
     let resolved = resolve_serve_base_url(

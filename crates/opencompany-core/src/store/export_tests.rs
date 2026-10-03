@@ -350,7 +350,9 @@ async fn secrets_excluded_by_default() {
         .await
         .unwrap();
     let bundle = Bundle::new(home.clone(), &id);
-    tokio::fs::write(bundle.agent_key(), b"seed-bytes")
+    // A bundle written while tiny.place existed holds its retired identity
+    // seed here; key material stays out of an export whatever it is for.
+    tokio::fs::write(bundle.keys_dir().join("agent.ed25519"), b"seed-bytes")
         .await
         .unwrap();
 

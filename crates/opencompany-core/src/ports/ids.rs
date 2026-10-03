@@ -87,8 +87,8 @@ pub fn iso8601(at_millis: u64) -> String {
 /// secret, a capability URL, or a nonce — anything whose safety rests on a
 /// reader being unable to name the next value. Those come from the OS CSPRNG
 /// through [`TokenSource`](crate::server::users::token::TokenSource); see
-/// [`mint_session_token`](crate::server::users::token::mint_session_token) and
-/// the x402 authorization nonce for the two shapes already in the tree.
+/// [`mint_session_token`](crate::server::users::token::mint_session_token) for
+/// the shape already in the tree.
 pub fn generate_id() -> String {
     let millis = now_millis();
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);

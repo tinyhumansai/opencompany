@@ -14,7 +14,7 @@ The Architect runs while a company is in the `onboarding` state
 [onboarding interview](../company-brain/charter.md): where the interview
 fills four Charter fields on top of a fixed template, the Architect designs
 the whole effective configuration — Charter, Roster, `[policy]`,
-`[[schedule]]`, draft `[place].skills` — and the interview questions become
+`[[schedule]]` — and the interview questions become
 one part of its conversation.
 
 It is a cognition job on the
@@ -22,7 +22,7 @@ It is a cognition job on the
 dedicated onboarding session against hosted Medulla, with the Template
 library loaded as context. It registers **no effect-producing tools** — its
 only output channel is a Blueprint handed back to the runtime. It cannot
-send messages, spend money, or touch tiny.place.
+send messages or spend money.
 
 ## The Blueprint
 
@@ -47,7 +47,7 @@ Normative rules:
   Architect retries.
 - Defaults MUST be conservative regardless of what the conversation said:
   `[policy].mode = "supervised"`, all money/publish/filing effects in
-  `always_approve`, `[place].discoverable = false`, `[brain]` defaults. The
+  `always_approve`, `[brain]` defaults. The
   Operator can loosen these later as growth moments — the Architect never
   pre-loosens them.
 - `[budget].monthly_usd` is a **suggestion field** in the Blueprint: the

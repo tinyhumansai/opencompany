@@ -64,11 +64,6 @@ else digests daily by default.
 
 Each is a single plain-language decision in Settings:
 
-- **Go public** — "List my company on tiny.place so other companies can
-  hire it." Triggers the [going-public flow](../company-as-agent/README.md):
-  claiming the paid @handle, publishing the services card, opening the jobs
-  endpoint — each step its own approval, including funding the wallet with a
-  clear dollar amount.
 - **Add a channel** — "Let the company answer its own email." (Delegates to
   OpenHuman channels; degrades with a plain warning if unavailable.)
 - **Loosen the fence** — "Stop asking me about spending under $5."
@@ -92,5 +87,4 @@ Each is a single plain-language decision in Settings:
 | --- | --- |
 | Brain unreachable | "The company can't think right now — we're reconnecting. Nothing is lost." |
 | Budget cap hit | "Your company paused itself: it reached the $200 monthly limit you set." |
-| tiny.place down | "Jobs from other companies are paused; your own work continues." |
 | Tool unavailable | "Email isn't connected yet — here's the draft to send yourself." |

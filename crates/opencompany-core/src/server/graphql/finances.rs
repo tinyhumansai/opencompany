@@ -1,7 +1,7 @@
 //! The finances read: `Company.finances` over WS5's ledger projection.
 //!
-//! `finances_from` folds the company ledger, the manifest `[budget]`, and (when
-//! present) the economy wallet balance into the console's finance surface.
+//! `finances_from` folds the company ledger and the manifest `[budget]` into
+//! the console's finance surface.
 
 use std::sync::Arc;
 
@@ -132,9 +132,6 @@ pub(crate) async fn resolve(runtime: &Arc<CompanyRuntime>) -> async_graphql::Res
         Some(record) => (record.ledger.clone(), record.manifest.budget.clone()),
         None => (Vec::new(), crate::company::Budget::default()),
     };
-    // The economy wallet balance is not surfaced through a read accessor, so the
-    // projection runs ledger-only; `has_economy` gates whether one exists.
-    let economy_balance = None;
-    let finances = finances_from(&ledger, &budget, economy_balance, now_millis());
+    let finances = finances_from(&ledger, &budget, now_millis());
     Ok(FinancesGql { inner: finances })
 }

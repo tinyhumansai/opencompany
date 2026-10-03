@@ -16,19 +16,12 @@ COMPANY="${OPENCOMPANY_COMPANY:-}"
 BIND="${OPENCOMPANY_BIND:-0.0.0.0:8080}"
 HOME_DIR="${OPENCOMPANY_DATA_DIR:-/data}"
 
-DISCOVER=""
-if [ "${OPENCOMPANY_DISCOVERABLE:-false}" = "true" ]; then
-  DISCOVER="--discoverable"
-fi
-
 if [ -z "${COMPANY}" ]; then
   # Unconfigured launch: no company, empty registry, first-run wizard.
   echo "opencompany: launching unconfigured (setup wizard) on ${BIND}"
-  # shellcheck disable=SC2086
   exec opencompany serve \
     --bind "${BIND}" \
-    --home "${HOME_DIR}" \
-    ${DISCOVER}
+    --home "${HOME_DIR}"
 fi
 
 # Friendly aliases → example directory names.
@@ -53,9 +46,7 @@ if [ ! -f "${DIR}/company.toml" ] && [ ! -f "${DIR}/agents.toml" ]; then
 fi
 
 echo "opencompany: launching '${COMPANY}' on ${BIND}"
-# shellcheck disable=SC2086
 exec opencompany serve \
   --company "${DIR}" \
   --bind "${BIND}" \
-  --home "${HOME_DIR}" \
-  ${DISCOVER}
+  --home "${HOME_DIR}"

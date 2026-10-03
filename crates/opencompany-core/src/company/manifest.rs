@@ -823,38 +823,6 @@ impl CompanyManifest {
             }
         }
 
-        if self.place.discoverable && self.company.handle.is_none() {
-            problems.push(
-                "`[place].discoverable` is true but `[company].handle` is not set — a public company needs a @handle.".into(),
-            );
-        }
-
-        for skill in &self.place.skills {
-            if parse_usd(&skill.price_usd).is_none() {
-                problems.push(format!(
-                    "skill `{}` has an invalid `price_usd` `{}` — use a decimal string like \"25.00\".",
-                    skill.id, skill.price_usd
-                ));
-            }
-        }
-
-        // A duplicate skill id is not two skills — it is one id with two
-        // conflicting answers to "what does this cost", and a lookup by id
-        // alone (Agent Card generation, x402 charging) can only ever return
-        // one of them. Rejecting the manifest outright, rather than picking a
-        // resolution order, is what keeps that lookup free to change without
-        // reopening a way to advertise a skill above zero and serve it for
-        // free.
-        let mut seen_skill_ids = std::collections::HashSet::new();
-        for skill in &self.place.skills {
-            if !seen_skill_ids.insert(skill.id.as_str()) {
-                problems.push(format!(
-                    "skill `{}` is declared more than once in `[place].skills` — each id must be unique.",
-                    skill.id
-                ));
-            }
-        }
-
         if let Some(monthly) = self.budget.monthly_usd
             && monthly < 0.0
         {
@@ -1343,15 +1311,6 @@ impl CompanyManifest {
         if let Some(monthly) = self.budget.monthly_usd {
             let _ = writeln!(out, "Budget:   ${monthly:.2}/month");
         }
-        let _ = writeln!(
-            out,
-            "Discover: {}",
-            if self.place.discoverable {
-                "public"
-            } else {
-                "private"
-            }
-        );
 
         let _ = writeln!(out, "\nRoster ({}):", self.agents.len());
         for agent in &self.agents {
@@ -1450,14 +1409,6 @@ fn ledger_grant_problems(
         }
     }
     problems
-}
-
-/// Parses a decimal USD string, rejecting anything non-numeric or negative.
-fn parse_usd(value: &str) -> Option<f64> {
-    match value.trim().parse::<f64>() {
-        Ok(amount) if amount >= 0.0 && amount.is_finite() => Some(amount),
-        _ => None,
-    }
 }
 
 /// Builds a "must be one of … — you wrote `x`" message.

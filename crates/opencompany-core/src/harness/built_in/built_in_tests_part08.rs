@@ -57,7 +57,6 @@ async fn racing_inference_turns_cannot_both_spend_the_last_monthly_budget() {
 
         let mut rec = record();
         rec.id = CompanyId::new(format!("monthly-budget-race-{attempt}"));
-        rec.manifest.place.discoverable = false;
         rec.manifest.budget.monthly_usd = Some(1.0);
         store.save(&rec).await.expect("company is persisted");
         store

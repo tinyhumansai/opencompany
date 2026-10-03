@@ -254,7 +254,7 @@ reachable through an authorized `Company`.
 | workspaceTree/File, tasks, memory, inboxes                   | WS3 ports                                                            |
 | chat history                                                 | `EventLog` (`OperatorMessage` + new `AgentReply`)                    |
 | usage                                                        | WS5 `UsageMeter`                                                     |
-| finances                                                     | ledger (`CompanyStore`) + `[budget]` + economy (feature `tinyplace`) |
+| finances                                                     | ledger (`CompanyStore`) + `[budget]` |
 | domain/smtp status                                           | `SecretStore` reserved keys (non-secret projection)                  |
 | connections connected/account                                | `SecretStore` oauth entries (WS6)                                    |
 

@@ -45,7 +45,7 @@ configuration fields.
 - `src/policy/`, `src/runtime/journal.rs`, and approval resolution
 - manifest policy plus Operator-owned overlay storage
 - OpenHuman tool and credential injection in `src/harness/`
-- `SecretStore`, connection lifecycle, and delegated signer scopes
+- `SecretStore` and connection lifecycle
 - Settings and Approvals console surfaces
 - webhook/event projections for security-relevant changes
 

@@ -24,7 +24,6 @@ you wrote `supervized`"), never serde traces.
 name = "Agentic Marketing Agency"
 output = "Campaigns across every channel"
 human_role = "Campaign review and sign-off"
-handle = "acme-marketing"          # NEW, optional: tiny.place @handle
 
 [[agent]]
 id = "copywriter"                  # snake_case, unique
@@ -147,17 +146,8 @@ auto_approve_under_usd = 1.0
 approval_ttl_hours = 24            # default 24; how long a parked approval
                                    # waits before it default-denies
 
-[place]                            # see company-as-agent/
-discoverable = false               # default false: going public is opt-in
-# `[place].skills` are priced A2A capabilities this company SELLS, served at
-# `GET /a2a/{handle}/skill.md`. Unrelated to the `SKILL.md` bundles an agent
-# reads, which `[[agent]].skills` above scopes — see manifest-semantics.md.
-skills = [
-  { id = "seo.audit", price_usd = "25.00", description = "Full SEO audit" },
-]
-
 [budget]
-monthly_usd = 200.0                # hard cap: inference + x402 combined
+monthly_usd = 200.0                # hard cap: inference + payments combined
 
 [plan]                             # capability tier gating (issue #108)
 name = "starter"                   # free | starter | pro | unlimited (optional)

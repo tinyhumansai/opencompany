@@ -20,7 +20,7 @@ fn budget(cap: Option<f64>) -> Budget {
 
 #[test]
 fn empty_ledger_is_all_zero() {
-    let f = finances_from(&[], &budget(None), None, at(2026, 7, 16));
+    let f = finances_from(&[], &budget(None), at(2026, 7, 16));
     assert_eq!(f.spent_usd, 0.0);
     assert_eq!(f.revenue_usd, 0.0);
     assert_eq!(f.net_usd, 0.0);
@@ -36,9 +36,9 @@ fn zero_cap_is_distinct_from_no_cap() {
     // A manifest that sets `monthly_usd = 0` is a hard cap, not an absent
     // budget: it survives as `Some(0.0)` so the console can say "capped at
     // zero" rather than "no budget is set".
-    let capped = finances_from(&[], &budget(Some(0.0)), None, now);
+    let capped = finances_from(&[], &budget(Some(0.0)), now);
     assert_eq!(capped.budget_usd, Some(0.0));
-    let uncapped = finances_from(&[], &budget(None), None, now);
+    let uncapped = finances_from(&[], &budget(None), now);
     assert_eq!(uncapped.budget_usd, None);
 }
 
@@ -52,21 +52,13 @@ fn current_month_spend_and_revenue() {
         // Last month: excluded from spent/revenue, still counts to balance.
         entry(at(2026, 6, 30), "inference.spend", -100.0, "old"),
     ];
-    let f = finances_from(&ledger, &budget(Some(2000.0)), None, now);
+    let f = finances_from(&ledger, &budget(Some(2000.0)), now);
     assert!((f.spent_usd - 20.0).abs() < 1e-9);
     assert!((f.revenue_usd - 30.0).abs() < 1e-9);
     assert!((f.net_usd - 10.0).abs() < 1e-9);
     assert_eq!(f.budget_usd, Some(2000.0));
     // Bookkeeping net across all time: 30 - 12 - 8 - 100 = -90.
     assert!((f.balance_usd - (-90.0)).abs() < 1e-9);
-}
-
-#[test]
-fn economy_balance_overrides_bookkeeping() {
-    let now = at(2026, 7, 16);
-    let ledger = vec![entry(at(2026, 7, 10), "inference.spend", -12.0, "ceo")];
-    let f = finances_from(&ledger, &budget(None), Some(8420.55), now);
-    assert!((f.balance_usd - 8420.55).abs() < 1e-9);
 }
 
 #[test]
@@ -84,7 +76,7 @@ fn by_category_groups_current_month_spend_only() {
             "revenue not a spend category",
         ),
     ];
-    let f = finances_from(&ledger, &budget(None), None, now);
+    let f = finances_from(&ledger, &budget(None), now);
     assert_eq!(f.by_category.len(), 3);
     // Highest first: Inference 20, Tools 5, Payments 3.
     assert_eq!(f.by_category[0].category, "Inference");
@@ -105,7 +97,7 @@ fn transactions_are_newest_first_and_directional() {
         // Zero-amount entries (e.g. filings) are excluded from the money list.
         entry(at(2026, 7, 15), "filing.submit", 0.0, "a filing"),
     ];
-    let f = finances_from(&ledger, &budget(None), None, now);
+    let f = finances_from(&ledger, &budget(None), now);
     assert_eq!(f.transactions.len(), 2);
     assert_eq!(f.transactions[0].description, "newer revenue");
     assert_eq!(f.transactions[0].direction, Direction::In);

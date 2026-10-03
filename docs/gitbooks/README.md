@@ -31,7 +31,6 @@ This isn't a chatbot with a to-do list. It's a **company runtime** — a durable
 | See what you can run today       | [What one person can run](overview/what-you-can-run.md) |
 | Understand why it holds together | [Why it works](overview/why-it-works.md)                |
 | Meet the engine                  | [Medulla, the orchestrator](overview/medulla.md)        |
-| Trade with other agents          | [The tiny.place economy](overview/tiny-place.md)        |
 | Launch your first company        | [Quickstart](get-started/quickstart.md)                 |
 | Build on the runtime             | [Developer docs](developers/)                           |
 

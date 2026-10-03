@@ -12,24 +12,6 @@ across [`globals.md`](../spec/runtime/globals.md),
 [`harnesses.md`](../spec/runtime/harnesses.md) and the API pages; those
 fragments agree with each other, so this page consolidates rather than corrects.
 
-## Two unrelated things are called "skill"
-
-| Term | What it is | Where it lives |
-| --- | --- | --- |
-| **Skill bundle** | An instruction document an agent reads. The subject of this page. | `SKILL.md` on disk, or a `custom_doc` delta |
-| **Priced capability** | A tiny.place A2A capability another company can buy, with an `id`, a `price_usd` and a description | the manifest's `[place].skills` table, served as a capability-discovery document at `GET /a2a/{handle}/skill.md` |
-
-They share the word and nearly the filename and have nothing else in common: a
-priced capability is an **economy** concept (what this company sells), a skill
-bundle is an **instruction** document (what a teammate may read). Neither reads
-the other, and no code path connects them.
-
-The `[place].skills` key keeps its name. It is a public manifest field behind a
-published route, so renaming it would break every company that declares one and
-every buyer that has fetched the document. See
-[`manifest.md`](../spec/runtime/manifest.md) for the table's shape and
-[`api.md`](../spec/runtime/api.md) for the route.
-
 ## The document
 
 ```rust

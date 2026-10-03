@@ -2,8 +2,7 @@
 //!
 //! [`RuntimeConfig`] is assembled from four layers, earlier winning over later:
 //!
-//! 1. Environment variables (`OPENCOMPANY_*`, `TINYHUMANS_*`, `TINYPLACE_*`,
-//!    `GITHUB_TOKEN`).
+//! 1. Environment variables (`OPENCOMPANY_*`, `TINYHUMANS_*`, `GITHUB_TOKEN`).
 //! 2. `~/.opencompany/config.toml`.
 //! 3. The company manifest (`[brain].mode`, `[users].mode`).
 //! 4. Built-in defaults.
@@ -15,15 +14,14 @@
 //! the [`EnvSource`] seam, which tests satisfy with an in-memory map (no
 //! `std::env::set_var` races).
 //!
-//! `api_url` and `tinyplace_api_url` default to the production TinyHumans and
-//! tiny.place hubs, which is the right built-in for a deployment an operator
-//! owns (self-hosted, desktop) — there is nothing else it could mean. A
-//! [`Deployment::HostedTenant`] container instead receives every setting from
-//! the platform that provisions it, so the same silent default there is a
-//! platform bug wearing a working boot: the tenant looks configured and talks
-//! to production regardless. `resolve` refuses to fill either field for a
-//! hosted tenant and fails loudly instead, naming the variable that must be
-//! set.
+//! `api_url` defaults to the production TinyHumans hub, which is the right
+//! built-in for a deployment an operator owns (self-hosted, desktop) — there
+//! is nothing else it could mean. A [`Deployment::HostedTenant`] container
+//! instead receives every setting from the platform that provisions it, so the
+//! same silent default there is a platform bug wearing a working boot: the
+//! tenant looks configured and talks to production regardless. `resolve`
+//! refuses to fill it for a hosted tenant and fails loudly instead, naming the
+//! variable that must be set.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,9 +45,6 @@ pub const DEFAULT_API_URL: &str = "https://api.tinyhumans.ai";
 /// that points at staging moves both together; this exists for a front end the
 /// convention does not describe.
 pub const WEB_URL_ENV: &str = "TINYHUMANS_WEB_URL";
-
-/// Default tiny.place economy API base URL.
-pub const DEFAULT_TINYPLACE_API_URL: &str = "https://api.tiny.place";
 
 /// Default HTTP bind address for the local host.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -321,9 +316,7 @@ pub struct ConfigFile {
     pub data_dir: Option<String>,
     /// OpenHuman sidecar base URL.
     pub openhuman_url: Option<String>,
-    /// tiny.place economy API base URL.
-    pub tinyplace_api_url: Option<String>,
-    /// Public host base URL advertised in published Agent Cards.
+    /// This host's public base URL — what it is reachable at from outside.
     pub public_url: Option<String>,
     /// GitHub token used by GitHub-backed tools.
     pub github_token: Option<String>,
@@ -703,10 +696,8 @@ pub struct RuntimeConfig {
     pub auth_mode: AuthMode,
     /// OpenHuman sidecar base URL, if configured.
     pub openhuman_url: Option<String>,
-    /// tiny.place economy API base URL.
-    pub tinyplace_api_url: String,
-    /// Public host base URL advertised in published Agent Cards, if configured.
-    /// When unset, the card endpoint falls back to `http://{bind}`.
+    /// This host's public base URL — what it is reachable at from outside —
+    /// if configured.
     pub public_url: Option<String>,
     /// GitHub token, if configured. Redacted in `Debug`.
     pub github_token: Option<SecretValue>,
@@ -769,7 +760,6 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("brain_mode", &self.brain_mode)
             .field("auth_mode", &self.auth_mode)
             .field("openhuman_url", &self.openhuman_url)
-            .field("tinyplace_api_url", &self.tinyplace_api_url)
             .field("public_url", &self.public_url)
             .field("github_token", &redacted(&self.github_token))
             .field(
@@ -849,23 +839,6 @@ pub fn resolve(
             .and_then(|c| c.web_url.clone())
             .filter(|value| !value.trim().is_empty()),
     );
-
-    let tinyplace_api_url = resolve_base_url(
-        &mut prov,
-        "tinyplace_api_url",
-        "TINYPLACE_API_URL",
-        deployment,
-        // Opt-in: `maybe_build_economy` returns before reading this unless the
-        // manifest sets `place.discoverable` AND names a handle, and takes the
-        // same default this does when it gets `None`. Refusing here stopped
-        // every tenant over a value almost none of them reach.
-        HostedDefault::Allow,
-        BaseUrlSources {
-            env: env.get("TINYPLACE_API_URL"),
-            toml: config_toml.and_then(|c| c.tinyplace_api_url.clone()),
-            default: DEFAULT_TINYPLACE_API_URL.to_string(),
-        },
-    )?;
 
     // brain_mode: env <- config.toml <- manifest (always present) <- default.
     let brain_raw = resolve_str(
@@ -970,7 +943,6 @@ pub fn resolve(
         brain_mode,
         auth_mode,
         openhuman_url,
-        tinyplace_api_url,
         public_url,
         github_token,
         tinyhumans_credential,
@@ -1056,7 +1028,7 @@ pub enum HostedDefault {
 }
 
 /// Resolves a base-URL field that names which real backend this process talks
-/// to (`api_url`, `tinyplace_api_url`).
+/// to (`api_url`).
 ///
 /// Behaves exactly like [`resolve_str`] for [`Deployment::SelfHosted`] and
 /// [`Deployment::Desktop`]: env, then `config.toml`, then the built-in

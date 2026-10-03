@@ -1250,12 +1250,9 @@ jobs:
       # Cargo features are ADDITIVE, so a union set runs a superset of what the
       # three ran separately. What that can change — and the reason this is a
       # deliberate grouping rather than "throw them all in" — is any test that
-      # asserts a feature's OFF state. Two exist in this tree
-      # (`#[cfg(not(feature = "tinyplace"))]` in `runtime::builder`,
-      # `#[cfg(not(feature = "tinymemory"))]` in `store::select`) and neither is
-      # reached by these filters. `tinyplace` is NOT in this group for exactly
-      # that reason: its step runs the whole `--lib`, where the `not(tinyplace)`
-      # arm is live coverage that a union set would silently delete.
+      # asserts a feature's OFF state. One exists in this tree
+      # (`#[cfg(not(feature = "tinymemory"))]` in `store::select`) and it is not
+      # reached by these filters.
       #
       # Through `run-scoped-suite.sh` rather than a bare `cargo test`, which the
       # `runner` and `acp` steps used before: a wider feature set makes "this
@@ -1519,59 +1516,6 @@ jobs:
 
       - name: Test the memory engine union selection
         run: scripts/ci/run-scoped-suite.sh "memory selection" tinymemory store::select
-
-      # Issue #477. Before this step, `tinyplace` was COMPILED by CI and
-      # EXECUTED by nothing. `Check (--all-features)` above builds every
-      # `tinyplace`-gated line and deliberately runs none of them, and no other
-      # `cargo test` line in this file names the feature — so the whole gate was
-      # covered for compilation and not at all for behaviour, and a logic defect
-      # behind it shipped green. Those are different claims, and only the second
-      # one is what a test suite is for: `src/economy/outbox.rs` carries a
-      # passing round-trip test for `Outbox::drain()` whose only caller in the
-      # entire tree is that test's own module (#454). Nothing ever ran the
-      # assertion, so nothing pointed out that the production drain it describes
-      # does not exist.
-      #
-      # FULL `--lib`, not a module filter — and this is the substance of the
-      # step, not a detail of it. `tinyplace` gates code across the tree, not
-      # just the economy adapter and its crypto primitives: company config, the
-      # runtime builder's economy wiring (in BOTH the `cfg` and the `cfg(not)`
-      # arm), the A2A server surface and the route that mounts it, and the
-      # platform-split key paths under `src/store/`. Narrowing to `economy::`
-      # would leave every one of those compiled and never run, which is the
-      # precise condition this step exists to end.
-      #
-      # The narrow shape of the belt-contract step above does NOT transfer here.
-      # That one is scoped because `mcp` changes what a tool belt *contains* and
-      # a single module pins that contract, so the rest of the run would be
-      # re-proving what an earlier lane already proved. `tinyplace` is the
-      # `openhuman,tinymemory` shape instead — a feature that changes behaviour
-      # at every site it gates — and that lane runs its whole suite for the same
-      # reason. The compile is what this costs; the compile is identical either
-      # way, so a filter would only discard results already paid for.
-      #
-      # `--lib` rather than `--tests` because no integration target under
-      # `tests/` carries a crate-level `cfg` on `tinyplace`; `--tests` would
-      # link an extra binary this feature set leaves empty. That does not
-      # reopen #475's hole. If such a target is ever added, `Assert every
-      # integration target actually runs` above fails it with `0 tests`, because
-      # that assertion sweeps EVERY target in the manifest whatever gates it —
-      # which is also why that script is not repeated here: on a lane without
-      # `openhuman` it would have to fail by design.
-      #
-      # A STEP on this job, not a fifth job: the vendored-submodule init and the
-      # system build dependencies this job already installs are exactly what
-      # this compile needs, and a separate job would repeat both plus a cold
-      # Rust cache to run a suite that finishes in seconds. Placed last so the
-      # cheaper cached steps still fail first. Split it out if this job's wall
-      # clock ever becomes the constraint — that is a pure CI-shape change with
-      # no argument riding on it.
-      #
-      # `--locked` per issue #251's rule for every graph-resolving invocation:
-      # this is a fifth distinct feature resolution, and without it this lane
-      # would be the one place CI silently re-resolves the dependency graph.
-      - name: Test (tinyplace)
-        run: cargo test --locked -p opencompany-core --features tinyplace --lib
 
       # `webhooks` gates `HttpWebhookSink` and its HMAC signer, and its tests
       # were compiled by `Check (--all-features)` and run by nothing. Scoped to

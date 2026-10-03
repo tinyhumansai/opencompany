@@ -31,60 +31,13 @@ fn rejects_unknown_channel_and_bad_tier() {
     );
 }
 
+/// tiny.place is gone, but manifests written for it are not: a
+/// `company.toml` — or a persisted company record — may still carry
+/// `[company].handle` and a `[place]` table. Both are ignored, not refused,
+/// and nothing about them is a validation problem any more: a public company
+/// with no handle, or a skill priced `"free"`, used to be one.
 #[test]
-fn public_company_requires_handle() {
-    let manifest = parse("[company]\nname = \"X\"\n[place]\ndiscoverable = true\n");
-    let problems = manifest.validate();
-    assert!(problems.iter().any(|p| p.contains("@handle")));
-}
-
-#[test]
-fn rejects_bad_skill_price_and_cron() {
-    let manifest = parse(
-        r#"
-        [company]
-        name = "X"
-        handle = "x"
-        [place]
-        discoverable = true
-        skills = [{ id = "seo.audit", price_usd = "free" }]
-        [[schedule]]
-        cron = "every monday"
-        prompt = "review"
-        "#,
-    );
-    let problems = manifest.validate();
-    assert!(problems.iter().any(|p| p.contains("price_usd")));
-    assert!(problems.iter().any(|p| p.contains("5 fields")));
-}
-
-/// `parse_usd` rejects negative amounts by construction (`amount >= 0.0`),
-/// but the only existing skill-price test exercises the non-numeric edge
-/// (`"free"`). A negative decimal string parses fine as an `f64` and would
-/// slip through a check that only asked "is this a number".
-#[test]
-fn rejects_a_negative_skill_price() {
-    let manifest = parse(
-        r#"
-        [company]
-        name = "X"
-        handle = "x"
-        [place]
-        discoverable = true
-        skills = [{ id = "seo.audit", price_usd = "-5.00" }]
-        "#,
-    );
-    let problems = manifest.validate();
-    assert!(
-        problems
-            .iter()
-            .any(|p| p.contains("price_usd") && p.contains("-5.00")),
-        "{problems:?}"
-    );
-}
-
-#[test]
-fn rejects_a_duplicate_skill_id() {
+fn retired_tiny_place_keys_are_ignored_not_refused() {
     let manifest = parse(
         r#"
         [company]
@@ -93,18 +46,35 @@ fn rejects_a_duplicate_skill_id() {
         [place]
         discoverable = true
         skills = [
-            { id = "seo.audit", price_usd = "0.00" },
-            { id = "seo.audit", price_usd = "25.00" },
+            { id = "seo.audit", price_usd = "free" },
+            { id = "seo.audit", price_usd = "-5.00" },
         ]
         "#,
     );
-    let problems = manifest.validate();
+    assert!(manifest.validate().is_empty(), "{:?}", manifest.validate());
+    assert!(!manifest.effective_summary().contains("Discover:"));
+
+    let unhandled = parse("[company]\nname = \"X\"\n[place]\ndiscoverable = true\n");
     assert!(
-        problems
-            .iter()
-            .any(|p| p.contains("seo.audit") && p.contains("more than once")),
-        "{problems:?}"
+        unhandled.validate().is_empty(),
+        "{:?}",
+        unhandled.validate()
     );
+}
+
+#[test]
+fn rejects_a_bad_cron() {
+    let manifest = parse(
+        r#"
+        [company]
+        name = "X"
+        [[schedule]]
+        cron = "every monday"
+        prompt = "review"
+        "#,
+    );
+    let problems = manifest.validate();
+    assert!(problems.iter().any(|p| p.contains("5 fields")));
 }
 
 #[test]
@@ -367,22 +337,6 @@ fn signals_opportunity_studio_template_passes_lint() {
     let unique = ids.len();
     ids.dedup();
     assert_eq!(ids.len(), unique, "agent ids must be unique");
-    // Every advertised skill is priced and described.
-    assert!(!manifest.place.skills.is_empty());
-    for skill in &manifest.place.skills {
-        assert!(
-            parse_usd(&skill.price_usd).is_some(),
-            "skill must be priced"
-        );
-        assert!(
-            skill
-                .description
-                .as_deref()
-                .is_some_and(|d| !d.trim().is_empty()),
-            "skill `{}` must be described",
-            skill.id
-        );
-    }
     // A supervised policy with a defined always-approve fence. Asserting
     // only `!is_empty()` is what let the template ship three entries that
     // matched nothing on its harness path (issue #684): a list's length

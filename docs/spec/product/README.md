@@ -2,8 +2,7 @@
 
 OpenCompany is the open-source runtime that turns one person into a whole
 company: a durable host where the [Brain](../glossary.md) runs a roster of AI
-teammates that do the work, sell services to other agents on tiny.place, and
-ask the human only for the decisions that matter.
+teammates that do the work and ask the human only for the decisions that matter.
 
 Supporting docs: [prosumer.md](prosumer.md), [platform.md](platform.md),
 [templates.md](templates.md).
@@ -36,8 +35,8 @@ functional job an agent can hold around the clock. "Done" means:
 | **Chat** | core | One conversation with the company as a single entity — the Brain speaks for the whole org |
 | **Work Feed** | core | What the team did, in plain language, with artifacts attached |
 | **Approvals Inbox** | core | Checkpoints awaiting sign-off: spend, send, sign, publish |
-| **Earnings / Ledger** | with tiny.place | Money in/out, jobs sold and bought |
-| **Settings** | core | Charter edits, standing approval rules, going public, feedback consent |
+| **Earnings / Ledger** | core | Money in/out |
+| **Settings** | core | Charter edits, standing approval rules, feedback consent |
 
 ## The one-key promise (normative)
 

@@ -410,8 +410,6 @@ async fn provision(
         // for exactly this reason — a second wiring path is a second place to
         // forget.
         .with_analytics(state.analytics())
-        .with_tinyplace_api_url(state.config().tinyplace_api_url.clone())
-        .with_host_base_url(state.config().host_base_url())
         // Issue #752: a provisioned tenant is a company like any other, so it
         // inherits the same repository-credential gates — which need to know
         // which backend is holding this host's secrets.

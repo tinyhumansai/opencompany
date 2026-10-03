@@ -8,7 +8,6 @@
 * [What one person can run](overview/what-you-can-run.md)
 * [Why it works](overview/why-it-works.md)
 * [Medulla, the orchestrator](overview/medulla.md)
-* [The tiny.place economy](overview/tiny-place.md)
 
 ## Get started
 

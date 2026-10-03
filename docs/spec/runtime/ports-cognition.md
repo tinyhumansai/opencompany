@@ -219,7 +219,7 @@ construction, ≥1 response per cycle) are inherited, not re-verified.
 ## ChannelAdapter
 
 Outbound conversation surfaces. The built-in `"operator"` channel is
-always present; others (email, tinyplace-dm, …) usually delegate to OpenHuman.
+always present; others (email, telegram, …) usually delegate to OpenHuman.
 
 Inbound messages do **not** flow through this trait (issue #1958). Ingress is
 route-specific:
@@ -243,7 +243,7 @@ is no replacement stream because ingress is route-specific (see above).
 ```rust
 // src/ports/channel.rs
 pub trait ChannelAdapter: Send + Sync {
-    fn channel_id(&self) -> &str; // "operator", "email", "tinyplace-dm", ...
+    fn channel_id(&self) -> &str; // "operator", "email", ...
     #[deprecated] // empty default — do not call or override in new code
     fn inbound(&self) -> BoxStream<'static, InboundMessage> { /* empty */ }
     async fn send(&self, msg: OutboundMessage) -> Result<()>;

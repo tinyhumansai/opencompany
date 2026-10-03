@@ -14,7 +14,7 @@
 # end-to-end suite and two OAuth secret-lifecycle tests in `app::types`.
 #
 # It is the same shape as #475 (an integration target no lane selected), #477
-# (`tinyplace` compiled and never run), #555 (the MongoDB conformance suite) and
+# (a feature compiled and never run), #555 (the MongoDB conformance suite) and
 # #592 (a submodule-init block copied into several lanes with one copy missed).
 # Each was found by hand, after the fact. This is the check that finds the next
 # one at the moment it is introduced.

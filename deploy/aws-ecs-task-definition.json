@@ -12,8 +12,7 @@
       "essential": true,
       "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
       "environment": [
-        { "name": "OPENCOMPANY_COMPANY", "value": "marketing_agency" },
-        { "name": "OPENCOMPANY_DISCOVERABLE", "value": "false" }
+        { "name": "OPENCOMPANY_COMPANY", "value": "marketing_agency" }
       ],
       "mountPoints": [
         { "sourceVolume": "workspace", "containerPath": "/data", "readOnly": false }

@@ -79,7 +79,6 @@ fn value_of(cfg: &RuntimeConfig, field: &str) -> String {
         "api_url" => cfg.api_url.clone(),
         "brain_mode" => cfg.brain_mode.to_string(),
         "openhuman_url" => cfg.openhuman_url.clone().unwrap_or_else(|| "unset".into()),
-        "tinyplace_api_url" => cfg.tinyplace_api_url.clone(),
         "github_token" => redacted(&cfg.github_token).to_string(),
         "tinyhumans_credential" => redacted(&cfg.tinyhumans_credential).to_string(),
         // A path, not a secret — printing it is how an operator confirms the pod
@@ -100,7 +99,6 @@ const FIELDS: &[&str] = &[
     "api_url",
     "brain_mode",
     "openhuman_url",
-    "tinyplace_api_url",
     "github_token",
     "tinyhumans_credential",
     "tinyhumans_token_file",
@@ -168,12 +166,6 @@ pub fn report(cfg: &RuntimeConfig, prov: &ConfigProvenance) -> DoctorReport {
         },
     };
 
-    let tinyplace = DoctorCapability {
-        name: "tinyplace",
-        available: true,
-        needs: String::new(),
-    };
-
     let github = DoctorCapability {
         name: "github",
         available: cfg.github_token.is_some(),
@@ -186,7 +178,7 @@ pub fn report(cfg: &RuntimeConfig, prov: &ConfigProvenance) -> DoctorReport {
 
     DoctorReport {
         values,
-        capabilities: vec![cycles, openhuman, tinyplace, github],
+        capabilities: vec![cycles, openhuman, github],
     }
 }
 

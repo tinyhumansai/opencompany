@@ -1,6 +1,6 @@
 //! [`CompanyScheduler`]: drives a company's `[[schedule]]` crons into cycles.
 //!
-//! Boot lifecycle step 4 starts one scheduler per live company. On each tick it
+//! Boot lifecycle step 3 starts one scheduler per live company. On each tick it
 //! asks an injectable [`Clock`] for the current minute, matches every parsed
 //! [`CronExpr`](crate::runtime::cron::CronExpr) against it, and — for each
 //! schedule that is due and has not already fired this minute — enqueues a

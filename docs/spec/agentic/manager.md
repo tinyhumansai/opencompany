@@ -74,7 +74,7 @@ runtime — not by prompting — when a proposal is filed:
 
 - MUST NOT raise `[budget].monthly_usd` or any cap above the company
   ceiling.
-- MUST NOT flip `[place].discoverable`, claim handles, or touch identity.
+- MUST NOT claim handles or touch identity.
 - MUST NOT remove money/publish/filing effects from `always_approve`, and
   MUST NOT relax `never_do`.
 - MUST NOT modify the `[manager]` table (its own cadence, quota, or

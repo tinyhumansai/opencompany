@@ -27,7 +27,6 @@ event vocabulary those traits carry moved to [`events.md`](events.md)
 | `SecretStore` | [ports-state.md](ports-state.md#secretstore) | per-company credentials |
 | `UserStore`, `SessionStore`, `LoginCodeStore` | [ports-state.md](ports-state.md#userstore-sessionstore-logincodestore) | human collaborators and their credentials ([users.md](users.md)) |
 | `ToolProvider` | [ports-effects.md](ports-effects.md#toolprovider) | tool catalog + invocation, grant-checked |
-| `AgentEconomy` | [ports-effects.md](ports-effects.md#agenteconomy) | the tiny.place seam |
 | `ApprovalGate` | [ports-effects.md](ports-effects.md#approvalgate) | policy evaluation and the approval queue |
 | `TaskStore` | [ports-console.md](ports-console.md#taskstore) | the Kanban board |
 | `ArtifactStore` | [ports-console.md](ports-console.md#artifactstore) | versioned task outputs and the human-edit diff |
@@ -53,7 +52,6 @@ pub struct CompanyRuntime {
     context: Arc<dyn ContextStore>,
     tools: Arc<dyn ToolProvider>,
     channels: Vec<Arc<dyn ChannelAdapter>>,
-    economy: Option<Arc<dyn AgentEconomy>>,
     approvals: Arc<dyn ApprovalGate>,
 }
 ```
@@ -72,7 +70,6 @@ the multi-tenant platform case with the same type.
 | `MemoryStore`, `ContextStore` | fs (JSONL + content-addressed blobs) | hosted provider, operator-supplied |
 | `ToolProvider` | OpenHuman RPC, built-ins fallback | TinyAgents-native |
 | `ChannelAdapter` | built-in operator chat | OpenHuman channels |
-| `AgentEconomy` | none (companies work offline) | tinyplace |
 | `ApprovalGate` | manifest `[policy]` evaluator | OpenHuman policy hook |
 | `SecretStore` | fs (encrypted at rest) | OS keychain, operator-supplied |
 | `TaskStore`, `WorkspaceStore`, `FactStore`, `UsageMeter`, `SkillStateStore`, `InboxStore` | fs bundle | sqlite, mongodb |

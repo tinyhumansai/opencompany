@@ -1,5 +1,5 @@
 use super::*;
-use crate::economy::signer::LocalSigner;
+use crate::crypto::ed25519::LocalSigner;
 
 struct Key {
     signer: LocalSigner,

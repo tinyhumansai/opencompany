@@ -122,28 +122,6 @@ fn event_seq_orders_numerically() {
     assert_eq!(EventSeq::new(7).value(), 7);
 }
 
-#[test]
-fn agent_card_round_trips_with_extended_fields() {
-    let card = AgentCard {
-        handle: "acme".into(),
-        description: "We audit SEO.".into(),
-        skills: vec!["seo.audit".into()],
-        name: "Acme SEO".into(),
-        actor_type: "agent".into(),
-        endpoint: "https://host/a2a/acme".into(),
-        supported_interfaces: vec!["a2a-jsonrpc".into()],
-        capabilities: vec!["seo.audit".into()],
-        tags: vec!["seo.audit".into()],
-        payment_requirements: vec![CardPayment {
-            skill_id: "seo.audit".into(),
-            price: "25.00".into(),
-            asset: "USDC".into(),
-            network: "solana".into(),
-        }],
-    };
-    assert_eq!(round_trip(&card), card);
-}
-
 fn desk_record(toml_src: &str, overlay: Vec<OverlayDeskMember>) -> CompanyRecord {
     CompanyRecord {
         general_channel: Default::default(),

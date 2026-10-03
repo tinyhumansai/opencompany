@@ -70,10 +70,7 @@ fn drops_non_attention_and_raw_payload_events() {
             channel: "email".into(),
             body: serde_json::json!({"authorization": "Bearer sk-secret"}),
         },
-        CompanyEvent::A2aTaskReceived {
-            from: "@peer".into(),
-            task: serde_json::json!({"token": "sk-secret"}),
-        },
+        CompanyEvent::Unknown,
         CompanyEvent::ScheduleFired {
             cron: "0 9 * * *".into(),
             prompt: "daily standup".into(),

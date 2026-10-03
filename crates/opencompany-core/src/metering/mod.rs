@@ -6,9 +6,8 @@
 //! - [`bucket_usage`] — [`UsageSample`](crate::ports::usage::UsageSample)s →
 //!   [`Usage`] (daily token series, tokens by teammate, calls by provider,
 //!   totals) over a 7/30/90-day [`UsageRange`].
-//! - [`finances_from`] — the ledger + `[budget]` + optional economy wallet
-//!   balance → [`Finances`] (balance, budget vs spend, revenue, spend by
-//!   category, the transaction journal).
+//! - [`finances_from`] — the ledger + `[budget]` → [`Finances`] (balance,
+//!   budget vs spend, revenue, spend by category, the transaction journal).
 //!
 //! The write-side pieces sit here rather than at their (feature-gated) call
 //! sites, so their contracts are compiled and tested by the default CI build —

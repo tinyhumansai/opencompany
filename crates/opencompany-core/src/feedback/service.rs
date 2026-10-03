@@ -204,9 +204,9 @@ pub async fn finalize(
     source: FeedbackSource,
     preview: bool,
 ) -> Result<FeedbackResponse> {
-    let handle = manifest
-        .and_then(|m| m.company.handle.clone())
-        .unwrap_or_else(|| company.as_ref().to_string());
+    // The company id is the provenance an issue is filed under: stable,
+    // already public on every URL the company serves, and never free text.
+    let handle = company.as_ref().to_string();
     let roster = roster_names(manifest);
     let charter = charter_terms(manifest);
     let keys = secret_keys(manifest);
@@ -376,8 +376,8 @@ async fn forward_to_hub(
     }
 }
 
-/// The roster names/handles to redact (agent ids plus the company `@handle`
-/// stem is intentionally *not* redacted — it is the public provenance signer).
+/// The roster names to redact (agent ids). The company id is intentionally
+/// *not* redacted — it is the public provenance signer.
 fn roster_names(manifest: Option<&CompanyManifest>) -> Vec<String> {
     manifest
         .map(|m| m.agents.iter().map(|a| a.id.clone()).collect())
@@ -390,11 +390,6 @@ fn charter_terms(manifest: Option<&CompanyManifest>) -> Vec<CharterTerm> {
     let Some(manifest) = manifest else {
         return terms;
     };
-    for skill in &manifest.place.skills {
-        if !skill.price_usd.trim().is_empty() {
-            terms.push(CharterTerm::new(skill.price_usd.clone(), "a priced skill"));
-        }
-    }
     if let Some(output) = &manifest.company.output
         && !output.trim().is_empty()
     {

@@ -82,7 +82,7 @@ pub trait SkillStateStore {
 
 **Deliberately not ports:** domain + SMTP config are JSON blobs under
 `SecretStore` reserved keys (`__domain`, `__smtp`); finances resolve from the
-existing ledger + `[budget]` + economy.
+existing ledger + `[budget]`.
 
 `FactStore` deliberately sits **beside** the two memory ports specified in
 [`docs/spec/company-brain/memory.md`](../spec/company-brain/memory.md)

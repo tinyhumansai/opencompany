@@ -341,17 +341,6 @@ pub enum OpenCompanyError {
         message: String,
     },
 
-    /// A tiny.place economy transport or protocol failure. `code` is a stable
-    /// machine-readable token (e.g. `unreachable`, `http_502`); `message` is the
-    /// human-readable detail.
-    #[error("tinyplace error ({code}): {message}")]
-    Tinyplace {
-        /// A stable, machine-readable failure token.
-        code: String,
-        /// A human-readable description of the failure.
-        message: String,
-    },
-
     /// A TinyHumans backend transport or protocol failure. `code` is a stable
     /// machine-readable token (e.g. `unreachable`, `http_502`); `message` is the
     /// human-readable detail.
@@ -499,15 +488,6 @@ impl OpenCompanyError {
         }
     }
 
-    /// Builds an [`OpenCompanyError::Tinyplace`] from a failure token and
-    /// message. `code` is stored verbatim and surfaced by [`Self::code`].
-    pub fn tinyplace(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Tinyplace {
-            code: code.into(),
-            message: message.into(),
-        }
-    }
-
     /// The partial run a [`WorkflowRunFailed`](Self::WorkflowRunFailed) carries,
     /// if this is one (issue #1008).
     ///
@@ -581,7 +561,6 @@ impl OpenCompanyError {
             Self::WorkflowInvalid { .. } => "workflow_invalid".to_string(),
             Self::Config(_) => "config_error".to_string(),
             Self::Orchestration { code, .. } => code.clone(),
-            Self::Tinyplace { code, .. } => format!("tinyplace_{code}"),
             Self::TinyHumans { code, .. } => format!("tinyhumans_{code}"),
             Self::Chargebee { code, .. } => format!("chargebee_{code}"),
             Self::Paypal { code, .. } => format!("paypal_{code}"),

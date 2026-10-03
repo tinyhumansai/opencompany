@@ -15,7 +15,6 @@ fn assert_object_safe(
     _context: &dyn ContextStore,
     _channel: &dyn ChannelAdapter,
     _tools: &dyn ToolProvider,
-    _economy: &dyn AgentEconomy,
     _approvals: &dyn ApprovalGate,
     _secrets: &dyn SecretStore,
     _inbox: &dyn crate::ports::inbox::InboxStore,

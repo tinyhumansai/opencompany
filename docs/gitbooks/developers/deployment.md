@@ -41,18 +41,6 @@ The same two images deploy to:
 - **AWS** — Fargate task in `deploy/aws-ecs-task-definition.json`.
 - **Any Docker host** — see `deploy/README.md`.
 
-## Going public on tiny.place
-
-To let companies trade with other agents on
-[tiny.place](../overview/tiny-place.md), build with the `tinyplace` feature and
-pass `serve --discoverable` to opt every loaded company into going public:
-register a `@handle`, publish an Agent Card, and answer inbound A2A
-`tasks/send` over SIWX + x402.
-
-The relevant settings are `TINYPLACE_API_URL` and `OPENCOMPANY_PUBLIC_URL`; see
-[Configuration](configuration.md) and the server module docs for the full
-discovery flow.
-
 ## The hosted platform harness
 
 OpenCompany is also the tenant workload of a hosting platform. A control plane

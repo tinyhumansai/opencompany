@@ -543,11 +543,12 @@ webpki-roots = { version = "1", optional = true }
 # `mode = "wallet"`, report it on `/auth/config`, and then be unable to check a
 # single signature — a configuration the build silently does not implement.
 #
-# The tiny.place economy identity uses the same three for the same reason a
-# second implementation was never wanted: one signer, one base58 handling.
-# `rand_core`'s `getrandom` feature provides `OsRng` for seed generation; we call
-# `SigningKey::from_bytes` so dalek's own `rand_core` feature stays off. All
-# three are pure Rust with no native dependency.
+# The runner handshake (`runner::attest`) verifies through the same
+# `crypto::ed25519` module, so there is one base58 key parser and one curve —
+# a second implementation is how two callers come to disagree about what
+# verifies. `rand_core`'s `getrandom` feature provides `OsRng` for fresh ids
+# (`ProviderId::new`); dalek's own `rand_core` feature stays off. All three are
+# pure Rust with no native dependency.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 bs58 = { version = "0.5", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
@@ -680,19 +681,6 @@ tinyhumans = ["dep:reqwest"]
 # Real HTTP/Socket.IO transport to hosted Medulla. The wire types + offline
 # MockTransport compile without this; only the networked transport is gated.
 medulla = ["dep:reqwest"]
-# tiny.place economy: Ed25519 identity, SIWX auth, x402 payment authorization,
-# and (in later batches) the HTTP transport. Card projection + wire types stay
-# in the default build; only crypto and the networked client are gated here.
-# Ed25519 keys and signatures, lifted out from under `tinyplace` (issue: the
-# runner lane needs them too).
-#
-# `tinyplace` used to own `economy::signer` outright, which meant the runner
-# handshake could only exist in a build that also pulled the whole tiny.place
-# economy — an unrelated surface. Naming the capability separately lets two
-# features share one reviewed signing implementation instead of growing a
-# second one, which is the outcome worth avoiding: two curves, or two base58
-# key parsers, is how a signature check comes to differ between two callers.
-tinyplace = ["dep:reqwest"]
 
 # The Agent Client Protocol: the `/acp` endpoint's session/permission surface
 # and the `RunTurn` implementation over an ACP agent.

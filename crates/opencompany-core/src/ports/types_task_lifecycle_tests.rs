@@ -567,10 +567,6 @@ fn company_event_variants_round_trip_tagged() {
             cron: "0 9 * * *".into(),
             prompt: "daily standup".into(),
         },
-        CompanyEvent::A2aTaskReceived {
-            from: "@peer".into(),
-            task: serde_json::json!({"skill": "seo.audit"}),
-        },
         CompanyEvent::ApprovalResolved {
             approval_id: ApprovalId::new("a1"),
             verdict: Verdict::Approve,
@@ -643,4 +639,24 @@ fn task_steered_round_trips_and_omits_empty_fields() {
         serde_json::to_string(&redirect).unwrap(),
         r#"{"kind":"TaskSteered","task_id":"t1","action":"redirect","instruction":"focus on the API"}"#
     );
+}
+
+/// A retired event kind still loads. The journal is append-only, so a row
+/// written by a build that knew `A2aTaskReceived` (the tiny.place inbound A2A
+/// task, removed with tiny.place) must not make the whole log unreadable.
+#[test]
+fn a_retired_a2a_task_row_deserializes_as_unknown() {
+    let legacy = r#"{"kind":"A2aTaskReceived","from":"@peer","task":{"skill":"seo.audit"}}"#;
+    let event: CompanyEvent = serde_json::from_str(legacy).expect("legacy row loads");
+    assert_eq!(event, CompanyEvent::Unknown);
+    assert_eq!(event.kind(), "Unknown");
+}
+
+/// Any kind this build has never heard of — a newer host's event, a typo in a
+/// hand-edited log — falls back the same way rather than failing the read.
+#[test]
+fn an_unrecognised_event_kind_deserializes_as_unknown() {
+    let event: CompanyEvent =
+        serde_json::from_str(r#"{"kind":"SomethingNew"}"#).expect("unknown kind loads");
+    assert_eq!(event, CompanyEvent::Unknown);
 }

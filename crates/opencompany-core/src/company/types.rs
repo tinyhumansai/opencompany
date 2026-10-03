@@ -550,9 +550,6 @@ pub struct CompanyManifest {
     /// Default approval policy.
     #[serde(default)]
     pub policy: Policy,
-    /// tiny.place going-public configuration.
-    #[serde(default)]
-    pub place: Place,
     /// Hard spend ceiling.
     #[serde(default)]
     pub budget: Budget,
@@ -606,9 +603,6 @@ pub struct Company {
     /// The one thing the human owns.
     #[serde(default)]
     pub human_role: Option<String>,
-    /// tiny.place `@handle`; only used when `[place].discoverable = true`.
-    #[serde(default)]
-    pub handle: Option<String>,
     /// Company logo as a self-contained data:image/... URL (issue: operator-set brand logo).
     #[serde(default)]
     pub logo_url: Option<String>,
@@ -1746,30 +1740,7 @@ fn default_always_approve() -> Vec<String> {
         .collect()
 }
 
-/// `[place]` — tiny.place going-public configuration.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Place {
-    /// Going public is opt-in; defaults to false.
-    #[serde(default)]
-    pub discoverable: bool,
-    /// Skills feeding Agent Card generation.
-    #[serde(default)]
-    pub skills: Vec<Skill>,
-}
-
-/// A priced skill advertised on the company's Agent Card.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Skill {
-    /// Skill identifier, e.g. `seo.audit`.
-    pub id: String,
-    /// Decimal USDC price string, e.g. `"25.00"`.
-    pub price_usd: String,
-    /// What the skill delivers.
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-/// `[budget]` — a hard ceiling across inference and x402 spend.
+/// `[budget]` — a hard ceiling across inference and payment spend.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Budget {
     /// Monthly hard cap in USD.

@@ -37,15 +37,6 @@ An Operator boots a real company from a manifest and works with it daily.
   ([integrations/openhuman.md](integrations/openhuman.md)). The JSON-RPC
   launcher/wire path (`openhuman-rpc`) has been removed.
 
-## Stage 2 — Public Company
-
-The company earns: it is discoverable and hireable on tiny.place.
-
-- **Phase 4 — tiny.place economy.** `TinyplaceEconomy` adapter (crate
-  `tinyplace`): keypair identity, handle claim, Agent Card publish, inbound
-  `/a2a/{handle}` with SIWX verification and x402-priced skills, outbound
-  hiring under `[budget]` caps, delegated signers.
-
 ## Stage 3 — Learning Company
 
 The product improves itself and companies remember.
@@ -128,8 +119,8 @@ locally:
 - **Not multi-human companies.** Exactly one Operator per Company.
 - **Not the AVI venture factory (yet).** No autonomous opportunity discovery
   or venture spawning; `vision/` only.
-- **Not custodial finance.** No fiat, no custody beyond the delegated-signer
-  model; x402 USDC only.
+- **Not custodial finance.** No fiat and no custody; the ledger journals
+  spend, it does not hold money.
 - **Not a legal-entity service.** Incorporation, tax, and compliance stay
   with the human.
 - **No private feedback backend, and no telemetry from an install that did not

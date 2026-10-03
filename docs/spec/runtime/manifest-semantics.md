@@ -7,7 +7,7 @@ each page under the 500-line cap.
 ## Semantics
 
 - **`[company]`** becomes the seed of the [Charter](../company-brain/charter.md).
-  `handle` is only used when `[place].discoverable = true`.
+  A `handle` key left over from tiny.place is ignored.
 - **`[[agent]]`** entries define the Roster — or, equivalently, one
   `agents/<id>.toml` file per teammate under the company bundle, carrying the
   same keys with the filename as the id. The two forms are **exclusive**:
@@ -125,12 +125,12 @@ each page under the 500-line cap.
 
   Known limits, stated rather than papered over:
 
-  - **Executed x402 payments escape the counter.** Ledger entries carry no
+  - **Executed payments escape the counter.** Ledger entries carry no
     agent, so there is nothing to attribute them to. What *is* covered is the
     pre-flight case: a call declaring an `amount_usd` that would breach the
     remaining budget parks before the money moves. Company-wide payment
     spending is governed by `[budget].monthly_usd`, which is enforced on the
-    economy path.
+    ledger path.
   - **Turn-boundary overshoot.** A turn or call that starts under the cap can
     finish over it; the overshoot is bounded by one call. There is no
     reservation ledger in v1 — the same documented window `[plan]` carries.
@@ -237,10 +237,10 @@ each page under the 500-line cap.
   through that taxonomy, so the conservative default is the mode, not the
   list. Existing values remain loadable for historical approvals and future
   policy modes.
-- **`[place]`** drives the [going-public flow](../company-as-agent/README.md).
-  `skills` feed Agent Card generation; prices are decimal strings (USDC).
+- **`[place]`** is retired with tiny.place. A manifest or persisted record
+  that still carries it loads; the table is ignored.
 - **`[budget].monthly_usd`** is a hard ceiling enforced by the kernel across
-  inference usage and x402 spend; reaching it pauses the company with an
+  inference usage and payment spend; reaching it pauses the company with an
   operator notification rather than silently degrading.
 - **`[plan]`** (issue #108) gates the exec tool families (`shell`, `code`,
   `web`, `subagent`) by the company's **token spend this period**, a distinct

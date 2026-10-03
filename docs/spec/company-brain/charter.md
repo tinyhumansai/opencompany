@@ -12,11 +12,11 @@ seed layer, not the live record ([runtime/manifest.md](../runtime/manifest.md)).
 
 | Field | Source | Purpose |
 | --- | --- | --- |
-| `name` | manifest `[company].name` | display + Agent Card |
+| `name` | manifest `[company].name` | display |
 | `output` | manifest `[company].output` | one-line what-we-make |
 | `mission` | interview | longer articulation the brain quotes when reasoning |
 | `human_role` | manifest `[company].human_role` | what the Operator keeps |
-| `services` | interview / `[place].skills` | the catalog: id, description, price — source of truth for the Agent Card |
+| `services` | interview | the catalog: id, description, price |
 | `tone` | interview | voice rules for outbound copy |
 | `never_do` | interview | hard prohibitions, enforced as `Deny` in the ApprovalGate |
 | `spend_caps` | `[policy]`, `[budget]` | standing limits |
@@ -56,9 +56,3 @@ The Charter is consulted, not decorative:
 - **ApprovalGate** — `never_do` compiles to `Deny` rules;
   `checkpoint_overrides` and `spend_caps` drive
   Allow/RequireApproval/Deny decisions ([approvals.md](approvals.md)).
-- **Agent Card generation** — `services` deterministically generates the
-  card and `skill.md`
-  ([company-as-agent/identity.md](../company-as-agent/identity.md));
-  publishing a changed card is itself a checkpoint.
-- **Delegated signer caps** — `spend_caps` bound every signer minted
-  ([company-as-agent/commerce.md](../company-as-agent/commerce.md)).

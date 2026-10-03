@@ -379,11 +379,6 @@ projection that retains it. Decide per feature; do not collapse them wholesale.
 
 ## What does not change
 
-**A2A.** `POST /a2a/{handle}` with `tasks/send` is an external protocol contract
-and carries payment. An inbound A2A task becomes a demand, and the externally
-addressable task id survives as its projection. The wire format is not ours to
-change.
-
 **Approvals, metering, budgets.** A claimed demand runs through the same gate,
 meter and caps a dispatched card does.
 

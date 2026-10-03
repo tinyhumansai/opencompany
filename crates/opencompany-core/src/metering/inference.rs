@@ -78,9 +78,8 @@ pub const INFERENCE_SPEND_KIND: &str = "inference.spend";
 ///
 /// Negated **here**, at the one constructor every writer goes through
 /// (`harness::cost`, `metering::planning`, `metering::triage`,
-/// `metering::workflow_build`), rather than at the reader — the x402 outflow in
-/// `economy::adapter` already posts negative, so inverting `finances_from`
-/// would have meant changing that and both server fixtures to match a
+/// `metering::workflow_build`), rather than at the reader — inverting
+/// `finances_from` would have meant changing both server fixtures to match a
 /// convention the docs already state correctly.
 ///
 /// `usage.cost_usd` is a non-zero cost, so the result is strictly negative; the

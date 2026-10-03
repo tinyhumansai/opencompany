@@ -173,7 +173,7 @@ pub const SECRET_REDACTED: &str = "[redacted]";
 /// accident rather than by mistake. The `Debug` half was patched five separate
 /// times on *enclosing* structs — [`RuntimeConfig`](crate::app::config::RuntimeConfig),
 /// [`AppConfig`](crate::app::AppConfig), `ChargebeeConfig`, `MailCredentials`,
-/// `HttpTinyplaceClient` — each time after somebody noticed a live key in a log
+/// and a since-removed HTTP client — each time after somebody noticed a live key in a log
 /// line. That is the failure mode of guarding the container instead of the
 /// contents: it protects the structs that exist and none of the ones written
 /// next.
@@ -1204,13 +1204,6 @@ pub enum CompanyEvent {
         cron: String,
         /// The prompt delivered to the company.
         prompt: String,
-    },
-    /// An A2A task was received from another agent.
-    A2aTaskReceived {
-        /// The sending agent's address.
-        from: String,
-        /// The task payload.
-        task: serde_json::Value,
     },
     /// An effect was parked for the operator's sign-off (issue #379).
     ///
@@ -2765,6 +2758,18 @@ pub enum CompanyEvent {
         /// Epoch-millis the funnel completed.
         at_millis: u64,
     },
+    /// A retired or unrecognised event kind, kept so old journals still load.
+    ///
+    /// The journal is append-only and every store reads it strictly, so a row
+    /// whose `kind` this build does not know would otherwise fail the whole
+    /// read. The motivating case is `A2aTaskReceived`, the inbound tiny.place
+    /// A2A task retired with tiny.place: logs written before then still hold
+    /// it. A newer host's kind read by an older build lands here too.
+    ///
+    /// Carries nothing — the row's fields are not kept — and every consumer
+    /// treats it as a no-op.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CompanyEvent {
@@ -2784,7 +2789,6 @@ impl CompanyEvent {
             Self::RunStatusChanged { .. } => "RunStatusChanged",
             Self::WebhookReceived { .. } => "WebhookReceived",
             Self::ScheduleFired { .. } => "ScheduleFired",
-            Self::A2aTaskReceived { .. } => "A2aTaskReceived",
             Self::ApprovalParked { .. } => "ApprovalParked",
             Self::ApprovalResolved { .. } => "ApprovalResolved",
             Self::ApprovalExtended { .. } => "ApprovalExtended",
@@ -2834,6 +2838,7 @@ impl CompanyEvent {
             Self::WorkflowNodeFinished { .. } => "WorkflowNodeFinished",
             Self::OnboardingStepCompleted { .. } => "OnboardingStepCompleted",
             Self::OnboardingCompleted { .. } => "OnboardingCompleted",
+            Self::Unknown => "Unknown",
         }
     }
 
@@ -2951,7 +2956,6 @@ impl CompanyEvent {
             | Self::TurnFailed { .. }
             | Self::WebhookReceived { .. }
             | Self::ScheduleFired { .. }
-            | Self::A2aTaskReceived { .. }
             | Self::ApprovalParked { .. }
             | Self::ApprovalResolved { .. }
             | Self::ApprovalExtended { .. }
@@ -3030,6 +3034,11 @@ impl CompanyEvent {
             // retention pass must not be allowed to quietly erase.
             | Self::OnboardingStepCompleted { .. }
             | Self::OnboardingCompleted { .. } => Permanent,
+            // A retired or unrecognised kind. A retention pass cannot judge
+            // what it cannot read, so it keeps it: the row may be a newer
+            // host's evidence, and discarding it would be the one irreversible
+            // answer to a question this build cannot ask.
+            Self::Unknown => Permanent,
             // Issue #617: permanent, and it is the clearest kind of evidence
             // this enum carries — the record that a consequential call ran
             // WITHOUT the operator being asked. Pruning it would delete the only
@@ -6689,139 +6698,6 @@ pub struct CompanySummary {
     pub name: String,
     /// Lifecycle state.
     pub lifecycle: String,
-}
-
-// ---------------------------------------------------------------------------
-// Agent economy (tiny.place seam)
-// ---------------------------------------------------------------------------
-
-/// A company's tiny.place identity.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CompanyIdentity {
-    /// The company id.
-    pub company: CompanyId,
-    /// The tiny.place `@handle`.
-    pub handle: String,
-}
-
-/// The registration state of a company on tiny.place.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum RegistrationState {
-    /// Not yet registered.
-    Unregistered,
-    /// Registered under this address.
-    Registered {
-        /// The registered agent address.
-        addr: AgentAddr,
-    },
-}
-
-/// A published Agent Card advertising a company's skills on tiny.place.
-///
-/// The three original fields (`handle`, `description`, `skills`) are unchanged;
-/// every field added for the A2A wire shape carries `#[serde(default)]` so
-/// records written by earlier phases round-trip without loss.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AgentCard {
-    /// The advertised `@handle`.
-    pub handle: String,
-    /// A short description of the company.
-    pub description: String,
-    /// The advertised skill ids.
-    pub skills: Vec<String>,
-    /// Human-readable display name (the company name).
-    #[serde(default)]
-    pub name: String,
-    /// The actor kind; always `"agent"` for a company.
-    #[serde(default)]
-    pub actor_type: String,
-    /// The A2A endpoint, e.g. `https://host/a2a/{handle}`.
-    #[serde(default)]
-    pub endpoint: String,
-    /// Interfaces the endpoint speaks, e.g. `["a2a-jsonrpc"]`.
-    #[serde(default)]
-    pub supported_interfaces: Vec<String>,
-    /// Capability tokens derived from the advertised skills.
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    /// Free-form discovery tags.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Per-skill payment requirements advertised to counterparties.
-    #[serde(default)]
-    pub payment_requirements: Vec<CardPayment>,
-}
-
-/// A single priced skill on an [`AgentCard`], in x402 terms.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CardPayment {
-    /// The skill this price applies to.
-    pub skill_id: String,
-    /// The decimal price string, e.g. `"25.00"`.
-    pub price: String,
-    /// The settlement asset, e.g. `"USDC"`.
-    pub asset: String,
-    /// The settlement network, e.g. `"solana"`.
-    pub network: String,
-}
-
-/// An addressable agent on tiny.place.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AgentAddr(pub String);
-
-/// A task sent agent-to-agent.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct A2aTask {
-    /// The requested skill id.
-    pub skill: String,
-    /// The task input.
-    pub input: serde_json::Value,
-}
-
-/// A handle to a dispatched A2A task.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct A2aTaskHandle(pub String);
-
-/// A payment requirement quoted by a counterparty.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PaymentRequirement {
-    /// The counterparty address.
-    pub to: AgentAddr,
-    /// The amount due, in USD.
-    pub amount_usd: f64,
-    /// What the payment is for.
-    pub memo: String,
-}
-
-/// A firm quote a company can pay against.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Quote {
-    /// A unique quote id.
-    pub quote_id: String,
-    /// The counterparty address.
-    pub to: AgentAddr,
-    /// The quoted amount, in USD.
-    pub amount_usd: f64,
-}
-
-/// The budget envelope a payment must fit within.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BudgetScope {
-    /// The remaining budget for this scope, in USD.
-    pub remaining_usd: f64,
-    /// A label describing the scope (e.g. an agent id).
-    pub label: String,
-}
-
-/// A receipt for a completed payment.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PaymentReceipt {
-    /// The quote that was paid.
-    pub quote_id: String,
-    /// The amount paid, in USD.
-    pub amount_usd: f64,
-    /// Epoch-millis timestamp of the payment.
-    pub at_millis: u64,
 }
 
 #[cfg(test)]

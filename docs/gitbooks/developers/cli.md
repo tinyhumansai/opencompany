@@ -25,7 +25,6 @@ opencompany serve --company companies/marketing_agency
 | `--bind <ADDR>` | Address to bind. Falls back to `OPENCOMPANY_BIND`, then to `config.toml`'s `bind`, then to `127.0.0.1:8080` — see [bind precedence](configuration.md#bind-precedence). |
 | `--company <DIR>` | A company to load at boot — a manifest file or a directory containing one. **Repeatable** for multi-company hosting. |
 | `--home <DIR>` | OpenCompany home holding company bundles (`<home>/companies/<slug>`). Falls back to `OPENCOMPANY_DATA_DIR`, then to `$HOME/.opencompany`. |
-| `--discoverable` | Opt every loaded company into going public on [tiny.place](../overview/tiny-place.md), regardless of each manifest's `[place].discoverable`. Needs the `tinyplace` feature to reach the network. |
 | `--openhuman-root <PATH>` | Records that an OpenHuman checkout is configured. Reporting only: `/spec` surfaces it as `openhuman_configured` (a boolean, never the path), and nothing else reads it — it does not choose a checkout to run. To launch one, see [`open-human`](#open-human), which takes its own `--root`. |
 
 ## `check`
