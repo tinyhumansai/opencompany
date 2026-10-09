@@ -80,6 +80,25 @@ describe("DeskRoutingPanel", () => {
     expect((panel.querySelector('[data-testid="desk-routing-round_width"]') as HTMLInputElement).value).toBe("2");
   });
 
+  it("shows the host failure when the first routing read rejects", async () => {
+    const { stub, getDeskRouting } = client(dto());
+    let reject!: (reason: Error) => void;
+    const pending = new Promise<DeskRoutingDto>((_resolve, rejectRead) => {
+      reject = rejectRead;
+    });
+    getDeskRouting.mockReturnValueOnce(pending);
+    const loading = await render(stub);
+    expect(loading.dataset.state).toBe("loading");
+    expect(loading.textContent).toContain("Reading routing");
+
+    await act(async () => reject(new Error("Routing read failed: HTTP 503")));
+
+    const panel = host.querySelector('[data-testid="desk-routing-panel"]') as HTMLElement;
+    expect(panel.dataset.state).toBe("error");
+    expect(panel.textContent).toBe("Routing read failed: HTTP 503");
+    expect(host.textContent).not.toContain("Reading routing");
+  });
+
   it("installs the edited block and re-renders from the host's answer", async () => {
     const { stub, putDeskRouting } = client(dto());
     const panel = await render(stub);
