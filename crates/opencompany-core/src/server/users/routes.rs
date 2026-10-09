@@ -627,6 +627,54 @@ pub(crate) async fn mint_session(
     Ok(([(header::SET_COOKIE, set)], body).into_response())
 }
 
+/// Mints a browser session for `user` and returns its `Set-Cookie` header value,
+/// split out of [`mint_session`] so a handler with its own response body —
+/// first-run setup's `AppliedDto` — can sign the operator in without having to
+/// emit [`mint_session`]'s `SignInResult`. The cookie's attributes still come
+/// from [`cookie::set_cookie`] and the value from [`create_session`], so a
+/// session minted here is indistinguishable from one minted by any other login
+/// path.
+///
+/// Cookie-only, with no header-carrier branch, because its one caller — the SSO
+/// bootstrap setup apply — is always same-origin: the platform SSO link lands
+/// the operator in the host's own console (where the console's `needsCarriedSession`
+/// is false), and the apply is an ordinary `post` that never asks for the header
+/// carrier. A cross-origin login still receives the header carrier through
+/// [`mint_session`], which every cross-origin sign-in path already routes through.
+pub(crate) async fn mint_session_cookie(
+    state: &AppState,
+    runtime: &CompanyRuntime,
+    user: &UserRecord,
+    headers: &HeaderMap,
+) -> Result<String, crate::server::Rejection> {
+    let company = runtime.id();
+    let Some(name) = cookie::session_cookie_name(company) else {
+        return Err(ApiError(OpenCompanyError::InvalidRequest(
+            "this company's id cannot carry a session cookie".to_string(),
+        ))
+        .into_response()
+        .into());
+    };
+    let plaintext = create_session(
+        runtime,
+        user,
+        SessionKind::Browser,
+        None,
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.chars().take(200).collect()),
+    )
+    .await?;
+    let insecure = !state.config().host_base_url().starts_with("https://");
+    Ok(cookie::set_cookie(
+        &name,
+        &plaintext,
+        token::SESSION_TTL_MILLIS / 1000,
+        insecure,
+    ))
+}
+
 fn me_result(company: &CompanyId, user: &UserRecord) -> MeResult {
     MeResult {
         id: user.id.clone(),

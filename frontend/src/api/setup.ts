@@ -107,6 +107,13 @@ export interface SetupStatus {
   inference: InferenceReady;
   /** What this host can do with a mailbox. */
   mail: MailReady;
+  /**
+   * Whether this GET was authorized by the platform SSO bootstrap session — the
+   * console arrived via the dashboard's one-click SSO. When true the wizard
+   * skips the sign-in step and sends no password: the apply signs that owner in
+   * directly. Absent on a host too old to report it (treated as `false`).
+   */
+  sso_bootstrap?: boolean;
 }
 
 /**

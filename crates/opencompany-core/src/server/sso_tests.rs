@@ -199,6 +199,17 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// The `name=value` pair from a response's `Set-Cookie`, ready to hand straight
+/// back as a `Cookie` request header, or `None` when the response set no cookie.
+///
+/// Read from the headers before [`body_json`] consumes the response.
+fn session_cookie(response: &axum::response::Response) -> Option<String> {
+    let set = response.headers().get("set-cookie")?.to_str().ok()?;
+    // `cookie::set_cookie` renders `name=value; Path=/; …`; a browser sends back
+    // only the pair before the first attribute.
+    set.split(';').next().map(|pair| pair.trim().to_string())
+}
+
 async fn redeem(state: &AppState, token: &str) -> axum::response::Response {
     router(state.clone())
         .oneshot(post(
@@ -305,6 +316,144 @@ async fn the_platform_owner_can_redeem_into_setup_on_a_routable_empty_host() {
         .await
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn setup_via_sso_bootstrap_signs_the_owner_in_without_a_password() {
+    // The one-click dashboard SSO lands on an empty host. The owner must finish
+    // setup signed in — no password step, no second sign-in. GET /setup flags the
+    // bootstrap arrival so the wizard can skip the sign-in step, and the POST
+    // /setup that seeds the company signs the owner in with a `Set-Cookie` that
+    // authenticates the console directly.
+    let home = home();
+    let state = empty_routable_state(home.path());
+
+    // Redeem the per-tenant SSO token to establish the bootstrap session.
+    let redeemed = router(state.clone())
+        .oneshot(post(
+            "/api/v1/sso/redeem",
+            serde_json::json!({ "token": valid_token() }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), StatusCode::OK);
+    let session = body_json(redeemed).await["session"]
+        .as_str()
+        .expect("bootstrap session")
+        .to_string();
+
+    // GET /setup on that session advertises the bootstrap arrival.
+    let read = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/setup")
+                .header(SESSION_HEADER, &session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(read).await["sso_bootstrap"],
+        serde_json::Value::Bool(true),
+        "GET /setup must flag an SSO bootstrap arrival"
+    );
+
+    // POST /setup seeds a company from a template and sends NO admin_password —
+    // the owner is signed in by the apply, not a credential they set. No carrier
+    // header: the SSO bootstrap console is same-origin, so the apply signs the
+    // owner in with a `Set-Cookie`, exactly as it does in production.
+    let applied = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/setup")
+                .header("content-type", "application/json")
+                .header(SESSION_HEADER, &session)
+                .body(Body::from(
+                    serde_json::json!({
+                        "fields": {},
+                        "template": crate::desktop::DEFAULT_PRESET_ID,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), StatusCode::OK);
+    let cookie =
+        session_cookie(&applied).expect("apply must sign the SSO owner in with a session cookie");
+    let seeded = body_json(applied).await["seeded_company"]
+        .as_str()
+        .expect("a company was seeded")
+        .to_string();
+
+    // That cookie authenticates the configured console — signed in, with no
+    // password ever set.
+    let me = router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/companies/{seeded}/auth/me"))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        me.status(),
+        StatusCode::OK,
+        "the session cookie must authenticate the configured console without a password"
+    );
+    assert_eq!(body_json(me).await["email"], "ada@example.com");
+}
+
+#[tokio::test]
+async fn a_plain_first_run_without_a_bootstrap_session_sets_no_cookie() {
+    // Only an SSO bootstrap arrival is signed in by the apply. An ordinary first
+    // run — a local host configuring itself with no bootstrap session — must fall
+    // through to a sessionless response: `apply_response` proved no owner, so it
+    // has nobody to sign in and sets no cookie. (The "owner is not a standing
+    // admin" fall-through is unreachable to assert: `bootstrap_setup_subject` and
+    // `bootstrap_admins` both derive the owner from `config.bootstrap_admin()`, so
+    // a proven owner is always in the standing list — this covers the reachable
+    // no-owner path instead.)
+    let home = home();
+    // The `AppConfig::default` bind is loopback, so `authorize` admits a local,
+    // header-less setup with no session — the `is_local_only` branch.
+    let state = AppState::new(AppConfig::default())
+        .with_home(home.path().to_path_buf())
+        .with_connections(ConnectionsRuntime::new());
+    assert!(state.registry().is_empty());
+
+    let applied = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "fields": {},
+                        "template": crate::desktop::DEFAULT_PRESET_ID,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.status(), StatusCode::OK);
+    assert!(
+        session_cookie(&applied).is_none(),
+        "a setup with no SSO bootstrap owner must not mint a session cookie"
+    );
+    assert!(
+        body_json(applied).await["seeded_company"].is_string(),
+        "the plain first run still seeds a company"
+    );
 }
 
 #[tokio::test]

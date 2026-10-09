@@ -333,6 +333,11 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
   const onNameLocalHost = useOptionalHosts()?.onNameLocalHost;
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // The console arrived via the dashboard's one-click SSO (an empty-host
+  // bootstrap session): `apply` signs that owner straight in, so the wizard
+  // skips the sign-in step and sends no password. False on a host too old to
+  // report it, which keeps the old password flow unchanged.
+  const ssoBootstrap = status?.sso_bootstrap ?? false;
   /**
    * Where the operator is, held as a step **id** rather than an index.
    *
@@ -617,8 +622,10 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
     const address = email.trim();
 
     // No status means the read failed and we cannot tell what mode this host is
-    // in; opening the console is the answer that cannot be wrong.
-    if (!company || !address || !status || !requiresSignIn(status, values)) {
+    // in; opening the console is the answer that cannot be wrong. The SSO path
+    // opens here too: `apply` already set this owner's session cookie, so the
+    // console lands signed in — a password login would be a step with no input.
+    if (!company || !address || !status || !requiresSignIn(status, values) || ssoBootstrap) {
       setHandoff({ kind: "open" });
       return;
     }
@@ -627,7 +634,7 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
     loginWithPassword(client, company, address, adminPassword)
       .then((signIn) => setHandoff({ kind: "signed-in", signIn }))
       .catch(() => setHandoff({ kind: "password" }));
-  }, [applied, email, adminPassword, client, status, values]);
+  }, [applied, email, adminPassword, client, status, values, ssoBootstrap]);
 
   // See `changedFields`: unchanged fields are omitted, env-owned ones are never
   // sent (the host refuses them and an apply is all-or-nothing), and a secret
@@ -734,10 +741,12 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
           (!BRANCH_STEP_IDS.includes(s.id) || tested.kind !== "hosted") &&
           (s.id !== "setup-way" || asksSetupWay) &&
           (!isStepOne(s.id) || (setupWay !== null && STEP_ONE_FOR[setupWay] === s.id)) &&
-          (s.id !== "account" || !status || requiresSignIn(status, values)) &&
+          // The SSO owner is signed in by `apply`, so the account (sign-in) step
+          // is skipped entirely — no email, no password to set.
+          (s.id !== "account" || !status || (requiresSignIn(status, values) && !ssoBootstrap)) &&
           (s.id !== "advanced" || ADVANCED_GROUPS.length > 0),
       ),
-    [status, values, tested, asksSetupWay, setupWay],
+    [status, values, tested, asksSetupWay, setupWay, ssoBootstrap],
   );
 
   // A position whose step is no longer shown falls back to the start. That is
@@ -939,7 +948,10 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
         // standing invite, so the hand-off below can sign them straight in.
         // Only where somebody will sign in: a `none`-mode host has nobody to
         // distinguish and the host ignores it there anyway.
-        admin_password: requiresSignIn(status, values) ? adminPassword : null,
+        // No password on the SSO path: `apply` signs the bootstrap owner in
+        // directly, so a generated password they would never use is not set.
+        admin_password:
+          requiresSignIn(status, values) && !ssoBootstrap ? adminPassword : null,
         // Deferred to here rather than sent from the step that collected it:
         // the fan-out writes a company's slots, and the company is what this
         // request creates. Carried past the template/designed fork because the
