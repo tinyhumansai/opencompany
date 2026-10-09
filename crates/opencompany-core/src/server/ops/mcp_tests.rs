@@ -1,6 +1,6 @@
 use super::*;
 use crate::company::CompanyManifest;
-use crate::ports::types::{CompanyId, OverlayAgent, OverlayDesk};
+use crate::ports::types::{CompanyId, CompanyRecord, OverlayAgent, OverlayDesk};
 
 /// A company allowing two MCP families, with one manifest agent that lists
 /// none (so it inherits both).
@@ -250,4 +250,22 @@ fn a_retired_manifest_teammate_is_not_a_reacher() {
         !grants.iter().any(|(agent, _)| agent.id == "ceo"),
         "a retired teammate is off the effective roster"
     );
+}
+
+#[test]
+fn roster_access_counts_console_added_grants() {
+    use crate::ports::types::{Actor, ActorKind, ToolGrantsOverride};
+    let mut record = record(Vec::new());
+    record.overlay_tool_grants = Some(ToolGrantsOverride {
+        added: vec!["mcp_registry".to_string()],
+        set_by: Actor {
+            kind: ActorKind::User,
+            id: "admin-1".to_string(),
+        },
+        at_millis: 1_700_000_000_000,
+    });
+    let access = access::roster_access(&record);
+    let ceo = access.iter().find(|a| a.agent.id == "ceo").expect("ceo");
+    assert!(ceo.ceiling.iter().any(|g| g == "mcp_registry"));
+    assert!(ceo.effective.iter().any(|g| g == "mcp_registry"));
 }

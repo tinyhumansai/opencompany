@@ -32,7 +32,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { TeammateAvatar } from "@/components/teammate-avatar";
+import { AgentAccessList } from "@/components/agent-access-list";
 import { consoleHref } from "@/lib/console-paths";
 import {
   SCOPE_CLEARS_TO_INHERITED_WARNING,
@@ -44,7 +44,12 @@ import {
   toggleSkillInScope,
 } from "@/lib/skill-scope";
 import { skillSourceLabel } from "@/lib/skills-list";
-import { avatarFor, teammateName } from "@/lib/team";
+import { teammateName } from "@/lib/team";
+import {
+  partialSaveMessage,
+  saveAgentAccess,
+  type AgentAccessWrite,
+} from "@/lib/agent-access-save";
 import { SkillPlaybook } from "@/views/skills/SkillPlaybook";
 
 /** Why the picker is read-only although the page opened. */
@@ -164,64 +169,38 @@ export function SkillPage({
     if (!skill || missingStoredList) return;
     setSaving(true);
     setProblem(null);
-    const total = pending.length;
-    let done = 0;
-    let failure: { agent: string; message: string } | null = null;
+    const writes: AgentAccessWrite[] = [];
     for (const agent of pending) {
-      const member = rosterById.get(agent.id);
-      const scope = member?.skills;
-      if (!scope) {
-        failure = {
-          agent: agent.id,
-          message: "this host did not report its skill list",
-        };
-        break;
-      }
-      try {
-        // `null` resets the teammate to inheriting. Writing the list that names
-        // everybody instead would leave it pinned to today's set, which is the
-        // state this mode exists to clear.
-        //
-        // Otherwise the whole list, computed from what that teammate *stores*:
-        // a body of `[skill.id]` is a legal narrowing the host accepts, and it
-        // would strip every other skill this teammate has.
-        const next =
-          mode === "all"
-            ? null
-            : toggleSkillInScope(
-                scope.requested,
-                scope.companyAvailable,
-                skill.id,
-                ticked(agent),
-              );
-        await client.updateAgent(agent.id, { skills: next }, company);
-        setMoved((all) => {
-          const rest = { ...all };
-          delete rest[agent.id];
-          return rest;
-        });
-        done += 1;
-      } catch (e) {
-        failure = {
-          agent: agent.id,
-          message: e instanceof Error ? e.message : "the host refused it",
-        };
-        break;
-      }
+      const scope = rosterById.get(agent.id)?.skills;
+      if (!scope) break;
+      // `null` hands the teammate back to inheriting; otherwise the whole list,
+      // computed from what that teammate stores, never `[skill.id]` alone.
+      const next =
+        mode === "all"
+          ? null
+          : toggleSkillInScope(
+              scope.requested,
+              scope.companyAvailable,
+              skill.id,
+              ticked(agent),
+            );
+      writes.push({ agentId: agent.id, input: { skills: next } });
     }
+    const outcome = await saveAgentAccess(client, company, writes, (agentId) =>
+      setMoved((all) => {
+        const rest = { ...all };
+        delete rest[agentId];
+        return rest;
+      }),
+    );
     setSaving(false);
     onSaved();
-    if (failure === null) {
+    const message = partialSaveMessage(outcome, (id) => teammateName(id, team), "Scoped");
+    if (message === null) {
       onClose();
       return;
     }
-    const unsent = total - done - 1;
-    setProblem(
-      `Scoped ${done} of ${total} teammates. Failed on ${failure.agent}: ${failure.message}.` +
-        (unsent > 0
-          ? ` The other ${unsent} ${unsent === 1 ? "was" : "were"} not changed — review and save again.`
-          : ""),
-    );
+    setProblem(message);
   }
 
   if (!skill) return null;
@@ -370,69 +349,31 @@ export function SkillPage({
             )}
 
             {(mode === "selected" || !canManage) && (
-              <div
-                className="divide-y rounded-lg border"
-                data-testid="skill-detail-agents"
-              >
-                {agents.map((agent) => (
-                  <div
-                    key={agent.id}
-                    className="flex items-center justify-between gap-3 px-3 py-2"
-                  >
-                    <label
-                      className="flex min-w-0 items-center gap-2"
-                      htmlFor={`skill-agent-${agent.id}`}
+              <AgentAccessList
+                rows={agents.map((agent) => ({
+                  id: agent.id,
+                  ticked: ticked(agent),
+                  holds: agent.holds,
+                  detail: (
+                    <a
+                      href={consoleHref("team", agent.id)}
+                      className="text-2xs text-muted-foreground transition-opacity hover:opacity-80"
+                      data-testid={`skill-agent-link-${agent.id}`}
                     >
-                      {canManage ? (
-                        <input
-                          type="checkbox"
-                          id={`skill-agent-${agent.id}`}
-                          checked={ticked(agent)}
-                          disabled={saving}
-                          data-testid={`skill-agent-toggle-${agent.id}`}
-                          onChange={(e) => {
-                            setRevealed(true);
-                            setMoved((all) => ({
-                              ...all,
-                              [agent.id]: e.target.checked,
-                            }));
-                          }}
-                        />
-                      ) : null}
-                      <TeammateAvatar
-                        name={teammateName(agent.id, team)}
-                        avatar={avatarFor(agent.id)}
-                        className="size-6 shrink-0"
-                      />
-                      <span className="min-w-0 truncate text-sm">
-                        {teammateName(agent.id, team)}
-                      </span>
-                    </label>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {/* What is true now, not what the tick would make true:
-                          a draft the operator has not saved must not read as
-                          reach it already has. */}
-                      <span
-                        className={
-                          agent.holds
-                            ? "text-2xs text-status-done-text"
-                            : "text-2xs text-muted-foreground"
-                        }
-                        data-testid={`skill-agent-reach-${agent.id}`}
-                      >
-                        {agent.holds ? "Reached" : "Not reached"}
-                      </span>
-                      <a
-                        href={consoleHref("team", agent.id)}
-                        className="text-2xs text-muted-foreground transition-opacity hover:opacity-80"
-                        data-testid={`skill-agent-link-${agent.id}`}
-                      >
-                        {stateLabel(agent)}
-                      </a>
-                    </div>
-                  </div>
-                ))}
-              </div>
+                      {stateLabel(agent)}
+                    </a>
+                  ),
+                }))}
+                team={team}
+                editable={canManage}
+                disabled={saving}
+                listTestId="skill-detail-agents"
+                rowTestIdPrefix="skill"
+                onToggle={(id, on) => {
+                  setRevealed(true);
+                  setMoved((all) => ({ ...all, [id]: on }));
+                }}
+              />
             )}
 
             <p className="text-xs text-muted-foreground">

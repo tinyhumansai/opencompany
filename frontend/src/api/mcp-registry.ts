@@ -28,7 +28,7 @@
 // build, not a failure. Callers classify that with
 // [`registryOutage`](@/lib/mcp-registry) rather than showing the raw error.
 
-import type { OpenCompanyClient } from "./client";
+import type { OpenCompanyClient, RequestOptions } from "./client";
 import { ApiError } from "./types";
 import type { McpHealth, McpServer } from "./types";
 import type { McpAuthKind } from "./mcp";
@@ -129,6 +129,7 @@ export async function searchMcpRegistry(
   client: OpenCompanyClient,
   company: string | null,
   query: { q?: string; page?: number; pageSize?: number },
+  options?: RequestOptions,
 ): Promise<McpCatalogueSearch> {
   const params = new URLSearchParams();
   if (query.q?.trim()) params.set("q", query.q.trim());
@@ -137,6 +138,7 @@ export async function searchMcpRegistry(
   const suffix = params.toString();
   const body = await client.get<unknown>(
     `${client.scopeFor(company)}/mcp/registry/search${suffix ? `?${suffix}` : ""}`,
+    options,
   );
   return expectCatalogue(body);
 }
@@ -146,9 +148,11 @@ export function getMcpRegistryEntry(
   client: OpenCompanyClient,
   company: string | null,
   qualifiedName: string,
+  options?: RequestOptions,
 ): Promise<McpCatalogueDetail> {
   return client.get<McpCatalogueDetail>(
     `${client.scopeFor(company)}/mcp/registry/entry?qualifiedName=${encodeURIComponent(qualifiedName)}`,
+    options,
   );
 }
 

@@ -44,6 +44,7 @@ import {
   McpServerIcon,
   type PrimaryAction,
 } from "@/views/connections/McpServerTable";
+import { McpAgentAccess } from "@/views/mcp/McpAgentAccess";
 import { McpToolPermissions } from "@/views/mcp/McpToolPermissions";
 
 const PROVENANCE_LABELS: Record<string, string> = {
@@ -82,6 +83,8 @@ interface Props {
   /** Absent when this row cannot be removed from the console. */
   onDisconnect: (() => void) | null;
   onBack: () => void;
+  /** Re-read the server list after an access change. */
+  onAccessSaved: () => void;
 }
 
 /** One MCP server: what it is, who can reach it, and what its tools may do. */
@@ -101,6 +104,7 @@ export function McpServerPage({
   onPrimary,
   onDisconnect,
   onBack,
+  onAccessSaved,
 }: Props) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const standing = mcpStanding(server, health);
@@ -245,41 +249,43 @@ export function McpServerPage({
         />
       </section>
 
-      {bridge !== "absent" && standing.live && reach !== undefined && (
-        <section className="space-y-2">
-          <div className="flex items-center justify-between gap-2">
+      {bridge !== "absent" && server.enabled && reach !== undefined && reach.length === 0 && (
+        <p
+          className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive"
+          data-testid="mcp-page-reachability"
+        >
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            No agent can reach this server yet — no teammate&apos;s tool grants
+            cover <code className="font-mono">{server.accessGrant ?? `mcp:${server.name}`}</code>.
+          </span>
+        </p>
+      )}
+
+      {bridge !== "absent" && server.agentAccess !== undefined ? (
+        <McpAgentAccess
+          client={client}
+          company={company}
+          server={server}
+          canManage={canManage}
+          onSaved={onAccessSaved}
+        />
+      ) : (
+        bridge !== "absent" &&
+        standing.live &&
+        reach !== undefined &&
+        reach.length > 0 && (
+          <section className="space-y-2">
             <h3 className="text-sm font-medium">Agents with access</h3>
-            <a
-              href="#/company"
-              className="text-xs font-medium text-muted-foreground underline"
-              data-testid="mcp-page-edit-agents"
-            >
-              Edit agents
-            </a>
-          </div>
-          {reach.length === 0 ? (
-            <p
-              className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive"
-              data-testid="mcp-page-reachability"
-            >
-              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-              <span>
-                No agent can reach this server — no tool grant covers{" "}
-                <code className="font-mono">mcp:{server.name}</code>, so the
-                permissions above are inert. Add the grant in{" "}
-                <code className="font-mono">company.toml</code>.
-              </span>
-            </p>
-          ) : (
-            <div className="flex flex-wrap gap-1.5" data-testid="mcp-page-reachability">
+            <div className="flex flex-wrap gap-1.5" data-testid="mcp-page-reach-list">
               {reach.map((agent) => (
                 <Badge key={agent.id} variant="secondary" className="font-normal">
                   {agent.name}
                 </Badge>
               ))}
             </div>
-          )}
-        </section>
+          </section>
+        )
       )}
 
       <UsageSection

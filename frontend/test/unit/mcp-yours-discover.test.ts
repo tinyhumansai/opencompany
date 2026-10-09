@@ -206,7 +206,7 @@ describe("Yours", () => {
       q: "linear",
       page: 1,
       pageSize: 20,
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 });
 
@@ -234,7 +234,7 @@ describe("Discover", () => {
       q: undefined,
       page: 1,
       pageSize: 20,
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(testId("mcp-discover")?.textContent).toContain("Top connectors");
     expect(all('[data-testid="mcp-discover-card"]')).toHaveLength(2);
     expect(all('[data-testid="mcp-discover-verified"]')).toHaveLength(2);
@@ -288,7 +288,7 @@ describe("Discover", () => {
       q: "github",
       page: 1,
       pageSize: 20,
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(testId("mcp-discover")?.textContent).toContain("Results");
   });
 

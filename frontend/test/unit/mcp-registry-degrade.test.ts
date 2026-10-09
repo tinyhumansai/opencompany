@@ -59,10 +59,43 @@ describe("registryOutage", () => {
     }
   });
 
+  it("never shows a harness error's internal wording", () => {
+    const outage = registryOutage(
+      new ApiError(
+        500,
+        "harness_error",
+        "harness error: mcp registry search failed: mcp transport failure for `https://registry.modelcontextprotocol.io`: error sending request",
+      ),
+    );
+    expect(outage).toEqual({
+      kind: "error",
+      message: "The MCP directory didn't answer. Try again in a moment.",
+    });
+  });
+
+  it("passes the host's typed directory sentences through", () => {
+    for (const code of ["registry_timeout", "registry_unavailable"]) {
+      const outage = registryOutage(
+        new ApiError(504, code, "The MCP directory is taking too long to search right now."),
+      );
+      expect(outage).toEqual({
+        kind: "error",
+        message: "The MCP directory is taking too long to search right now.",
+      });
+    }
+  });
+
+  it("reads the console's own request deadline as a slow directory", () => {
+    const outage = registryOutage(
+      new ApiError(0, "timeout", "the company host at http://x did not respond in time"),
+    );
+    expect(outage.kind === "error" && outage.message).toContain("taking too long");
+  });
+
   it("falls back to its own sentence when the host's envelope was blank", () => {
     expect(registryOutage(new ApiError(500, "boom", "   "))).toEqual({
       kind: "error",
-      message: "The MCP directory didn't answer.",
+      message: "The MCP directory didn't answer. Try again in a moment.",
     });
   });
 });

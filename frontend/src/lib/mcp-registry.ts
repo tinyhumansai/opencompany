@@ -188,12 +188,19 @@ export type McpRegistryOutage = { kind: "unwired" } | { kind: "error"; message: 
 export function registryOutage(err: unknown): McpRegistryOutage {
   if (err instanceof ApiError) {
     if (err.code === "not_wired") return { kind: "unwired" };
-    // The host's own sentence when it sent one; its envelope is prose meant for
-    // an operator. A network failure carries our sentence instead.
+    if (err.code === "timeout") return { kind: "error", message: DIRECTORY_SLOW };
+    if (OPAQUE_CODES.has(err.code)) return { kind: "error", message: DIRECTORY_DOWN };
     if (err.message.trim()) return { kind: "error", message: err.message };
   }
-  return { kind: "error", message: "The MCP directory didn't answer." };
+  return { kind: "error", message: DIRECTORY_DOWN };
 }
+
+const DIRECTORY_DOWN = "The MCP directory didn't answer. Try again in a moment.";
+const DIRECTORY_SLOW =
+  "The MCP directory is taking too long to answer. Try again in a moment.";
+
+/** Codes whose message is internal detail, not prose for an operator. */
+const OPAQUE_CODES = new Set(["harness_error", "internal", "unexpected_shape"]);
 
 /** What the console says when the directory surface is missing from the build. */
 export const REGISTRY_UNWIRED_NOTICE =

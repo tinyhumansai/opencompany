@@ -79,6 +79,7 @@ async function mount(over: Partial<McpServer> = {}) {
         onPrimary: () => {},
         onDisconnect: null,
         onBack: () => {},
+        onAccessSaved: () => {},
       }),
     );
   });

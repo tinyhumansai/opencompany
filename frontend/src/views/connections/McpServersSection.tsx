@@ -37,6 +37,7 @@ import {
 } from "@/api/types";
 import { type McpBridgeState, mcpBridgeState } from "@/lib/mcp-bridge";
 import {
+  mcpDisplayName,
   missingEnvKeys,
   mcpRowControls,
   REGISTRY_UNWIRED_NOTICE,
@@ -89,6 +90,16 @@ import {
 } from "@/views/mcp/McpConnectDialog";
 import { McpJsonEditor } from "@/views/mcp/McpJsonEditor";
 import { McpServerPage } from "@/views/mcp/McpServerPage";
+import { type SignInWatch, watchSignIn } from "@/lib/mcp-sign-in-watch";
+
+/** The toast a finished browser sign-in raises. */
+export function signedInMessage(
+  server: Pick<McpServer, "name" | "probedTitle">,
+  health: Pick<McpHealth, "toolCount">,
+): string {
+  const n = health.toolCount;
+  return `Connected to ${mcpDisplayName(server)} · ${n} tool${n === 1 ? "" : "s"}`;
+}
 
 /**
  * What a server's health entitles its row to offer (issues #1260, #1270).
@@ -198,14 +209,7 @@ export function McpServersSection({
   const [tools, setTools] = useState<Record<string, ToolsState>>({});
   // Live health from an on-demand re-check, overriding the persisted badge.
   const [tested, setTested] = useState<Record<string, McpHealth>>({});
-  // In-flight OAuth sign-in poll timers, keyed by server name. A row with a live
-  // timer is still "signing in" even after its `busy` flag clears, so a repeat
-  // click can't spawn a second overlapping poll.
-  const pollTimers = useRef<Record<string, number>>({});
-  // Names the operator cancelled mid-flight — checked after the poll's own
-  // await resolves, since by then `pollTimers` may already hold a new timer
-  // for the same name with nothing to clear.
-  const cancelledSignIns = useRef<Set<string>>(new Set());
+  const watches = useRef<Record<string, SignInWatch>>({});
   const [signIns, setSignIns] = useState<Record<string, SignInFlight>>({});
   // Opens the detail panel on the permissions section. Kept as its own key so
   // links already written against it keep landing where they meant to.
@@ -251,10 +255,6 @@ export function McpServersSection({
   const [envFields, setEnvFields] = useState<EnvFields>({ kind: "loading" });
   const [envDraft, setEnvDraft] = useState<Record<string, string>>({});
   const [envError, setEnvError] = useState<string | null>(null);
-  // Set by the unmount cleanup below. A sign-in poll that is mid-`await` when
-  // this component goes away has already removed its own timer entry, so the
-  // cleanup has nothing left to cancel — it checks this instead of re-arming.
-  const unmounted = useRef(false);
   // Which company's answers are still wanted, bumped whenever the scope changes.
   // `refresh` reads it before asking and again on arrival, and drops the answer
   // if it moved: without this, switching company while the list request is in
@@ -324,15 +324,21 @@ export function McpServersSection({
     };
   }, [client, company]);
 
-  // Cancel any in-flight sign-in polls when the view unmounts so their timers
-  // don't fire against a torn-down component, and tell a poll that is currently
-  // between its own `delete` and its next arm that there is nothing to come
-  // back to.
   useEffect(() => {
-    const timers = pollTimers.current;
+    const live = watches.current;
+    const recheck = () => {
+      if (document.visibilityState === "hidden") return;
+      for (const watch of Object.values(live)) watch.checkNow();
+    };
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
     return () => {
-      unmounted.current = true;
-      for (const id of Object.values(timers)) window.clearTimeout(id);
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
+      for (const [name, watch] of Object.entries(live)) {
+        watch.stop();
+        delete live[name];
+      }
     };
   }, []);
 
@@ -394,91 +400,68 @@ export function McpServersSection({
 
   /** Stop watching for a sign-in the operator has given up on. */
   function cancelSignIn(name: string) {
-    const timer = pollTimers.current[name];
-    if (timer !== undefined) window.clearTimeout(timer);
-    delete pollTimers.current[name];
-    cancelledSignIns.current.add(name);
+    watches.current[name]?.stop();
+    delete watches.current[name];
     setSignIns(({ [name]: _dropped, ...rest }) => rest);
   }
 
-  // Browser OAuth sign-in: open the authorization URL in a new tab,
-  // then poll the server's health until it flips to `ok` (the host stores the
-  // token on its callback route) so the amber badge turns green on its own. The
-  // row holds the waiting state throughout, because a toast fired at the moment
-  // the operator acts is gone long before the poll is.
+  function patchFlight(name: string, patch: Partial<SignInFlight>) {
+    setSignIns((s) => {
+      const flight = s[name];
+      return flight ? { ...s, [name]: { ...flight, ...patch } } : s;
+    });
+  }
+
+  /**
+   * Browser OAuth sign-in: open the authorization page in a new tab, then watch
+   * the server's health until it reports `ok`. The host stores the token on its
+   * callback route, which tells this tab nothing, so the watch is the only
+   * signal.
+   */
   async function signIn(server: McpServer) {
-    // Guard both the shared `busy` flag and a per-server poll already in flight:
-    // the poll outlives `busy`, so without the second check a repeat click would
-    // spawn a second overlapping sign-in (duplicate token exchange + toasts).
-    setConnectFor(server.name);
-    if (busy || pollTimers.current[server.name] !== undefined) return;
-    setBusy(server.name);
-    cancelledSignIns.current.delete(server.name);
+    const name = server.name;
+    setConnectFor(name);
+    const live = watches.current[name];
+    if (busy || (live && !live.stopped && !live.timedOut)) return;
+    live?.stop();
+    delete watches.current[name];
+    setBusy(name);
     try {
-      const { authorizeUrl } = await startMcpOAuth(
-        client,
-        company,
-        server.name,
-      );
-      // See `OAuthView`: in the desktop shell a webview cannot create this tab,
-      // so the authorization page never opens.
+      const { authorizeUrl } = await startMcpOAuth(client, company, name);
       let opened = openOutward(authorizeUrl);
       if (!opened) {
         opened = openInNewTab(authorizeUrl);
       }
       setSignIns((s) => ({
         ...s,
-        [server.name]: {
+        [name]: {
           authorizeUrl,
           blocked: !opened,
-          checkedAtMillis: Date.now(),
+          startedAtMillis: Date.now(),
+          checkedAtMillis: null,
           timedOut: false,
         },
       }));
-      // Poll for completion for up to ~2 minutes; stop as soon as it's healthy.
-      const deadline = Date.now() + 120_000;
-      const poll = async () => {
-        // The entry goes before the probe, so from here to the arm at the bottom
-        // this poll is invisible to the unmount cleanup — which is why every step
-        // below re-checks.
-        delete pollTimers.current[server.name];
-        if (unmounted.current) return;
-        if (Date.now() > deadline) {
-          setSignIns((s) => {
-            const flight = s[server.name];
-            return flight ? { ...s, [server.name]: { ...flight, timedOut: true } } : s;
-          });
-          return;
-        }
-        try {
-          const health = await testMcpServer(client, company, server.name);
-          if (unmounted.current) return;
-          if (cancelledSignIns.current.has(server.name)) return;
-          setTested((t) => ({ ...t, [server.name]: health }));
-          setSignIns((s) => {
-            const flight = s[server.name];
-            return flight
-              ? { ...s, [server.name]: { ...flight, checkedAtMillis: Date.now() } }
-              : s;
-          });
-          if (health.status === "ok") {
-            cancelSignIn(server.name);
-            await refresh();
-            return;
-          }
-        } catch {
-          // Ignore transient probe errors while the operator finishes sign-in.
-        }
-        if (unmounted.current) return;
-        pollTimers.current[server.name] = window.setTimeout(
-          () => void poll(),
-          2_000,
-        );
-      };
-      pollTimers.current[server.name] = window.setTimeout(
-        () => void poll(),
-        2_000,
-      );
+      const watch: SignInWatch = watchSignIn({
+        probe: () => testMcpServer(client, company, name),
+        onProbe: (health) => {
+          if (watches.current[name] !== watch) return;
+          setTested((t) => ({ ...t, [name]: health }));
+          patchFlight(name, { checkedAtMillis: Date.now() });
+        },
+        onConnected: (health) => {
+          if (watches.current[name] !== watch) return;
+          delete watches.current[name];
+          setSignIns(({ [name]: _dropped, ...rest }) => rest);
+          toast.success(signedInMessage(server, health));
+          void refresh();
+        },
+        onTimeout: () => {
+          if (watches.current[name] !== watch) return;
+          patchFlight(name, { timedOut: true });
+        },
+      });
+      watches.current[name] = watch;
     } catch (err) {
       if (err instanceof ApiError && err.code === "not_wired") {
         toast.message(
@@ -596,8 +579,8 @@ export function McpServersSection({
    * entry needs is collected on the row the install lands as — which is the one
    * control that writes to the store that install is actually dialled from.
    */
-  async function install(entry: McpCatalogueEntry) {
-    if (installing) return;
+  async function install(entry: McpCatalogueEntry): Promise<boolean> {
+    if (installing) return false;
     setInstalling(entry.qualifiedName);
     try {
       const res = await installMcpRegistryEntry(client, company, {
@@ -607,11 +590,13 @@ export function McpServersSection({
       if (after) setTested((t) => ({ ...t, [res.server.name]: after }));
       await refresh();
       setConnectFor(res.server.name);
+      return true;
     } catch (err) {
       const outage = registryOutage(err);
       toast.error(
         outage.kind === "unwired" ? REGISTRY_UNWIRED_NOTICE : outage.message,
       );
+      return false;
     } finally {
       setInstalling(null);
     }
@@ -885,6 +870,8 @@ export function McpServersSection({
         connecting && runPrimary(connecting, primaryFor(connecting, connectingHealth))
       }
       onCancelSignIn={() => connecting && cancelSignIn(connecting.name)}
+      onCheckSignIn={() => connecting && watches.current[connecting.name]?.checkNow()}
+      onRetrySignIn={() => connecting && void signIn(connecting)}
       onOpenServer={() => {
         const name = connectFor;
         closeConnect();
@@ -954,6 +941,7 @@ export function McpServersSection({
               : () => setPendingRemoval(openedServer)
           }
           onBack={closeDetail}
+          onAccessSaved={() => void refresh()}
         />
         {removalDialog}
         {connectDialog}
@@ -1047,7 +1035,7 @@ export function McpServersSection({
           servers={servers}
           installing={installing}
           canManage={canManage}
-          onInstall={(entry) => void install(entry)}
+          onInstall={install}
         />
       ) : servers.length === 0 ? (
         <Card>

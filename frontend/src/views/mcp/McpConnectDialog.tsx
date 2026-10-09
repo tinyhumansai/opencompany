@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, KeyRound, Loader2, LogIn, Plug } from "lucide-react";
 
 import type { McpHealth, McpServer, McpToolInfo } from "@/api/types";
@@ -14,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { openOutward } from "@/lib/external-links";
 import type { McpBridgeState } from "@/lib/mcp-bridge";
+import { SIGN_IN_DEADLINE_MS } from "@/lib/mcp-sign-in-watch";
 import {
   mcpDisplayName,
   REGISTRY_OAUTH_UNSUPPORTED_NOTICE,
@@ -29,7 +31,9 @@ export interface SignInFlight {
   authorizeUrl: string;
   /** The tab could not be created — a blocked popup, or a desktop webview. */
   blocked: boolean;
-  checkedAtMillis: number;
+  startedAtMillis: number;
+  /** When the last probe answered; `null` until the first one does. */
+  checkedAtMillis: number | null;
   timedOut: boolean;
 }
 
@@ -78,6 +82,8 @@ interface Props {
   tools: ToolsState;
   onPrimary: () => void;
   onCancelSignIn: () => void;
+  onCheckSignIn: () => void;
+  onRetrySignIn: () => void;
   onOpenServer: () => void;
   onClose: () => void;
 }
@@ -103,6 +109,8 @@ export function McpConnectDialog({
   tools,
   onPrimary,
   onCancelSignIn,
+  onCheckSignIn,
+  onRetrySignIn,
   onOpenServer,
   onClose,
 }: Props) {
@@ -194,7 +202,10 @@ export function McpConnectDialog({
             <SignInFlightPanel
               name={server.name}
               flight={flight}
+              busy={busy !== null}
               onCancel={onCancelSignIn}
+              onCheck={onCheckSignIn}
+              onRetry={onRetrySignIn}
             />
           )}
 
@@ -365,25 +376,45 @@ function EnvRotation({
   );
 }
 
+function useSecondsSince(from: number | null, live: boolean): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, [live]);
+  if (from === null) return null;
+  return Math.max(0, Math.round((now - from) / 1000));
+}
+
 function SignInFlightPanel({
   name,
   flight,
+  busy,
   onCancel,
+  onCheck,
+  onRetry,
 }: {
   name: string;
   flight: SignInFlight;
+  busy: boolean;
   onCancel: () => void;
+  onCheck: () => void;
+  onRetry: () => void;
 }) {
-  const ago = Math.max(0, Math.round((Date.now() - flight.checkedAtMillis) / 1000));
+  const ago = useSecondsSince(flight.checkedAtMillis, !flight.timedOut);
+  const minutes = Math.round(SIGN_IN_DEADLINE_MS / 60_000);
   return (
     <div
       className="min-w-0 space-y-2 rounded-md border border-border bg-muted/30 p-3"
       data-testid="mcp-signin-flight"
     >
       {flight.timedOut ? (
-        <p className="text-xs text-status-blocked-text">
-          Sign-in for {name} timed out. Nothing was stored — start it again when
-          you are ready.
+        <p className="text-xs text-status-blocked-text" data-testid="mcp-signin-timed-out">
+          <strong className="font-medium">
+            {name} didn&apos;t report a finished sign-in within {minutes} minutes.
+          </strong>{" "}
+          If you completed it, check now. Otherwise start it again.
         </p>
       ) : flight.blocked ? (
         <p className="text-xs text-status-blocked-text" data-testid="mcp-signin-blocked">
@@ -395,7 +426,7 @@ function SignInFlightPanel({
           <strong className="font-medium text-foreground">
             Finish signing in to {name} in the tab that just opened.
           </strong>{" "}
-          This dialog updates on its own.
+          This dialog updates on its own when you come back.
         </p>
       )}
       <code
@@ -405,17 +436,37 @@ function SignInFlightPanel({
         {flight.authorizeUrl}
       </code>
       <div className="flex flex-wrap items-center gap-2">
+        {flight.timedOut ? (
+          <Button
+            size="sm"
+            variant="outline"
+            data-testid="mcp-signin-retry"
+            disabled={busy}
+            onClick={onRetry}
+          >
+            Try again
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            data-testid="mcp-signin-reopen"
+            onClick={() => {
+              if (!openOutward(flight.authorizeUrl)) {
+                window.open(flight.authorizeUrl, "_blank", "noopener,noreferrer");
+              }
+            }}
+          >
+            Reopen sign-in
+          </Button>
+        )}
         <Button
           size="sm"
           variant="outline"
-          data-testid="mcp-signin-reopen"
-          onClick={() => {
-            if (!openOutward(flight.authorizeUrl)) {
-              window.open(flight.authorizeUrl, "_blank", "noopener,noreferrer");
-            }
-          }}
+          data-testid="mcp-signin-check"
+          onClick={onCheck}
         >
-          Reopen sign-in
+          Check now
         </Button>
         <Button
           size="sm"
@@ -426,8 +477,12 @@ function SignInFlightPanel({
           {flight.timedOut ? "Dismiss" : "Cancel"}
         </Button>
         {!flight.timedOut && (
-          <span className="flex items-center gap-1 text-3xs text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" /> checked {ago}s ago
+          <span
+            className="flex items-center gap-1 text-3xs text-muted-foreground"
+            data-testid="mcp-signin-checked"
+          >
+            <Loader2 className="size-3 animate-spin" />
+            {ago === null ? "waiting for sign-in…" : `checked ${ago}s ago`}
           </span>
         )}
       </div>

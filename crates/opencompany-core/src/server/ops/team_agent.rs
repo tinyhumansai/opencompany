@@ -1252,6 +1252,7 @@ async fn edit_agent(
     // carried the field at all — including a `null` that clears it, which
     // changes routing exactly as much as setting one does.
     let routing_changed = model.is_some() || harness.is_some() || provider.is_some();
+    let belt_changed = tools.is_some();
 
     if is_manifest {
         // Stored as an overlay on the record, exactly like the daily-budget
@@ -1451,14 +1452,16 @@ async fn edit_agent(
     // until the process restarts. The same reasoning `inference.rs` applies to
     // a provider change, which is likewise chosen at build time.
     //
-    // Only for these two fields. A name, role, tools or description edit does
-    // not affect routing, and rebuilding a company for one would be a large
-    // cost for no effect.
+    // A tools edit also needs it off the harness path, where the belt is built
+    // once; the harness path picks a tools edit up on the next turn.
     // A let-chain rather than a nested `if`: the tuple form clippy's
     // `collapsible_if` suggests would evaluate `rebuild_company` before
     // testing the flag, rebuilding on every name edit — the exact cost this
     // guard exists to avoid.
-    if routing_changed
+    let belt_needs_rebuild = belt_changed
+        && company.runtime.cognition().path != crate::ports::brain::HARNESS_PATH
+        && state.can_rebuild_in_place();
+    if (routing_changed || belt_needs_rebuild)
         && let Err(error) = crate::runtime::rebuild_company(&state, company.id()).await
     {
         // Not fatal, and deliberately not a failed response: the edit *is*
@@ -2695,3 +2698,6 @@ mod tests_skill_scope;
 #[cfg(test)]
 #[path = "team_agent_the_roster_list_carries_tests.rs"]
 mod tests_the_roster_list_carries;
+#[cfg(test)]
+#[path = "team_agent_tools_rebuild_tests.rs"]
+mod tests_tools_rebuild;

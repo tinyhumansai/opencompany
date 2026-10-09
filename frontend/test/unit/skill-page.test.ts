@@ -79,7 +79,8 @@ function clientWith(updateAgent: unknown = vi.fn(() => Promise.resolve({}))) {
     get: () =>
       Promise.resolve({
         slug: "brand-voice",
-        markdown: "---\nname: Brand Voice\ndescription: How we sound.\n---\nStep one.\n",
+        markdown:
+          "---\nname: Brand Voice\ndescription: How we sound.\n---\nStep one.\n",
         editable: true,
       }),
   } as unknown as OpenCompanyClient;
@@ -411,7 +412,11 @@ describe("a partial failure", () => {
         scope("writer", "inherited"),
         scope("analyst", "inherited"),
       ]),
-      [member("ceo", null), member("writer", null), member("analyst", null)],
+      [
+        member("ceo", null),
+        { ...member("writer", null), name: "Wanda Writer" } as TeamMemberDto,
+        member("analyst", null),
+      ],
       true,
       clientWith(updateAgent),
       { onClose, onSaved },
@@ -432,7 +437,7 @@ describe("a partial failure", () => {
       message,
       "the count is what returned 2xx, not what was attempted",
     ).toContain("Scoped 1 of 3");
-    expect(message).toContain("writer");
+    expect(message).toContain("Wanda Writer");
     expect(message).toContain("forbidden");
     expect(message).toContain("The other 1 was not changed");
     expect(
@@ -450,6 +455,24 @@ describe("a partial failure", () => {
     expect(
       (node("skill-agent-toggle-analyst") as HTMLInputElement).checked,
     ).toBe(false);
+  });
+
+  it("names the refused teammate rather than its id", async () => {
+    const updateAgent = vi.fn(() => Promise.reject(new Error("forbidden")));
+    await open(
+      skill([scope("writer", "inherited")]),
+      [{ ...member("writer", null), name: "Wanda Writer" } as TeamMemberDto],
+      true,
+      clientWith(updateAgent),
+    );
+
+    await reveal();
+    await tick("writer", false);
+    await click("skill-detail-save");
+
+    const message = node("skill-detail-problem").textContent ?? "";
+    expect(message).toContain("Wanda Writer");
+    expect(message).not.toContain("writer:");
   });
 
   it("closes and reports nothing when every write lands", async () => {

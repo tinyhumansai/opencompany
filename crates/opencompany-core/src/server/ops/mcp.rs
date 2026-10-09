@@ -30,12 +30,10 @@ use crate::company::mcp::{
 use crate::company::runtime::CompanyRuntime;
 use crate::error::OpenCompanyError;
 use crate::mcp::decl::server_info::{self as mcp_server_info, McpServerInfo};
-use crate::metering::roster_display_names;
-use crate::ports::types::CompanyRecord;
-use crate::runtime::builder::agent_scoped_grants;
-use crate::runtime::tools::grants_cover_server;
 use crate::server::error::ApiError;
 use crate::server::ops::{AdminScopedCompany, ScopedCompany, mcp_registry, scoped};
+
+pub(super) mod access;
 
 /// The reminder attached to every mutating response: the effective MCP set is
 /// re-resolved and fingerprinted on every harness cycle (`HarnessPool::ensure`),
@@ -145,12 +143,16 @@ pub(super) struct McpServerDto {
     /// console reads the empty case against `enabled` and stays quiet there.
     /// Always serialized (even when empty).
     ///
-    /// A **registry** row lists the whole roster: `build.rs` pushes the registry
-    /// bridge tools into every agent's toolbelt with no grant check, so every
-    /// teammate really can call every installed server. Issue #1270 leaves that
-    /// asymmetry in place deliberately and makes it operator-visible here rather
-    /// than inventing a grant filter the harness does not apply.
+    /// A **registry** row is reached through `mcp_registry` or
+    /// `mcp_registry.<serverId>`, the grant the harness gates installs on.
     pub(super) reachable_by: Vec<RosterAgentDto>,
+    /// The exact grant that reaches this server: `mcp:<name>`, or
+    /// `mcp_registry.<serverId>` for an install that reconciled with nothing.
+    pub(super) access_grant: String,
+    /// Every roster agent's standing with this server and the `tools` list
+    /// that would add or remove it, so the console edits access without
+    /// matching grants itself.
+    pub(super) agent_access: Vec<access::AgentAccessDto>,
     /// The last recorded probe outcome (scrubbed), or `None` when never probed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) health: Option<McpHealth>,
@@ -333,7 +335,6 @@ pub(super) async fn manifest_servers(runtime: &CompanyRuntime) -> Result<Vec<Mcp
 /// can reach it (issue #568), and attaching the last (scrubbed) probe health.
 fn dto_from_decl(
     decl: &mcp::McpServerDecl,
-    reachable_by: Vec<RosterAgentDto>,
     health: Option<McpHealth>,
     info: McpServerInfo,
 ) -> McpServerDto {
@@ -358,118 +359,22 @@ fn dto_from_decl(
         probed_description: info.description,
         website_url: info.website_url,
         transport: None,
-        reachable_by,
+        reachable_by: Vec::new(),
+        access_grant: String::new(),
+        agent_access: Vec::new(),
         health,
     }
 }
 
-/// Every roster agent's *effective* tool grants (issue #568), as
-/// `(agent, grants)`.
-///
-/// `pub(super)` since issue #245: the repositories surface answers the same
-/// question about a different namespace ("who can read this?"), and a second
-/// roster walk beside this one is exactly how the two consoles would come to
-/// disagree with each other and with the harness. The roster is exactly what the harness builds in
-/// `build_roster` — the **effective** roster, not the blueprint's: the manifest
-/// agents with every operator edit applied (each with its own `tools` narrowed
-/// by the company `allow` **and** by the desks it sits on — issue #1674), plus
-/// the promoted overlay teammates — each narrowed by
-/// **its own** `tools` line the same way (issue #661), which for the common
-/// empty line is still the full company `allow`, the standard grant
-/// `overlay_agent_to_manifest` gives it. An overlay id already claimed by a
-/// manifest agent is skipped, both mirroring the harness so console
-/// reachability equals what an agent is actually granted.
-///
-/// Each agent carries its display label alongside its id (issue #931), resolved
-/// through [`roster_display_names`] — the same map the Team page and the usage
-/// buckets read, so one teammate is named identically everywhere in the console.
-/// An id absent from that map (it cannot be, over this roster) falls back to the
-/// id, matching `bucket_usage`.
-pub(super) fn roster_grants(record: &CompanyRecord) -> Vec<(RosterAgentDto, Vec<String>)> {
-    let allow = &record.manifest.tools.allow;
-    // The roster as it *effectively* stands, exactly as `build_roster` builds
-    // it: a teammate an operator edited keeps its edits (an override `tools`
-    // line replaces the manifest's), and a retired teammate is not on the
-    // roster at all. Reading the raw manifest half here made `reachableBy`
-    // track the blueprint while the harness and the Team tab's Tools card
-    // tracked the edit — so granting or revoking `mcp:*` on a manifest
-    // teammate never moved the Connections surface.
-    let effective = record.effective_agents();
-    let names = roster_display_names(&effective, &record.overlay_agents);
-    let roster_agent = |id: &str| RosterAgentDto {
-        id: id.to_string(),
-        name: names.get(id).cloned().unwrap_or_else(|| id.to_string()),
-    };
-    // Three-level narrowing, exactly as `build_roster` builds the roster (issue
-    // #1674): company `allow` → the desks this teammate sits on → the teammate's
-    // own `tools`. `agent_desk_tools` resolves through the record's *effective*
-    // desk membership, so a console-seated member is scoped by its desk as a
-    // manifest one is. Without this level a teammate on a desk whose ceiling
-    // omits `mcp:*` still read back here as reaching every server the company
-    // grants, while the harness gives it no such tools.
-    let desk_narrowed = |id: &str, tools: Option<&[String]>| {
-        let desk_tools = record.agent_desk_tools(id);
-        let desk_refs: Vec<&[String]> = desk_tools.iter().map(Vec::as_slice).collect();
-        agent_scoped_grants(allow, &desk_refs, tools)
-    };
-    let mut grants: Vec<(RosterAgentDto, Vec<String>)> = effective
-        .iter()
-        .map(|agent| {
-            (
-                roster_agent(&agent.id),
-                desk_narrowed(&agent.id, agent.tools.as_deref()),
-            )
-        })
-        .collect();
-    let manifest_ids: std::collections::HashSet<&str> = record
-        .manifest
-        .agents
-        .iter()
-        .map(|agent| agent.id.as_str())
-        .collect();
-    for overlay in &record.overlay_agents {
-        if manifest_ids.contains(overlay.id.as_str()) {
-            continue;
-        }
-        // The overlay teammate's **own** tools line, read through the same
-        // function and with the same empty-means-inherit rule as the manifest
-        // half above — matching `overlay_agent_to_manifest` (issue #740).
-        //
-        // This read was hard-coded empty until #661 gave `OverlayAgent` a tools
-        // list. The comment that stood here ("no manifest tools row → the
-        // company's standard grant") described a fact that expired with that
-        // change, which is why it read as a decision rather than a stale
-        // assumption: a scoped teammate reported as reaching every enabled
-        // server, and the console asserted a connection the harness does not
-        // grant.
-        grants.push((
-            roster_agent(&overlay.id),
-            desk_narrowed(&overlay.id, overlay.tools.as_deref()),
-        ));
-    }
-    grants
-}
-
-/// The agents whose effective `grants` reach `decl` (issue #568), read through
-/// the shared [`grants_cover_server`] so this agrees with the harness registry.
-/// Empty ⇒ no teammate can reach the server.
-///
-/// A **disabled** server reaches nobody regardless of grants: `resolve_for_agent`
-/// filters on `decl.enabled && grants_cover_server(..)`, so an agent granted
-/// `mcp:<slug>` still gets no such tool while the server is off. Mirroring both
-/// halves of that filter here is what keeps the console from claiming a
-/// reachability the harness does not hand out.
-fn reachers_of(
-    roster_grants: &[(RosterAgentDto, Vec<String>)],
-    decl: &mcp::McpServerDecl,
-) -> Vec<RosterAgentDto> {
-    if !decl.enabled {
-        return Vec::new();
-    }
-    roster_grants
-        .iter()
-        .filter(|(_, grants)| grants_cover_server(grants, &decl.name))
-        .map(|(agent, _)| agent.clone())
+/// Every roster agent's effective tool grants, as `(agent, grants)` — the
+/// projection the reach tests assert against.
+#[cfg(test)]
+pub(super) fn roster_grants(
+    record: &crate::ports::types::CompanyRecord,
+) -> Vec<(RosterAgentDto, Vec<String>)> {
+    access::roster_access(record)
+        .into_iter()
+        .map(|entry| (entry.agent, entry.effective))
         .collect()
 }
 
@@ -501,9 +406,10 @@ pub(super) async fn merged_rows(runtime: &CompanyRuntime) -> Result<Vec<McpServe
     )
     .await
     .map_err(ApiError)?;
-    // Resolve every agent's effective grants once, then ask per server who is
-    // covered — the wildcard-heavy work happens N(agents) times, not N×M.
-    let grants = record.as_ref().map(roster_grants).unwrap_or_default();
+    let roster = record
+        .as_ref()
+        .map(access::roster_access)
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(decls.len());
     for decl in &decls {
         let health = load_health(runtime.id(), &decl.name, runtime.secrets().as_ref())
@@ -511,18 +417,51 @@ pub(super) async fn merged_rows(runtime: &CompanyRuntime) -> Result<Vec<McpServe
             .map_err(ApiError)?;
         let info =
             mcp_server_info::load(runtime.id(), &decl.name, runtime.secrets().as_ref()).await;
-        out.push(dto_from_decl(
-            decl,
-            reachers_of(&grants, decl),
-            health,
-            info,
-        ));
+        out.push(dto_from_decl(decl, health, info));
     }
     // The directory half. A registry that cannot be read yields nothing and the
     // declared servers stand on their own — see `mcp_registry::installs`.
-    let roster: Vec<RosterAgentDto> = grants.iter().map(|(agent, _)| agent.clone()).collect();
-    mcp_registry::merge_installs(&mut out, mcp_registry::installs(runtime).await, &roster);
+    mcp_registry::merge_installs(&mut out, mcp_registry::installs(runtime).await);
+    attach_access(&mut out, &roster);
     Ok(out)
+}
+
+/// The grant key a row is reached by: a directory install that reconciled with
+/// nothing by its install id, every other row by its name.
+fn server_key(row: &McpServerDto) -> access::ServerKey<'_> {
+    match (row.source, row.server_id.as_deref()) {
+        (McpSource::Registry, Some(id)) => access::ServerKey::Registry(id),
+        _ => access::ServerKey::Declared(&row.name),
+    }
+}
+
+/// Fills every row's `agentAccess`, `accessGrant` and `reachableBy` from one
+/// roster walk, so the three can never disagree.
+pub(super) fn attach_access(rows: &mut [McpServerDto], roster: &[access::RosterAccess]) {
+    let computed: Vec<(String, Vec<access::AgentAccessDto>)> = {
+        let keys: Vec<access::ServerKey<'_>> = rows.iter().map(server_key).collect();
+        rows.iter()
+            .zip(&keys)
+            .map(|(row, key)| {
+                (
+                    key.grant(),
+                    access::access_for(roster, *key, row.enabled, &keys),
+                )
+            })
+            .collect()
+    };
+    for (row, (grant, agents)) in rows.iter_mut().zip(computed) {
+        row.reachable_by = agents
+            .iter()
+            .filter(|agent| agent.reaches)
+            .map(|agent| RosterAgentDto {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+            })
+            .collect();
+        row.access_grant = grant;
+        row.agent_access = agents;
+    }
 }
 
 /// `GET …/mcp/servers` — the company's effective MCP servers, each with its last

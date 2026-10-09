@@ -50,7 +50,7 @@ use crate::AppState;
 use crate::company::McpServer;
 use crate::company::mcp::{McpHealth, McpSource};
 use crate::mcp::decl::endpoint::normalize_endpoint;
-use crate::server::ops::mcp::{McpServerDto, RosterAgentDto};
+use crate::server::ops::mcp::McpServerDto;
 use crate::server::ops::scoped;
 
 /// The per-request timeout a registry row reports.
@@ -247,11 +247,7 @@ pub(super) fn declaration_from_directory(
 /// when List A has never probed. Health prefers List A's probe because that
 /// probe dials the endpoint the way the agents' bridge tools do, credential
 /// included.
-pub(super) fn merge_installs(
-    rows: &mut Vec<McpServerDto>,
-    installs: Vec<RegistryInstall>,
-    roster: &[RosterAgentDto],
-) {
+pub(super) fn merge_installs(rows: &mut Vec<McpServerDto>, installs: Vec<RegistryInstall>) {
     let mut by_endpoint: HashMap<String, usize> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
         if let Some(key) = normalize_endpoint(&row.endpoint) {
@@ -270,7 +266,7 @@ pub(super) fn merge_installs(
         }
         let name = registry_row_name(&install, &taken);
         taken.insert(name.clone());
-        rows.push(row_from_install(install, name, roster));
+        rows.push(row_from_install(install, name));
         if let Some(key) = key {
             by_endpoint.entry(key).or_insert(rows.len() - 1);
         }
@@ -296,11 +292,7 @@ fn adopt(row: &mut McpServerDto, install: RegistryInstall) {
 }
 
 /// Projects an install that reconciled with nothing into its own row.
-fn row_from_install(
-    install: RegistryInstall,
-    name: String,
-    roster: &[RosterAgentDto],
-) -> McpServerDto {
+fn row_from_install(install: RegistryInstall, name: String) -> McpServerDto {
     McpServerDto {
         name,
         endpoint: install.endpoint.unwrap_or_default(),
@@ -325,13 +317,9 @@ fn row_from_install(
         probed_description: None,
         website_url: None,
         transport: Some(install.transport),
-        // Every teammate, or nobody when the install is off — see
-        // `McpServerDto::reachable_by`.
-        reachable_by: if install.enabled {
-            roster.to_vec()
-        } else {
-            Vec::new()
-        },
+        reachable_by: Vec::new(),
+        access_grant: String::new(),
+        agent_access: Vec::new(),
         health: install.health,
     }
 }
@@ -382,6 +370,12 @@ pub(super) fn removal_for(had_index_entry: bool, backed_by_install: bool) -> Rem
 #[cfg(any(feature = "mcp", test))]
 pub(in crate::server::ops) mod catalogue;
 
+#[cfg(any(feature = "mcp", test))]
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+mod failure;
+#[cfg(any(feature = "mcp", test))]
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+mod icon_cache;
 #[cfg(feature = "mcp")]
 mod wired;
 #[cfg(feature = "mcp")]

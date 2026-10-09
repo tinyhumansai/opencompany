@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, BadgeCheck, Check, Loader2, Plus } from "lucide-react";
+import { useEffect, useState } from "react";
+import { AlertTriangle, BadgeCheck, Check, Loader2, Plus, RotateCw } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
 import {
   getMcpRegistryEntry,
-  searchMcpRegistry,
   type McpCatalogueDetail,
   type McpCatalogueEntry,
 } from "@/api/mcp-registry";
@@ -19,119 +18,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 import {
   catalogPublisher,
   REGISTRY_UNWIRED_NOTICE,
   directoryServerName,
   registryOutage,
-  type McpRegistryOutage,
 } from "@/lib/mcp-registry";
+import { useMcpDirectory } from "@/hooks/use-mcp-directory";
 import {
   McpServerIcon,
   openFromItem,
 } from "@/views/connections/McpServerTable";
-
-/** How many directory rows one page asks for. */
-const PAGE_SIZE = 20;
-
-/** How long a keystroke waits before it costs a directory call. */
-const DEBOUNCE_MS = 350;
-
-export type DirectoryState =
-  | { kind: "loading" }
-  | { kind: "outage"; outage: McpRegistryOutage }
-  | {
-      kind: "ready";
-      entries: McpCatalogueEntry[];
-      page: number;
-      totalPages: number;
-      loadingMore: boolean;
-    };
-
-/**
- * The directory, browsed with no query and searched with one. A failure is an
- * outage with a reason, never an exception.
- */
-export function useMcpDirectory(
-  client: OpenCompanyClient,
-  company: string | null,
-  query: string,
-): { state: DirectoryState; loadMore: () => void } {
-  const [state, setState] = useState<DirectoryState>({ kind: "loading" });
-  const generation = useRef(0);
-  const term = query.trim();
-
-  useEffect(() => {
-    generation.current += 1;
-    const mine = generation.current;
-    setState({ kind: "loading" });
-    const timer = window.setTimeout(
-      () => {
-        void (async () => {
-          try {
-            const found = await searchMcpRegistry(client, company, {
-              q: term || undefined,
-              page: 1,
-              pageSize: PAGE_SIZE,
-            });
-            if (generation.current !== mine) return;
-            setState({
-              kind: "ready",
-              entries: found.servers,
-              page: found.page,
-              totalPages: found.totalPages,
-              loadingMore: false,
-            });
-          } catch (err) {
-            if (generation.current !== mine) return;
-            setState({ kind: "outage", outage: registryOutage(err) });
-          }
-        })();
-      },
-      term === "" ? 0 : DEBOUNCE_MS,
-    );
-    return () => window.clearTimeout(timer);
-  }, [client, company, term]);
-
-  const loadMore = useCallback(() => {
-    if (state.kind !== "ready" || state.loadingMore) return;
-    if (state.page >= state.totalPages) return;
-    const mine = generation.current;
-    const next = state.page + 1;
-    setState({ ...state, loadingMore: true });
-    void (async () => {
-      try {
-        const found = await searchMcpRegistry(client, company, {
-          q: term || undefined,
-          page: next,
-          pageSize: PAGE_SIZE,
-        });
-        if (generation.current !== mine) return;
-        setState((prev) => {
-          if (prev.kind !== "ready") return prev;
-          const known = new Set(prev.entries.map((e) => e.qualifiedName));
-          return {
-            kind: "ready",
-            entries: [
-              ...prev.entries,
-              ...found.servers.filter((e) => !known.has(e.qualifiedName)),
-            ],
-            page: found.page,
-            totalPages: found.totalPages,
-            loadingMore: false,
-          };
-        });
-      } catch {
-        if (generation.current !== mine) return;
-        setState((prev) =>
-          prev.kind === "ready" ? { ...prev, loadingMore: false } : prev,
-        );
-      }
-    })();
-  }, [client, company, state, term]);
-
-  return { state, loadMore };
-}
 
 /** The name this company already holds a directory entry under, if it does. */
 export function installedAs(
@@ -319,6 +217,7 @@ function McpDirectoryDialog({
   onInstall: (entry: McpCatalogueEntry) => void;
   onClose: () => void;
 }) {
+  const [lookup, setLookup] = useState(0);
   const [detail, setDetail] = useState<
     | { kind: "loading" }
     | { kind: "ready"; detail: McpCatalogueDetail }
@@ -327,12 +226,16 @@ function McpDirectoryDialog({
 
   useEffect(() => {
     if (!entry) return;
-    let live = true;
+    const controller = new AbortController();
     setDetail({ kind: "loading" });
-    getMcpRegistryEntry(client, company, entry.qualifiedName)
-      .then((found) => live && setDetail({ kind: "ready", detail: found }))
+    getMcpRegistryEntry(client, company, entry.qualifiedName, {
+      signal: controller.signal,
+    })
+      .then((found) => {
+        if (!controller.signal.aborted) setDetail({ kind: "ready", detail: found });
+      })
       .catch((err) => {
-        if (!live) return;
+        if (controller.signal.aborted) return;
         const outage = registryOutage(err);
         setDetail({
           kind: "failed",
@@ -340,10 +243,8 @@ function McpDirectoryDialog({
             outage.kind === "unwired" ? REGISTRY_UNWIRED_NOTICE : outage.message,
         });
       });
-    return () => {
-      live = false;
-    };
-  }, [client, company, entry]);
+    return () => controller.abort();
+  }, [client, company, entry, lookup]);
 
   if (!entry) return null;
   const publisher = catalogPublisher(entry);
@@ -380,7 +281,20 @@ function McpDirectoryDialog({
           {detail.kind === "loading" ? (
             <Skeleton className="h-8 rounded-md" />
           ) : detail.kind === "failed" ? (
-            <p className="text-xs text-destructive">{detail.message}</p>
+            <div
+              className="flex items-start justify-between gap-2"
+              data-testid="mcp-discover-detail-failed"
+            >
+              <p className="text-xs text-destructive">{detail.message}</p>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="mcp-discover-detail-retry"
+                onClick={() => setLookup((n) => n + 1)}
+              >
+                <RotateCw className="size-4" /> Retry
+              </Button>
+            </div>
           ) : detail.detail.endpoint ? (
             <code className="block truncate rounded-md border border-border bg-muted/40 px-2 py-1 font-mono text-xs select-text">
               {detail.detail.endpoint}
@@ -416,7 +330,9 @@ function McpDirectoryDialog({
             canManage && (
               <Button
                 data-testid="mcp-discover-detail-install"
-                disabled={installing || refusal !== undefined}
+                disabled={
+                  installing || refusal !== undefined || detail.kind === "failed"
+                }
                 onClick={() => onInstall(entry)}
               >
                 {installing ? (
@@ -452,11 +368,12 @@ export function McpDiscover({
   servers: McpServer[];
   installing: string | null;
   canManage: boolean;
-  onInstall: (entry: McpCatalogueEntry) => void;
+  onInstall: (entry: McpCatalogueEntry) => Promise<boolean> | void;
 }) {
-  const { state, loadMore } = useMcpDirectory(client, company, query);
+  const { state, matches, loadMore, retry } = useMcpDirectory(client, company, query);
   const [previewing, setPreviewing] = useState<McpCatalogueEntry | null>(null);
-  const searching = query.trim() !== "";
+  const term = query.trim();
+  const searching = term !== "";
 
   if (state.kind === "outage") {
     return state.outage.kind === "unwired" ? (
@@ -464,12 +381,33 @@ export function McpDiscover({
         {REGISTRY_UNWIRED_NOTICE}
       </p>
     ) : (
-      <p className="text-xs text-status-blocked-text" data-testid="mcp-registry-error">
-        <strong className="font-medium">The directory isn&apos;t answering.</strong>{" "}
-        {state.outage.message} Your own servers are unaffected.
-      </p>
+      <div className="flex flex-wrap items-center gap-2" data-testid="mcp-registry-outage">
+        <p className="text-xs text-status-blocked-text" data-testid="mcp-registry-error">
+          <strong className="font-medium">
+            {searching ? `Couldn't search for “${term}”.` : "The directory isn't answering."}
+          </strong>{" "}
+          {state.outage.message} Your own servers are unaffected.
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          data-testid="mcp-registry-retry"
+          onClick={retry}
+        >
+          <RotateCw className="size-4" /> Retry
+        </Button>
+      </div>
     );
   }
+
+  const instant = state.kind === "loading" && searching && matches.length > 0;
+  const shown =
+    state.kind === "loading"
+      ? instant
+        ? matches
+        : state.previous
+      : state.entries;
+  const stale = state.kind === "loading" && !instant && shown.length > 0;
 
   const itemProps = (entry: McpCatalogueEntry): EntryProps => ({
     entry,
@@ -487,11 +425,34 @@ export function McpDiscover({
           {searching ? "Results" : "Top connectors"}
         </h3>
         {state.kind === "loading" && (
-          <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+          <span
+            className="flex items-center gap-1 text-xs text-muted-foreground"
+            role="status"
+            data-testid="mcp-discover-searching"
+          >
+            <Loader2 className="size-3.5 animate-spin" />
+            {searching ? `Searching for “${term}”…` : "Loading…"}
+          </span>
         )}
       </div>
 
-      {state.kind === "loading" ? (
+      {state.kind === "fallback" && (
+        <div className="flex flex-wrap items-center gap-2" data-testid="mcp-discover-fallback">
+          <p className="text-xs text-muted-foreground">
+            Showing popular matches — the MCP directory is slow right now.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            data-testid="mcp-discover-fallback-retry"
+            onClick={retry}
+          >
+            <RotateCw className="size-4" /> Retry
+          </Button>
+        </div>
+      )}
+
+      {state.kind === "loading" && shown.length === 0 ? (
         layout === "cards" ? (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {Array.from({ length: 4 }, (_, i) => (
@@ -505,28 +466,44 @@ export function McpDiscover({
             ))}
           </div>
         )
-      ) : state.entries.length === 0 ? (
+      ) : shown.length === 0 ? (
         <p className="text-sm text-muted-foreground" data-testid="mcp-search-nothing">
           {searching
             ? "The directory has no listing for that. A server running inside your own network is added as a custom server."
             : "The directory returned nothing to show."}
         </p>
-      ) : layout === "cards" ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          {state.entries.map((entry) => (
-            <McpDirectoryCard key={entry.qualifiedName} {...itemProps(entry)} />
-          ))}
-        </div>
       ) : (
-        <DirectoryTable>
-          {state.entries.map((entry) => (
-            <McpDirectoryRow key={entry.qualifiedName} {...itemProps(entry)} />
-          ))}
-        </DirectoryTable>
+        <div
+          className={cn("transition-opacity", stale && "opacity-50")}
+          aria-busy={stale || undefined}
+          data-testid="mcp-discover-results"
+        >
+          {layout === "cards" ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {shown.map((entry) => (
+                <McpDirectoryCard key={entry.qualifiedName} {...itemProps(entry)} />
+              ))}
+            </div>
+          ) : (
+            <DirectoryTable>
+              {shown.map((entry) => (
+                <McpDirectoryRow key={entry.qualifiedName} {...itemProps(entry)} />
+              ))}
+            </DirectoryTable>
+          )}
+        </div>
       )}
 
       {state.kind === "ready" && state.page < state.totalPages && (
-        <div className="flex justify-center">
+        <div className="flex flex-col items-center gap-2">
+          {state.moreFailed && (
+            <p
+              className="text-xs text-status-blocked-text"
+              data-testid="mcp-discover-more-error"
+            >
+              {state.moreFailed}
+            </p>
+          )}
           <Button
             variant="outline"
             size="sm"
@@ -535,7 +512,7 @@ export function McpDiscover({
             onClick={loadMore}
           >
             {state.loadingMore && <Loader2 className="size-4 animate-spin" />}
-            Show more
+            {state.moreFailed ? "Retry" : "Show more"}
           </Button>
         </div>
       )}
@@ -547,7 +524,11 @@ export function McpDiscover({
         installedAs={previewing ? installedAs(servers, previewing) : null}
         installing={previewing !== null && installing === previewing.qualifiedName}
         canManage={canManage}
-        onInstall={onInstall}
+        onInstall={(entry) => {
+          void Promise.resolve(onInstall(entry)).then((installed) => {
+            if (installed) setPreviewing(null);
+          });
+        }}
         onClose={() => setPreviewing(null)}
       />
     </section>

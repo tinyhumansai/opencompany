@@ -17,7 +17,7 @@
 //! [`ScopedCompany`], matching `GET …/mcp/servers`.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -51,6 +51,8 @@ use super::catalogue::{
     catalogue_search, featured_entry, featured_page, health_from_status, inline_icon, inline_icons,
     install_name_for, rank_catalogue, shift_browse_page,
 };
+use super::failure::{FEATURED_LOOKUP_BUDGET, RegistryRead, SEARCH_BUDGET, bounded};
+use super::icon_cache::{ICON_BUDGET, ICON_NEGATIVE_TTL, IconCache};
 
 // ---------------------------------------------------------------------------
 // Request and response bodies
@@ -212,11 +214,14 @@ async fn featured_servers(mcp: &McpRuntime) -> Vec<CatalogueEntryDto> {
             .collect()
     };
     let fetched = futures::future::join_all(due.into_iter().map(|name| async move {
-        let entry = mcp
-            .registry_get(name.to_string())
-            .await
-            .ok()
-            .and_then(|raw| featured_entry(&raw));
+        let entry = bounded(
+            RegistryRead::Lookup,
+            Some(FEATURED_LOOKUP_BUDGET),
+            mcp.registry_get(name.to_string()),
+        )
+        .await
+        .ok()
+        .and_then(|raw| featured_entry(&raw));
         (name, entry)
     }))
     .await;
@@ -234,31 +239,14 @@ async fn featured_servers(mcp: &McpRuntime) -> Vec<CatalogueEntryDto> {
         .collect()
 }
 
-/// Entries kept before the icon cache starts over.
-const ICON_CACHE_LIMIT: usize = 512;
+static ICONS: LazyLock<Arc<IconCache>> =
+    LazyLock::new(|| IconCache::new(ICON_BUDGET, ICON_NEGATIVE_TTL));
 
-static ICON_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// [`fetch_icon`], remembered per address for the life of the process.
+/// [`fetch_icon`] through the shared icon cache.
 async fn cached_icon(url: String) -> Option<String> {
-    if let Some(hit) = ICON_CACHE
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&url).cloned())
-    {
-        return hit;
-    }
-    let icon = fetch_icon(&url).await;
-    if let Ok(mut cache) = ICON_CACHE.lock() {
-        if cache.len() >= ICON_CACHE_LIMIT {
-            cache.clear();
-        }
-        if icon.is_some() {
-            cache.insert(url, icon.clone());
-        }
-    }
-    icon
+    ICONS
+        .get(url, |url| async move { fetch_icon(&url).await })
+        .await
 }
 
 /// One store record plus its live connection state.
@@ -323,12 +311,15 @@ pub(super) async fn search(company: ScopedCompany, Query(query): Query<SearchQue
     } else {
         shown_page
     };
-    let mut results = match mcp
-        .search(query.q, Some(upstream_page), query.page_size)
-        .await
+    let mut results = match bounded(
+        RegistryRead::Search,
+        Some(SEARCH_BUDGET),
+        mcp.search(query.q, Some(upstream_page), query.page_size),
+    )
+    .await
     {
         Ok(raw) => catalogue_search(&raw),
-        Err(error) => return ApiError(error).into_response(),
+        Err(failure) => return failure.response(RegistryRead::Search),
     };
     if browsing {
         let already_listed: &[&str] = if shown_page == 1 {
@@ -357,9 +348,15 @@ pub(super) async fn entry(company: ScopedCompany, Query(query): Query<EntryQuery
         ))
         .into_response();
     }
-    let raw = match mcp.registry_get(qualified_name.clone()).await {
+    let raw = match bounded(
+        RegistryRead::Lookup,
+        None,
+        mcp.registry_get(qualified_name.clone()),
+    )
+    .await
+    {
         Ok(raw) => raw,
-        Err(error) => return ApiError(error).into_response(),
+        Err(failure) => return failure.response(RegistryRead::Lookup),
     };
     match catalogue_detail(&raw) {
         Some(mut detail) => {
@@ -408,9 +405,15 @@ pub(super) async fn install(
         .into_response();
     }
 
-    let raw = match mcp.registry_get(qualified_name.clone()).await {
+    let raw = match bounded(
+        RegistryRead::Lookup,
+        None,
+        mcp.registry_get(qualified_name.clone()),
+    )
+    .await
+    {
         Ok(raw) => raw,
-        Err(error) => return ApiError(error).into_response(),
+        Err(failure) => return failure.response(RegistryRead::Lookup),
     };
     let Some(detail) = catalogue_detail(&raw) else {
         return ApiError(OpenCompanyError::McpServerNotFound(qualified_name)).into_response();

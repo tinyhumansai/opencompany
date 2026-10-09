@@ -2029,6 +2029,27 @@ export type McpSource = "manifest" | "runtime" | "default" | "registry";
  * no install behind it, so a manifest / runtime / default row arrives exactly
  * as it always did.
  */
+/**
+ * Where one teammate stands with one MCP server.
+ *
+ * `blocked` means the company or desk ceiling leaves the server out, so no
+ * edit to the teammate can grant it.
+ */
+export type McpAccessState = "inherited" | "included" | "excluded" | "blocked";
+
+/** One teammate's access to one MCP server, as the host computed it. */
+export interface McpAgentAccess {
+  id: string;
+  name: string;
+  state: McpAccessState;
+  /** Whether the teammate can call the server right now. */
+  reaches: boolean;
+  /** The whole `tools` list that grants access; absent when none is needed or possible. */
+  grantTools?: string[];
+  /** The whole `tools` list that withdraws access; absent when it cannot be withdrawn here. */
+  revokeTools?: string[];
+}
+
 export interface McpServer {
   name: string;
   endpoint: string;
@@ -2074,6 +2095,10 @@ export interface McpServer {
    * Render {@link RosterAgent.name}, never the id (issue #931).
    */
   reachableBy?: RosterAgent[];
+  /** The exact grant that reaches this server (`mcp:<name>` or `mcp_registry.<serverId>`). */
+  accessGrant?: string;
+  /** Every teammate's standing with this server, with the `tools` list that flips it. */
+  agentAccess?: McpAgentAccess[];
   /** The last recorded (scrubbed) probe outcome, when the server has been probed. */
   health?: McpHealth;
   /**

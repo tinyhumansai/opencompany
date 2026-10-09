@@ -91,6 +91,13 @@ role = "Researcher"
 tools = ["mcp:notion", "mcp:linear"]   # or "mcp:*"
 ```
 
+Each `GET …/mcp/servers` row carries `accessGrant` and `agentAccess`: per agent
+its `state` (`inherited`/`included`/`excluded`/`blocked` by the ceiling),
+`reaches`, and the whole `tools` list that grants (`grantTools`) or withdraws
+(`revokeTools`) it, `mcp:*` expanded host-side. The server page's **Agents with
+access** editor sends that list via `PATCH …/team/{id}`; off the harness path
+the edit rebuilds the runtime.
+
 `mcp_call_tool` runs under a permissive OpenHuman `SecurityPolicy`. It is still
 classified for audit, but policy-generated HITL is disabled.
 
@@ -148,6 +155,9 @@ The minted token is stored through `store_auth` as `AuthMaterial::OAuth`, and
 the harness refreshes a near-expiry one through `OAuthFlow::refresh`, which
 re-checks the stored token endpoint
 ([`company::mcp_oauth`](../../src/company/mcp_oauth.rs)).
+
+The console then re-tests the server every 2 s (and on tab return) until `ok`,
+toasts `Connected to <name> · N tools`, and after 5 minutes offers Check now.
 
 ## Per-tool permissions
 
@@ -383,6 +393,7 @@ a build without the `mcp` feature every `…/mcp/registry/…` route answers
 turns *every* rejection into one of two notices and never rethrows. A dead
 directory is an empty result with a reason; a missing feature is a sentence
 about the build. The company's installed servers keep rendering through both.
+Slow or failing reads: [mcp-registry.md](mcp-registry.md#a-slow-or-failing-directory).
 
 ### Provenance picks the routes, not just the badge
 

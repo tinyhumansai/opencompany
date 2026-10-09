@@ -31,6 +31,8 @@ fn declared(name: &str, endpoint: &str, source: McpSource) -> McpServerDto {
         website_url: None,
         transport: None,
         reachable_by: Vec::new(),
+        access_grant: String::new(),
+        agent_access: Vec::new(),
         health: None,
     }
 }
@@ -54,8 +56,8 @@ fn install(server_id: &str, qualified_name: &str, endpoint: Option<&str>) -> Reg
     }
 }
 
-fn agent(id: &str) -> RosterAgentDto {
-    RosterAgentDto {
+fn agent(id: &str) -> crate::server::ops::mcp::RosterAgentDto {
+    crate::server::ops::mcp::RosterAgentDto {
         id: id.to_string(),
         name: id.to_string(),
     }
@@ -85,7 +87,6 @@ fn a_server_in_both_lists_reconciles_to_one_row() {
             "@browserbasehq/mcp",
             Some("https://api.browserbase.com/mcp"),
         )],
-        &[],
     );
 
     assert_eq!(rows.len(), 1, "one server, one row");
@@ -124,7 +125,6 @@ fn reconciliation_ignores_query_strings_ports_and_trailing_slashes() {
             "@parallel/search",
             Some("https://mcp.parallel.ai/search"),
         )],
-        &[],
     );
     assert_eq!(
         rows.len(),
@@ -148,7 +148,6 @@ fn a_manifest_row_keeps_its_badge_when_an_install_reconciles_onto_it() {
             "@deepwiki/mcp",
             Some("https://mcp.deepwiki.com/mcp"),
         )],
-        &[],
     );
     assert_eq!(rows[0].source, McpSource::Manifest);
 }
@@ -165,7 +164,6 @@ fn distinct_endpoints_stay_distinct_rows() {
     merge_installs(
         &mut rows,
         vec![install("id-1", "@exa/exa", Some("https://mcp.exa.ai/mcp"))],
-        &[],
     );
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1].source, McpSource::Registry);
@@ -181,11 +179,7 @@ fn an_install_without_an_endpoint_reconciles_with_nothing() {
         "https://mcp.exa.ai/mcp",
         McpSource::Runtime,
     )];
-    merge_installs(
-        &mut rows,
-        vec![install("id-1", "@old/stdio-server", None)],
-        &[],
-    );
+    merge_installs(&mut rows, vec![install("id-1", "@old/stdio-server", None)]);
     assert_eq!(rows.len(), 2);
     assert!(rows[0].server_id.is_none(), "the http row is untouched");
     assert_eq!(rows[1].transport.as_deref(), Some("stdio"));
@@ -203,7 +197,7 @@ fn auth_configured_is_the_union_on_a_reconciled_row() {
     )];
     let mut with_env = install("id-1", "@exa/exa", Some("https://mcp.exa.ai/mcp"));
     with_env.auth_configured = true;
-    merge_installs(&mut rows, vec![with_env], &[]);
+    merge_installs(&mut rows, vec![with_env]);
     assert!(rows[0].auth_configured);
 }
 
@@ -230,7 +224,7 @@ fn list_a_health_wins_and_registry_health_fills_a_gap() {
     let mut b = install("id-2", "@linear/linear", Some("https://mcp.linear.app/mcp"));
     b.health = from_registry.clone();
 
-    merge_installs(&mut rows, vec![a, b], &[]);
+    merge_installs(&mut rows, vec![a, b]);
     assert_eq!(
         rows[0].health,
         Some(probed),
@@ -265,7 +259,6 @@ fn a_registry_row_carries_its_server_id_and_a_declared_row_is_unchanged() {
             "@modelcontextprotocol/server-git",
             Some("https://git.example.test/mcp"),
         )],
-        &[agent("ceo")],
     );
 
     let declared_json = serde_json::to_value(&rows[0]).expect("serializes");
@@ -288,12 +281,41 @@ fn a_registry_row_carries_its_server_id_and_a_declared_row_is_unchanged() {
         "the row's name is a display slug; `serverId` is the key"
     );
     assert_eq!(registry.source, McpSource::Registry);
-    assert_eq!(
-        registry.reachable_by.len(),
-        1,
-        "every teammate reaches an installed server — the harness pushes the \
-         registry bridge tools with no grant check"
+    assert!(
+        registry.reachable_by.is_empty(),
+        "reach is attached from grants afterwards, never assumed for the roster"
     );
+}
+
+fn holder(id: &str, grants: &[&str]) -> crate::server::ops::mcp::access::RosterAccess {
+    let grants: Vec<String> = grants.iter().map(|g| g.to_string()).collect();
+    crate::server::ops::mcp::access::RosterAccess {
+        agent: agent(id),
+        requested: None,
+        ceiling: grants.clone(),
+        effective: grants,
+    }
+}
+
+#[test]
+fn an_install_reaches_only_the_agents_whose_grants_name_it() {
+    let mut rows = Vec::new();
+    merge_installs(
+        &mut rows,
+        vec![install("id-1", "@exa/exa", Some("https://mcp.exa.ai/mcp"))],
+    );
+    let roster = [
+        holder("scoped", &["mcp_registry.id-1"]),
+        holder("all", &["mcp_registry"]),
+        holder("declared-only", &["mcp:*"]),
+        holder("wildcard", &["*"]),
+        holder("other", &["mcp_registry.id-2"]),
+    ];
+    crate::server::ops::mcp::attach_access(&mut rows, &roster);
+
+    let reached: Vec<&str> = rows[0].reachable_by.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(reached, ["scoped", "all"]);
+    assert_eq!(rows[0].access_grant, "mcp_registry.id-1");
 }
 
 /// A disabled install hands out no tools, so it reaches nobody — the same rule
@@ -303,7 +325,8 @@ fn a_disabled_install_reaches_nobody() {
     let mut rows = Vec::new();
     let mut off = install("id-1", "@exa/exa", Some("https://mcp.exa.ai/mcp"));
     off.enabled = false;
-    merge_installs(&mut rows, vec![off], &[agent("ceo"), agent("cto")]);
+    merge_installs(&mut rows, vec![off]);
+    crate::server::ops::mcp::attach_access(&mut rows, &[holder("ceo", &["mcp_registry"])]);
     assert!(rows[0].reachable_by.is_empty());
     assert!(!rows[0].enabled);
 }
@@ -332,7 +355,6 @@ fn a_colliding_row_name_falls_back_to_the_server_id() {
                 Some("https://two.example.test/mcp"),
             ),
         ],
-        &[],
     );
     let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
     assert_eq!(
@@ -608,7 +630,7 @@ fn no_installs_leaves_the_declared_list_untouched() {
         declared("exa", "https://mcp.exa.ai/mcp", McpSource::Runtime),
     ];
     let before = serde_json::to_value(&rows).expect("serializes");
-    merge_installs(&mut rows, Vec::new(), &[agent("ceo")]);
+    merge_installs(&mut rows, Vec::new());
     assert_eq!(serde_json::to_value(&rows).expect("serializes"), before);
 }
 

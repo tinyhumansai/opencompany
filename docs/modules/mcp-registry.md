@@ -211,10 +211,30 @@ A tool that *enumerates* installs rather than addressing one carries no
 predicate, the way `resolve_for_agent` filters declared servers with
 `grants_cover_server`. `mcp_registry_installed_list` is the one that does.
 
-A registry row's `reachableBy` has not caught up to this gate yet: it still
-lists the whole roster (and nobody when the install is disabled), the shape it
-had when the tools were wired unconditionally. An agent without the
-`mcp_registry` grant can therefore appear as a reacher on the Connections
-screen even though the harness will not wire it the tools — narrowing
-`reachableBy` to agents holding the grant is a tracked follow-up, not done
-here.
+A registry row's `reachableBy` follows this gate: it lists the agents whose
+effective grants pass `grants_cover_registry_server` for that install (and
+nobody while it is disabled), and its `accessGrant` is
+`mcp_registry.<server_id>`.
+
+## A slow or failing directory
+
+The host bounds every directory read and answers a typed failure instead of the
+upstream error: a search gets 8 s, then `504 registry_timeout`; any other
+upstream failure is `503 registry_unavailable`. Both bodies are an operator
+sentence with no upstream address or transport detail, which goes to the log.
+Each featured connector lookup gets 4 s, and a page waits at most 1.5 s per icon:
+the fetch carries on in the background and fills the cache for the next page,
+and a failed icon address is left alone for 10 minutes.
+
+In the console, a new search term aborts the request it replaces, keeps the
+previous rows on screen (dimmed) under "Searching for …", and a failed search or
+a failed **Show more** says so in place with a **Retry**. A search first answers
+from the featured rows already loaded: every word of the query is matched,
+case-insensitively, against the display name, qualified name and description,
+and name matches come first. Those rows show at once while the live search runs,
+lead the merged list when it lands (deduped by qualified name), and stay on
+screen with "Showing popular matches — the MCP directory is slow right now." and
+a **Retry** when the search answers `registry_timeout` or `registry_unavailable`.
+Only a search with no featured match shows the error state. The entry pop-up will
+not install while its directory lookup has failed, and closes once an install
+succeeds.

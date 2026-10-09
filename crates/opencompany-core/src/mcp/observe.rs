@@ -43,7 +43,7 @@ pub struct McpCallObserver {
 /// What classifying and scrubbing a failure needs of the declared servers: who
 /// is configured, and every credential value to scrub. Held once per company
 /// observer, not per agent.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct ObservedServers {
     configured: Vec<(String, bool)>,
     secrets: Vec<String>,
