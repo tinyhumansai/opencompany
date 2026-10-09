@@ -2613,7 +2613,14 @@ export function DiscussionTab({
             // Enter posts; Shift+Enter is a newline. A note about a task is
             // usually one line, and the mouse trip for every one of them is
             // what stops people writing them down at all.
-            if (e.key === "Enter" && !e.shiftKey) {
+            // Enter also confirms IME input. Safari may clear isComposing
+            // before that keydown, while still reporting key code 229.
+            if (
+              e.key === "Enter" &&
+              !e.shiftKey &&
+              !e.nativeEvent.isComposing &&
+              e.nativeEvent.keyCode !== 229
+            ) {
               e.preventDefault();
               void post();
             }

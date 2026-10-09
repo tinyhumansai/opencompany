@@ -254,6 +254,44 @@ describe("the composer surfaces the limit", () => {
   });
 });
 
+describe("the composer keeps IME confirmation separate from posting", () => {
+  it.each([
+    { label: "composing Enter", isComposing: true, keyCode: 13, draft: "日本語を入力" },
+    { label: "Safari's composition-ending Enter", isComposing: false, keyCode: 229, draft: "中文输入" },
+  ])("keeps the draft on $label, then posts on an ordinary Enter", async ({ isComposing, keyCode, draft }) => {
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), draft);
+    const confirmation = new KeyboardEvent("keydown", {
+      key: "Enter", bubbles: true, cancelable: true, isComposing, keyCode,
+    });
+    await act(async () => { textarea().dispatchEvent(confirmation); });
+
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe(draft);
+    expect(confirmation.defaultPrevented).toBe(false);
+
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(enter); });
+    expect(seen).toEqual([draft]);
+    expect(textarea().value).toBe("");
+    expect(enter.defaultPrevented).toBe(true);
+  });
+
+  it("leaves Shift+Enter to the textarea", async () => {
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "a note");
+    const newline = new KeyboardEvent("keydown", {
+      key: "Enter", shiftKey: true, bubbles: true, cancelable: true,
+    });
+    await act(async () => { textarea().dispatchEvent(newline); });
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("a note");
+    expect(newline.defaultPrevented).toBe(false);
+  });
+});
+
 describe("withdrawing a message has an in-flight state", () => {
   /** Presses Remove and confirms it in the portalled dialog. */
   async function withdraw() {
