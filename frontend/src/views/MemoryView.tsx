@@ -664,16 +664,26 @@ function AddLearningPanel({
   const [kind, setKind] = useState<LearningKind>("fact");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const kindRevision = useRef(0);
+  const textRevision = useRef(0);
 
   async function submit() {
     if (!text.trim()) return;
     setBusy(true);
+    const submittedKindRevision = kindRevision.current;
+    const submittedTextRevision = textRevision.current;
     try {
       await onAdd({ kind, text: text.trim() });
       // Nothing closes, so the form resets explicitly — text left standing
       // after a successful save reads as work that has not been saved yet.
-      setKind("fact");
-      setText("");
+      // Clear each saved field only when nothing newer was typed into it
+      // during the write; never erase edits made while the save was pending.
+      if (kindRevision.current === submittedKindRevision) {
+        setKind("fact");
+      }
+      if (textRevision.current === submittedTextRevision) {
+        setText("");
+      }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "could not save the learning");
     } finally {
@@ -696,7 +706,12 @@ function AddLearningPanel({
           <Label htmlFor="mem-kind">Kind</Label>
           <Select
             value={kind}
-            onValueChange={(v) => v && setKind(v as LearningKind)}
+            onValueChange={(v) => {
+              if (v) {
+                kindRevision.current++;
+                setKind(v as LearningKind);
+              }
+            }}
             items={LEARNING_KIND_LABELS}
           >
             <SelectTrigger id="mem-kind" className="w-full">
@@ -718,7 +733,10 @@ function AddLearningPanel({
             data-testid="memory-text"
             rows={3}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              textRevision.current++;
+              setText(e.target.value);
+            }}
             placeholder="e.g. The client prefers Friday reviews."
           />
         </div>

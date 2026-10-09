@@ -141,6 +141,71 @@ describe("MemoryView add: save vs reload", () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
+  it("keeps a newer learning typed while the earlier save is pending", async () => {
+    let resolveSave!: (value: { id: string }) => void;
+    createMemory.mockImplementation(
+      () => new Promise<{ id: string }>((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    listMemory.mockResolvedValue(EMPTY_LIST);
+    act(() => {
+      root.render(createElement(MemoryView, { client: stubClient(), company: "acme", sub: "upload" }));
+    });
+    await settle();
+    await openAndSave();
+    const title = query("memory-text") as HTMLTextAreaElement;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(title, "Newer unsaved learning");
+      title.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await settle();
+    act(() => {
+      resolveSave({ id: "m1" });
+    });
+    await settle();
+    expect(createMemory).toHaveBeenCalledWith(expect.anything(), "acme", {
+      kind: "fact",
+      text: "Client prefers Friday reviews",
+    });
+    expect(titleValue()).toBe("Newer unsaved learning");
+  });
+
+  it("resets only the fields that were saved, keeping an untouched edit", async () => {
+    let resolveSave!: (value: { id: string }) => void;
+    createMemory.mockImplementation(
+      () => new Promise<{ id: string }>((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    listMemory.mockResolvedValue(EMPTY_LIST);
+    act(() => {
+      root.render(createElement(MemoryView, { client: stubClient(), company: "acme", sub: "upload" }));
+    });
+    await settle();
+    await openAndSave();
+    // Change only the kind while the write is pending. The saved text must
+    // still clear (it was saved), and the newer kind choice must survive.
+    act(() => {
+      document.getElementById("mem-kind")?.click();
+    });
+    await settle();
+    act(() => {
+      const item = Array.from(document.querySelectorAll("[role=option]")).find(
+        (el) => el.textContent?.trim() === "Preference",
+      ) as HTMLElement | undefined;
+      item?.click();
+    });
+    await settle();
+    act(() => {
+      resolveSave({ id: "m1" });
+    });
+    await settle();
+    expect(titleValue()).toBe("");
+    expect(document.getElementById("mem-kind")?.textContent).toContain("Preference");
+  });
+
   it("does not report a failed reload as a failed save", async () => {
     createMemory.mockResolvedValue({ id: "m1" });
     listMemory.mockRejectedValue(new Error("reload boom"));
