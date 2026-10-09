@@ -77,13 +77,13 @@ export function ignored(path: string): boolean {
 
 /** Recursively collects every file under one dropped entry. */
 async function walk(entry: FileSystemEntry, prefix: string): Promise<DroppedFile[]> {
+  const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+  if (ignored(entry.isDirectory ? `${path}/` : path)) return [];
   if (entry.isFile) {
-    const file = await new Promise<File | null>((resolve) => {
-      (entry as FileSystemFileEntry).file(resolve, () => resolve(null));
+    const file = await new Promise<File>((resolve, reject) => {
+      (entry as FileSystemFileEntry).file(resolve, () => reject(new Error(`Could not read ${path}. Drop it again after checking file access.`)));
     });
-    if (!file) return [];
-    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    return ignored(path) ? [] : [{ path, file }];
+    return [{ path, file }];
   }
   if (!entry.isDirectory) return [];
   const reader = (entry as FileSystemDirectoryEntry).createReader();
@@ -92,14 +92,12 @@ async function walk(entry: FileSystemEntry, prefix: string): Promise<DroppedFile
   // empty batch — reading once silently truncates any folder past 100 files,
   // which is exactly the size where a folder drop starts to matter.
   for (;;) {
-    const batch = await new Promise<FileSystemEntry[]>((resolve) => {
-      reader.readEntries(resolve, () => resolve([]));
+    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
+      reader.readEntries(resolve, () => reject(new Error(`Could not read ${path}. Drop it again after checking folder access.`)));
     });
     if (batch.length === 0) break;
     children.push(...batch);
   }
-  const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-  if (ignored(`${path}/`)) return [];
   const nested = await Promise.all(children.map((child) => walk(child, path)));
   return nested.flat();
 }
@@ -204,7 +202,9 @@ export function DropZone({ client, company, onIngested, off }: Props) {
           return;
         }
         const transfer = e.dataTransfer;
-        void readDrop(transfer).then(({ files, urls }) => send(files, urls));
+        void readDrop(transfer)
+          .then(({ files, urls }) => send(files, urls))
+          .catch((e: unknown) => toast.error(e instanceof Error ? e.message : "the drop could not be read"));
       }}
       className={cn(
         "border-dashed transition-colors",
