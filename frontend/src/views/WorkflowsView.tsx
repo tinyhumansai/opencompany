@@ -50,6 +50,7 @@ import {
   workflowRunOutput,
 } from "@/api/workflows";
 import type { CompanyStreamEvent } from "@/hooks/use-events";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import { withHostParam } from "@/hooks/use-host-route";
 import type { OpenCompanyClient } from "@/api/client";
 import { ApiError } from "@/api/types";
@@ -410,6 +411,7 @@ export function WorkflowsView({
   const [request, setRequest] = useState("");
   const [ranWith, setRanWith] = useState("");
   // Issue #1204: whether that dialog is up.
+  const runInputImeEnter = useImeEnter();
   const [runInputOpen, setRunInputOpen] = useState(false);
   // Issue #1002: the roster read behind the cards' "Asked by" line, keyed to the
   // approvals of the run on screen rather than to the whole queue — so a console
@@ -3645,9 +3647,16 @@ export function WorkflowsView({
             autoFocus
             value={request}
             onChange={(e) => setRequest(e.target.value)}
+            onCompositionEnd={runInputImeEnter.onCompositionEnd}
             onKeyDown={(e) => {
-              // Enter runs, exactly as it did from the toolbar box (#154).
-              if (e.key === "Enter") runWithInput(false);
+              // Enter runs, exactly as it did from the toolbar box (#154) —
+              // but an Enter still confirming an IME candidate is the
+              // composition's, not a dispatch: firing here would run the
+              // workflow on the half-composed text. Safari's completing Enter
+              // arrives after compositionend (WebKit bug 165004), so the
+              // shared guard decides.
+              if (e.key === "Enter" && !runInputImeEnter.confirmsComposition(e))
+                runWithInput(false);
             }}
             placeholder="What should this run work on?"
             aria-label="Request for this run"

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import {
   ChevronDown,
   ChevronRight,
@@ -3114,6 +3115,7 @@ function NamePrompt({
   onSubmit: (name: string) => void;
 }) {
   const [name, setName] = useState("");
+  const imeEnter = useImeEnter();
   /** The typed name, held back until the audience warning is acknowledged. */
   const [pending, setPending] = useState<{ name: string; warning: MoveAudienceWarning } | null>(
     null,
@@ -3195,8 +3197,15 @@ function NamePrompt({
                 autoFocus
                 value={name}
                 onChange={(e) => setName(e.target.value)}
+                onCompositionEnd={imeEnter.onCompositionEnd}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && name.trim()) submit(name);
+                  // An Enter still confirming an IME candidate belongs to the
+                  // composition, not to submit — filing "かな" half-composed
+                  // names the note or folder something nobody typed. Safari's
+                  // completing Enter arrives after compositionend (WebKit bug
+                  // 165004), so the shared guard decides.
+                  if (e.key === "Enter" && !imeEnter.confirmsComposition(e) && name.trim())
+                    submit(name);
                 }}
                 placeholder={state?.mode === "folder" ? "e.g. Campaigns" : "e.g. Notes"}
               />
