@@ -11,6 +11,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import { COMPOSER_INTENT_HIDDEN } from "@/product-scope";
 import { cn } from "@/lib/utils";
 import { MentionPicker } from "@/views/room/MentionPicker";
@@ -206,6 +207,7 @@ export function MessageComposer({
   deleteAttachment,
 }: Props) {
   const [draft, setDraft] = useState("");
+  const imeEnter = useImeEnter();
   // Up to the server's bounded maximum of twenty files can ride one message.
   // Each keeps the delete callback for the company scope that owns its node.
   const [pending, setPending] = useState<PendingAttachment[]>([]);
@@ -593,7 +595,11 @@ export function MessageComposer({
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey) {
+    // An Enter that confirms an IME candidate finishes the composition — it
+    // does not send the half-written draft. isComposing alone misses Safari,
+    // whose completing Enter arrives after compositionend (WebKit bug
+    // 165004), so the shared guard covers all three signals.
+    if (e.key === "Enter" && !e.shiftKey && !imeEnter.confirmsComposition(e)) {
       e.preventDefault();
       send();
     }
@@ -813,6 +819,7 @@ export function MessageComposer({
             onChange={onChange}
             onPaste={onPaste}
             onKeyDown={onKeyDown}
+            onCompositionEnd={imeEnter.onCompositionEnd}
             // A click or an arrow can move the caret into (or out of) an
             // existing `@name` without changing the text, so the query is
             // re-read on selection changes too, not only on edits.

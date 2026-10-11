@@ -40,6 +40,7 @@ import { Loader2, Send, Sparkles } from "lucide-react";
 import type { CopilotTurn, DraftableField, ProfileDraft } from "@/api/agent-copilot";
 import { copilotTurnText, refusalNotice } from "@/api/agent-copilot";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -106,6 +107,7 @@ export function FieldCopilot({
   const [open, setOpen] = useState(false);
   const [turns, setTurns] = useState<CopilotTurn[]>([]);
   const [input, setInput] = useState("");
+  const imeEnter = useImeEnter();
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   /**
@@ -345,10 +347,14 @@ export function FieldCopilot({
           rows={2}
           value={input}
           onChange={(e) => setInput(e.target.value)}
+          onCompositionEnd={imeEnter.onCompositionEnd}
           onKeyDown={(e) => {
             // Enter sends, Shift+Enter breaks the line — the convention every
-            // composer in this console follows.
-            if (e.key === "Enter" && !e.shiftKey) {
+            // composer in this console follows. An Enter that confirms an IME
+            // candidate does neither — Safari's completing Enter arrives after
+            // compositionend, so the shared guard, not a bare isComposing read
+            // (WebKit bug 165004).
+            if (e.key === "Enter" && !e.shiftKey && !imeEnter.confirmsComposition(e)) {
               e.preventDefault();
               if (input.trim()) void run(input.trim());
             }

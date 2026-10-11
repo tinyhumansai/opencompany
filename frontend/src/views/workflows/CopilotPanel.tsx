@@ -32,6 +32,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Loader2, Send } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import { getInferenceStatus, type CognitionPath } from "@/api/inference";
 import { ApiError, type WorkflowProblem } from "@/api/types";
 import {
@@ -132,6 +133,7 @@ export function CopilotPanel({
 }) {
   const [messages, setMessages] = useState<CopilotMessage[]>([]);
   const [draft, setDraft] = useState("");
+  const imeEnter = useImeEnter();
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -727,10 +729,14 @@ export function CopilotPanel({
         <Textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onCompositionEnd={imeEnter.onCompositionEnd}
           onKeyDown={(e) => {
             // Enter sends, Shift+Enter breaks the line — the convention the
-            // company chat composer already uses.
-            if (e.key === "Enter" && !e.shiftKey) {
+            // company chat composer already uses. An Enter that confirms an
+            // IME candidate does neither — Safari's completing Enter arrives
+            // after compositionend, so the shared guard, not a bare
+            // isComposing read (WebKit bug 165004).
+            if (e.key === "Enter" && !e.shiftKey && !imeEnter.confirmsComposition(e)) {
               e.preventDefault();
               void send();
             }
