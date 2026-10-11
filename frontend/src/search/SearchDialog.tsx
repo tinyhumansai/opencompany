@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Search } from "lucide-react";
 
 import type { OpenCompanyClient } from "@/api/client";
+import { useImeEnter } from "@/hooks/use-ime-enter";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { parseSearchQuery, SCOPE_PREFIX, withScopeName } from "./query";
 import { SearchResultRow } from "./SearchResultRow";
@@ -38,6 +39,7 @@ export function SearchDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [raw, setRaw] = useState("");
+  const imeEnter = useImeEnter();
   const [cursor, setCursor] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -81,6 +83,14 @@ export function SearchDialog({
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // An Enter (or arrow, or Escape) that confirms or navigates an IME
+    // candidate belongs to the composition — leave it, or confirming "かな"
+    // would jump to whatever result happened to be highlighted and close the
+    // palette mid-word. Safari's completing Enter arrives after
+    // compositionend with isComposing already false (WebKit bug 165004), so
+    // the shared guard decides, not a bare isComposing read.
+    if (event.key === "Enter" && imeEnter.confirmsComposition(event)) return;
+    if (event.nativeEvent.isComposing) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setCursor((at) => (flat.length === 0 ? 0 : (at + 1) % flat.length));
@@ -124,6 +134,7 @@ export function SearchDialog({
             autoFocus
             value={raw}
             onChange={(event) => setRaw(event.target.value)}
+            onCompositionEnd={imeEnter.onCompositionEnd}
             onKeyDown={onKeyDown}
             placeholder="Search channels, agents, messages and files"
             aria-label="Search this company"
