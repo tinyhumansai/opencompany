@@ -562,6 +562,7 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
   useEffect(() => {
     if (!status?.inference.ready) return;
     let cancelled = false;
+    const generation = setupWayGenerationRef.current;
     setTested({ kind: "testing" });
     testInference(client, {
       provider: status.inference.provider ?? SETUP_INFERENCE_OPTIONS[0].id,
@@ -569,7 +570,7 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
       baseUrl: null,
     })
       .then((result) => {
-        if (cancelled) return;
+        if (cancelled || generation !== setupWayGenerationRef.current) return;
         setTested(
           result.ok
             ? { kind: "hosted" }
@@ -577,7 +578,7 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
         );
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (cancelled || generation !== setupWayGenerationRef.current) return;
         setTested({ kind: "failed", error: err instanceof Error ? err.message : String(err) });
       });
     return () => {
@@ -1303,6 +1304,20 @@ export function SetupWizard({ client, onDone, onCancel, expectsShellRemount }: P
             <span />
           )}
           <div className="flex gap-2">
+            {current.id === STEP_ONE_FOR.managed &&
+              tested.kind !== "ok" && tested.kind !== "hosted" && (
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    // Retire this branch's key and any probe still in flight.
+                    chooseSetupWay("self-managed");
+                    setTouched(false);
+                    setStepId("business");
+                  }}
+                >
+                  Continue without a model
+                </Button>
+              )}
             <Button
               variant="outline"
               disabled={step === 0}

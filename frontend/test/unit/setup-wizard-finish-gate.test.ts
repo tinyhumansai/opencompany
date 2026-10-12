@@ -323,6 +323,99 @@ describe("finishing setup with no companies on the host", () => {
     expect(container.querySelector('[data-testid="setup-field-industry"]')).toBeTruthy();
   });
 
+  it("lets a managed operator explicitly continue without a model", async () => {
+    await show(clientWith(status()));
+    await chooseManaged();
+    await next();
+
+    expect(container.querySelector('[data-testid="setup-problem"]')).toBeTruthy();
+    await act(async () => {
+      button("Continue without a model").click();
+    });
+
+    expect(container.querySelector('[data-testid="setup-field-industry"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="setup-field-key"]')).toBeNull();
+    expect(container.querySelector('[data-testid="setup-problem"]')).toBeNull();
+  });
+
+  it.each(["failed", "pending"])(
+    "discards the managed credential when continuing after a %s probe",
+    async (probe) => {
+      let resolveProbe!: (value: unknown) => void;
+      const response = new Promise<unknown>((resolve) => {
+        resolveProbe = resolve;
+      });
+      const client = clientWith(status(), { post: async () => response });
+      const requests: { path: string; body: unknown }[] = [];
+      const post = client.post.bind(client);
+      client.post = async (path, body, ...rest) => {
+        requests.push({ path, body });
+        return post(path, body, ...rest);
+      };
+      await show(client);
+      await chooseManaged();
+      await fill("setup-field-key", "discard-this-key");
+      await act(async () => {
+        button("Test connection").click();
+      });
+      if (probe === "failed") {
+        await act(async () => {
+          resolveProbe({ ok: false, error: "Rejected" });
+        });
+      }
+      await act(async () => {
+        button("Continue without a model").click();
+      });
+      if (probe === "pending") {
+        await act(async () => {
+          resolveProbe({ ok: true, baseUrl: "https://example.test/v1" });
+        });
+      }
+
+      expect(container.querySelector('[data-testid="setup-field-industry"]')).toBeTruthy();
+      expect(container.querySelector('[data-testid="setup-field-teamHint"]')).toBeNull();
+      expect(container.querySelector('[data-testid="setup-field-automate"]')).toBeNull();
+      await fill("setup-field-industry", "Homeware");
+      await next();
+      await next();
+      await fill("setup-field-email", "ada@example.com");
+      await next();
+      const design = requests.find(({ path }) => path.includes("/roster"));
+      expect(design?.body).toMatchObject({ inferenceKey: null, forceCurated: true });
+    },
+  );
+
+  it.each(["success", "failure", "rejection"])(
+    "ignores a late host probe %s after explicitly continuing without a model",
+    async (outcome) => {
+      let resolveProbe!: (value: unknown) => void;
+      let rejectProbe!: (error: Error) => void;
+      const response = new Promise<unknown>((resolve, reject) => {
+        resolveProbe = resolve;
+        rejectProbe = reject;
+      });
+      await show(
+        clientWith(
+          status({ inference: { ready: true, provider: "managed", base_url: null } }),
+          { post: async () => response },
+        ),
+      );
+      await chooseManaged();
+      await act(async () => {
+        button("Continue without a model").click();
+      });
+      await act(async () => {
+        if (outcome === "rejection") rejectProbe(new Error("Host unreachable"));
+        else resolveProbe({ ok: outcome === "success", error: "Host rejected" });
+      });
+
+      expect(container.querySelector('[data-testid="setup-field-industry"]')).toBeTruthy();
+      expect(container.querySelector('[data-testid="setup-field-teamHint"]')).toBeNull();
+      expect(container.querySelector('[data-testid="setup-field-automate"]')).toBeNull();
+      expect(container.querySelector('[data-testid="setup-problem"]')).toBeNull();
+    },
+  );
+
   /**
    * A failed test is not a passed one. The step reports the reason and still
    * holds, because "we could not reach that" is exactly when carrying on
@@ -384,6 +477,7 @@ describe("finishing setup with no companies on the host", () => {
     expect(
       container.querySelector('[data-testid="setup-test-ok"]')?.textContent,
     ).toContain("https://example.test/v1");
+    expect(container.textContent).not.toContain("Continue without a model");
     await next();
     expect(container.querySelector('[data-testid="setup-field-industry"]')).toBeTruthy();
   });
