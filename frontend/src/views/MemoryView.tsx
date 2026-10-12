@@ -666,14 +666,22 @@ function AddLearningPanel({
   const [busy, setBusy] = useState(false);
 
   async function submit() {
-    if (!text.trim()) return;
+    const savedText = text.trim();
+    if (!savedText) return;
+    const savedKind = kind;
+    const savedRaw = text;
     setBusy(true);
     try {
-      await onAdd({ kind, text: text.trim() });
-      // Nothing closes, so the form resets explicitly — text left standing
-      // after a successful save reads as work that has not been saved yet.
-      setKind("fact");
-      setText("");
+      await onAdd({ kind: savedKind, text: savedText });
+      // Nothing closes, so the form resets explicitly — but only the work
+      // this save actually sent. Anything typed while the request was in
+      // flight is a newer, unsent learning; clearing it would lose it.
+      setText((current) => {
+        if (current.trim() === savedText) return "";
+        if (current.startsWith(savedRaw)) return current.slice(savedRaw.length);
+        return current;
+      });
+      setKind((current) => (current === savedKind ? "fact" : current));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "could not save the learning");
     } finally {
