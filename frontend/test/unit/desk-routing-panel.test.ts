@@ -143,4 +143,12 @@ describe("DeskRoutingPanel", () => {
     const panel = await render({} as unknown as OpenCompanyClient);
     expect(panel.dataset.state).toBe("unavailable");
   });
+
+  it("shows the error when the initial routing read fails", async () => {
+    const getDeskRouting = vi.fn().mockRejectedValue(new Error("routing read failed"));
+    const panel = await render({ getDeskRouting } as unknown as OpenCompanyClient);
+    await settle();
+    expect(panel.dataset.state).toBe("error");
+    expect(panel.textContent).toContain("routing read failed");
+  });
 });

@@ -140,19 +140,21 @@ export function DeskRoutingPanel({ client, company, deskId, refreshKey = 0, canM
       </p>
     );
   }
+  // Error before the null-data loading guard: a failed first read has no
+  // data, and taking the loading branch would hide the error forever.
+  if (load === "error") {
+    return (
+      <p className="text-sm text-muted-foreground" data-testid="desk-routing-panel" data-state="error">
+        {error}
+      </p>
+    );
+  }
   if (load === "loading" || !dto) {
     return (
       <div className="flex items-center gap-2 text-sm text-muted-foreground" data-testid="desk-routing-panel" data-state="loading">
         <Loader2 className="size-4 animate-spin" aria-hidden />
         Reading routing…
       </div>
-    );
-  }
-  if (load === "error") {
-    return (
-      <p className="text-sm text-muted-foreground" data-testid="desk-routing-panel" data-state="error">
-        {error}
-      </p>
     );
   }
 
