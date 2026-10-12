@@ -76,36 +76,55 @@ export function ignored(path: string): boolean {
 }
 
 /** Recursively collects every file under one dropped entry. */
-async function walk(entry: FileSystemEntry, prefix: string): Promise<DroppedFile[]> {
+async function walk(
+  entry: FileSystemEntry,
+  prefix: string,
+): Promise<{ files: DroppedFile[]; skipped: string[] }> {
   if (entry.isFile) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (ignored(path)) return { files: [], skipped: [] };
     const file = await new Promise<File | null>((resolve) => {
       (entry as FileSystemFileEntry).file(resolve, () => resolve(null));
     });
-    if (!file) return [];
-    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    return ignored(path) ? [] : [{ path, file }];
+    // A failed `file()` read must not vanish into the upload set: the drop
+    // reports what it skipped so a partial read is never announced as done.
+    if (!file) return { files: [], skipped: [path] };
+    return { files: [{ path, file }], skipped: [] };
   }
-  if (!entry.isDirectory) return [];
+  if (!entry.isDirectory) return { files: [], skipped: [] };
   const reader = (entry as FileSystemDirectoryEntry).createReader();
   const children: FileSystemEntry[] = [];
   // `readEntries` returns at most 100 at a time and signals the end with an
   // empty batch — reading once silently truncates any folder past 100 files,
   // which is exactly the size where a folder drop starts to matter.
+  let readFailed = false;
   for (;;) {
-    const batch = await new Promise<FileSystemEntry[]>((resolve) => {
-      reader.readEntries(resolve, () => resolve([]));
+    const batch = await new Promise<FileSystemEntry[] | null>((resolve) => {
+      reader.readEntries(resolve, () => resolve(null));
     });
+    // A failed batch resolves as null: an empty array is the genuine
+    // end-of-directory signal, and mistaking a failure for it truncates the
+    // folder while looking like a complete read.
+    if (batch === null) {
+      readFailed = true;
+      break;
+    }
     if (batch.length === 0) break;
     children.push(...batch);
   }
   const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-  if (ignored(`${path}/`)) return [];
+  if (ignored(`${path}/`)) return { files: [], skipped: [] };
   const nested = await Promise.all(children.map((child) => walk(child, path)));
-  return nested.flat();
+  const files = nested.flatMap((n) => n.files);
+  const skipped = nested.flatMap((n) => n.skipped);
+  if (readFailed) skipped.unshift(`${path}/…`);
+  return { files, skipped };
 }
 
 /** Pulls files and links out of a drop. */
-async function readDrop(transfer: DataTransfer): Promise<{ files: DroppedFile[]; urls: string[] }> {
+async function readDrop(
+  transfer: DataTransfer,
+): Promise<{ files: DroppedFile[]; urls: string[]; skipped: string[] }> {
   const entries: FileSystemEntry[] = [];
   const urls: string[] = [];
   // `items` is live and empties as soon as the handler yields, so every entry
@@ -124,13 +143,13 @@ async function readDrop(transfer: DataTransfer): Promise<{ files: DroppedFile[];
 
   if (entries.length > 0) {
     const walked = await Promise.all(entries.map((entry) => walk(entry, "")));
-    return { files: walked.flat(), urls };
+    return { files: walked.flatMap((w) => w.files), urls, skipped: walked.flatMap((w) => w.skipped) };
   }
   // A browser with no entry API still gives plain files, without their paths.
   const files = Array.from(transfer.files)
     .map((file) => ({ path: file.name, file }))
     .filter((f) => !ignored(f.path));
-  return { files, urls };
+  return { files, urls, skipped: [] };
 }
 
 export function DropZone({ client, company, onIngested, off }: Props) {
@@ -144,9 +163,17 @@ export function DropZone({ client, company, onIngested, off }: Props) {
   const depth = useRef(0);
 
   const send = useCallback(
-    async (files: DroppedFile[], urls: string[]) => {
+    async (files: DroppedFile[], urls: string[], skipped: string[] = []) => {
       if (files.length === 0 && urls.length === 0) {
-        toast.error("nothing in that drop could be read");
+        if (skipped.length > 0) {
+          toast.warning(
+            `skipped ${skipped.length} ${
+              skipped.length === 1 ? "entry" : "entries"
+            } that could not be read`,
+          );
+        } else {
+          toast.error("nothing in that drop could be read");
+        }
         return;
       }
       const items: IngestedItem[] = [];
@@ -174,10 +201,36 @@ export function DropZone({ client, company, onIngested, off }: Props) {
       setReport(items);
       const stored = items.filter((i) => i.status === "stored").length;
       if (stored > 0) {
-        toast.success(`Remembered ${stored} of ${items.length}.`);
+        if (skipped.length > 0) {
+          // A partial read is not a full success: name what was skipped so
+          // the drop is never announced as fully remembered.
+          toast.warning(
+            `Remembered ${stored} of ${items.length}; skipped ${skipped.length} ${
+              skipped.length === 1 ? "entry" : "entries"
+            } that could not be read.`,
+          );
+        } else {
+          toast.success(`Remembered ${stored} of ${items.length}.`);
+        }
         onIngested();
       } else if (items.length > 0) {
-        toast.error("nothing in that drop could be turned into memory");
+        // A failed store with unread entries is also a partial read: name
+        // the skips here too, like the no-items branch below does.
+        toast.error(
+          `nothing in that drop could be turned into memory${
+            skipped.length > 0
+              ? `; skipped ${skipped.length} ${
+                  skipped.length === 1 ? "entry" : "entries"
+                } that could not be read`
+              : ""
+          }`,
+        );
+      } else if (skipped.length > 0) {
+        toast.warning(
+          `skipped ${skipped.length} ${
+            skipped.length === 1 ? "entry" : "entries"
+          } that could not be read`,
+        );
       }
     },
     [client, company, onIngested],
@@ -204,7 +257,7 @@ export function DropZone({ client, company, onIngested, off }: Props) {
           return;
         }
         const transfer = e.dataTransfer;
-        void readDrop(transfer).then(({ files, urls }) => send(files, urls));
+        void readDrop(transfer).then(({ files, urls, skipped }) => send(files, urls, skipped));
       }}
       className={cn(
         "border-dashed transition-colors",
@@ -248,7 +301,7 @@ export function DropZone({ client, company, onIngested, off }: Props) {
                 const typed = window.prompt("Link to remember");
                 const url = typed?.trim();
                 if (!url) return;
-                void send([], [url]);
+                void send([], [url], []);
               }}
             >
               <Link2 className="size-4" /> Add link
@@ -273,7 +326,7 @@ export function DropZone({ client, company, onIngested, off }: Props) {
             // Reset first: picking the same file twice in a row fires no
             // change event otherwise, and the second attempt looks broken.
             e.target.value = "";
-            void send(files, []);
+            void send(files, [], []);
           }}
         />
 
