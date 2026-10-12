@@ -100,6 +100,8 @@ export function createSaveBuffer(): SaveBuffer {
     },
     clear() {
       pending = null;
+      // A removed or closed note also retires writes already in flight.
+      newest += 1;
     },
     holdsUnsavedWork() {
       return pending !== null || inFlight > 0;

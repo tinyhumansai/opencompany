@@ -262,3 +262,37 @@ describe("the ordinary path", () => {
     expect(buffer.holdsUnsavedWork()).toBe(false);
   });
 });
+
+describe("a cleared note with an outstanding save", () => {
+  it("does not restore a deleted note when its old save fails", async () => {
+    const held = heldWrite<Ack>();
+    const buffer = createSaveBuffer();
+    const sink = spySink(held.write);
+    buffer.stage({ id: "deleted-note", content: "rescued elsewhere" });
+    const flushed = buffer.flush(sink);
+    await held.started;
+    buffer.clear();
+    held.reject(new Error("note no longer exists"));
+    await flushed;
+    expect(buffer.peek()).toBeNull();
+    expect(buffer.holdsUnsavedWork()).toBe(false);
+    expect(sink.onFailed).not.toHaveBeenCalled();
+    expect(sink.onSaved).not.toHaveBeenCalled();
+  });
+
+  it("does not report a cleared note's delayed acknowledgement as saved", async () => {
+    const held = heldWrite<Ack>();
+    const buffer = createSaveBuffer();
+    const sink = spySink(held.write);
+    buffer.stage({ id: "deleted-note", content: "old words" });
+    const flushed = buffer.flush(sink);
+    await held.started;
+    buffer.clear();
+    held.resolve({ updatedAt: 1 });
+    await flushed;
+    expect(buffer.peek()).toBeNull();
+    expect(buffer.holdsUnsavedWork()).toBe(false);
+    expect(sink.onSaved).not.toHaveBeenCalled();
+    expect(sink.onFailed).not.toHaveBeenCalled();
+  });
+});
