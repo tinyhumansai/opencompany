@@ -33,7 +33,7 @@
 // This is the run drawer's fix (#1002) reaching the surface an operator
 // actually works from.
 
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 
 import {
   AlertTriangle,
@@ -175,6 +175,9 @@ export function TaskItem({
   onOpen: () => void;
   onResume: () => void;
 }) {
+  // Last accepted Resume click; see the button's onClick for why it lives
+  // here rather than in the shell.
+  const resumeClickedAt = useRef(0);
   // One group per turn, never one card-wide batch (#1895 review). `ApprovalRow`
   // consolidates because #842's premise is that a batch is *one piece of work*
   // — one turn's parked calls, interrupting once. A paused card can hold more
@@ -352,6 +355,17 @@ export function TaskItem({
             onClick={(e) => {
               // Don't let the click bubble to the card's open handler.
               e.stopPropagation();
+              // A real double-click lands a second handler call before the
+              // resume PATCH can flip the card off `paused` and re-render —
+              // nothing in props changes between the two clicks, so the
+              // click-time gate has to live here. One second covers the
+              // whole double-click gesture (the OS ceiling is ~500ms) and is
+              // far shorter than reading the failure toast and clicking
+              // again, so a refused resume stays retryable; this is a rate
+              // limit, not busy state the card could be stuck holding.
+              const clickedAt = Date.now();
+              if (clickedAt - resumeClickedAt.current < 1000) return;
+              resumeClickedAt.current = clickedAt;
               onResume();
             }}
           >

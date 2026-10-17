@@ -78,15 +78,11 @@ afterEach(async () => {
 });
 
 describe("A real double-click on Resume", () => {
-  // FINDING: `TaskItem`'s Resume button has no click-time debounce of its own
-  // — `disabled={rows.length > 0}` is the only gate, and `rows` does not
-  // change between two synchronous clicks. Two clicks before the caller's
-  // `onResume` has had a chance to do anything both reach it, so a real
-  // double-click can fire two re-dispatches. Confirmed failing against the
-  // current source (frontend/src/views/TaskCard.tsx, the Resume `onClick`
-  // handler) before being marked skip; not fixed here (frontend-only,
-  // test-only task) — see the report.
-  it.skip("reaches the resume handler once, not twice, for two clicks before either settles", async () => {
+  // Fixed in `TaskItem`'s Resume `onClick`: a click-time gate ignores a
+  // second click within two seconds of an accepted one, because nothing in
+  // props changes between the two clicks of a real double-click — the resume
+  // PATCH has not had a chance to flip the card off `paused` yet.
+  it("reaches the resume handler once, not twice, for two clicks before either settles", async () => {
     const onResume = vi.fn();
     await render(onResume);
 
@@ -137,9 +133,20 @@ describe("A resume that did not land", () => {
     // no "resuming" state of its own that a rejection could leave stuck.
     expect(button.disabled).toBe(false);
 
+    // The one-second click gate against double-clicks is a rate limit, not
+    // busy state: once the gesture window has passed, a retry click reaches
+    // the handler exactly as before.
     await act(async () => {
-      button.click();
+      vi.useFakeTimers();
+      vi.advanceTimersByTime(1500);
     });
-    expect(onResume).toHaveBeenCalledTimes(2);
+    try {
+      await act(async () => {
+        button.click();
+      });
+      expect(onResume).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
