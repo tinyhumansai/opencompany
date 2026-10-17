@@ -87,16 +87,11 @@ afterEach(() => {
 });
 
 describe("two overlapping renames of the same node race on the network, not on the operator's intent", () => {
-  // FINDING (see report): `rename()` has no per-node request ordering guard —
-  // unlike InboxView / ArtifactsTab / PagesView / TaskDetailView, all of which
-  // carry a generation counter or an `isActive()` check specifically so a
-  // late, superseded response cannot overwrite a newer one. This is the
-  // console's only rename path; it applies whichever PATCH response settles
-  // last, so a slow first request finishing after a fast second one reverts
-  // the node to the stale name. Kept as `it.skip` with the desired (safe)
-  // assertion — see the report's Findings section rather than a passing test
-  // asserting the current, unsafe behaviour.
-  it.skip("keeps the operator's second, newer rename even when the first request's response arrives after it", async () => {
+  // Fixed in `rename()`: a per-node generation counter — the gate InboxView,
+  // ArtifactsTab, PagesView and TaskDetailView already carry for their racy
+  // reads — so a late, superseded response can no longer overwrite the newer
+  // name, and a stale failure cannot toast over the newer attempt's outcome.
+  it("keeps the operator's second, newer rename even when the first request's response arrives after it", async () => {
     let resolveFirst: ((node: unknown) => void) | null = null;
     let resolveSecond: ((node: unknown) => void) | null = null;
     let call = 0;
@@ -142,6 +137,9 @@ describe("two overlapping renames of the same node race on the network, not on t
     });
 
     const label = container.querySelector('[data-testid="workspace-tree-name"]');
-    expect(label?.textContent).toBe("Second.md");
+    // The tree renders `titleOf` (the extension-stripped title — the row is
+    // found by "Plan" above, not "Plan.md"), so the newer name proves itself
+    // as "Second"; the stale response would show "First".
+    expect(label?.textContent).toBe("Second");
   });
 });

@@ -564,6 +564,12 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
   // Generation tokens so a response from a previous company scope (or from a
   // file that has since been closed) can never overwrite the current one.
   const treeGen = useRef(0);
+  // Per-node rename generation: the Rename dialog fires and forgets, so a
+  // second rename of the same node can start before the first one's PATCH
+  // settles. Only the newest attempt may apply its response or toast its
+  // failure — the same gate InboxView/PagesView carry for their racy reads.
+  const renameGen = useRef(new Map<string, number>());
+
   const fileGen = useRef(0);
   const searchGen = useRef(0);
   const rosterGen = useRef(0);
@@ -1278,13 +1284,20 @@ export function WorkspaceView({ client, company, event, refreshTick = 0, initial
 
   async function rename(node: FsNode, name: string) {
     const next = (node.kind === "file" ? ensureMdExt(name.trim()) : name.trim()) || node.name;
+    const run = (renameGen.current.get(node.id) ?? 0) + 1;
+    renameGen.current.set(node.id, run);
     try {
       const updated = await renameMoveNode(client, company, node.id, {
         name: next,
       });
+      // A late response from a superseded rename must not revert the newer
+      // name — the requests race on the network, not on the operator's intent.
+      if (renameGen.current.get(node.id) !== run) return;
       setNodes((all) => all.map((n) => (n.id === updated.id ? updated : n)));
       setOpenFile((f) => (f && f.id === updated.id ? { ...f, name: updated.name } : f));
     } catch (e) {
+      // A stale failure must not toast over a newer attempt's outcome either.
+      if (renameGen.current.get(node.id) !== run) return;
       toast.error(message(e, "could not rename this item"));
     }
   }
