@@ -226,17 +226,27 @@ export function PeopleView({ client, company }: Props) {
   }
 
   if (!isAdmin) {
+    // Fail closed either way - no control is offered - but say which closed
+    // it: a genuine read failure (a dropped connection, a 500) is not "you
+    // lack access", and showing the member notice for it misleads the
+    // operator into waiting on an admin instead of retrying the load.
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {header}
         <div className="min-h-0 w-full flex-1 overflow-y-auto px-4 py-6">
-        <Alert>
-          <ShieldCheck className="size-4" />
-          <AlertDescription>
-            Only an admin can manage people. Ask one of them to invite someone or
-            change access.
-          </AlertDescription>
-        </Alert>
+        {error ? (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : (
+          <Alert>
+            <ShieldCheck className="size-4" />
+            <AlertDescription>
+              Only an admin can manage people. Ask one of them to invite someone or
+              change access.
+            </AlertDescription>
+          </Alert>
+        )}
         </div>
       </div>
     );

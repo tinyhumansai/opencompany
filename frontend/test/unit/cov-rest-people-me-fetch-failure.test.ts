@@ -71,13 +71,11 @@ describe("PeopleView, /auth/me merely failing to answer (not a real member)", ()
     expect(get).toHaveBeenCalledWith(expect.stringMatching(/\/auth\/me$/));
   });
 
-  // FINDING: fails today. The failure renders "Only an admin can manage
-  // people" (the isAdmin=false branch) instead of the page's own honest
-  // "Couldn't load people" error state, because that branch returns before
-  // the `error` alert is ever reached. A dropped connection reads exactly
-  // like being told you lack access, which is a false explanation even
-  // though no control leaks. See the file's doc comment.
-  it.skip("says the read failed, not that the viewer lacks access — currently shows the wrong reason", async () => {
+  // Fixed in `PeopleView`: the fail-closed branch renders the page's `error`
+  // alert when the read failed and the member notice only when a member
+  // actually answered, so a dropped connection no longer reads as "you lack
+  // access".
+  it("says the read failed, not that the viewer lacks access", async () => {
     const client = clientAs((path) => {
       if (path.endsWith("/auth/me")) {
         return Promise.reject(new ApiError(0, "network_error", "cannot reach the company host"));
