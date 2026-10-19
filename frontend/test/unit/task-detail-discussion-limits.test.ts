@@ -254,6 +254,250 @@ describe("the composer surfaces the limit", () => {
   });
 });
 
+describe("the composer keeps IME confirmation separate from posting", () => {
+  it.each([
+    { label: "composing Enter", isComposing: true, keyCode: 13, draft: "日本語を入力", prevented: false },
+    { label: "an Enter the IME handled (keyCode 229)", isComposing: false, keyCode: 229, draft: "中文输入", prevented: true },
+  ])("keeps the draft on $label, then posts on an ordinary Enter", async ({ isComposing, keyCode, draft, prevented }) => {
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), draft);
+    const confirmation = new KeyboardEvent("keydown", {
+      key: "Enter", bubbles: true, cancelable: true, isComposing,
+    });
+    // keyCode is read-only and some environments ignore the constructor init, so set it explicitly.
+    Object.defineProperty(confirmation, "keyCode", { value: keyCode });
+    await act(async () => { textarea().dispatchEvent(confirmation); });
+
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe(draft);
+    // A swallowed Enter must not insert a newline - but while composing the
+    // default belongs to the IME, so only the post-composition 229 cancels.
+    expect(confirmation.defaultPrevented).toBe(prevented);
+
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(enter); });
+    expect(seen).toEqual([draft]);
+    expect(textarea().value).toBe("");
+    expect(enter.defaultPrevented).toBe(true);
+  });
+
+  it("keeps the IME's default on a 229 confirming Enter that precedes compositionend", async () => {
+    // WebKit can mark the confirming Enter keyCode 229 with isComposing
+    // already false even though compositionend has not fired yet. Cancelling
+    // that keydown's default breaks the IME commit, so while the composition
+    // is still active the hook must suppress the post without cancelling.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "中文输入");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    });
+    const confirming = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(confirming, "keyCode", { value: 229 });
+    await act(async () => { textarea().dispatchEvent(confirming); });
+
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("中文输入");
+    expect(confirming.defaultPrevented).toBe(false);
+
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(enter); });
+    expect(seen).toEqual(["中文输入"]);
+  });
+
+  it("keeps the IME's default on a repeated 229 confirming Enter before compositionend", async () => {
+    // Holding the confirming Enter repeats it: repeat=true, isComposing=false,
+    // keyCode 229, and on WebKit possibly before compositionend. The repeat is
+    // still the composition's key, so its default must run for the commit.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "中文输入");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    });
+    const confirming = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(confirming, "keyCode", { value: 229 });
+    await act(async () => { textarea().dispatchEvent(confirming); });
+    const repeated = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, repeat: true });
+    Object.defineProperty(repeated, "keyCode", { value: 229 });
+    Object.defineProperty(repeated, "repeat", { value: true });
+    await act(async () => { textarea().dispatchEvent(repeated); });
+
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("中文输入");
+    expect(confirming.defaultPrevented).toBe(false);
+    expect(repeated.defaultPrevented).toBe(false);
+
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(enter); });
+    expect(seen).toEqual(["中文输入"]);
+  });
+
+  it("keeps the draft on Safari's completing Enter (compositionend, then a plain Enter)", async () => {
+    // WebKit bug 165004: the completing keydown arrives after compositionend,
+    // isComposing already false, keyCode an ordinary 13. Only the just-ended
+    // composition burst marks it as the IME's, so neither of the other two
+    // signals can catch it.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "한국어 입력");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => {
+      textarea().dispatchEvent(enter);
+    });
+
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("한국어 입력");
+    // The caller skips its own preventDefault for a suppressed Enter; the
+    // guard must cancel the default itself or the completing Enter inserts a
+    // newline mid-draft in a real browser.
+    expect(enter.defaultPrevented).toBe(true);
+  });
+
+  it("posts on the Enter right after a Chrome-style confirmed composition", async () => {
+    // Chrome/Firefox order: the confirming keydown (isComposing) runs BEFORE
+    // compositionend. That compositionend must not arm the burst window, or the
+    // operator's immediate send Enter would be misclassified as a confirmation.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "日本語を入力");
+    const confirm = new KeyboardEvent("keydown", {
+      key: "Enter", bubbles: true, cancelable: true, isComposing: true,
+    });
+    await act(async () => { textarea().dispatchEvent(confirm); });
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const send = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(send); });
+
+    expect(seen).toEqual(["日本語を入力"]);
+  });
+
+  it("posts on the operator's Enter right after Safari's completing Enter", async () => {
+    // The burst window suppresses Safari's completing Enter exactly once; a
+    // genuine Enter inside the same window must still post.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "한국어 입력");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const completing = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(completing); });
+    expect(seen).toEqual([]);
+
+    const send = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(send); });
+    expect(seen).toEqual(["한국어 입력"]);
+  });
+
+  it("posts on the operator's Enter after a completing Enter reported as keyCode 229", async () => {
+    // Some engines end the composition first and still send the completing
+    // Enter as keyCode 229. That Enter spends the burst window it follows;
+    // the operator's next Enter must post.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "日本語");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const completing = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(completing, "keyCode", { value: 229 });
+    await act(async () => { textarea().dispatchEvent(completing); });
+    expect(seen).toEqual([]);
+
+    const send = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(send); });
+    expect(seen).toEqual(["日本語"]);
+  });
+
+  it("ignores the auto-repeats of a held confirming Enter", async () => {
+    // Holding Enter to confirm a composition repeats the key after
+    // compositionend with isComposing already false. Each repeat is the same
+    // gesture; none of them posts.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "한국어");
+    const confirm = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true });
+    await act(async () => { textarea().dispatchEvent(confirm); });
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    // Held-Enter repeats keep coming long after the composition burst window
+    // closes, so run them past it; the repeat signal, not the window, must
+    // be what stops them.
+    const pastWindow = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5000);
+    try {
+      for (let i = 0; i < 3; i++) {
+        const repeat = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, repeat: true });
+        await act(async () => { textarea().dispatchEvent(repeat); });
+        // The composition is over, so the default action would be a real
+        // newline; every repeat must be cancelled, not only kept from posting.
+        expect(repeat.defaultPrevented).toBe(true);
+      }
+    } finally {
+      pastWindow.mockRestore();
+    }
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("한국어");
+  });
+
+  it("arms the burst again for a composition that follows a post-end 229 completing Enter", async () => {
+    // WebKit order with a 229-marked completion: compositionend first, then
+    // the completing Enter as keyCode 229. That keydown spends the burst and
+    // must not leak confirmation state into the next composition on the same
+    // mounted composer - its own completing Enter still needs the burst.
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "日本語");
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const completing229 = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    Object.defineProperty(completing229, "keyCode", { value: 229 });
+    await act(async () => { textarea().dispatchEvent(completing229); });
+    expect(seen).toEqual([]);
+
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionstart", { bubbles: true }));
+    });
+    await act(async () => {
+      textarea().dispatchEvent(new Event("compositionend", { bubbles: true }));
+    });
+    const completing = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(completing); });
+    expect(seen).toEqual([]);
+
+    const send = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await act(async () => { textarea().dispatchEvent(send); });
+    expect(seen).toEqual(["日本語"]);
+  });
+
+  it("leaves Shift+Enter to the textarea", async () => {
+    const seen: string[] = [];
+    await render(postingClient(seen));
+    await type(textarea(), "a note");
+    const newline = new KeyboardEvent("keydown", {
+      key: "Enter", shiftKey: true, bubbles: true, cancelable: true,
+    });
+    await act(async () => { textarea().dispatchEvent(newline); });
+    expect(seen).toEqual([]);
+    expect(textarea().value).toBe("a note");
+    expect(newline.defaultPrevented).toBe(false);
+  });
+});
+
 describe("withdrawing a message has an in-flight state", () => {
   /** Presses Remove and confirms it in the portalled dialog. */
   async function withdraw() {
